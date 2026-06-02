@@ -1,0 +1,80 @@
+"""Stdlib-only tests (unittest, so the repo has zero test deps either).
+
+  python3 -m unittest discover -s tests
+"""
+
+import unittest
+from unittest import mock
+
+from makeros_hub import http
+from makeros_hub.agent import heartbeat_payload
+from makeros_hub.config import Config
+
+
+class TestHttpParse(unittest.TestCase):
+    def test_parses_json_object(self):
+        r = http._parse(200, b'{"ok": true, "hubId": "h1"}')
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.body["hubId"], "h1")
+
+    def test_empty_body_is_empty_dict(self):
+        self.assertEqual(http._parse(200, b"").body, {})
+
+    def test_non_json_raises(self):
+        with self.assertRaises(http.TransportError):
+            http._parse(200, b"<html>not json</html>")
+
+    def test_json_array_raises(self):
+        with self.assertRaises(http.TransportError):
+            http._parse(200, b"[1, 2, 3]")
+
+
+class TestConfigUrls(unittest.TestCase):
+    def test_endpoint_urls(self):
+        cfg = Config(cloud_url="https://host.example/")
+        self.assertEqual(cfg.enroll_url, "https://host.example/api/print/hub/enroll")
+        self.assertEqual(cfg.heartbeat_url, "https://host.example/api/print/hub/heartbeat")
+
+
+class TestHeartbeatPayload(unittest.TestCase):
+    def test_shape(self):
+        p = heartbeat_payload()
+        # The contract the cloud Zod-parses: liveness self-report + empty
+        # printer/job arrays (the printer adapter fills these in PR 5).
+        for key in ("agentVersion", "os", "hostname", "uptimeSec", "printers", "jobs"):
+            self.assertIn(key, p)
+        self.assertEqual(p["printers"], [])
+        self.assertEqual(p["jobs"], [])
+
+
+class TestEnroll(unittest.TestCase):
+    def test_enroll_writes_credential_on_200(self):
+        from makeros_hub import enroll as enroll_mod
+
+        cfg = Config(cloud_url="https://host.example")
+        with mock.patch.object(
+            enroll_mod, "read_credential", return_value=None
+        ), mock.patch.object(
+            enroll_mod, "post_json",
+            return_value=http.Response(200, {"hubId": "h1", "credential": "secret-cred"}),
+        ), mock.patch.object(enroll_mod, "write_credential") as wc:
+            hub_id = enroll_mod.enroll(cfg, "the-token")
+        self.assertEqual(hub_id, "h1")
+        wc.assert_called_once_with("secret-cred")
+
+    def test_enroll_consumed_token_exits(self):
+        from makeros_hub import enroll as enroll_mod
+
+        cfg = Config(cloud_url="https://host.example")
+        with mock.patch.object(
+            enroll_mod, "read_credential", return_value=None
+        ), mock.patch.object(
+            enroll_mod, "post_json",
+            return_value=http.Response(410, {"error": "token_consumed"}),
+        ):
+            with self.assertRaises(SystemExit):
+                enroll_mod.enroll(cfg, "used-token")
+
+
+if __name__ == "__main__":
+    unittest.main()

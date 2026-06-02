@@ -1,0 +1,27 @@
+[Unit]
+Description=makeros native-print hub agent
+Documentation=https://github.com/overengineered-solutions/makeros-hub-agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=makeros-hub
+Group=makeros-hub
+Environment=PYTHONPATH=/opt/makeros-hub
+ExecStart=/usr/bin/python3 -m makeros_hub run
+# Restart=always IS the self-healing reconnect primitive — a network blip,
+# a cloud deploy, or a transient 5xx just bounces the loop.
+Restart=always
+RestartSec=5
+# Modest hardening (a box on the shop LAN). The credential + state live under
+# the StateDirectory, which systemd creates 0700 owned by the service user.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=makeros-hub
+ConfigurationDirectory=makeros-hub
+
+[Install]
+WantedBy=multi-user.target
