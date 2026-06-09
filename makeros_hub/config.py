@@ -11,6 +11,7 @@ manual run can point at a different cloud without editing files.
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,36 @@ def load_config(cloud_url_override: str | None = None) -> Config:
         or DEFAULT_HEARTBEAT_SEC
     )
     return Config(cloud_url=cloud_url, heartbeat_sec=heartbeat)
+
+
+def persist_cloud_url(cloud_url: str) -> None:
+    """Write `cloud_url` into config.toml so the heartbeat loop targets the host
+    the operator enrolled with — not the template placeholder. Called after a
+    successful enroll.
+
+    Stdlib-only: a minimal line rewrite (tomllib is read-only and we don't pull
+    a TOML writer into a zero-dep agent). Replaces an existing top-level
+    `cloud_url = …` line (commented lines don't match) or appends one; other
+    lines (heartbeat_sec, comments) are preserved.
+    """
+    line = f'cloud_url = "{cloud_url}"\n'
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(line, encoding="utf-8")
+        return
+    out: list[str] = []
+    replaced = False
+    for ln in CONFIG_PATH.read_text(encoding="utf-8").splitlines(keepends=True):
+        if not replaced and re.match(r"\s*cloud_url\s*=", ln):
+            out.append(line)
+            replaced = True
+        else:
+            out.append(ln)
+    if not replaced:
+        if out and not out[-1].endswith("\n"):
+            out[-1] += "\n"
+        out.append(line)
+    CONFIG_PATH.write_text("".join(out), encoding="utf-8")
 
 
 def read_credential() -> str | None:
