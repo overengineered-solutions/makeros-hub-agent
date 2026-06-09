@@ -23,6 +23,19 @@ auditable record of the trust model.
 - Authentication is **hash-lookup + constant-time hash compare**, never a plaintext `==`.
 - The one-time enrollment token is single-use, 15-minute TTL, and likewise stored only as a hash.
 
+## Printer credentials (config-down)
+
+- A Bambu **LAN access code** is a low-stakes secret (it's printed on the printer's own screen
+  and is rotatable there). The operator enters it in the cloud admin UI; the cloud stores it
+  **encrypted at rest in Supabase Vault** — only its last-4 lands in a regular column.
+- The agent **pulls** its printer list, access codes included, from `GET /api/print/hub/config`,
+  authenticated with its per-hub bearer over TLS. This is the **only** direction a printer
+  secret travels, and only to the one hub that owns the printer.
+- On the Pi the access code is held **only in process memory** (the MQTT password) — never
+  written to disk, never logged, and **never sent back up** on the heartbeat (which carries
+  printer telemetry only). The wire status DTO has no `accessCode`/`serial`/`ip` fields by
+  construction.
+
 ## Least privilege
 
 - Runs as a dedicated **non-login system user** (`makeros-hub`), not root.

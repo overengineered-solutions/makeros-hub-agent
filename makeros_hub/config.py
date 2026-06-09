@@ -36,6 +36,10 @@ class Config:
     def heartbeat_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/heartbeat"
 
+    @property
+    def config_url(self) -> str:
+        return self.cloud_url.rstrip("/") + "/api/print/hub/config"
+
 
 def load_config(cloud_url_override: str | None = None) -> Config:
     """Resolve config from (precedence): explicit arg > env > config.toml."""

@@ -61,6 +61,23 @@ def post_json(
         time.sleep(min(sleep_s, 30.0))
 
 
+def get_json(url: str, *, bearer: str | None = None, timeout: float = 15.0) -> Response:
+    """GET JSON, parse a JSON object back. Used for config-down (the printer
+    list + access codes). No retries — the heartbeat loop re-pulls on the next
+    configVersion change anyway. Raises TransportError on a network failure."""
+    headers = {"Accept": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return _parse(resp.status, resp.read())
+    except urllib.error.HTTPError as exc:
+        return Response(status=exc.code, body=_safe_read(exc))
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        raise TransportError(f"network error talking to {url}: {exc}") from exc
+
+
 def _parse(status: int, raw: bytes) -> Response:
     try:
         body = json.loads(raw.decode("utf-8")) if raw else {}

@@ -9,7 +9,10 @@ Type=simple
 User=makeros-hub
 Group=makeros-hub
 Environment=PYTHONPATH=/opt/makeros-hub
-ExecStart=/usr/bin/python3 -m makeros_hub run
+# The venv python carries paho-mqtt (the Bambu adapter). install.sh creates it.
+# If it's ever absent the agent still enrolls + heartbeats — swap to
+# /usr/bin/python3 and printers report 'agent_missing_paho' until paho is added.
+ExecStart=/opt/makeros-hub/venv/bin/python -m makeros_hub run
 # Restart=always IS the self-healing reconnect primitive — a network blip,
 # a cloud deploy, or a transient 5xx just bounces the loop.
 Restart=always
