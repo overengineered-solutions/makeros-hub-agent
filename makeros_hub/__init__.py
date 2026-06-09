@@ -6,4 +6,4 @@ on a fresh Raspberry Pi OS with zero `pip install`. The printer adapters (PR 5)
 add httpx + the vendor libraries behind the abstracted transport in `http.py`.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

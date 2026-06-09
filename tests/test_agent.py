@@ -3,7 +3,9 @@
   python3 -m unittest discover -s tests
 """
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from makeros_hub import http
@@ -74,6 +76,37 @@ class TestEnroll(unittest.TestCase):
         ):
             with self.assertRaises(SystemExit):
                 enroll_mod.enroll(cfg, "used-token")
+
+
+class TestPersistCloudUrl(unittest.TestCase):
+    def test_replaces_placeholder_and_preserves_other_lines(self):
+        from makeros_hub import config as cfg_mod
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.toml"
+            p.write_text(
+                '# comment\ncloud_url = "https://your-makeros-host.example"\nheartbeat_sec = 30\n',
+                encoding="utf-8",
+            )
+            with mock.patch.object(cfg_mod, "CONFIG_PATH", p):
+                cfg_mod.persist_cloud_url("https://www.makeros.net")
+            txt = p.read_text(encoding="utf-8")
+            self.assertIn('cloud_url = "https://www.makeros.net"', txt)
+            self.assertNotIn("your-makeros-host.example", txt)
+            self.assertIn("heartbeat_sec = 30", txt)  # other lines preserved
+            self.assertIn("# comment", txt)
+
+    def test_appends_when_absent(self):
+        from makeros_hub import config as cfg_mod
+
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "config.toml"
+            p.write_text("heartbeat_sec = 30\n", encoding="utf-8")
+            with mock.patch.object(cfg_mod, "CONFIG_PATH", p):
+                cfg_mod.persist_cloud_url("https://www.makeros.net")
+            txt = p.read_text(encoding="utf-8")
+            self.assertIn('cloud_url = "https://www.makeros.net"', txt)
+            self.assertIn("heartbeat_sec = 30", txt)
 
 
 if __name__ == "__main__":

@@ -36,8 +36,12 @@ echo "==> config -> $CONFIG_DIR/config.toml"
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
   cp "$HERE/config.toml.example" "$CONFIG_DIR/config.toml"
-  echo "    (created from template — set cloud_url in it, or pass --cloud-url to enroll)"
+  echo "    (created from template — enroll writes cloud_url here automatically)"
 fi
+# enroll runs as $SERVICE_USER and persists the enrolled cloud_url into this
+# file, so it must be writable by that user. It's non-secret config (the bearer
+# credential lives 0600 in $STATE_DIR). Unconditional so re-runs fix ownership.
+chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR/config.toml"
 
 echo "==> wrapper -> /usr/local/bin/makeros-hub"
 cat > /usr/local/bin/makeros-hub <<'WRAP'
@@ -53,10 +57,10 @@ systemctl daemon-reload
 cat <<DONE
 
 Installed. Next:
-  1) Set cloud_url in $CONFIG_DIR/config.toml (or pass --cloud-url to enroll).
-  2) Mint a token at <cloud>/admin/3dprinting/hubs, then on this Pi run:
+  1) Mint a token at <cloud>/admin/3dprinting/hubs and run the command it shows
+     (it includes --cloud-url, which enroll saves into config.toml):
        sudo -u $SERVICE_USER makeros-hub enroll --token <token> --cloud-url <url>
-  3) Start the loop:
+  2) Start the loop:
        sudo systemctl enable --now makeros-hub
        journalctl -u makeros-hub -f      # 'heartbeat ok 200' every ~30s
 DONE
