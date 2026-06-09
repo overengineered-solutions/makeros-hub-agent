@@ -4,12 +4,16 @@
 #
 #   sudo ./install.sh
 #
-# No pip / venv: the enrollment-slice agent is standard-library only, so it runs
-# on a fresh Raspberry Pi OS (Python 3.11) with zero dependency installs.
+# The printer-adapter slice (PR 5) adds the agent's first runtime dependency,
+# paho-mqtt (Bambu LAN telemetry), installed into a venv at $INSTALL_DIR/venv.
+# Enrollment + heartbeat stay stdlib-only, so the agent still runs (printers just
+# report 'agent_missing_paho') even if the venv step is skipped — but the
+# installer sets it up so the Bambu adapter works out of the box.
 set -euo pipefail
 
 SERVICE_USER=makeros-hub
 INSTALL_DIR=/opt/makeros-hub
+VENV="$INSTALL_DIR/venv"
 CONFIG_DIR=/etc/makeros-hub
 STATE_DIR=/var/lib/makeros-hub
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -26,6 +30,34 @@ mkdir -p "$INSTALL_DIR"
 rm -rf "$INSTALL_DIR/makeros_hub"
 cp -r "$HERE/makeros_hub" "$INSTALL_DIR/"
 chmod -R a+rX "$INSTALL_DIR"
+
+echo "==> python venv + deps ($VENV)"
+PYBIN="$VENV/bin/python"
+if [ ! -x "$PYBIN" ]; then
+  if ! python3 -m venv "$VENV" 2>/dev/null; then
+    echo "    venv module missing — installing python3-venv/python3-pip via apt"
+    if command -v apt-get >/dev/null; then
+      apt-get update -qq && apt-get install -y -qq python3-venv python3-pip
+      python3 -m venv "$VENV"
+    else
+      echo "    !! could not create a venv and apt-get isn't available."
+      echo "    !! install python3-venv yourself, then re-run. Continuing without paho —"
+      echo "    !! enrollment/heartbeat work; printers will report 'agent_missing_paho'."
+    fi
+  fi
+fi
+if [ -x "$PYBIN" ]; then
+  "$PYBIN" -m pip install --quiet --upgrade pip || true
+  # paho-mqtt v2 (CallbackAPIVersion.VERSION2 / MQTTv311). piwheels has a
+  # pure-python wheel for the Pi — no compiler needed.
+  if "$PYBIN" -m pip install --quiet "paho-mqtt>=2.0,<3"; then
+    echo "    paho-mqtt installed"
+  else
+    echo "    !! paho-mqtt install failed (offline?) — adapters report 'agent_missing_paho'"
+    echo "    !! until you run: sudo $PYBIN -m pip install 'paho-mqtt>=2.0,<3'"
+  fi
+  chmod -R a+rX "$VENV"
+fi
 
 echo "==> state dir -> $STATE_DIR (credential lands here, 0700, owned by $SERVICE_USER)"
 mkdir -p "$STATE_DIR"
@@ -46,7 +78,11 @@ chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR/config.toml"
 echo "==> wrapper -> /usr/local/bin/makeros-hub"
 cat > /usr/local/bin/makeros-hub <<'WRAP'
 #!/bin/sh
-exec env PYTHONPATH=/opt/makeros-hub python3 -m makeros_hub "$@"
+# Prefer the venv python (has paho-mqtt); fall back to system python3, which
+# still runs enroll + heartbeat (stdlib-only).
+PY=/opt/makeros-hub/venv/bin/python
+[ -x "$PY" ] || PY=python3
+exec env PYTHONPATH=/opt/makeros-hub "$PY" -m makeros_hub "$@"
 WRAP
 chmod +x /usr/local/bin/makeros-hub
 

@@ -36,6 +36,7 @@ class TestConfigUrls(unittest.TestCase):
         cfg = Config(cloud_url="https://host.example/")
         self.assertEqual(cfg.enroll_url, "https://host.example/api/print/hub/enroll")
         self.assertEqual(cfg.heartbeat_url, "https://host.example/api/print/hub/heartbeat")
+        self.assertEqual(cfg.config_url, "https://host.example/api/print/hub/config")
 
 
 class TestHeartbeatPayload(unittest.TestCase):
