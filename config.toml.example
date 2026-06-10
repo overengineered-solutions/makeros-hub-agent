@@ -5,9 +5,17 @@
 # /var/lib/makeros-hub/credential during enrollment, and never logged.
 
 # The makeros cloud base URL this hub reports to (your prod host).
-# Outbound HTTPS only — no inbound ports needed on the shop LAN.
+# The hub→cloud link is outbound HTTPS only. The ONE inbound listener is the
+# OrcaSlicer ingest server (below) on the trusted shop LAN.
 cloud_url = "https://your-makeros-host.example"
 
 # Heartbeat cadence in seconds. The cloud can override this per heartbeat
 # response (nextPollMs), so you rarely need to change it here.
 heartbeat_sec = 30
+
+# The OrcaSlicer ingest server binds this (non-privileged) LAN port. Members
+# point OrcaSlicer's Print Host at http://<this-hub>.local:<ingest_port>.
+ingest_port = 8787
+
+# Cap a single sliced-file upload, in MB (guards the Pi against a runaway upload).
+max_upload_mb = 256
