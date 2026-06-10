@@ -108,24 +108,55 @@ def build_print_start_payload(
     ams_mapping=None,
     sequence_id,
     subtask_name: str | None = None,
+    bed_type: str = "textured_plate",
 ) -> dict:
     """Build the exact MQTT project_file command for a root-uploaded 3MF."""
     task_name = subtask_name or os.path.splitext(os.path.basename(file_name))[0]
     return {
         "print": {
             "command": "project_file",
+            "project_id": "0",
+            "profile_id": "0",
+            "task_id": "0",
+            "subtask_id": "0",
             "param": f"Metadata/plate_{plate}.gcode",
             "file": file_name,
             "url": f"ftp:///{file_name}",
             "subtask_name": task_name,
-            "bed_type": "textured_plate",
+            "bed_type": bed_type,
             "bed_leveling": True,
             "bed_levelling": True,
             "flow_cali": False,
             "vibration_cali": True,
             "layer_inspect": False,
+            "timelapse": False,
+            "md5": "",
             "use_ams": use_ams,
-            "ams_mapping": list(ams_mapping or []),
+            "ams_mapping": _coerce_ams_mapping(ams_mapping),
             "sequence_id": str(sequence_id),
         }
     }
+
+
+def _coerce_ams_mapping(value) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        parts = [part.strip() for part in text.split(",")]
+        if any(part == "" for part in parts):
+            return []
+        try:
+            return [int(part) for part in parts]
+        except ValueError:
+            return []
+    if isinstance(value, list):
+        out: list[int] = []
+        for item in value:
+            if isinstance(item, bool) or not isinstance(item, int):
+                return []
+            out.append(item)
+        return out
+    return []

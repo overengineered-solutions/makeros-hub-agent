@@ -16,6 +16,10 @@ class TestPrintStartPayload(unittest.TestCase):
         payload = build_print_start_payload("bracket.3mf", sequence_id="seq123")
         p = payload["print"]
         self.assertEqual(p["command"], "project_file")
+        self.assertEqual(p["project_id"], "0")
+        self.assertEqual(p["profile_id"], "0")
+        self.assertEqual(p["task_id"], "0")
+        self.assertEqual(p["subtask_id"], "0")
         self.assertEqual(p["param"], "Metadata/plate_1.gcode")
         self.assertEqual(p["file"], "bracket.3mf")
         self.assertEqual(p["url"], "ftp:///bracket.3mf")
@@ -26,6 +30,8 @@ class TestPrintStartPayload(unittest.TestCase):
         self.assertIs(p["flow_cali"], False)
         self.assertIs(p["vibration_cali"], True)
         self.assertIs(p["layer_inspect"], False)
+        self.assertIs(p["timelapse"], False)
+        self.assertEqual(p["md5"], "")
         self.assertIs(p["use_ams"], False)
         self.assertEqual(p["ams_mapping"], [])
         self.assertIsInstance(p["sequence_id"], str)
@@ -36,16 +42,36 @@ class TestPrintStartPayload(unittest.TestCase):
             "plate-set.3mf",
             plate=3,
             use_ams=True,
-            ams_mapping=[2, 0],
+            ams_mapping="0,1",
             sequence_id=55,
             subtask_name="Customer order",
+            bed_type="auto",
         )
         p = payload["print"]
         self.assertEqual(p["param"], "Metadata/plate_3.gcode")
+        self.assertEqual(p["bed_type"], "auto")
         self.assertIs(p["use_ams"], True)
-        self.assertEqual(p["ams_mapping"], [2, 0])
+        self.assertEqual(p["ams_mapping"], [0, 1])
         self.assertEqual(p["sequence_id"], "55")
         self.assertEqual(p["subtask_name"], "Customer order")
+
+    def test_unparseable_ams_mapping_becomes_empty(self):
+        payload = build_print_start_payload(
+            "plate-set.3mf",
+            ams_mapping="0,nope",
+            sequence_id="seq123",
+        )
+
+        self.assertEqual(payload["print"]["ams_mapping"], [])
+
+    def test_list_ams_mapping_still_supported(self):
+        payload = build_print_start_payload(
+            "plate-set.3mf",
+            ams_mapping=[2, 0],
+            sequence_id="seq123",
+        )
+
+        self.assertEqual(payload["print"]["ams_mapping"], [2, 0])
 
 
 class TestImplicitFTP(unittest.TestCase):

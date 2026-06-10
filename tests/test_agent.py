@@ -9,7 +9,14 @@ from pathlib import Path
 from unittest import mock
 
 from makeros_hub import http
-from makeros_hub.agent import heartbeat_payload
+from makeros_hub.agent import (
+    QUEUE_STATUS_DROP,
+    QUEUE_STATUS_RETRY,
+    QUEUE_STATUS_SENT,
+    _flush_queue_status_reports,
+    heartbeat_payload,
+    make_queue_status_reporter,
+)
 from makeros_hub.config import Config
 
 
@@ -49,6 +56,57 @@ class TestHeartbeatPayload(unittest.TestCase):
             self.assertIn(key, p)
         self.assertEqual(p["printers"], [])
         self.assertEqual(p["jobs"], [])
+
+
+class TestQueueStatusOutbox(unittest.TestCase):
+    def test_flush_drops_deterministic_4xx_and_continues(self):
+        reports = [
+            {"queueJobId": "q1", "state": "completed"},
+            {"queueJobId": "q2", "state": "completed"},
+            {"queueJobId": "q3", "state": "completed"},
+        ]
+
+        def reporter(report):
+            if report["queueJobId"] == "q2":
+                return QUEUE_STATUS_DROP
+            return QUEUE_STATUS_SENT
+
+        self.assertEqual(_flush_queue_status_reports(reporter, reports), [])
+
+    def test_flush_retains_5xx_retry_and_later_reports(self):
+        reports = [
+            {"queueJobId": "q1", "state": "completed"},
+            {"queueJobId": "q2", "state": "completed"},
+            {"queueJobId": "q3", "state": "completed"},
+        ]
+
+        def reporter(report):
+            if report["queueJobId"] == "q2":
+                return QUEUE_STATUS_RETRY
+            return QUEUE_STATUS_SENT
+
+        self.assertEqual(_flush_queue_status_reports(reporter, reports), reports[1:])
+
+    def test_reporter_drops_4xx_and_retries_5xx_or_transport(self):
+        cfg = Config(cloud_url="https://host.example")
+        reporter = make_queue_status_reporter(cfg, "cred")
+        report = {"queueJobId": "q1", "state": "held", "reason": "bad_assignment"}
+
+        with mock.patch(
+            "makeros_hub.agent.post_json",
+            return_value=http.Response(409, {"error": "bad transition"}),
+        ):
+            self.assertEqual(reporter(report), QUEUE_STATUS_DROP)
+        with mock.patch(
+            "makeros_hub.agent.post_json",
+            return_value=http.Response(503, {"error": "try later"}),
+        ):
+            self.assertEqual(reporter(report), QUEUE_STATUS_RETRY)
+        with mock.patch(
+            "makeros_hub.agent.post_json",
+            side_effect=http.TransportError("network down"),
+        ):
+            self.assertEqual(reporter(report), QUEUE_STATUS_RETRY)
 
 
 class TestEnroll(unittest.TestCase):

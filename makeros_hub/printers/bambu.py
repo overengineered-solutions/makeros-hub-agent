@@ -32,6 +32,7 @@ import paho.mqtt.client as mqtt
 
 from . import bambu_parse, bambu_send
 from .jobs import JobTracker
+from .queue_progress import QueueProgressTracker
 
 log = logging.getLogger("makeros-hub.bambu")
 
@@ -70,14 +71,11 @@ class BambuAdapter:
         self._client: mqtt.Client | None = None
         # Terminal-job detection over the merged state (pure; fed under _lock).
         self._jobs = JobTracker(printer_id, serial)
-        # Queue assignment correlation is intentionally conservative: we only
-        # link a queue job to a terminal JobTracker record that appears after a
-        # start_print call, and we choose the newest terminal job for the most
-        # recent unresolved queue start. If a member manually starts another
-        # print in that window, we may skip or mis-link; avoiding a stronger
-        # claim keeps this slice simple until firmware-supplied ids are proven.
-        self._queue_starts: list[dict[str, Any]] = []
-        self._queue_linked_job_keys: set[str] = set()
+        # Queue assignment state is driven by OBSERVED telemetry, not by
+        # MQTT-publish success. The tracker reports "printing" only after
+        # RUNNING/PAUSE appears and links completion to the JobTracker's real
+        # terminal printer job key.
+        self._queue_progress = QueueProgressTracker()
 
     @property
     def _report_topic(self) -> str:
@@ -244,45 +242,16 @@ class BambuAdapter:
             )
             return {"ok": False, "reason": "start_command_failed"}
 
-        expected_job_key = f"task_{self.serial}_{sequence_id}"
         if queue_job_id:
             with self._lock:
-                self._queue_starts.append(
-                    {
-                        "queueJobId": queue_job_id,
-                        "baselineKeys": {j["jobKey"] for j in self._jobs.pending()},
-                    }
-                )
-        return {"ok": True, "jobKey": expected_job_key}
+                self._queue_progress.record_dispatch(queue_job_id, self._jobs.pending())
+        return {"ok": True}
 
-    def take_completed_queue_links(self) -> list[dict]:
-        """Drain conservative queue-job ↔ terminal-printer-job links.
-
-        We do not get a guaranteed local-print id at command time, so this uses
-        the next new terminal JobTracker record after start_print as the link.
-        """
+    def collect_queue_progress(self) -> list[dict]:
+        """Drain queue-status reports inferred from observed printer telemetry."""
         with self._lock:
-            pending = self._jobs.pending()
-            links: list[dict] = []
-            while self._queue_starts:
-                start = self._queue_starts[-1]
-                candidates = [
-                    j
-                    for j in pending
-                    if j.get("jobKey") not in start["baselineKeys"]
-                    and j.get("jobKey") not in self._queue_linked_job_keys
-                ]
-                if not candidates:
-                    break
-                job = candidates[-1]
-                job_key = job["jobKey"]
-                self._queue_linked_job_keys.add(job_key)
-                self._queue_starts.pop()
-                links.append(
-                    {
-                        "queueJobId": start["queueJobId"],
-                        "jobKey": job_key,
-                        "status": job.get("status"),
-                    }
-                )
-            return links
+            print_obj = self._data.get("print") if isinstance(self._data.get("print"), dict) else {}
+            return self._queue_progress.collect(
+                self._jobs.pending(),
+                print_obj.get("gcode_state"),
+            )

@@ -30,6 +30,10 @@ from .update import maybe_update
 
 log = logging.getLogger("makeros-hub")
 
+QUEUE_STATUS_SENT = "sent"
+QUEUE_STATUS_RETRY = "retry"
+QUEUE_STATUS_DROP = "drop"
+
 
 def make_cloud_submit(cfg: Config, credential: str):
     """Closure the ingest server calls to register an OrcaSlicer upload with the
@@ -68,7 +72,7 @@ def make_cloud_submit(cfg: Config, credential: str):
 def make_queue_status_reporter(cfg: Config, credential: str):
     """Closure for queue assignment state transitions."""
 
-    def report(status_report: dict) -> bool:
+    def report(status_report: dict) -> str:
         body = {
             "queueJobId": status_report.get("queueJobId"),
             "state": status_report.get("state"),
@@ -92,9 +96,18 @@ def make_queue_status_reporter(cfg: Config, credential: str):
                 body.get("state"),
                 exc,
             )
-            return False
+            return QUEUE_STATUS_RETRY
         if 200 <= resp.status < 300:
-            return True
+            return QUEUE_STATUS_SENT
+        if 400 <= resp.status < 500:
+            log.warning(
+                "dropping deterministic queue status report after HTTP %s for %s/%s: %s",
+                resp.status,
+                body.get("queueJobId"),
+                body.get("state"),
+                resp.body.get("error"),
+            )
+            return QUEUE_STATUS_DROP
         log.warning(
             "queue status report unexpected %s for %s/%s: %s",
             resp.status,
@@ -102,16 +115,24 @@ def make_queue_status_reporter(cfg: Config, credential: str):
             body.get("state"),
             resp.body.get("error"),
         )
-        return False
+        return QUEUE_STATUS_RETRY
 
     return report
 
 
 def _flush_queue_status_reports(reporter, reports: list[dict]) -> list[dict]:
-    """POST in order; keep the failed report and everything after it."""
+    """POST in order; retry transport/5xx, drop deterministic 4xx."""
     for idx, report in enumerate(reports):
-        if not reporter(report):
+        result = reporter(report)
+        if result in (True, QUEUE_STATUS_SENT):
+            continue
+        if result == QUEUE_STATUS_DROP:
+            continue
+        if result is False:
+            result = QUEUE_STATUS_RETRY
+        if result == QUEUE_STATUS_RETRY:
             return reports[idx:]
+        return reports[idx:]
     return []
 
 
@@ -205,19 +226,21 @@ def run(cfg: Config) -> int:
                     backoff_base=2.0,
                 )
                 if resp.status == 200:
-                    queue_links = manager.collect_queue_links()
-                    if queue_links:
-                        pending_queue_reports.extend(queue_links)
                     assignments = resp.body.get("assignments")
-                    if isinstance(assignments, list):
-                        dispatch_reports = manager.dispatch_assignments(assignments, SPOOL_DIR)
-                        if dispatch_reports:
-                            pending_queue_reports.extend(dispatch_reports)
-                            log.info(
-                                "dispatched %d assignment report(s) from %d assignment(s)",
-                                len(dispatch_reports),
-                                len(assignments),
-                            )
+                    dispatch_reports = manager.dispatch_assignments(
+                        assignments if isinstance(assignments, list) else [],
+                        SPOOL_DIR,
+                    )
+                    if dispatch_reports:
+                        pending_queue_reports.extend(dispatch_reports)
+                        log.info(
+                            "dispatched %d assignment report(s) from %d assignment(s)",
+                            len(dispatch_reports),
+                            len(assignments) if isinstance(assignments, list) else 0,
+                        )
+                    progress_reports = manager.collect_queue_progress()
+                    if progress_reports:
+                        pending_queue_reports.extend(progress_reports)
                     if pending_queue_reports:
                         before = len(pending_queue_reports)
                         pending_queue_reports = _flush_queue_status_reports(
@@ -226,7 +249,7 @@ def run(cfg: Config) -> int:
                         )
                         sent = before - len(pending_queue_reports)
                         if sent:
-                            log.info("reported %d queue status update(s) to the cloud", sent)
+                            log.info("flushed %d queue status update(s) from the local outbox", sent)
                     # Confirmed delivery — drop the sent jobs from the buffers.
                     # (A non-200 keeps them; the cloud dedupes re-sends.)
                     if jobs:
