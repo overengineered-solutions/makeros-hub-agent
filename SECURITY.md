@@ -55,6 +55,25 @@ auditable record of the trust model.
   + checksum verification in the installer, and a `--verify` step in the bootstrap one-liner.
   Until then, install only from a tag you (or your operator) have reviewed.
 
+## OrcaSlicer ingest server (the one inbound listener)
+
+The agent runs an OctoPrint-compatible HTTP server on the LAN (default `:8787`) so members'
+OrcaSlicer can "Send" to the hub. Trust model:
+
+- **Bound to the shop LAN only**, a non-privileged port; the hub→cloud link stays
+  outbound-HTTPS. There is no inbound path from the internet (Phase 2's relay/NetBird adds
+  encrypted remote send).
+- **Every upload is authenticated by the member's print token** (OrcaSlicer's `X-Api-Key`),
+  which the hub does **not** validate itself — it forwards the token to the cloud, which
+  resolves it to a member + runs the eligibility gate. A bad/revoked token is rejected
+  (`403`); the hub stores nothing attributable without a valid member.
+- **Uploads are inert data**: the sliced file is written to a hub-local spool dir and
+  forwarded; it is never executed, and the filename is sanitized before it touches the
+  filesystem. Upload size is capped (default 256MB) to prevent a runaway upload exhausting
+  the Pi.
+- The member token rides in cleartext over the trusted LAN (like the Bambu access codes) —
+  acceptable for on-LAN send; remote send (Phase 2) is the encrypted path.
+
 ## Over-the-air self-update
 
 The agent can update itself when the cloud (in the heartbeat response) names a newer release —

@@ -24,6 +24,11 @@ small always-on Linux box) on the shop network.
    Bambu printer** (port 8883, TLS-insecure self-signed, `bblp` + access code) and reports
    normalized status (connection + activity state, progress, temps) back in the heartbeat.
    **No secret ever goes back up on the wire** — the heartbeat carries telemetry only.
+4. **OrcaSlicer ingest:** the hub runs an OctoPrint-compatible HTTP server on the LAN
+   (default `:8787`). A member sets OrcaSlicer's Print Host to `http://<hub>.local:8787` with
+   their **print token** as the API key and hits **Send**; the hub spools the sliced file
+   locally and registers the job with the cloud (which resolves the token → member, runs the
+   eligibility gate, and queues it). The member watches it in their `/member/printing/queue`.
 
 ## Quick start (Raspberry Pi) — one command
 

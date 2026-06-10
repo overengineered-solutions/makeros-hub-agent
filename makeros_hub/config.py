@@ -20,13 +20,22 @@ CONFIG_PATH = Path(os.environ.get("MAKEROS_HUB_CONFIG", "/etc/makeros-hub/config
 CREDENTIAL_PATH = Path(
     os.environ.get("MAKEROS_HUB_CREDENTIAL", "/var/lib/makeros-hub/credential")
 )
+SPOOL_DIR = Path(os.environ.get("MAKEROS_HUB_SPOOL_DIR", "/var/lib/makeros-hub/spool"))
 DEFAULT_HEARTBEAT_SEC = 30
+# Non-privileged port the OrcaSlicer ingest HTTP server binds on the LAN. The
+# member points OrcaSlicer's Print Host at http://<hub>.local:<port>.
+DEFAULT_INGEST_PORT = 8787
+# Cap a single sliced-file upload (sliced 3MFs run a few MB; 256MB is a generous
+# guard against a runaway/abusive upload OOMing the Pi).
+DEFAULT_MAX_UPLOAD_MB = 256
 
 
 @dataclass
 class Config:
     cloud_url: str
     heartbeat_sec: int = DEFAULT_HEARTBEAT_SEC
+    ingest_port: int = DEFAULT_INGEST_PORT
+    max_upload_mb: int = DEFAULT_MAX_UPLOAD_MB
 
     @property
     def enroll_url(self) -> str:
@@ -39,6 +48,10 @@ class Config:
     @property
     def config_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/config"
+
+    @property
+    def submit_url(self) -> str:
+        return self.cloud_url.rstrip("/") + "/api/print/hub/submit"
 
 
 def load_config(cloud_url_override: str | None = None) -> Config:
@@ -62,7 +75,22 @@ def load_config(cloud_url_override: str | None = None) -> Config:
         or data.get("heartbeat_sec")
         or DEFAULT_HEARTBEAT_SEC
     )
-    return Config(cloud_url=cloud_url, heartbeat_sec=heartbeat)
+    ingest_port = int(
+        os.environ.get("MAKEROS_HUB_INGEST_PORT")
+        or data.get("ingest_port")
+        or DEFAULT_INGEST_PORT
+    )
+    max_upload_mb = int(
+        os.environ.get("MAKEROS_HUB_MAX_UPLOAD_MB")
+        or data.get("max_upload_mb")
+        or DEFAULT_MAX_UPLOAD_MB
+    )
+    return Config(
+        cloud_url=cloud_url,
+        heartbeat_sec=heartbeat,
+        ingest_port=ingest_port,
+        max_upload_mb=max_upload_mb,
+    )
 
 
 def persist_cloud_url(cloud_url: str) -> None:
