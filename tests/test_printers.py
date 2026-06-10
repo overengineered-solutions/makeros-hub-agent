@@ -114,6 +114,36 @@ class TestManagerNonPahoPaths(unittest.TestCase):
         self.assertEqual(m.statuses(), [])
         self.assertEqual(m.config_version, "v2")
 
+    def test_teardown_rescues_unacked_jobs(self):
+        # Codex finding: a config change rebuilds the adapter — its in-memory
+        # job buffer must survive into the manager's orphan buffer until acked.
+        class FakeAdapter:
+            def __init__(self):
+                self.jobs = [{"jobKey": "task_S_1", "printerId": "b1", "status": "done"}]
+                self.stopped = False
+
+            def pending_jobs(self):
+                return list(self.jobs)
+
+            def ack_jobs(self, keys):
+                self.jobs = [j for j in self.jobs if j["jobKey"] not in set(keys)]
+
+            def stop(self):
+                self.stopped = True
+
+        m = PrinterManager()
+        fake = FakeAdapter()
+        m._adapters["b1"] = fake
+        m._fingerprints["b1"] = ("bambu", "h", "s", "c")
+
+        m.reconcile([], version="v2")  # printer removed → adapter torn down
+        self.assertTrue(fake.stopped)
+        pending = m.pending_jobs()
+        self.assertEqual([j["jobKey"] for j in pending], ["task_S_1"])  # rescued
+
+        m.ack_jobs(["task_S_1"])  # confirmed send clears the orphan too
+        self.assertEqual(m.pending_jobs(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

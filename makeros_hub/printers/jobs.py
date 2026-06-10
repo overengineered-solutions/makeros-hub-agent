@@ -40,13 +40,17 @@ heartbeat 200 (`ack`), so a failed POST can't drop a job; the cloud's
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
-# Keep at most this many unacked terminal jobs per printer (a hub offline for
-# a week shouldn't grow unbounded; oldest dropped first — they'd be visible in
-# the printer's own history if it came to that).
-MAX_PENDING = 50
+log = logging.getLogger("makeros-hub.jobs")
+
+# Unacked-terminal-job buffer cap per printer. Each entry is a tiny dict, so
+# the cap is sized for a hub offline for WEEKS, not days — and hitting it is
+# LOGGED loudly (Codex review: silent truncation of billable jobs is a
+# delivery-loss path, not housekeeping).
+MAX_PENDING = 500
 
 _TERMINAL_DONE = "FINISH"
 _TERMINAL_FAILED = "FAILED"
@@ -110,6 +114,8 @@ def decode_active_material(merged: dict) -> str | None:
         idx = int(tray_now)
     except ValueError:
         return None
+    if idx < 0:
+        return None  # malformed — never index from the list end (Codex review)
     units = ams_obj.get("ams")
     if not isinstance(units, list):
         return None
@@ -140,11 +146,17 @@ class JobTracker:
         basis = f"{self.serial}|{name or '?'}|{int(started_ts)}"
         return "fp_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
 
+    def _task_key(self, task_id: str) -> str:
+        # Namespaced by SERIAL (Codex review): in LAN mode task ids may be
+        # printer-local counters — two printers on one hub reporting the same
+        # task_id must not alias to one cloud dedupe key.
+        return f"task_{self.serial}_{task_id}"
+
     def _open(self, merged: dict, now: float) -> None:
         name = _job_name(merged)
         task_id = _printer_task_id(merged)
         self._active = {
-            "key": f"task_{task_id}" if task_id else self._fingerprint(name, now),
+            "key": self._task_key(task_id) if task_id else self._fingerprint(name, now),
             "name": name,
             "startedAt": now,
             "material": decode_active_material(merged),
@@ -165,10 +177,54 @@ class JobTracker:
             job["filename"] = self._active["name"]
         if self._active["material"]:
             job["materialKey"] = self._active["material"]
+        self._buffer(job)
+        self._active = None
+
+    def _buffer(self, job: dict) -> None:
         self._pending.append(job)
         if len(self._pending) > MAX_PENDING:
+            dropped = self._pending[: len(self._pending) - MAX_PENDING]
             self._pending = self._pending[-MAX_PENDING:]
-        self._active = None
+            # Loud, never silent (Codex review): these jobs will NOT reach the
+            # cloud — the printer's own on-screen history is the only record.
+            log.error(
+                "job buffer overflow on %s — dropped %d oldest unacked job(s): %s",
+                self.printer_id,
+                len(dropped),
+                [j["jobKey"] for j in dropped],
+            )
+
+    def _emit_recovered(self, merged: dict, state: str, now: float) -> None:
+        """First signal after tracker creation is already FINISH/FAILED — the
+        print ran (or ended) while the agent was down, so there's no observed
+        start. Emit a terminal record ONLY when the printer supplies its own
+        task id: that key is stable across restarts, so if the pre-restart
+        agent already reported this job the cloud dedupe absorbs the re-send.
+        Without a printer id we'd have to invent a key (risking a duplicate
+        row for an already-reported job) — we skip instead; the cloud's
+        needs_review/zero-gram paths and the printer's own history cover it.
+        endedAt=now is approximate (the real end predates the restart)."""
+        task_id = _printer_task_id(merged)
+        if not task_id:
+            log.info(
+                "recovered terminal state %s on %s with no printer task id — not emitting",
+                state,
+                self.printer_id,
+            )
+            return
+        job = {
+            "jobKey": self._task_key(task_id),
+            "printerId": self.printer_id,
+            "status": "done" if state == _TERMINAL_DONE else "failed",
+            "endedAt": _iso(now),
+        }
+        name = _job_name(merged)
+        if name:
+            job["filename"] = name
+        material = decode_active_material(merged)
+        if material:
+            job["materialKey"] = material
+        self._buffer(job)
 
     # -- public -------------------------------------------------------------
     def observe(self, merged: dict, now: float) -> None:
@@ -179,6 +235,13 @@ class JobTracker:
         if self._active is None:
             if state == _ACTIVE:
                 self._open(merged, now)
+            elif self._last_state == "" and state in (_TERMINAL_DONE, _TERMINAL_FAILED):
+                # Agent (re)started onto an already-terminal printer — the
+                # RUNNING phase happened while we were down (Codex review:
+                # this was a silent job-loss path). Edge-gated on the very
+                # first signal so the FINISH frames a printer keeps sending
+                # for hours after a print never re-emit.
+                self._emit_recovered(merged, state, now)
         else:
             if state == _TERMINAL_DONE:
                 self._close("done", now)
@@ -199,7 +262,7 @@ class JobTracker:
                         self._active["name"] = name
                     task_id = _printer_task_id(merged)
                     if task_id and not str(self._active["key"]).startswith("task_"):
-                        self._active["key"] = f"task_{task_id}"
+                        self._active["key"] = self._task_key(task_id)
                     if not self._active["material"]:
                         self._active["material"] = decode_active_material(merged)
             elif state not in _STILL_ACTIVE:

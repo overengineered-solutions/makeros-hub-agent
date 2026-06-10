@@ -31,6 +31,10 @@ class PrinterManager:
         # Static status for printers the agent can't drive yet (klipper, or a
         # Bambu missing its connection facts) — surfaced so the admin sees why.
         self._static: dict[str, dict] = {}
+        # Unacked terminal jobs rescued from torn-down adapters (config change
+        # rebuilds the adapter; its in-memory buffer must NOT die with it —
+        # Codex review finding). Drained by pending_jobs / cleared by ack_jobs.
+        self._orphan_jobs: list[dict] = []
         self.config_version: str | None = None
 
     def reconcile(self, printers: list[dict], version: str | None) -> None:
@@ -96,6 +100,16 @@ class PrinterManager:
         adapter = self._adapters.pop(pid, None)
         self._fingerprints.pop(pid, None)
         if adapter is not None:
+            # Rescue unacked terminal jobs BEFORE teardown — a config edit
+            # (e.g. rotated access code) rebuilds the adapter and its buffer
+            # would otherwise vanish with it.
+            try:
+                rescued = adapter.pending_jobs()
+                if rescued:
+                    self._orphan_jobs.extend(rescued)
+                    log.info("rescued %d unacked job(s) from %s before teardown", len(rescued), pid)
+            except Exception as e:  # noqa: BLE001
+                log.warning("could not rescue pending jobs from %s: %s", pid, e)
             adapter.stop()
 
     def statuses(self) -> list[dict]:
@@ -110,9 +124,10 @@ class PrinterManager:
         return out
 
     def pending_jobs(self) -> list[dict]:
-        """Unacked terminal jobs across all adapters (for the heartbeat's
-        jobs[]). Safe to send repeatedly — the cloud dedupes on jobKey."""
-        out: list[dict] = []
+        """Unacked terminal jobs across all adapters + any rescued from
+        torn-down adapters. Safe to send repeatedly — the cloud dedupes on
+        jobKey."""
+        out: list[dict] = list(self._orphan_jobs)
         for pid, adapter in self._adapters.items():
             try:
                 out.extend(adapter.pending_jobs())
@@ -121,9 +136,11 @@ class PrinterManager:
         return out
 
     def ack_jobs(self, job_keys: list[str]) -> None:
-        """Fan a confirmed-send ack out to every adapter."""
+        """Fan a confirmed-send ack out to every adapter + the orphan buffer."""
         if not job_keys:
             return
+        keys = set(job_keys)
+        self._orphan_jobs = [j for j in self._orphan_jobs if j["jobKey"] not in keys]
         for pid, adapter in self._adapters.items():
             try:
                 adapter.ack_jobs(job_keys)

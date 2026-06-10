@@ -38,7 +38,9 @@ class TestHappyPath(unittest.TestCase):
         self.assertEqual(len(jobs), 1)
         j = jobs[0]
         self.assertEqual(j["status"], "done")
-        self.assertEqual(j["jobKey"], "task_998877")  # printer-supplied id wins
+        # Printer-supplied id wins, namespaced by serial (cross-printer
+        # task-id collisions on one hub must not alias dedupe keys).
+        self.assertEqual(j["jobKey"], "task_SER1_998877")
         self.assertEqual(j["printerId"], "p1")
         self.assertEqual(j["filename"], "bracket.3mf")
         self.assertEqual(j["materialKey"], "PLA")
@@ -93,7 +95,15 @@ class TestEdges(unittest.TestCase):
         t.observe(report("RUNNING", subtask="x.3mf"), now=10.0)  # no task_id yet
         t.observe(report("RUNNING", task_id="42"), now=20.0)  # arrives late
         t.observe(report("FINISH"), now=30.0)
-        self.assertEqual(t.pending()[0]["jobKey"], "task_42")
+        self.assertEqual(t.pending()[0]["jobKey"], "task_SER1_42")
+
+    def test_same_task_id_on_two_printers_yields_distinct_keys(self):
+        a = JobTracker("p1", "SER_A")
+        b = JobTracker("p2", "SER_B")
+        for t in (a, b):
+            t.observe(report("RUNNING", subtask="x.3mf", task_id="7"), now=10.0)
+            t.observe(report("FINISH"), now=20.0)
+        self.assertNotEqual(a.pending()[0]["jobKey"], b.pending()[0]["jobKey"])
 
     def test_fingerprint_key_when_printer_gives_no_id(self):
         t = JobTracker("p1", "SER1")
@@ -108,10 +118,66 @@ class TestEdges(unittest.TestCase):
         t.observe(report("RUNNING", subtask="b.3mf", task_id="2"), now=3.0)
         t.observe(report("FINISH"), now=4.0)
         self.assertEqual(len(t.pending()), 2)
-        t.ack(["task_1"])
+        t.ack(["task_SER1_1"])
         remaining = t.pending()
         self.assertEqual(len(remaining), 1)
-        self.assertEqual(remaining[0]["jobKey"], "task_2")
+        self.assertEqual(remaining[0]["jobKey"], "task_SER1_2")
+
+
+class TestRestartRecovery(unittest.TestCase):
+    """Agent (re)started onto an already-terminal printer (Codex finding #1):
+    the print ran while the agent was down — emit a recovered terminal job
+    when the printer supplies a stable task id; never re-emit on the FINISH
+    frames the printer keeps sending afterward."""
+
+    def test_first_signal_finish_with_task_id_emits_recovered_done(self):
+        t = JobTracker("p1", "SER1")
+        t.observe(report("FINISH", subtask="overnight.3mf", task_id="555"), now=100.0)
+        jobs = t.pending()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["status"], "done")
+        self.assertEqual(jobs[0]["jobKey"], "task_SER1_555")  # stable → cloud dedupes
+        self.assertNotIn("startedAt", jobs[0])  # start was never observed
+
+        # The printer keeps reporting FINISH for hours — no re-emission.
+        t.observe(report("FINISH"), now=200.0)
+        t.observe(report("FINISH"), now=300.0)
+        self.assertEqual(len(t.pending()), 1)
+
+    def test_first_signal_failed_with_task_id_emits_recovered_failed(self):
+        t = JobTracker("p1", "SER1")
+        t.observe(report("FAILED", task_id="556"), now=100.0)
+        self.assertEqual(t.pending()[0]["status"], "failed")
+
+    def test_first_signal_finish_without_task_id_emits_nothing(self):
+        # No stable identity → emitting risks duplicating an already-reported
+        # job under a fresh key. Skip (printer history is the fallback record).
+        t = JobTracker("p1", "SER1")
+        t.observe(report("FINISH", subtask="x.3mf"), now=100.0)
+        self.assertEqual(t.pending(), [])
+
+    def test_first_signal_idle_then_finish_is_not_recovery(self):
+        # IDLE first = we joined between prints; a later FINISH without an
+        # observed RUNNING is the tail of something already handled — only the
+        # very first signal qualifies as recovery.
+        t = JobTracker("p1", "SER1")
+        t.observe(report("IDLE"), now=1.0)
+        t.observe(report("FINISH", task_id="9"), now=2.0)
+        self.assertEqual(t.pending(), [])
+
+
+class TestBufferCap(unittest.TestCase):
+    def test_overflow_drops_oldest_and_keeps_cap(self):
+        from makeros_hub.printers import jobs as jobs_mod
+
+        t = JobTracker("p1", "SER1")
+        for i in range(jobs_mod.MAX_PENDING + 3):
+            t.observe(report("RUNNING", subtask=f"f{i}.3mf", task_id=str(i + 1)), now=float(i * 10))
+            t.observe(report("FINISH"), now=float(i * 10 + 5))
+        pending = t.pending()
+        self.assertEqual(len(pending), jobs_mod.MAX_PENDING)
+        # Oldest dropped — the newest survives.
+        self.assertEqual(pending[-1]["jobKey"], f"task_SER1_{jobs_mod.MAX_PENDING + 3}")
 
 
 class TestDecodeActiveMaterial(unittest.TestCase):
@@ -127,6 +193,10 @@ class TestDecodeActiveMaterial(unittest.TestCase):
         self.assertIsNone(decode_active_material({"print": {}}))
         # slot index out of range
         merged = {"print": {"ams": {"tray_now": "7", "ams": [{"tray": [{}]}]}}}
+        self.assertIsNone(decode_active_material(merged))
+
+    def test_negative_tray_now_never_indexes_from_list_end(self):
+        merged = {"print": {"ams": {"tray_now": "-1", "ams": [{"tray": [{"tray_type": "PLA"}]}]}}}
         self.assertIsNone(decode_active_material(merged))
 
 
