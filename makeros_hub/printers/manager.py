@@ -109,6 +109,27 @@ class PrinterManager:
         out.extend(self._static.values())
         return out
 
+    def pending_jobs(self) -> list[dict]:
+        """Unacked terminal jobs across all adapters (for the heartbeat's
+        jobs[]). Safe to send repeatedly — the cloud dedupes on jobKey."""
+        out: list[dict] = []
+        for pid, adapter in self._adapters.items():
+            try:
+                out.extend(adapter.pending_jobs())
+            except Exception as e:  # noqa: BLE001 — one adapter can't sink the loop
+                log.warning("pending_jobs failed for %s: %s", pid, e)
+        return out
+
+    def ack_jobs(self, job_keys: list[str]) -> None:
+        """Fan a confirmed-send ack out to every adapter."""
+        if not job_keys:
+            return
+        for pid, adapter in self._adapters.items():
+            try:
+                adapter.ack_jobs(job_keys)
+            except Exception as e:  # noqa: BLE001
+                log.warning("ack_jobs failed for %s: %s", pid, e)
+
     def stop_all(self) -> None:
         for pid in list(self._adapters):
             self._stop(pid)
