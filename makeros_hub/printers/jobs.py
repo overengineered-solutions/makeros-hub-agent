@@ -143,7 +143,11 @@ class JobTracker:
 
     # -- internals ----------------------------------------------------------
     def _fingerprint(self, name: str | None, started_ts: float) -> str:
-        basis = f"{self.serial}|{name or '?'}|{int(started_ts)}"
+        # Millisecond resolution (Codex re-review): whole seconds could collide
+        # when a job closes and a same-named one opens within one second (e.g.
+        # cancel→restart of the same file) — the cloud would dedupe two real
+        # jobs into one row. A printer can't transition twice in the same ms.
+        basis = f"{self.serial}|{name or '?'}|{started_ts:.3f}"
         return "fp_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
 
     def _task_key(self, task_id: str) -> str:
