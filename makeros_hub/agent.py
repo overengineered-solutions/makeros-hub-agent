@@ -38,14 +38,19 @@ def _uptime_sec() -> int | None:
         return None
 
 
-def heartbeat_payload(printers: list[dict] | None = None) -> dict:
+def heartbeat_payload(
+    printers: list[dict] | None = None, jobs: list[dict] | None = None
+) -> dict:
     return {
         "agentVersion": __version__,
         "os": f"{platform.system()} {platform.release()}",
         "hostname": socket.gethostname(),
         "uptimeSec": _uptime_sec(),
         "printers": printers or [],
-        "jobs": [],  # native job -> billing ingestion is a later slice
+        # Terminal jobs observed since the last confirmed send — the cloud
+        # ingests them into print_jobs (observe-only until a printer is
+        # billing-authoritative) and dedupes on jobKey, so re-sends are safe.
+        "jobs": jobs or [],
     }
 
 
@@ -88,15 +93,21 @@ def run(cfg: Config) -> int:
         while True:
             try:
                 statuses = manager.statuses()
+                jobs = manager.pending_jobs()
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
-                    heartbeat_payload(statuses),
+                    heartbeat_payload(statuses, jobs),
                     bearer=credential,
                     retries=3,
                     backoff_base=2.0,
                 )
                 if resp.status == 200:
+                    # Confirmed delivery — drop the sent jobs from the buffers.
+                    # (A non-200 keeps them; the cloud dedupes re-sends.)
+                    if jobs:
+                        manager.ack_jobs([j["jobKey"] for j in jobs])
+                        log.info("reported %d terminal job(s) to the cloud", len(jobs))
                     log.info(
                         "heartbeat ok 200 (hub %s) — %d printers, %d connected",
                         resp.body.get("hubId", "?"),

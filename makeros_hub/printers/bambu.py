@@ -30,6 +30,7 @@ from typing import Any
 import paho.mqtt.client as mqtt
 
 from . import bambu_parse
+from .jobs import JobTracker
 
 log = logging.getLogger("makeros-hub.bambu")
 
@@ -66,6 +67,8 @@ class BambuAdapter:
         self._started = 0.0
         self._shape_logged = False
         self._client: mqtt.Client | None = None
+        # Terminal-job detection over the merged state (pure; fed under _lock).
+        self._jobs = JobTracker(printer_id, serial)
 
     @property
     def _report_topic(self) -> str:
@@ -130,6 +133,9 @@ class BambuAdapter:
         with self._lock:
             bambu_parse.merge_report(self._data, doc)
             self._last_report_at = time.monotonic()
+            # Job lifecycle detection (wall-clock — startedAt/endedAt are real
+            # timestamps on the wire, unlike the monotonic staleness clock).
+            self._jobs.observe(self._data, time.time())
             if not self._shape_logged:
                 self._shape_logged = True
                 # First-parse shape observability (redacted) — see CLAUDE doctrine.
@@ -170,3 +176,13 @@ class BambuAdapter:
         return bambu_parse.normalize_status(
             self.printer_id, data, connection_state=conn_state, error_reason=reason
         )
+
+    def pending_jobs(self) -> list[dict]:
+        """Unacked terminal jobs (re-send-safe — the cloud dedupes on jobKey)."""
+        with self._lock:
+            return self._jobs.pending()
+
+    def ack_jobs(self, job_keys: list[str]) -> None:
+        """Drop jobs after a confirmed heartbeat 200."""
+        with self._lock:
+            self._jobs.ack(job_keys)
