@@ -21,7 +21,12 @@ Field references (verified against ha-bambulab/pybambu + bambulabs_api):
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+# A Bambu tray_color is 8 hex chars (RRGGBBAA), no leading '#'. Anything else is
+# garbage we omit so the cloud only ever stores a renderable swatch value.
+_HEX8_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
 
 # Bambu gcode_state -> our normalized printer activity state. The cloud column
 # enum is idle|printing|paused|error|offline.
@@ -72,6 +77,115 @@ def _num(v: Any) -> float | None:
     return None
 
 
+def _to_int(v: Any) -> int | None:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        # Only a whole-number float is a real int; "1.9"-as-float, inf and nan
+        # are not (is_integer() is False for inf/nan).
+        return int(v) if v.is_integer() else None
+    if isinstance(v, str):
+        # Strict integer parse: int("1.9")/int("1e3") raise, so malformed
+        # numerics never silently truncate into a valid-looking id.
+        try:
+            return int(v.strip())
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def build_ams(print_obj: dict) -> list[dict] | None:
+    """Per-AMS-unit filament state for the cloud DTO. None when no AMS present.
+    Each unit -> {"unit": <int>, "trays": [{"slot": <int 0-3>, "material"?: str,
+    "colorHex"?: <8-hex>, "remainPct"?: float 0-100}, ...]}. Empty {} trays are
+    skipped. Omit per-tray keys that are absent, like normalize_status."""
+    if not isinstance(print_obj, dict):
+        return None
+    ams_obj = print_obj.get("ams")
+    if not isinstance(ams_obj, dict):
+        return None
+    units_raw = ams_obj.get("ams")
+    if not isinstance(units_raw, list):
+        return None
+
+    units: list[dict] = []
+    for unit_idx, unit in enumerate(units_raw):
+        if not isinstance(unit, dict):
+            continue
+        trays_raw = unit.get("tray")
+        if not isinstance(trays_raw, list):
+            continue
+
+        unit_id = _to_int(unit.get("id"))
+        unit_out = {"unit": unit_idx if unit_id is None else unit_id, "trays": []}
+        for slot_idx, tray in enumerate(trays_raw):
+            # A physical AMS unit has 4 trays (slots 0-3). The downstream
+            # ams_mapping is unit*4+slot, so never emit a slot outside 0-3 even
+            # if a malformed report carries a longer tray array.
+            if slot_idx > 3:
+                break
+            if not isinstance(tray, dict) or not tray:
+                continue
+            tray_out: dict[str, Any] = {"slot": slot_idx}
+
+            material = tray.get("tray_type")
+            if isinstance(material, str) and material.strip():
+                tray_out["material"] = material.strip()[:64]
+
+            color = tray.get("tray_color")
+            if isinstance(color, str):
+                hex_color = color.strip().lstrip("#")
+                if _HEX8_RE.match(hex_color):
+                    tray_out["colorHex"] = hex_color.upper()
+
+            remain = _num(tray.get("remain"))
+            if remain is not None:
+                tray_out["remainPct"] = max(0.0, min(100.0, remain))
+
+            unit_out["trays"].append(tray_out)
+
+        units.append(unit_out)
+
+    return units or None
+
+
+def build_active_tray(print_obj: dict) -> int | None:
+    """The currently-selected AMS global tray index, or None for external(254)/
+    none(255)/absent."""
+    if not isinstance(print_obj, dict):
+        return None
+    ams_obj = print_obj.get("ams")
+    if not isinstance(ams_obj, dict):
+        return None
+    tray_now = _to_int(ams_obj.get("tray_now"))
+    # Sentinels: 254 = external spool, 255 = none. Bound to a sane global index
+    # (16 AMS units * 4 slots) so a garbage value like -1 or 999 never escapes.
+    if tray_now is None or tray_now < 0 or tray_now > 63 or tray_now in (254, 255):
+        return None
+    return tray_now
+
+
+def build_hms(print_obj: dict) -> list[dict] | None:
+    """List of {"attr": int, "code": int} from print.hms, or None when
+    empty/absent."""
+    if not isinstance(print_obj, dict):
+        return None
+    hms_raw = print_obj.get("hms")
+    if not isinstance(hms_raw, list):
+        return None
+    hms: list[dict] = []
+    for item in hms_raw:
+        if not isinstance(item, dict):
+            continue
+        attr = _to_int(item.get("attr"))
+        code = _to_int(item.get("code"))
+        if attr is not None and code is not None:
+            hms.append({"attr": attr, "code": code})
+    return hms or None
+
+
 def normalize_status(
     printer_id: str,
     merged: dict,
@@ -115,6 +229,20 @@ def normalize_status(
     if eta is not None:
         out["etaMinutes"] = int(eta)
 
+    if connection_state == "connected":
+        ams = build_ams(print_obj)
+        if ams:
+            out["ams"] = ams
+        active = build_active_tray(print_obj)
+        if active is not None:
+            out["amsActiveTray"] = active
+        hms = build_hms(print_obj)
+        if hms:
+            out["hms"] = hms
+        pe = _to_int(print_obj.get("print_error"))
+        if pe:
+            out["printError"] = pe
+
     return out
 
 
@@ -123,6 +251,15 @@ def summarize_shape(merged: dict) -> dict:
     names + array lengths only, never values (no serial/IP/material leak)."""
     print_obj = merged.get("print") if isinstance(merged.get("print"), dict) else {}
     array_lengths = {k: len(v) for k, v in print_obj.items() if isinstance(v, list)}
+    ams_obj = print_obj.get("ams")
+    units = ams_obj.get("ams") if isinstance(ams_obj, dict) else None
+    if isinstance(units, list):
+        array_lengths["ams.units"] = len(units)
+        array_lengths["ams.trays_total"] = sum(
+            len(unit.get("tray"))
+            for unit in units
+            if isinstance(unit, dict) and isinstance(unit.get("tray"), list)
+        )
     return {
         "topLevelKeys": sorted(merged.keys()),
         "printKeys": sorted(print_obj.keys()),
