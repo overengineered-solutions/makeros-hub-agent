@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import ssl
 import threading
 import time
@@ -29,8 +30,9 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 
-from . import bambu_parse
+from . import bambu_parse, bambu_send
 from .jobs import JobTracker
+from .queue_progress import QueueProgressTracker
 
 log = logging.getLogger("makeros-hub.bambu")
 
@@ -69,6 +71,11 @@ class BambuAdapter:
         self._client: mqtt.Client | None = None
         # Terminal-job detection over the merged state (pure; fed under _lock).
         self._jobs = JobTracker(printer_id, serial)
+        # Queue assignment state is driven by OBSERVED telemetry, not by
+        # MQTT-publish success. The tracker reports "printing" only after
+        # RUNNING/PAUSE appears and links completion to the JobTracker's real
+        # terminal printer job key.
+        self._queue_progress = QueueProgressTracker()
 
     @property
     def _report_topic(self) -> str:
@@ -186,3 +193,65 @@ class BambuAdapter:
         """Drop jobs after a confirmed heartbeat 200."""
         with self._lock:
             self._jobs.ack(job_keys)
+
+    def start_print(
+        self,
+        local_path,
+        file_name: str,
+        *,
+        plate: int = 1,
+        use_ams: bool = False,
+        ams_mapping=None,
+        queue_job_id: str | None = None,
+    ) -> dict:
+        client = self._client
+        connected = False
+        if client is not None:
+            is_connected = getattr(client, "is_connected", None)
+            try:
+                connected = bool(is_connected()) if callable(is_connected) else self._connack == "ok"
+            except Exception:  # noqa: BLE001
+                connected = self._connack == "ok"
+        if client is None or not connected:
+            return {"ok": False, "reason": "not_connected"}
+
+        try:
+            bambu_send.upload_3mf(self.host, self._access_code, local_path, file_name)
+        except bambu_send.BambuSendError as exc:
+            log.warning("bambu %s upload failed: %s", self.printer_id, exc)
+            return {"ok": False, "reason": "upload_failed"}
+
+        sequence_id = os.urandom(4).hex()
+        payload = bambu_send.build_print_start_payload(
+            file_name,
+            plate=plate,
+            use_ams=use_ams,
+            ams_mapping=ams_mapping,
+            sequence_id=sequence_id,
+        )
+        try:
+            info = client.publish(self._request_topic, json.dumps(payload))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bambu %s print-start publish failed: %s", self.printer_id, exc)
+            return {"ok": False, "reason": "start_command_failed"}
+        if getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS) != mqtt.MQTT_ERR_SUCCESS:
+            log.warning(
+                "bambu %s print-start publish returned rc=%s",
+                self.printer_id,
+                getattr(info, "rc", "unknown"),
+            )
+            return {"ok": False, "reason": "start_command_failed"}
+
+        if queue_job_id:
+            with self._lock:
+                self._queue_progress.record_dispatch(queue_job_id, self._jobs.pending())
+        return {"ok": True}
+
+    def collect_queue_progress(self) -> list[dict]:
+        """Drain queue-status reports inferred from observed printer telemetry."""
+        with self._lock:
+            print_obj = self._data.get("print") if isinstance(self._data.get("print"), dict) else {}
+            return self._queue_progress.collect(
+                self._jobs.pending(),
+                print_obj.get("gcode_state"),
+            )

@@ -30,6 +30,10 @@ from .update import maybe_update
 
 log = logging.getLogger("makeros-hub")
 
+QUEUE_STATUS_SENT = "sent"
+QUEUE_STATUS_RETRY = "retry"
+QUEUE_STATUS_DROP = "drop"
+
 
 def make_cloud_submit(cfg: Config, credential: str):
     """Closure the ingest server calls to register an OrcaSlicer upload with the
@@ -63,6 +67,73 @@ def make_cloud_submit(cfg: Config, credential: str):
         return {"status": "error", "detail": f"http_{resp.status}"}
 
     return submit
+
+
+def make_queue_status_reporter(cfg: Config, credential: str):
+    """Closure for queue assignment state transitions."""
+
+    def report(status_report: dict) -> str:
+        body = {
+            "queueJobId": status_report.get("queueJobId"),
+            "state": status_report.get("state"),
+        }
+        if status_report.get("printerJobKey"):
+            body["printerJobKey"] = status_report["printerJobKey"]
+        if status_report.get("reason"):
+            body["reason"] = status_report["reason"]
+        try:
+            resp = post_json(
+                cfg.queue_status_url,
+                body,
+                bearer=credential,
+                retries=2,
+                backoff_base=1.0,
+            )
+        except TransportError as exc:
+            log.warning(
+                "queue status report failed for %s/%s: %s",
+                body.get("queueJobId"),
+                body.get("state"),
+                exc,
+            )
+            return QUEUE_STATUS_RETRY
+        if 200 <= resp.status < 300:
+            return QUEUE_STATUS_SENT
+        if 400 <= resp.status < 500:
+            log.warning(
+                "dropping deterministic queue status report after HTTP %s for %s/%s: %s",
+                resp.status,
+                body.get("queueJobId"),
+                body.get("state"),
+                resp.body.get("error"),
+            )
+            return QUEUE_STATUS_DROP
+        log.warning(
+            "queue status report unexpected %s for %s/%s: %s",
+            resp.status,
+            body.get("queueJobId"),
+            body.get("state"),
+            resp.body.get("error"),
+        )
+        return QUEUE_STATUS_RETRY
+
+    return report
+
+
+def _flush_queue_status_reports(reporter, reports: list[dict]) -> list[dict]:
+    """POST in order; retry transport/5xx, drop deterministic 4xx."""
+    for idx, report in enumerate(reports):
+        result = reporter(report)
+        if result in (True, QUEUE_STATUS_SENT):
+            continue
+        if result == QUEUE_STATUS_DROP:
+            continue
+        if result is False:
+            result = QUEUE_STATUS_RETRY
+        if result == QUEUE_STATUS_RETRY:
+            return reports[idx:]
+        return reports[idx:]
+    return []
 
 
 def _uptime_sec() -> int | None:
@@ -119,6 +190,8 @@ def run(cfg: Config) -> int:
 
     interval = cfg.heartbeat_sec
     manager = PrinterManager()
+    queue_status_reporter = make_queue_status_reporter(cfg, credential)
+    pending_queue_reports: list[dict] = []
     log.info("makeros-hub %s starting; heartbeat every %ss to %s", __version__, interval, cfg.cloud_url)
 
     # Pull the printer list up front so the first heartbeat already carries status.
@@ -153,6 +226,30 @@ def run(cfg: Config) -> int:
                     backoff_base=2.0,
                 )
                 if resp.status == 200:
+                    assignments = resp.body.get("assignments")
+                    dispatch_reports = manager.dispatch_assignments(
+                        assignments if isinstance(assignments, list) else [],
+                        SPOOL_DIR,
+                    )
+                    if dispatch_reports:
+                        pending_queue_reports.extend(dispatch_reports)
+                        log.info(
+                            "dispatched %d assignment report(s) from %d assignment(s)",
+                            len(dispatch_reports),
+                            len(assignments) if isinstance(assignments, list) else 0,
+                        )
+                    progress_reports = manager.collect_queue_progress()
+                    if progress_reports:
+                        pending_queue_reports.extend(progress_reports)
+                    if pending_queue_reports:
+                        before = len(pending_queue_reports)
+                        pending_queue_reports = _flush_queue_status_reports(
+                            queue_status_reporter,
+                            pending_queue_reports,
+                        )
+                        sent = before - len(pending_queue_reports)
+                        if sent:
+                            log.info("flushed %d queue status update(s) from the local outbox", sent)
                     # Confirmed delivery — drop the sent jobs from the buffers.
                     # (A non-200 keeps them; the cloud dedupes re-sends.)
                     if jobs:

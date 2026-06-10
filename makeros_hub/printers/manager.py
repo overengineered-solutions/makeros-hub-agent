@@ -14,9 +14,17 @@ loop — stay importable on a box where paho isn't installed yet.
 from __future__ import annotations
 
 import logging
+import os
+import re
+import time
+from collections import OrderedDict
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("makeros-hub.printers")
+
+MAX_DISPATCHED_QUEUE_JOBS = 1000
+_SUBMISSION_UID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
 
 def _fingerprint(p: dict) -> tuple:
@@ -35,6 +43,11 @@ class PrinterManager:
         # rebuilds the adapter; its in-memory buffer must NOT die with it —
         # Codex review finding). Drained by pending_jobs / cleared by ack_jobs.
         self._orphan_jobs: list[dict] = []
+        # Queue assignments are at-least-once from the cloud. Once this process
+        # has successfully sent a start command for a queueJobId, a same-window
+        # resend must not re-upload or re-start the printer. Terminal progress
+        # reports prune this bounded guard.
+        self._dispatched_queue_jobs: OrderedDict[str, float] = OrderedDict()
         self.config_version: str | None = None
 
     def reconcile(self, printers: list[dict], version: str | None) -> None:
@@ -146,6 +159,124 @@ class PrinterManager:
                 adapter.ack_jobs(job_keys)
             except Exception as e:  # noqa: BLE001
                 log.warning("ack_jobs failed for %s: %s", pid, e)
+
+    def _remember_dispatched_queue_job(self, queue_job_id: str) -> None:
+        self._dispatched_queue_jobs[queue_job_id] = time.monotonic()
+        self._dispatched_queue_jobs.move_to_end(queue_job_id)
+        while len(self._dispatched_queue_jobs) > MAX_DISPATCHED_QUEUE_JOBS:
+            self._dispatched_queue_jobs.popitem(last=False)
+
+    def _forget_dispatched_queue_job(self, queue_job_id: str) -> None:
+        self._dispatched_queue_jobs.pop(queue_job_id, None)
+
+    def _assignment_path_ok(self, submission_uid: str, file_name: str) -> bool:
+        return (
+            bool(_SUBMISSION_UID_RE.fullmatch(submission_uid))
+            and file_name == os.path.basename(file_name)
+            and file_name not in (".", "..")
+            and "/" not in file_name
+            and "\\" not in file_name
+        )
+
+    def dispatch_assignments(self, assignments, spool_dir) -> list[dict]:
+        """Start cloud-assigned queue jobs and return queue-status reports.
+
+        Reports are ordered for the cloud transition map: assigned -> uploading,
+        or uploading -> held after a real send failure. The transition to
+        printing is observed later from printer telemetry.
+        """
+        reports: list[dict] = []
+        base = Path(spool_dir)
+        for assignment in assignments if isinstance(assignments, list) else []:
+            if not isinstance(assignment, dict):
+                continue
+            queue_job_id = assignment.get("queueJobId")
+            printer_id = assignment.get("printerId")
+            submission_uid = assignment.get("submissionUid")
+            file_name = assignment.get("fileName")
+            if not all(isinstance(v, str) and v for v in (queue_job_id, printer_id, submission_uid, file_name)):
+                log.warning("skipping malformed assignment: %s", assignment)
+                continue
+            if queue_job_id in self._dispatched_queue_jobs:
+                continue
+            if not self._assignment_path_ok(submission_uid, file_name):
+                reports.append(
+                    {
+                        "queueJobId": queue_job_id,
+                        "state": "held",
+                        "reason": "bad_assignment",
+                    }
+                )
+                continue
+
+            adapter = self._adapters.get(printer_id)
+            start_print = getattr(adapter, "start_print", None) if adapter is not None else None
+            if not callable(start_print):
+                reports.append(
+                    {
+                        "queueJobId": queue_job_id,
+                        "state": "held",
+                        "reason": "printer_unavailable",
+                    }
+                )
+                continue
+
+            local_path = base / submission_uid / file_name
+            if not local_path.is_file():
+                reports.append(
+                    {
+                        "queueJobId": queue_job_id,
+                        "state": "held",
+                        "reason": "file_not_found",
+                    }
+                )
+                continue
+
+            reports.append({"queueJobId": queue_job_id, "state": "uploading"})
+            try:
+                result = start_print(
+                    local_path,
+                    file_name,
+                    plate=assignment.get("plate") or 1,
+                    use_ams=bool(assignment.get("useAms", False)),
+                    ams_mapping=assignment.get("amsMapping"),
+                    queue_job_id=queue_job_id,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("assignment dispatch failed for %s on %s: %s", queue_job_id, printer_id, e)
+                result = {"ok": False, "reason": "start_failed"}
+            if not isinstance(result, dict):
+                result = {"ok": False, "reason": "start_failed"}
+
+            if result.get("ok"):
+                self._remember_dispatched_queue_job(queue_job_id)
+            else:
+                reports.append(
+                    {
+                        "queueJobId": queue_job_id,
+                        "state": "held",
+                        "reason": result.get("reason", "start_failed"),
+                    }
+                )
+        return reports
+
+    def collect_queue_progress(self) -> list[dict]:
+        """Drain queue-status updates observed by printer adapters."""
+        reports: list[dict] = []
+        for pid, adapter in self._adapters.items():
+            collect_progress = getattr(adapter, "collect_queue_progress", None)
+            if not callable(collect_progress):
+                continue
+            try:
+                for report in collect_progress():
+                    reports.append(report)
+                    if report.get("state") in ("completed", "held") and isinstance(
+                        report.get("queueJobId"), str
+                    ):
+                        self._forget_dispatched_queue_job(report["queueJobId"])
+            except Exception as e:  # noqa: BLE001
+                log.warning("collect_queue_progress failed for %s: %s", pid, e)
+        return reports
 
     def stop_all(self) -> None:
         for pid in list(self._adapters):
