@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "makeros-hub-agent"
-version = "0.5.0"
+version = "0.6.0"
 description = "On-LAN bridge between makerspace 3D printers and the makeros cloud control plane (the SimplyPrint replacement)"
 requires-python = ">=3.11"
 # Enrollment + heartbeat are stdlib-only. The Bambu LAN adapter (PR 5) adds

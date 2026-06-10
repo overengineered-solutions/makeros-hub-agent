@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import ssl
 import threading
 import time
@@ -29,7 +30,7 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 
-from . import bambu_parse
+from . import bambu_parse, bambu_send
 from .jobs import JobTracker
 
 log = logging.getLogger("makeros-hub.bambu")
@@ -69,6 +70,14 @@ class BambuAdapter:
         self._client: mqtt.Client | None = None
         # Terminal-job detection over the merged state (pure; fed under _lock).
         self._jobs = JobTracker(printer_id, serial)
+        # Queue assignment correlation is intentionally conservative: we only
+        # link a queue job to a terminal JobTracker record that appears after a
+        # start_print call, and we choose the newest terminal job for the most
+        # recent unresolved queue start. If a member manually starts another
+        # print in that window, we may skip or mis-link; avoiding a stronger
+        # claim keeps this slice simple until firmware-supplied ids are proven.
+        self._queue_starts: list[dict[str, Any]] = []
+        self._queue_linked_job_keys: set[str] = set()
 
     @property
     def _report_topic(self) -> str:
@@ -186,3 +195,94 @@ class BambuAdapter:
         """Drop jobs after a confirmed heartbeat 200."""
         with self._lock:
             self._jobs.ack(job_keys)
+
+    def start_print(
+        self,
+        local_path,
+        file_name: str,
+        *,
+        plate: int = 1,
+        use_ams: bool = False,
+        ams_mapping=None,
+        queue_job_id: str | None = None,
+    ) -> dict:
+        client = self._client
+        connected = False
+        if client is not None:
+            is_connected = getattr(client, "is_connected", None)
+            try:
+                connected = bool(is_connected()) if callable(is_connected) else self._connack == "ok"
+            except Exception:  # noqa: BLE001
+                connected = self._connack == "ok"
+        if client is None or not connected:
+            return {"ok": False, "reason": "not_connected"}
+
+        try:
+            bambu_send.upload_3mf(self.host, self._access_code, local_path, file_name)
+        except bambu_send.BambuSendError as exc:
+            log.warning("bambu %s upload failed: %s", self.printer_id, exc)
+            return {"ok": False, "reason": "upload_failed"}
+
+        sequence_id = os.urandom(4).hex()
+        payload = bambu_send.build_print_start_payload(
+            file_name,
+            plate=plate,
+            use_ams=use_ams,
+            ams_mapping=ams_mapping,
+            sequence_id=sequence_id,
+        )
+        try:
+            info = client.publish(self._request_topic, json.dumps(payload))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bambu %s print-start publish failed: %s", self.printer_id, exc)
+            return {"ok": False, "reason": "start_command_failed"}
+        if getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS) != mqtt.MQTT_ERR_SUCCESS:
+            log.warning(
+                "bambu %s print-start publish returned rc=%s",
+                self.printer_id,
+                getattr(info, "rc", "unknown"),
+            )
+            return {"ok": False, "reason": "start_command_failed"}
+
+        expected_job_key = f"task_{self.serial}_{sequence_id}"
+        if queue_job_id:
+            with self._lock:
+                self._queue_starts.append(
+                    {
+                        "queueJobId": queue_job_id,
+                        "baselineKeys": {j["jobKey"] for j in self._jobs.pending()},
+                    }
+                )
+        return {"ok": True, "jobKey": expected_job_key}
+
+    def take_completed_queue_links(self) -> list[dict]:
+        """Drain conservative queue-job ↔ terminal-printer-job links.
+
+        We do not get a guaranteed local-print id at command time, so this uses
+        the next new terminal JobTracker record after start_print as the link.
+        """
+        with self._lock:
+            pending = self._jobs.pending()
+            links: list[dict] = []
+            while self._queue_starts:
+                start = self._queue_starts[-1]
+                candidates = [
+                    j
+                    for j in pending
+                    if j.get("jobKey") not in start["baselineKeys"]
+                    and j.get("jobKey") not in self._queue_linked_job_keys
+                ]
+                if not candidates:
+                    break
+                job = candidates[-1]
+                job_key = job["jobKey"]
+                self._queue_linked_job_keys.add(job_key)
+                self._queue_starts.pop()
+                links.append(
+                    {
+                        "queueJobId": start["queueJobId"],
+                        "jobKey": job_key,
+                        "status": job.get("status"),
+                    }
+                )
+            return links

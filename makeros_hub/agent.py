@@ -65,6 +65,56 @@ def make_cloud_submit(cfg: Config, credential: str):
     return submit
 
 
+def make_queue_status_reporter(cfg: Config, credential: str):
+    """Closure for queue assignment state transitions."""
+
+    def report(status_report: dict) -> bool:
+        body = {
+            "queueJobId": status_report.get("queueJobId"),
+            "state": status_report.get("state"),
+        }
+        if status_report.get("printerJobKey"):
+            body["printerJobKey"] = status_report["printerJobKey"]
+        if status_report.get("reason"):
+            body["reason"] = status_report["reason"]
+        try:
+            resp = post_json(
+                cfg.queue_status_url,
+                body,
+                bearer=credential,
+                retries=2,
+                backoff_base=1.0,
+            )
+        except TransportError as exc:
+            log.warning(
+                "queue status report failed for %s/%s: %s",
+                body.get("queueJobId"),
+                body.get("state"),
+                exc,
+            )
+            return False
+        if 200 <= resp.status < 300:
+            return True
+        log.warning(
+            "queue status report unexpected %s for %s/%s: %s",
+            resp.status,
+            body.get("queueJobId"),
+            body.get("state"),
+            resp.body.get("error"),
+        )
+        return False
+
+    return report
+
+
+def _flush_queue_status_reports(reporter, reports: list[dict]) -> list[dict]:
+    """POST in order; keep the failed report and everything after it."""
+    for idx, report in enumerate(reports):
+        if not reporter(report):
+            return reports[idx:]
+    return []
+
+
 def _uptime_sec() -> int | None:
     try:
         with open("/proc/uptime", encoding="utf-8") as fh:
@@ -119,6 +169,8 @@ def run(cfg: Config) -> int:
 
     interval = cfg.heartbeat_sec
     manager = PrinterManager()
+    queue_status_reporter = make_queue_status_reporter(cfg, credential)
+    pending_queue_reports: list[dict] = []
     log.info("makeros-hub %s starting; heartbeat every %ss to %s", __version__, interval, cfg.cloud_url)
 
     # Pull the printer list up front so the first heartbeat already carries status.
@@ -153,6 +205,28 @@ def run(cfg: Config) -> int:
                     backoff_base=2.0,
                 )
                 if resp.status == 200:
+                    queue_links = manager.collect_queue_links()
+                    if queue_links:
+                        pending_queue_reports.extend(queue_links)
+                    assignments = resp.body.get("assignments")
+                    if isinstance(assignments, list):
+                        dispatch_reports = manager.dispatch_assignments(assignments, SPOOL_DIR)
+                        if dispatch_reports:
+                            pending_queue_reports.extend(dispatch_reports)
+                            log.info(
+                                "dispatched %d assignment report(s) from %d assignment(s)",
+                                len(dispatch_reports),
+                                len(assignments),
+                            )
+                    if pending_queue_reports:
+                        before = len(pending_queue_reports)
+                        pending_queue_reports = _flush_queue_status_reports(
+                            queue_status_reporter,
+                            pending_queue_reports,
+                        )
+                        sent = before - len(pending_queue_reports)
+                        if sent:
+                            log.info("reported %d queue status update(s) to the cloud", sent)
                     # Confirmed delivery — drop the sent jobs from the buffers.
                     # (A non-200 keeps them; the cloud dedupes re-sends.)
                     if jobs:

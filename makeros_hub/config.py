@@ -53,6 +53,10 @@ class Config:
     def submit_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/submit"
 
+    @property
+    def queue_status_url(self) -> str:
+        return self.cloud_url.rstrip("/") + "/api/print/hub/queue-status"
+
 
 def load_config(cloud_url_override: str | None = None) -> Config:
     """Resolve config from (precedence): explicit arg > env > config.toml."""
