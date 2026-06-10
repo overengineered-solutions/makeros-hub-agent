@@ -78,6 +78,203 @@ class TestNormalizeStatus(unittest.TestCase):
         )
         self.assertEqual(s["jobName"], "Metadata/plate_1.gcode")
 
+    def test_connected_status_includes_ams_hms_and_print_error(self):
+        merged = self._merged(
+            gcode_state="RUNNING",
+            ams={
+                "tray_now": "2",
+                "ams": [
+                    {
+                        "id": "0",
+                        "tray": [
+                            {
+                                "id": "0",
+                                "tray_type": "PLA",
+                                "tray_color": "AABBCCDD",
+                                "remain": "45",
+                            },
+                            {},
+                            {"id": "2", "tray_type": "PETG", "remain": 101},
+                            {},
+                        ],
+                    }
+                ],
+            },
+            hms=[{"attr": "1", "code": 1234}],
+            print_error="7",
+        )
+        s = bambu_parse.normalize_status("p", merged, connection_state="connected")
+        self.assertEqual(
+            s["ams"],
+            [
+                {
+                    "unit": 0,
+                    "trays": [
+                        {
+                            "slot": 0,
+                            "material": "PLA",
+                            "colorHex": "AABBCCDD",
+                            "remainPct": 45.0,
+                        },
+                        {"slot": 2, "material": "PETG", "remainPct": 100.0},
+                    ],
+                }
+            ],
+        )
+        self.assertEqual(s["amsActiveTray"], 2)
+        self.assertEqual(s["hms"], [{"attr": 1, "code": 1234}])
+        self.assertEqual(s["printError"], 7)
+
+    def test_connected_status_omits_absent_ams_hms_and_zero_print_error(self):
+        s = bambu_parse.normalize_status(
+            "p", self._merged(gcode_state="IDLE", print_error=0), connection_state="connected"
+        )
+        self.assertNotIn("ams", s)
+        self.assertNotIn("amsActiveTray", s)
+        self.assertNotIn("hms", s)
+        self.assertNotIn("printError", s)
+
+    def test_disconnected_status_never_includes_ams_hms_or_print_error(self):
+        merged = self._merged(
+            ams={"tray_now": "0", "ams": [{"id": "0", "tray": [{"tray_type": "PLA"}]}]},
+            hms=[{"attr": 1, "code": 2}],
+            print_error=9,
+        )
+        for state in ("offline", "error"):
+            with self.subTest(connection_state=state):
+                s = bambu_parse.normalize_status("p", merged, connection_state=state)
+                self.assertNotIn("ams", s)
+                self.assertNotIn("amsActiveTray", s)
+                self.assertNotIn("hms", s)
+                self.assertNotIn("printError", s)
+
+
+class TestAmsHmsBuilders(unittest.TestCase):
+    def test_build_ams_emits_units_and_trays_while_omitting_absent_fields(self):
+        print_obj = {
+            "ams": {
+                "ams": [
+                    {
+                        "id": "3",
+                        "tray": [
+                            {
+                                "id": "0",
+                                "tray_type": "PLA",
+                                "tray_color": "aabbccdd",
+                                "remain": "87.5",
+                            },
+                            {},
+                            {"id": "2"},
+                            {"id": "3", "tray_type": "PETG", "remain": -10},
+                        ],
+                    }
+                ]
+            }
+        }
+        self.assertEqual(
+            bambu_parse.build_ams(print_obj),
+            [
+                {
+                    "unit": 3,
+                    "trays": [
+                        {
+                            "slot": 0,
+                            "material": "PLA",
+                            "colorHex": "AABBCCDD",  # normalized to upper, 8-hex
+                            "remainPct": 87.5,
+                        },
+                        {"slot": 2},
+                        {"slot": 3, "material": "PETG", "remainPct": 0.0},
+                    ],
+                }
+            ],
+        )
+
+    def test_build_ams_omits_invalid_color_and_caps_slots(self):
+        # Non-8-hex colors are dropped; a malformed >4-tray unit only emits 0-3.
+        print_obj = {
+            "ams": {
+                "ams": [
+                    {
+                        "id": "0",
+                        "tray": [
+                            {"tray_type": "PLA", "tray_color": "GGGGGGGG"},  # non-hex
+                            {"tray_type": "PETG", "tray_color": "FF0000FF11"},  # too long
+                            {"tray_type": "TPU", "tray_color": "#00FF00FF"},  # leading # stripped
+                            {"tray_type": "ABS"},
+                            {"tray_type": "PA", "tray_color": "FFFFFFFF"},  # slot 4 — dropped
+                        ],
+                    }
+                ]
+            }
+        }
+        self.assertEqual(
+            bambu_parse.build_ams(print_obj),
+            [
+                {
+                    "unit": 0,
+                    "trays": [
+                        {"slot": 0, "material": "PLA"},
+                        {"slot": 1, "material": "PETG"},
+                        {"slot": 2, "material": "TPU", "colorHex": "00FF00FF"},
+                        {"slot": 3, "material": "ABS"},
+                    ],
+                }
+            ],
+        )
+
+    def test_build_ams_multi_unit_preserves_ids(self):
+        print_obj = {
+            "ams": {
+                "ams": [
+                    {"id": "0", "tray": [{"tray_type": "PLA"}]},
+                    {"id": "1", "tray": [{"tray_type": "PETG"}]},
+                ]
+            }
+        }
+        self.assertEqual(
+            [u["unit"] for u in bambu_parse.build_ams(print_obj)],
+            [0, 1],
+        )
+
+    def test_build_ams_skips_garbage_without_crashing(self):
+        self.assertIsNone(bambu_parse.build_ams({}))
+        self.assertIsNone(bambu_parse.build_ams({"ams": {"ams": "bad"}}))
+        self.assertEqual(
+            bambu_parse.build_ams(
+                {"ams": {"ams": ["bad", {"id": "not-int", "tray": [{}, "bad", {"remain": "x"}]}]}}
+            ),
+            [{"unit": 1, "trays": [{"slot": 2}]}],
+        )
+
+    def test_build_active_tray(self):
+        self.assertEqual(bambu_parse.build_active_tray({"ams": {"tray_now": "5"}}), 5)
+        self.assertEqual(bambu_parse.build_active_tray({"ams": {"tray_now": "63"}}), 63)  # max
+        self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": 999}}))  # out of range
+        self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": "-1"}}))  # negative
+        self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": "254"}}))
+        self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": "255"}}))
+        self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": None}}))
+        self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": "bad"}}))
+
+    def test_to_int_rejects_non_integral(self):
+        self.assertEqual(bambu_parse._to_int("42"), 42)
+        self.assertEqual(bambu_parse._to_int("  -7 "), -7)
+        self.assertEqual(bambu_parse._to_int(5.0), 5)
+        self.assertIsNone(bambu_parse._to_int("1.9"))  # not silently truncated to 1
+        self.assertIsNone(bambu_parse._to_int("1e3"))  # not silently widened to 1000
+        self.assertIsNone(bambu_parse._to_int(1.9))
+        self.assertIsNone(bambu_parse._to_int(float("inf")))
+        self.assertIsNone(bambu_parse._to_int(True))
+
+    def test_build_hms(self):
+        self.assertEqual(
+            bambu_parse.build_hms({"hms": [{"attr": "1", "code": 2}, "bad", {"attr": 3}]}),
+            [{"attr": 1, "code": 2}],
+        )
+        self.assertIsNone(bambu_parse.build_hms({}))
+        self.assertIsNone(bambu_parse.build_hms({"hms": []}))
+
 
 class TestSummarizeShape(unittest.TestCase):
     def test_redacts_values_keeps_keys(self):
@@ -88,6 +285,25 @@ class TestSummarizeShape(unittest.TestCase):
         self.assertEqual(shape["arrayLengths"]["hms"], 2)
         # No actual telemetry values leak into the shape summary.
         self.assertNotIn("210", str(shape))
+
+    def test_counts_ams_units_and_trays_without_values(self):
+        merged = {
+            "print": {
+                "ams": {
+                    "tray_now": "0",
+                    "ams": [
+                        {"id": "0", "tray": [{"tray_type": "PLA"}, {}]},
+                        {"id": "1", "tray": [{}, {}, {}, {}]},
+                    ],
+                },
+                "hms": [{"attr": 1, "code": 2}],
+            }
+        }
+        shape = bambu_parse.summarize_shape(merged)
+        self.assertEqual(shape["arrayLengths"]["ams.units"], 2)
+        self.assertEqual(shape["arrayLengths"]["ams.trays_total"], 6)
+        self.assertEqual(shape["arrayLengths"]["hms"], 1)
+        self.assertNotIn("PLA", str(shape))
 
 
 class TestManagerNonPahoPaths(unittest.TestCase):
