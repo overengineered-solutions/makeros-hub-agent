@@ -61,6 +61,10 @@ class _Handler(BaseHTTPRequestHandler):
     submit_fn: SubmitFn
     spool_dir: Path
     max_bytes: int
+    # Per-request socket timeout — bounds a slow/stalled connection (a partial
+    # upload won't hold a thread forever). A real 256MB LAN upload is seconds;
+    # 120s is generous headroom.
+    timeout = 120
 
     # Quiet the default stderr logging; route through our logger at debug.
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
@@ -157,12 +161,22 @@ class _Handler(BaseHTTPRequestHandler):
 
         status = outcome.get("status")
         if status == "bad_token":
+            # Bad member — the spooled file will never print; don't leak it.
+            self._discard_spool(dest_dir)
             # OrcaSlicer treats 403 as "invalid API key" — the right hint.
             self._json(403, {"error": "invalid_api_key"})
             return
         if status == "error":
+            # The job never registered (cloud unreachable/error) — OrcaSlicer
+            # will retry with a fresh submission; drop this orphan so a flaky
+            # cloud can't slowly fill the spool disk.
+            self._discard_spool(dest_dir)
             self._json(502, {"error": "cloud_error", "detail": outcome.get("detail")})
             return
+        if status == "rejected":
+            # Eligibility rejection: the queue row records WHY (member sees it in
+            # the portal), but the file won't print — discard it to bound disk use.
+            self._discard_spool(dest_dir)
 
         # queued OR rejected → the UPLOAD succeeded (OctoPrint's 201 contract is
         # "did the file land"); an eligibility rejection is surfaced in the
@@ -195,6 +209,16 @@ class _Handler(BaseHTTPRequestHandler):
                 "done": True,
             },
         )
+
+    def _discard_spool(self, dest_dir: Path) -> None:
+        """Remove a spooled submission whose job won't print (rejected / bad
+        token / never-registered) so the spool disk stays bounded."""
+        try:
+            for child in dest_dir.iterdir():
+                child.unlink(missing_ok=True)
+            dest_dir.rmdir()
+        except OSError:
+            pass  # best-effort; a leftover dir is harmless
 
     def _read_exact(self, n: int) -> bytes | None:
         buf = bytearray()

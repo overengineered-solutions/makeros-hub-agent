@@ -160,6 +160,17 @@ class TestIngestServer(unittest.TestCase):
         self.assertEqual(status, 201)
         self.assertTrue(body["done"])
 
+    def test_rejected_discards_the_spooled_file(self):
+        # A rejected job's file won't print — it must not leak on disk.
+        self._upload("ineligible")
+        spooled = list(Path(self.tmp.name).rglob("*.3mf"))
+        self.assertEqual(spooled, [])
+
+    def test_bad_token_discards_the_spooled_file(self):
+        self._upload("bad")
+        spooled = list(Path(self.tmp.name).rglob("*.3mf"))
+        self.assertEqual(spooled, [])
+
 
 if __name__ == "__main__":
     unittest.main()
