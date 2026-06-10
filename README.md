@@ -25,28 +25,24 @@ small always-on Linux box) on the shop network.
    normalized status (connection + activity state, progress, temps) back in the heartbeat.
    **No secret ever goes back up on the wire** — the heartbeat carries telemetry only.
 
-## Quick start (Raspberry Pi)
+## Quick start (Raspberry Pi) — one command
 
 1. Flash **Raspberry Pi OS Lite (64-bit)** with the Imager (set hostname, SSH key, Wi-Fi).
-   Boot, SSH in, `sudo apt update && sudo apt full-upgrade -y`.
-2. Get the agent onto the Pi from a **pinned, reviewed release tag** (never mutable `main` —
-   see [`SECURITY.md`](SECURITY.md) supply chain):
+   Boot and SSH in.
+2. In the admin (`<cloud>/admin/3dprinting/hubs`) click **Mint enrollment token** and paste the
+   **one command** it gives you onto the Pi. It installs prerequisites, clones the **pinned,
+   reviewed release** (never mutable `main` — see [`SECURITY.md`](SECURITY.md)), installs the
+   agent, enrolls this hub, and starts the service:
    ```sh
-   git clone --branch v0.2.0 https://github.com/overengineered-solutions/makeros-hub-agent.git
-   cd makeros-hub-agent
-   sudo ./install.sh    # creates a venv + installs paho-mqtt for the Bambu adapter
+   curl -fsSL https://raw.githubusercontent.com/overengineered-solutions/makeros-hub-agent/v0.3.0/bootstrap.sh \
+     | sudo bash -s -- --token <TOKEN> --cloud-url https://<cloud-host> --ref v0.3.0
    ```
-3. Mint a token at `<cloud>/admin/3dprinting/hubs`, then on the Pi run the command it shows:
-   ```sh
-   sudo -u makeros-hub makeros-hub enroll --token <token> --cloud-url https://<cloud-host>
-   ```
-4. Start the loop:
-   ```sh
-   sudo systemctl enable --now makeros-hub
-   journalctl -u makeros-hub -f          # 'heartbeat ok 200' every ~30s
-   ```
-5. Watch it go **online** at `<cloud>/admin/3dprinting/hubs`. Stop the service → it flips
-   **offline** after ~90s; revoke in the UI → the next heartbeat 401s.
+3. Watch it go **online** within ~30s: `journalctl -u makeros-hub -f` (`heartbeat ok 200`). Stop
+   the service → it flips **offline** after ~90s; revoke in the UI → the next heartbeat 401s.
+
+**After this, updates are over-the-air.** Flip on **Auto-update** for the hub in the admin (or
+click **Update now**) and it self-updates to new releases — no SSH. (Manual install still works:
+`git clone --branch <tag> … && cd makeros-hub-agent && sudo ./install.sh`.)
 
 ## Config
 

@@ -25,6 +25,7 @@ from . import __version__
 from .config import Config, read_credential
 from .http import TransportError, get_json, post_json
 from .printers.manager import PrinterManager
+from .update import maybe_update
 
 log = logging.getLogger("makeros-hub")
 
@@ -111,6 +112,13 @@ def run(cfg: Config) -> int:
                     if isinstance(new_version, str) and new_version != manager.config_version:
                         log.info("configVersion changed (%s) — re-pulling", new_version)
                         _pull_config(cfg, credential, manager)
+                    # Over-the-air self-update: the cloud names the release this
+                    # hub should run. No-op unless it's a strictly-newer release
+                    # tag and the cooldown has passed; on apply, the update
+                    # script restarts the service onto the new version.
+                    target = resp.body.get("targetVersion")
+                    if isinstance(target, str) and target and maybe_update(__version__, target):
+                        log.info("OTA: update to %s launched; the service will restart", target)
                 elif resp.status == 401:
                     log.error(
                         "heartbeat rejected 401 — this hub's credential was revoked or is "

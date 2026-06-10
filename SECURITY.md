@@ -55,6 +55,25 @@ auditable record of the trust model.
   + checksum verification in the installer, and a `--verify` step in the bootstrap one-liner.
   Until then, install only from a tag you (or your operator) have reviewed.
 
+## Over-the-air self-update
+
+The agent can update itself when the cloud (in the heartbeat response) names a newer release —
+the one remote-code-execution path in the system, so it is deliberately narrow:
+
+- **Release tags only.** The agent acts only on a well-formed `vX.Y.Z` tag, validated by regex
+  on both the agent and the root script. The cloud cannot point it at a branch, a commit,
+  `main`, or any non-release ref — only a real tagged release of the one hardcoded repo URL.
+- **Forward-only.** Never downgrades; a cooldown stops an update loop on a broken target.
+- **Narrow sudoers.** The non-root `makeros-hub` user may run **only** `/opt/makeros-hub/update.sh`
+  as root (an `/etc/sudoers.d/makeros-hub` drop-in, validated with `visudo` at install). The
+  script is root-owned and not writable by the service user, so it can't be swapped. The update
+  runs in an independent systemd transient unit so the service restart can't kill it mid-flight.
+- **Operator-controlled.** Auto-update is **off by default**, per hub; the admin opts in (or
+  triggers a one-shot "Update now") from the dashboard.
+- **Roadmap:** signed release artifacts (minisign/Sigstore) + signature verification in the
+  update path, so even a compromised repo can't push code to tenant hardware. Until then the
+  control is pinned reviewed releases + the narrow sudoers surface above.
+
 ## Reporting
 
 Report security issues privately to `security@overengineeredsolutions.org`. Do not open a

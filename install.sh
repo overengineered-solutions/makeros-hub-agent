@@ -29,7 +29,11 @@ echo "==> code -> $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 rm -rf "$INSTALL_DIR/makeros_hub"
 cp -r "$HERE/makeros_hub" "$INSTALL_DIR/"
+# OTA update script — run as root via the narrow sudoers rule below. Kept
+# root-owned + non-writable by the service user (else it'd be a priv-esc path).
+cp "$HERE/update.sh" "$INSTALL_DIR/update.sh"
 chmod -R a+rX "$INSTALL_DIR"
+chmod 0755 "$INSTALL_DIR/update.sh"
 
 echo "==> python venv + deps ($VENV)"
 PYBIN="$VENV/bin/python"
@@ -85,6 +89,18 @@ PY=/opt/makeros-hub/venv/bin/python
 exec env PYTHONPATH=/opt/makeros-hub "$PY" -m makeros_hub "$@"
 WRAP
 chmod +x /usr/local/bin/makeros-hub
+
+echo "==> OTA sudoers (the service user may run ONLY the update script as root)"
+SUDOERS=/etc/sudoers.d/makeros-hub
+echo "$SERVICE_USER ALL=(root) NOPASSWD: $INSTALL_DIR/update.sh" > "$SUDOERS.tmp"
+chmod 0440 "$SUDOERS.tmp"
+if visudo -cf "$SUDOERS.tmp" >/dev/null 2>&1; then
+  mv -f "$SUDOERS.tmp" "$SUDOERS"
+  echo "    OTA self-update enabled (web-controlled)"
+else
+  rm -f "$SUDOERS.tmp"
+  echo "    !! sudoers validation failed — OTA self-update off (bootstrap/manual updates still work)"
+fi
 
 echo "==> systemd unit"
 cp "$HERE/systemd/makeros-hub.service" /etc/systemd/system/makeros-hub.service
