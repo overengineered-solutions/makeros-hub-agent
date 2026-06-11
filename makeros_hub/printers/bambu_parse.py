@@ -21,12 +21,21 @@ Field references (verified against ha-bambulab/pybambu + bambulabs_api):
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
 # A Bambu tray_color is 8 hex chars (RRGGBBAA), no leading '#'. Anything else is
 # garbage we omit so the cloud only ever stores a renderable swatch value.
 _HEX8_RE = re.compile(r"^[0-9A-Fa-f]{8}$")
+_RAW_AMS_UNIT_MAX_BYTES = 8 * 1024
+# Long, unambiguous tokens matched as substrings; short/ambiguous ones (sn, ip,
+# mac, pass, key, ...) matched ONLY as whole key-segments, so benign AMS keys like
+# "snapshot"/"recipe"/"ipcam" aren't collaterally dropped from the raw passthrough.
+_SECRETISH_SUBSTRINGS = (
+    "serial", "password", "passwd", "secret", "accesscode", "access_code", "apikey", "api_key", "token"
+)
+_SECRETISH_SEGMENTS = frozenset({"sn", "ip", "mac", "pass", "key", "access", "auth", "cert"})
 
 # Bambu gcode_state -> our normalized printer activity state. The cloud column
 # enum is idle|printing|paused|error|offline.
@@ -96,11 +105,119 @@ def _to_int(v: Any) -> int | None:
     return None
 
 
+def _num_to_int(v: Any) -> int | None:
+    num = _num(v)
+    if num is None:
+        return None
+    try:
+        return int(num)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _is_secretish_key(key: Any) -> bool:
+    key_s = (key if isinstance(key, str) else str(key)).lower()
+    if any(tok in key_s for tok in _SECRETISH_SUBSTRINGS):
+        return True
+    return any(seg in _SECRETISH_SEGMENTS for seg in re.split(r"[^a-z0-9]+", key_s))
+
+
+def _drop_secretish_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _drop_secretish_keys(v) for k, v in value.items() if not _is_secretish_key(k)}
+    if isinstance(value, list):
+        return [_drop_secretish_keys(v) for v in value]
+    return value
+
+
+def _raw_ams_unit(unit: dict) -> dict | None:
+    raw = _drop_secretish_keys(unit)
+    try:
+        encoded = json.dumps(raw, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    if len(encoded) > _RAW_AMS_UNIT_MAX_BYTES:
+        return None
+    return raw
+
+
+def _add_tray_identity_fields(tray_out: dict[str, Any], tray: dict) -> None:
+    material = tray.get("tray_type")
+    if isinstance(material, str) and material.strip():
+        tray_out["material"] = material.strip()[:64]
+
+    product_name = tray.get("tray_sub_brands")
+    if isinstance(product_name, str) and product_name.strip():
+        tray_out["productName"] = product_name.strip()[:64]
+
+    filament_id = tray.get("tray_info_idx")
+    if isinstance(filament_id, str) and filament_id.strip():
+        tray_out["filamentId"] = filament_id.strip()[:32]
+
+    color = tray.get("tray_color")
+    if isinstance(color, str):
+        hex_color = color.strip().lstrip("#")
+        if _HEX8_RE.match(hex_color):
+            tray_out["colorHex"] = hex_color.upper()
+
+    colors_raw = tray.get("cols")
+    if isinstance(colors_raw, list):
+        colors: list[str] = []
+        for item in colors_raw:
+            if not isinstance(item, str):
+                continue
+            hex_color = item.strip().lstrip("#")
+            if _HEX8_RE.match(hex_color):
+                colors.append(hex_color.upper())
+                if len(colors) >= 8:
+                    break
+        if colors:
+            tray_out["colors"] = colors
+
+    remain = _num(tray.get("remain"))
+    if remain is not None:
+        tray_out["remainPct"] = max(0.0, min(100.0, remain))
+
+    tag_uid = tray.get("tag_uid")
+    if isinstance(tag_uid, str) and tag_uid.strip():
+        tray_out["tagUid"] = tag_uid.strip()[:64]
+
+    nozzle_temp_min = _num_to_int(tray.get("nozzle_temp_min"))
+    if nozzle_temp_min is not None:
+        tray_out["nozzleTempMin"] = nozzle_temp_min
+
+    nozzle_temp_max = _num_to_int(tray.get("nozzle_temp_max"))
+    if nozzle_temp_max is not None:
+        tray_out["nozzleTempMax"] = nozzle_temp_max
+
+
+def _build_ams_tray(tray: dict, slot: int) -> dict[str, Any]:
+    tray_out: dict[str, Any] = {"slot": slot}
+    _add_tray_identity_fields(tray_out, tray)
+    return tray_out
+
+
+def build_vt_tray(print_obj: dict) -> dict | None:
+    """External/A1-direct spool state from print.vt_tray, or None when empty."""
+    if not isinstance(print_obj, dict):
+        return None
+    vt_tray = print_obj.get("vt_tray")
+    if not isinstance(vt_tray, dict) or not vt_tray:
+        return None
+
+    tray_out: dict[str, Any] = {}
+    _add_tray_identity_fields(tray_out, vt_tray)
+    return {
+        k: tray_out[k]
+        for k in ("material", "productName", "colorHex", "remainPct", "tagUid")
+        if k in tray_out
+    } or None
+
+
 def build_ams(print_obj: dict) -> list[dict] | None:
     """Per-AMS-unit filament state for the cloud DTO. None when no AMS present.
-    Each unit -> {"unit": <int>, "trays": [{"slot": <int 0-3>, "material"?: str,
-    "colorHex"?: <8-hex>, "remainPct"?: float 0-100}, ...]}. Empty {} trays are
-    skipped. Omit per-tray keys that are absent, like normalize_status."""
+    Empty {} trays are skipped. Omit keys that are absent, like
+    normalize_status. Unit raw passthrough is scrubbed for secret-ish keys."""
     if not isinstance(print_obj, dict):
         return None
     ams_obj = print_obj.get("ams")
@@ -114,37 +231,37 @@ def build_ams(print_obj: dict) -> list[dict] | None:
     for unit_idx, unit in enumerate(units_raw):
         if not isinstance(unit, dict):
             continue
-        trays_raw = unit.get("tray")
-        if not isinstance(trays_raw, list):
-            continue
 
         unit_id = _to_int(unit.get("id"))
-        unit_out = {"unit": unit_idx if unit_id is None else unit_id, "trays": []}
-        for slot_idx, tray in enumerate(trays_raw):
-            # A physical AMS unit has 4 trays (slots 0-3). The downstream
-            # ams_mapping is unit*4+slot, so never emit a slot outside 0-3 even
-            # if a malformed report carries a longer tray array.
-            if slot_idx > 3:
-                break
-            if not isinstance(tray, dict) or not tray:
-                continue
-            tray_out: dict[str, Any] = {"slot": slot_idx}
+        unit_out: dict[str, Any] = {"unit": unit_idx if unit_id is None else unit_id, "trays": []}
 
-            material = tray.get("tray_type")
-            if isinstance(material, str) and material.strip():
-                tray_out["material"] = material.strip()[:64]
+        humidity = _num(unit.get("humidity"))
+        if humidity is not None:
+            # Bound to 0-100 (the cloud DTO mirrors this). NOTE: some Bambu AMS
+            # report humidity as a 1-5 dryness LEVEL rather than a %; the v0.8.0
+            # cloud renders "{n}%" — confirm against the live AMS 2 Pro value and
+            # adjust the label if it's a level (tracked).
+            unit_out["humidity"] = max(0.0, min(100.0, float(humidity)))
 
-            color = tray.get("tray_color")
-            if isinstance(color, str):
-                hex_color = color.strip().lstrip("#")
-                if _HEX8_RE.match(hex_color):
-                    tray_out["colorHex"] = hex_color.upper()
+        temp = _num(unit.get("temp"))
+        if temp is not None:
+            unit_out["temp"] = float(temp)
 
-            remain = _num(tray.get("remain"))
-            if remain is not None:
-                tray_out["remainPct"] = max(0.0, min(100.0, remain))
+        trays_raw = unit.get("tray")
+        if isinstance(trays_raw, list):
+            for slot_idx, tray in enumerate(trays_raw):
+                # A physical AMS unit has 4 trays (slots 0-3). The downstream
+                # ams_mapping is unit*4+slot, so never emit a slot outside 0-3
+                # even if a malformed report carries a longer tray array.
+                if slot_idx > 3:
+                    break
+                if not isinstance(tray, dict) or not tray:
+                    continue
+                unit_out["trays"].append(_build_ams_tray(tray, slot_idx))
 
-            unit_out["trays"].append(tray_out)
+        raw = _raw_ams_unit(unit)
+        if raw is not None:
+            unit_out["raw"] = raw
 
         units.append(unit_out)
 
@@ -233,6 +350,9 @@ def normalize_status(
         ams = build_ams(print_obj)
         if ams:
             out["ams"] = ams
+        vt_tray = build_vt_tray(print_obj)
+        if vt_tray:
+            out["vtTray"] = vt_tray
         active = build_active_tray(print_obj)
         if active is not None:
             out["amsActiveTray"] = active
@@ -255,14 +375,30 @@ def summarize_shape(merged: dict) -> dict:
     units = ams_obj.get("ams") if isinstance(ams_obj, dict) else None
     if isinstance(units, list):
         array_lengths["ams.units"] = len(units)
-        array_lengths["ams.trays_total"] = sum(
-            len(unit.get("tray"))
-            for unit in units
-            if isinstance(unit, dict) and isinstance(unit.get("tray"), list)
-        )
-    return {
+        trays_total = 0
+        trays_loaded = 0
+        tray_keys: set[str] = set()
+        for unit in units:
+            if not isinstance(unit, dict) or not isinstance(unit.get("tray"), list):
+                continue
+            trays_total += len(unit["tray"])
+            for tray in unit["tray"]:
+                if not isinstance(tray, dict):
+                    continue
+                tray_keys.update(str(k) for k in tray.keys())
+                material = tray.get("tray_type")
+                if isinstance(material, str) and material.strip():
+                    trays_loaded += 1
+        array_lengths["ams.trays_total"] = trays_total
+        array_lengths["ams.trays_loaded"] = trays_loaded
+    else:
+        tray_keys = set()
+    out = {
         "topLevelKeys": sorted(merged.keys()),
         "printKeys": sorted(print_obj.keys()),
         "arrayLengths": array_lengths,
         "values": "[redacted]",
     }
+    if tray_keys:
+        out["amsTrayKeys"] = sorted(tray_keys)
+    return out

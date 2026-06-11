@@ -118,6 +118,20 @@ class TestNormalizeStatus(unittest.TestCase):
                         },
                         {"slot": 2, "material": "PETG", "remainPct": 100.0},
                     ],
+                    "raw": {
+                        "id": "0",
+                        "tray": [
+                            {
+                                "id": "0",
+                                "tray_type": "PLA",
+                                "tray_color": "AABBCCDD",
+                                "remain": "45",
+                            },
+                            {},
+                            {"id": "2", "tray_type": "PETG", "remain": 101},
+                            {},
+                        ],
+                    },
                 }
             ],
         )
@@ -139,6 +153,7 @@ class TestNormalizeStatus(unittest.TestCase):
             ams={"tray_now": "0", "ams": [{"id": "0", "tray": [{"tray_type": "PLA"}]}]},
             hms=[{"attr": 1, "code": 2}],
             print_error=9,
+            vt_tray={"tray_type": "PLA"},
         )
         for state in ("offline", "error"):
             with self.subTest(connection_state=state):
@@ -147,6 +162,7 @@ class TestNormalizeStatus(unittest.TestCase):
                 self.assertNotIn("amsActiveTray", s)
                 self.assertNotIn("hms", s)
                 self.assertNotIn("printError", s)
+                self.assertNotIn("vtTray", s)
 
 
 class TestAmsHmsBuilders(unittest.TestCase):
@@ -186,9 +202,100 @@ class TestAmsHmsBuilders(unittest.TestCase):
                         {"slot": 2},
                         {"slot": 3, "material": "PETG", "remainPct": 0.0},
                     ],
+                    "raw": {
+                        "id": "3",
+                        "tray": [
+                            {
+                                "id": "0",
+                                "tray_type": "PLA",
+                                "tray_color": "aabbccdd",
+                                "remain": "87.5",
+                            },
+                            {},
+                            {"id": "2"},
+                            {"id": "3", "tray_type": "PETG", "remain": -10},
+                        ],
+                    },
                 }
             ],
         )
+
+    def test_build_ams_extracts_rich_tray_unit_fields_and_scrubs_raw(self):
+        cols = [
+            "11223344",
+            "#55667788",
+            "bad",
+            "99aabbcc",
+            "01020304",
+            "11111111",
+            "22222222",
+            "33333333",
+            "44444444",
+            "55555555",
+        ]
+        print_obj = {
+            "ams": {
+                "ams": [
+                    {
+                        "id": "0",
+                        "humidity": "3",
+                        "temp": 25,
+                        "dry_time": "120",
+                        "serialNumber": "drop-me",
+                        "access_code": "drop-me",
+                        "tray": [
+                            {
+                                "id": "0",
+                                "tray_type": " PLA ",
+                                "tray_sub_brands": "PLA Marble",
+                                "tray_info_idx": "GFA00",
+                                "tray_color": "abcdef12",
+                                "cols": cols,
+                                "remain": "88.2",
+                                "tag_uid": " UID123 ",
+                                "nozzle_temp_min": "190.5",
+                                "nozzle_temp_max": "230",
+                                "ip_addr": "drop-me",
+                                "token_value": "drop-me",
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+
+        unit = bambu_parse.build_ams(print_obj)[0]
+        self.assertEqual(unit["humidity"], 3.0)
+        self.assertEqual(unit["temp"], 25.0)
+        self.assertEqual(
+            unit["trays"][0],
+            {
+                "slot": 0,
+                "material": "PLA",
+                "productName": "PLA Marble",
+                "filamentId": "GFA00",
+                "colorHex": "ABCDEF12",
+                "colors": [
+                    "11223344",
+                    "55667788",
+                    "99AABBCC",
+                    "01020304",
+                    "11111111",
+                    "22222222",
+                    "33333333",
+                    "44444444",
+                ],
+                "remainPct": 88.2,
+                "tagUid": "UID123",
+                "nozzleTempMin": 190,
+                "nozzleTempMax": 230,
+            },
+        )
+        self.assertEqual(unit["raw"]["dry_time"], "120")
+        self.assertNotIn("serialNumber", unit["raw"])
+        self.assertNotIn("access_code", unit["raw"])
+        self.assertNotIn("ip_addr", unit["raw"]["tray"][0])
+        self.assertNotIn("token_value", unit["raw"]["tray"][0])
 
     def test_build_ams_omits_invalid_color_and_caps_slots(self):
         # Non-8-hex colors are dropped; a malformed >4-tray unit only emits 0-3.
@@ -219,6 +326,16 @@ class TestAmsHmsBuilders(unittest.TestCase):
                         {"slot": 2, "material": "TPU", "colorHex": "00FF00FF"},
                         {"slot": 3, "material": "ABS"},
                     ],
+                    "raw": {
+                        "id": "0",
+                        "tray": [
+                            {"tray_type": "PLA", "tray_color": "GGGGGGGG"},
+                            {"tray_type": "PETG", "tray_color": "FF0000FF11"},
+                            {"tray_type": "TPU", "tray_color": "#00FF00FF"},
+                            {"tray_type": "ABS"},
+                            {"tray_type": "PA", "tray_color": "FFFFFFFF"},
+                        ],
+                    },
                 }
             ],
         )
@@ -244,7 +361,51 @@ class TestAmsHmsBuilders(unittest.TestCase):
             bambu_parse.build_ams(
                 {"ams": {"ams": ["bad", {"id": "not-int", "tray": [{}, "bad", {"remain": "x"}]}]}}
             ),
-            [{"unit": 1, "trays": [{"slot": 2}]}],
+            [
+                {
+                    "unit": 1,
+                    "trays": [{"slot": 2}],
+                    "raw": {"id": "not-int", "tray": [{}, "bad", {"remain": "x"}]},
+                }
+            ],
+        )
+        self.assertEqual(
+            bambu_parse.build_ams({"ams": {"ams": [{"id": "2", "humidity": "4", "dry_time": "120"}]}}),
+            [{"unit": 2, "trays": [], "humidity": 4.0, "raw": {"id": "2", "humidity": "4", "dry_time": "120"}}],
+        )
+
+    def test_build_vt_tray_from_external_spool(self):
+        print_obj = {
+            "vt_tray": {
+                "tray_type": "PLA",
+                "tray_sub_brands": "PLA Marble",
+                "tray_info_idx": "ignored-for-vt",
+                "tray_color": "10203040",
+                "remain": "55.5",
+                "tag_uid": "vt-uid",
+                "nozzle_temp_min": "190",
+            }
+        }
+        self.assertEqual(
+            bambu_parse.build_vt_tray(print_obj),
+            {
+                "material": "PLA",
+                "productName": "PLA Marble",
+                "colorHex": "10203040",
+                "remainPct": 55.5,
+                "tagUid": "vt-uid",
+            },
+        )
+        s = bambu_parse.normalize_status("p", {"print": print_obj}, connection_state="connected")
+        self.assertEqual(s["vtTray"], bambu_parse.build_vt_tray(print_obj))
+        self.assertIsNone(bambu_parse.build_vt_tray({"vt_tray": {}}))
+        self.assertIsNone(bambu_parse.build_vt_tray({"vt_tray": {"id": "0"}}))
+
+    def test_build_ams_omits_oversized_raw_passthrough(self):
+        unit = {"id": "0", "drying_blob": "x" * 9000, "tray": [{"tray_type": "PLA"}]}
+        self.assertEqual(
+            bambu_parse.build_ams({"ams": {"ams": [unit]}}),
+            [{"unit": 0, "trays": [{"slot": 0, "material": "PLA"}]}],
         )
 
     def test_build_active_tray(self):
@@ -302,7 +463,9 @@ class TestSummarizeShape(unittest.TestCase):
         shape = bambu_parse.summarize_shape(merged)
         self.assertEqual(shape["arrayLengths"]["ams.units"], 2)
         self.assertEqual(shape["arrayLengths"]["ams.trays_total"], 6)
+        self.assertEqual(shape["arrayLengths"]["ams.trays_loaded"], 1)
         self.assertEqual(shape["arrayLengths"]["hms"], 1)
+        self.assertEqual(shape["amsTrayKeys"], ["tray_type"])
         self.assertNotIn("PLA", str(shape))
 
 
