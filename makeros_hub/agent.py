@@ -26,6 +26,7 @@ from .config import SPOOL_DIR, Config, read_credential
 from .http import TransportError, get_json, post_json
 from .ingest import IngestServer
 from .printers.manager import PrinterManager
+from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
 from .update import maybe_update
 
 log = logging.getLogger("makeros-hub")
@@ -144,10 +145,23 @@ def _uptime_sec() -> int | None:
         return None
 
 
+TAILSCALE_HEARTBEAT_FIELDS = (
+    "tailscaleIp",
+    "tailscaleHostname",
+    "tailscaleStatus",
+    "tailscaleStatusReason",
+)
+
+TAILSCALE_RETRY_INITIAL_SEC = 30
+TAILSCALE_RETRY_MAX_SEC = 300
+
+
 def heartbeat_payload(
-    printers: list[dict] | None = None, jobs: list[dict] | None = None
+    printers: list[dict] | None = None,
+    jobs: list[dict] | None = None,
+    tailscale_status: dict | None = None,
 ) -> dict:
-    return {
+    payload = {
         "agentVersion": __version__,
         "os": f"{platform.system()} {platform.release()}",
         "hostname": socket.gethostname(),
@@ -158,25 +172,164 @@ def heartbeat_payload(
         # billing-authoritative) and dedupes on jobKey, so re-sends are safe.
         "jobs": jobs or [],
     }
+    if isinstance(tailscale_status, dict):
+        for key in TAILSCALE_HEARTBEAT_FIELDS:
+            value = tailscale_status.get(key)
+            if value not in (None, ""):
+                payload[key] = value
+    return payload
 
 
-def _pull_config(cfg: Config, credential: str, manager: PrinterManager) -> None:
+def _tailscale_config_enabled(tailscale_cfg) -> bool:
+    return bool(tailscale_cfg.get("enabled")) if isinstance(tailscale_cfg, dict) else False
+
+
+def _tailscale_connected(status: dict | None) -> bool:
+    return isinstance(status, dict) and status.get("tailscaleStatus") == "connected"
+
+
+def _tailscale_secret(tailscale_cfg) -> str | None:
+    if not isinstance(tailscale_cfg, dict):
+        return None
+    auth_key = tailscale_cfg.get("authKey")
+    return auth_key if isinstance(auth_key, str) and auth_key else None
+
+
+def _redact_secret(value: str | None, secret: str | None) -> str | None:
+    if value is None:
+        return None
+    safe = str(value)
+    if secret:
+        safe = safe.replace(secret, "[redacted]")
+    return safe
+
+
+def _sanitize_tailscale_status(status, tailscale_cfg) -> dict:
+    if not isinstance(status, dict):
+        return {
+            "tailscaleIp": None,
+            "tailscaleHostname": None,
+            "tailscaleStatus": "error",
+            "tailscaleStatusReason": "tailscale reconcile failed",
+        }
+    clean = dict(status)
+    if clean.get("tailscaleStatusReason"):
+        clean["tailscaleStatusReason"] = _redact_secret(
+            clean.get("tailscaleStatusReason"),
+            _tailscale_secret(tailscale_cfg),
+        )
+    return clean
+
+
+class _TailscaleRuntimeState:
+    def __init__(self):
+        self.config: dict | None = None
+        self.status: dict | None = None
+        self.reconcile_status_pending = False
+        self.next_retry_at = 0.0
+        self.retry_delay_sec = TAILSCALE_RETRY_INITIAL_SEC
+
+    def remember_config(self, tailscale_cfg) -> None:
+        self.config = dict(tailscale_cfg) if isinstance(tailscale_cfg, dict) else None
+
+    def needs_retry(self) -> bool:
+        return _tailscale_config_enabled(self.config) and not _tailscale_connected(self.status)
+
+    def retry_due(self, now: float) -> bool:
+        if not self.needs_retry():
+            return False
+        return self.next_retry_at <= 0 or now >= self.next_retry_at
+
+    def record_reconcile_status(self, status: dict | None, now: float) -> None:
+        self.status = status if isinstance(status, dict) else None
+        self.reconcile_status_pending = True
+        if self.needs_retry():
+            self.next_retry_at = now + self.retry_delay_sec
+            self.retry_delay_sec = min(self.retry_delay_sec * 2, TAILSCALE_RETRY_MAX_SEC)
+        else:
+            self.next_retry_at = 0.0
+            self.retry_delay_sec = TAILSCALE_RETRY_INITIAL_SEC
+
+    def record_observed_status(self, status: dict | None, now: float) -> None:
+        self.status = status if isinstance(status, dict) else None
+        if self.needs_retry() and self.next_retry_at <= 0:
+            self.next_retry_at = now + self.retry_delay_sec
+        elif not self.needs_retry():
+            self.next_retry_at = 0.0
+            self.retry_delay_sec = TAILSCALE_RETRY_INITIAL_SEC
+
+    def mark_reported(self) -> None:
+        self.reconcile_status_pending = False
+
+    def should_read_status(self) -> bool:
+        if self.reconcile_status_pending:
+            return False
+        return _tailscale_config_enabled(self.config) or tailscale_binary_exists()
+
+
+def _reconcile_tailscale_config(tailscale_cfg, reconciler=reconcile_tailscale) -> dict:
+    try:
+        status = reconciler(tailscale_cfg)
+    except Exception:  # noqa: BLE001 - config-down must not break heartbeat
+        status = {
+            "tailscaleIp": None,
+            "tailscaleHostname": None,
+            "tailscaleStatus": "error",
+            "tailscaleStatusReason": "tailscale reconcile failed",
+        }
+    else:
+        status = _sanitize_tailscale_status(status, tailscale_cfg)
+    if status.get("tailscaleStatus") == "error":
+        log.error("tailscale.error: %s", status.get("tailscaleStatusReason") or "unknown")
+    return status
+
+
+def _maybe_retry_tailscale_config(
+    tailscale_state: _TailscaleRuntimeState,
+    now: float,
+    reconciler=reconcile_tailscale,
+) -> dict | None:
+    if not tailscale_state.retry_due(now):
+        return None
+    status = _reconcile_tailscale_config(tailscale_state.config, reconciler)
+    tailscale_state.record_reconcile_status(status, now)
+    return status
+
+
+def _pull_config(
+    cfg: Config,
+    credential: str,
+    manager: PrinterManager,
+    tailscale_reconciler=reconcile_tailscale,
+    tailscale_state: _TailscaleRuntimeState | None = None,
+) -> dict | None:
     """Fetch the printer list (config-down) and reconcile adapters. Best-effort:
     a transport blip just leaves the current adapters running until next time."""
     try:
         resp = get_json(cfg.config_url, bearer=credential)
     except TransportError as exc:
         log.warning("config pull failed (will retry on next change): %s", exc)
-        return
+        return None
     if resp.status == 200:
         printers = resp.body.get("printers")
         version = resp.body.get("version")
         manager.reconcile(printers if isinstance(printers, list) else [], version)
+        tailscale_cfg = resp.body.get("tailscale")
+        if tailscale_state is not None:
+            tailscale_state.remember_config(tailscale_cfg)
+        tailscale_status = _reconcile_tailscale_config(
+            tailscale_cfg,
+            tailscale_reconciler,
+        )
+        if tailscale_state is not None:
+            tailscale_state.record_reconcile_status(tailscale_status, time.monotonic())
         log.info("config pulled: %d printers (configVersion=%s)", len(manager.statuses()), version)
+        return tailscale_status
     elif resp.status == 401:
         log.error("config pull rejected 401 — credential revoked. Re-enroll.")
     else:
         log.warning("config pull unexpected %s: %s", resp.status, resp.body.get("error"))
+    return None
 
 
 def run(cfg: Config) -> int:
@@ -192,10 +345,14 @@ def run(cfg: Config) -> int:
     manager = PrinterManager()
     queue_status_reporter = make_queue_status_reporter(cfg, credential)
     pending_queue_reports: list[dict] = []
+    tailscale_state = _TailscaleRuntimeState()
+    tailscale_status: dict | None = None
     log.info("makeros-hub %s starting; heartbeat every %ss to %s", __version__, interval, cfg.cloud_url)
 
     # Pull the printer list up front so the first heartbeat already carries status.
-    _pull_config(cfg, credential, manager)
+    pulled_tailscale_status = _pull_config(cfg, credential, manager, tailscale_state=tailscale_state)
+    if pulled_tailscale_status:
+        tailscale_status = pulled_tailscale_status
 
     # Start the OrcaSlicer ingest server (inbound HTTP on the LAN). Best-effort:
     # if the port is taken we log + continue (heartbeat/telemetry still work).
@@ -215,16 +372,30 @@ def run(cfg: Config) -> int:
     try:
         while True:
             try:
+                now = time.monotonic()
+                retry_tailscale_status = _maybe_retry_tailscale_config(tailscale_state, now)
+                if retry_tailscale_status:
+                    tailscale_status = retry_tailscale_status
+                elif tailscale_state.should_read_status():
+                    current_ts = current_tailscale_status(
+                        enabled=_tailscale_config_enabled(tailscale_state.config)
+                    )
+                    if current_ts:
+                        tailscale_status = current_ts
+                        tailscale_state.record_observed_status(current_ts, now)
+                elif not tailscale_state.reconcile_status_pending:
+                    tailscale_status = None
                 statuses = manager.statuses()
                 jobs = manager.pending_jobs()
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
-                    heartbeat_payload(statuses, jobs),
+                    heartbeat_payload(statuses, jobs, tailscale_status),
                     bearer=credential,
                     retries=3,
                     backoff_base=2.0,
                 )
+                tailscale_state.mark_reported()
                 if resp.status == 200:
                     assignments = resp.body.get("assignments")
                     dispatch_reports = manager.dispatch_assignments(
@@ -269,7 +440,14 @@ def run(cfg: Config) -> int:
                     new_version = resp.body.get("configVersion")
                     if isinstance(new_version, str) and new_version != manager.config_version:
                         log.info("configVersion changed (%s) — re-pulling", new_version)
-                        _pull_config(cfg, credential, manager)
+                        pulled_tailscale_status = _pull_config(
+                            cfg,
+                            credential,
+                            manager,
+                            tailscale_state=tailscale_state,
+                        )
+                        if pulled_tailscale_status:
+                            tailscale_status = pulled_tailscale_status
                     # Over-the-air self-update: the cloud names the release this
                     # hub should run. No-op unless it's a strictly-newer release
                     # tag and the cooldown has passed; on apply, the update

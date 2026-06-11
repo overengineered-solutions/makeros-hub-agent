@@ -3,6 +3,7 @@
   python3 -m unittest discover -s tests
 """
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,7 +14,11 @@ from makeros_hub.agent import (
     QUEUE_STATUS_DROP,
     QUEUE_STATUS_RETRY,
     QUEUE_STATUS_SENT,
+    _TailscaleRuntimeState,
     _flush_queue_status_reports,
+    _maybe_retry_tailscale_config,
+    _pull_config,
+    _reconcile_tailscale_config,
     heartbeat_payload,
     make_queue_status_reporter,
 )
@@ -56,6 +61,123 @@ class TestHeartbeatPayload(unittest.TestCase):
             self.assertIn(key, p)
         self.assertEqual(p["printers"], [])
         self.assertEqual(p["jobs"], [])
+
+    def test_tailscale_fields_omit_absent_values(self):
+        p = heartbeat_payload(
+            tailscale_status={
+                "tailscaleIp": "100.64.0.10",
+                "tailscaleHostname": "hub-one",
+                "tailscaleStatus": "connected",
+                "tailscaleStatusReason": None,
+            }
+        )
+        self.assertEqual(p["tailscaleIp"], "100.64.0.10")
+        self.assertEqual(p["tailscaleHostname"], "hub-one")
+        self.assertEqual(p["tailscaleStatus"], "connected")
+        self.assertNotIn("tailscaleStatusReason", p)
+
+
+class TestConfigDownTailscale(unittest.TestCase):
+    def test_pull_config_reconciles_tailscale_block(self):
+        class Manager:
+            config_version = None
+
+            def __init__(self):
+                self.reconciled = None
+
+            def reconcile(self, printers, version):
+                self.reconciled = (printers, version)
+                self.config_version = version
+
+            def statuses(self):
+                return []
+
+        cfg = Config(cloud_url="https://host.example")
+        manager = Manager()
+        tailscale_cfg = {"enabled": False}
+        tailscale_status = {
+            "tailscaleIp": None,
+            "tailscaleHostname": None,
+            "tailscaleStatus": "disabled",
+            "tailscaleStatusReason": None,
+        }
+        reconciler = mock.Mock(return_value=tailscale_status)
+        with mock.patch(
+            "makeros_hub.agent.get_json",
+            return_value=http.Response(200, {"printers": [], "version": "v1", "tailscale": tailscale_cfg}),
+        ):
+            returned = _pull_config(cfg, "cred", manager, tailscale_reconciler=reconciler)
+
+        self.assertEqual(manager.reconciled, ([], "v1"))
+        reconciler.assert_called_once_with(tailscale_cfg)
+        self.assertEqual(returned, tailscale_status)
+
+    def test_pull_config_reconciler_raise_returns_sanitized_error(self):
+        class Manager:
+            config_version = None
+
+            def reconcile(self, printers, version):
+                self.config_version = version
+
+            def statuses(self):
+                return []
+
+        key = "tskey-secret"
+        tailscale_cfg = {"enabled": True, "authKey": key, "hostname": "hub-one"}
+
+        def reconciler(_tailscale_cfg):
+            raise RuntimeError(f"boom {key}")
+
+        cfg = Config(cloud_url="https://host.example")
+        with mock.patch(
+            "makeros_hub.agent.get_json",
+            return_value=http.Response(200, {"printers": [], "version": "v1", "tailscale": tailscale_cfg}),
+        ), self.assertLogs("makeros-hub", level="ERROR") as logs:
+            returned = _pull_config(cfg, "cred", Manager(), tailscale_reconciler=reconciler)
+
+        self.assertEqual(returned["tailscaleStatus"], "error")
+        self.assertEqual(returned["tailscaleStatusReason"], "tailscale reconcile failed")
+        self.assertNotIn(key, json.dumps(returned))
+        self.assertNotIn(key, "\n".join(logs.output))
+        payload = heartbeat_payload(tailscale_status=returned)
+        self.assertNotIn(key, json.dumps(payload))
+
+    def test_reconcile_tailscale_config_sanitizes_returned_reason(self):
+        key = "tskey-secret"
+
+        def reconciler(_tailscale_cfg):
+            return {
+                "tailscaleIp": None,
+                "tailscaleHostname": None,
+                "tailscaleStatus": "error",
+                "tailscaleStatusReason": f"bad auth {key}",
+            }
+
+        with self.assertLogs("makeros-hub", level="ERROR") as logs:
+            returned = _reconcile_tailscale_config(
+                {"enabled": True, "authKey": key},
+                reconciler,
+            )
+
+        self.assertIn("[redacted]", returned["tailscaleStatusReason"])
+        self.assertNotIn(key, json.dumps(returned))
+        self.assertNotIn(key, "\n".join(logs.output))
+
+    def test_enabled_not_connected_retries_on_later_beat_with_backoff(self):
+        state = _TailscaleRuntimeState()
+        state.remember_config({"enabled": True, "authKey": "tskey-secret", "hostname": "hub-one"})
+        state.record_reconcile_status({"tailscaleStatus": "joining"}, now=0)
+        reconciler = mock.Mock(return_value={"tailscaleStatus": "joining"})
+
+        self.assertIsNone(_maybe_retry_tailscale_config(state, 29, reconciler))
+        self.assertEqual(reconciler.call_count, 0)
+
+        returned = _maybe_retry_tailscale_config(state, 30, reconciler)
+
+        self.assertEqual(returned["tailscaleStatus"], "joining")
+        reconciler.assert_called_once_with(state.config)
+        self.assertEqual(state.next_retry_at, 90)
+        self.assertLessEqual(state.retry_delay_sec, 300)
 
 
 class TestQueueStatusOutbox(unittest.TestCase):
