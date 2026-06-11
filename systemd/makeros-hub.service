@@ -19,7 +19,12 @@ Restart=always
 RestartSec=5
 # Modest hardening (a box on the shop LAN). The credential + state live under
 # the StateDirectory, which systemd creates 0700 owned by the service user.
-NoNewPrivileges=true
+# NOTE: deliberately NO NoNewPrivileges — it blocks the agent's one privileged
+# path, the sudo-scoped OTA self-update (`sudo /opt/makeros-hub/update.sh`),
+# which is the ONLY thing the service user may run as root. With NoNewPrivileges
+# set, sudo can't escalate even with a valid NOPASSWD rule, so OTA silently
+# fails ("no new privileges flag is set"). The narrow sudoers rule is the real
+# control here.
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
