@@ -239,8 +239,11 @@ class TestAmsHmsBuilders(unittest.TestCase):
                     {
                         "id": "0",
                         "humidity": "3",
+                        "humidity_raw": "44",
                         "temp": 25,
                         "dry_time": "120",
+                        "ams_id": "AMS-SERIAL-123",
+                        "chip_id": "CHIP-XYZ",
                         "serialNumber": "drop-me",
                         "access_code": "drop-me",
                         "tray": [
@@ -291,8 +294,12 @@ class TestAmsHmsBuilders(unittest.TestCase):
                 "nozzleTempMax": 230,
             },
         )
+        self.assertEqual(unit["humidityRaw"], 44.0)
+        self.assertEqual(unit["dryTime"], 120)
         self.assertEqual(unit["raw"]["dry_time"], "120")
         self.assertNotIn("serialNumber", unit["raw"])
+        self.assertNotIn("ams_id", unit["raw"])
+        self.assertNotIn("chip_id", unit["raw"])
         self.assertNotIn("access_code", unit["raw"])
         self.assertNotIn("ip_addr", unit["raw"]["tray"][0])
         self.assertNotIn("token_value", unit["raw"]["tray"][0])
@@ -371,7 +378,15 @@ class TestAmsHmsBuilders(unittest.TestCase):
         )
         self.assertEqual(
             bambu_parse.build_ams({"ams": {"ams": [{"id": "2", "humidity": "4", "dry_time": "120"}]}}),
-            [{"unit": 2, "trays": [], "humidity": 4.0, "raw": {"id": "2", "humidity": "4", "dry_time": "120"}}],
+            [
+                {
+                    "unit": 2,
+                    "trays": [],
+                    "humidity": 4.0,
+                    "dryTime": 120,
+                    "raw": {"id": "2", "humidity": "4", "dry_time": "120"},
+                }
+            ],
         )
 
     def test_build_vt_tray_from_external_spool(self):

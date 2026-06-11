@@ -33,7 +33,10 @@ _RAW_AMS_UNIT_MAX_BYTES = 8 * 1024
 # mac, pass, key, ...) matched ONLY as whole key-segments, so benign AMS keys like
 # "snapshot"/"recipe"/"ipcam" aren't collaterally dropped from the raw passthrough.
 _SECRETISH_SUBSTRINGS = (
-    "serial", "password", "passwd", "secret", "accesscode", "access_code", "apikey", "api_key", "token"
+    "serial", "password", "passwd", "secret", "accesscode", "access_code", "apikey", "api_key", "token",
+    # AMS/chip hardware ids leak into the raw passthrough otherwise (low-stakes,
+    # but the doctrine is no hardware serials in stored telemetry).
+    "ams_id", "chip_id",
 )
 _SECRETISH_SEGMENTS = frozenset({"sn", "ip", "mac", "pass", "key", "access", "auth", "cert"})
 
@@ -235,17 +238,25 @@ def build_ams(print_obj: dict) -> list[dict] | None:
         unit_id = _to_int(unit.get("id"))
         unit_out: dict[str, Any] = {"unit": unit_idx if unit_id is None else unit_id, "trays": []}
 
+        # `humidity` is a 1-5 dryness LEVEL (verified live on the AMS 2 Pro);
+        # `humidity_raw` is the actual percentage (e.g. "44"). Capture both — the
+        # cloud prefers humidityRaw for the "% " readout and keeps the level too.
         humidity = _num(unit.get("humidity"))
         if humidity is not None:
-            # Bound to 0-100 (the cloud DTO mirrors this). NOTE: some Bambu AMS
-            # report humidity as a 1-5 dryness LEVEL rather than a %; the v0.8.0
-            # cloud renders "{n}%" — confirm against the live AMS 2 Pro value and
-            # adjust the label if it's a level (tracked).
-            unit_out["humidity"] = max(0.0, min(100.0, float(humidity)))
+            unit_out["humidity"] = max(0.0, min(5.0, float(humidity)))
+
+        humidity_raw = _num(unit.get("humidity_raw"))
+        if humidity_raw is not None:
+            unit_out["humidityRaw"] = max(0.0, min(100.0, float(humidity_raw)))
 
         temp = _num(unit.get("temp"))
         if temp is not None:
             unit_out["temp"] = float(temp)
+
+        # Drying timer: 0 = not drying, >0 = actively drying (minutes remaining).
+        dry_time = _num(unit.get("dry_time"))
+        if dry_time is not None:
+            unit_out["dryTime"] = max(0, int(dry_time))
 
         trays_raw = unit.get("tray")
         if isinstance(trays_raw, list):
