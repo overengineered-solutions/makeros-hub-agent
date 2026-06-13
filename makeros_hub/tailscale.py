@@ -15,6 +15,8 @@ import socket
 import subprocess
 from collections.abc import Callable, Sequence
 
+from . import diagnostics
+
 TAILSCALE_BIN = os.environ.get("MAKEROS_HUB_TAILSCALE_BIN", "tailscale")
 TAILSCALE_SETUP_SCRIPT = os.environ.get(
     "MAKEROS_HUB_TAILSCALE_SETUP_SCRIPT",
@@ -50,10 +52,12 @@ def _decode(value) -> str:
 
 
 def _sanitize(value: str, secret: str | None = None) -> str:
-    safe = value.strip()
-    if secret:
-        safe = safe.replace(secret, "[redacted]")
-    return safe
+    return diagnostics.redact(value.strip(), extra_secrets=[secret] if secret else None)
+
+
+def _record_failure(reason: str | None) -> None:
+    if reason:
+        diagnostics.record("tailscale", reason)
 
 
 def _status(
@@ -256,6 +260,7 @@ def reconcile_tailscale(cfg: dict | None, runner: Runner = subprocess_runner) ->
 
     current = _sanitize_status(current_tailscale_status(runner), auth_key)
     if current.get("tailscaleStatus") == "error":
+        _record_failure(current.get("tailscaleStatusReason"))
         return current
 
     if not enabled:
@@ -266,9 +271,13 @@ def reconcile_tailscale(cfg: dict | None, runner: Runner = subprocess_runner) ->
                     timeout=60,
                 )
             except Exception as exc:  # noqa: BLE001 - reconciliation must not sink heartbeat
-                return _status("error", reason=_sanitize(str(exc), auth_key) or "tailscale down failed")
+                reason = _sanitize(str(exc), auth_key) or "tailscale down failed"
+                _record_failure(reason)
+                return _status("error", reason=reason)
             if getattr(result, "returncode", 1) != 0:
-                return _status("error", reason=_first_detail("tailscale down failed", result, auth_key))
+                reason = _first_detail("tailscale down failed", result, auth_key)
+                _record_failure(reason)
+                return _status("error", reason=reason)
         return _status("disabled")
 
     if current.get("tailscaleStatus") == "connected" and _host_matches(
@@ -279,7 +288,9 @@ def reconcile_tailscale(cfg: dict | None, runner: Runner = subprocess_runner) ->
             return current
 
     if not auth_key:
-        return _status("error", reason="tailscale authKey missing")
+        reason = "tailscale authKey missing"
+        _record_failure(reason)
+        return _status("error", reason=reason)
 
     try:
         result = runner(
@@ -288,15 +299,20 @@ def reconcile_tailscale(cfg: dict | None, runner: Runner = subprocess_runner) ->
             timeout=180,
         )
     except Exception as exc:  # noqa: BLE001 - reconciliation must not sink heartbeat
-        return _status("error", reason=_sanitize(str(exc), auth_key) or "tailscale up failed")
+        reason = _sanitize(str(exc), auth_key) or "tailscale up failed"
+        _record_failure(reason)
+        return _status("error", reason=reason)
 
     if getattr(result, "returncode", 1) != 0:
-        return _status("error", reason=_first_detail("tailscale up failed", result, auth_key))
+        reason = _first_detail("tailscale up failed", result, auth_key)
+        _record_failure(reason)
+        return _status("error", reason=reason)
 
     after = _sanitize_status(current_tailscale_status(runner), auth_key)
     if after.get("tailscaleStatus") == "connected":
         return after
     if after.get("tailscaleStatus") == "error":
+        _record_failure(after.get("tailscaleStatusReason"))
         return after
     return _status(
         "joining",

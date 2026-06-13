@@ -4,6 +4,7 @@ paths (klipper/incomplete/removal). Run: python3 -m unittest discover -s tests""
 
 import unittest
 
+from makeros_hub import diagnostics
 from makeros_hub.printers import bambu_parse
 from makeros_hub.printers.manager import PrinterManager
 
@@ -537,6 +538,31 @@ class TestManagerNonPahoPaths(unittest.TestCase):
 
         m.ack_jobs(["task_S_1"])  # confirmed send clears the orphan too
         self.assertEqual(m.pending_jobs(), [])
+
+    def test_adapter_status_error_records_with_printer_access_code_secret(self):
+        class CapturingDiagnostics(diagnostics.Diagnostics):
+            def __init__(self):
+                super().__init__(enable_network=False)
+                self.extra_secrets = None
+
+            def record(self, subsystem, message, extra_secrets=None):
+                self.extra_secrets = extra_secrets
+                super().record(subsystem, message, extra_secrets=extra_secrets)
+
+        class FakeAdapter:
+            def status(self):
+                raise RuntimeError("MQTT refused: adapter saw bare code 12345678")
+
+        diag = CapturingDiagnostics()
+        m = PrinterManager(diagnostics=diag)
+        m._adapters["b1"] = FakeAdapter()
+        m._fingerprints["b1"] = ("bambu", "h", "s", "12345678")
+
+        statuses = m.statuses()
+
+        self.assertEqual(statuses[0]["errorReason"], "agent_status_error")
+        self.assertEqual(diag.extra_secrets, ["12345678"])
+        self.assertNotIn("12345678", diag.errors.snapshot()["printers"]["message"])
 
 
 if __name__ == "__main__":

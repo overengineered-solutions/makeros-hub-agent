@@ -23,6 +23,7 @@ import time
 
 from . import __version__
 from .config import SPOOL_DIR, Config, read_credential
+from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import TransportError, get_json, post_json
 from .ingest import IngestServer
 from .printers.manager import PrinterManager
@@ -36,7 +37,7 @@ QUEUE_STATUS_RETRY = "retry"
 QUEUE_STATUS_DROP = "drop"
 
 
-def make_cloud_submit(cfg: Config, credential: str):
+def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
     """Closure the ingest server calls to register an OrcaSlicer upload with the
     cloud. Maps the /api/print/hub/submit response to an ingest outcome dict."""
 
@@ -56,7 +57,9 @@ def make_cloud_submit(cfg: Config, credential: str):
                 backoff_base=1.0,
             )
         except TransportError as exc:
-            return {"status": "error", "detail": f"transport: {exc}"}
+            safe = redact(str(exc))
+            _record_diagnostic(diagnostics, "ingest", f"cloud submit transport: {safe}")
+            return {"status": "error", "detail": f"transport: {safe}"}
 
         if resp.status == 200:
             if resp.body.get("ok"):
@@ -65,12 +68,13 @@ def make_cloud_submit(cfg: Config, credential: str):
         if resp.status == 401:
             # invalid member token (the hub's own bearer is valid — we're enrolled).
             return {"status": "bad_token"}
+        _record_diagnostic(diagnostics, "ingest", f"cloud submit unexpected {resp.status}")
         return {"status": "error", "detail": f"http_{resp.status}"}
 
     return submit
 
 
-def make_queue_status_reporter(cfg: Config, credential: str):
+def make_queue_status_reporter(cfg: Config, credential: str, diagnostics=None):
     """Closure for queue assignment state transitions."""
 
     def report(status_report: dict) -> str:
@@ -91,30 +95,36 @@ def make_queue_status_reporter(cfg: Config, credential: str):
                 backoff_base=1.0,
             )
         except TransportError as exc:
+            safe = redact(str(exc))
+            _record_diagnostic(diagnostics, "heartbeat", f"queue status transport: {safe}")
             log.warning(
                 "queue status report failed for %s/%s: %s",
                 body.get("queueJobId"),
                 body.get("state"),
-                exc,
+                safe,
             )
             return QUEUE_STATUS_RETRY
         if 200 <= resp.status < 300:
             return QUEUE_STATUS_SENT
         if 400 <= resp.status < 500:
+            safe = redact(resp.body.get("error"))
+            _record_diagnostic(diagnostics, "heartbeat", f"queue status HTTP {resp.status}: {safe}")
             log.warning(
                 "dropping deterministic queue status report after HTTP %s for %s/%s: %s",
                 resp.status,
                 body.get("queueJobId"),
                 body.get("state"),
-                resp.body.get("error"),
+                safe,
             )
             return QUEUE_STATUS_DROP
+        safe = redact(resp.body.get("error"))
+        _record_diagnostic(diagnostics, "heartbeat", f"queue status unexpected {resp.status}: {safe}")
         log.warning(
             "queue status report unexpected %s for %s/%s: %s",
             resp.status,
             body.get("queueJobId"),
             body.get("state"),
-            resp.body.get("error"),
+            safe,
         )
         return QUEUE_STATUS_RETRY
 
@@ -156,10 +166,16 @@ TAILSCALE_RETRY_INITIAL_SEC = 30
 TAILSCALE_RETRY_MAX_SEC = 300
 
 
+def _record_diagnostic(diagnostics, subsystem: str, message) -> None:
+    if diagnostics is not None:
+        diagnostics.record(subsystem, message)
+
+
 def heartbeat_payload(
     printers: list[dict] | None = None,
     jobs: list[dict] | None = None,
     tailscale_status: dict | None = None,
+    diagnostics=None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -177,6 +193,9 @@ def heartbeat_payload(
             value = tailscale_status.get(key)
             if value not in (None, ""):
                 payload[key] = value
+    diag = collect_cheap_diagnostics(diagnostics)
+    if diag:
+        payload["diagnostics"] = diag
     return payload
 
 
@@ -198,10 +217,7 @@ def _tailscale_secret(tailscale_cfg) -> str | None:
 def _redact_secret(value: str | None, secret: str | None) -> str | None:
     if value is None:
         return None
-    safe = str(value)
-    if secret:
-        safe = safe.replace(secret, "[redacted]")
-    return safe
+    return redact(str(value), extra_secrets=[secret] if secret else None)
 
 
 def _sanitize_tailscale_status(status, tailscale_cfg) -> dict:
@@ -267,7 +283,7 @@ class _TailscaleRuntimeState:
         return _tailscale_config_enabled(self.config) or tailscale_binary_exists()
 
 
-def _reconcile_tailscale_config(tailscale_cfg, reconciler=reconcile_tailscale) -> dict:
+def _reconcile_tailscale_config(tailscale_cfg, reconciler=reconcile_tailscale, diagnostics=None) -> dict:
     try:
         status = reconciler(tailscale_cfg)
     except Exception:  # noqa: BLE001 - config-down must not break heartbeat
@@ -277,10 +293,13 @@ def _reconcile_tailscale_config(tailscale_cfg, reconciler=reconcile_tailscale) -
             "tailscaleStatus": "error",
             "tailscaleStatusReason": "tailscale reconcile failed",
         }
+        _record_diagnostic(diagnostics, "tailscale", status["tailscaleStatusReason"])
     else:
         status = _sanitize_tailscale_status(status, tailscale_cfg)
     if status.get("tailscaleStatus") == "error":
-        log.error("tailscale.error: %s", status.get("tailscaleStatusReason") or "unknown")
+        reason = status.get("tailscaleStatusReason") or "unknown"
+        _record_diagnostic(diagnostics, "tailscale", reason)
+        log.error("tailscale.error: %s", reason)
     return status
 
 
@@ -288,10 +307,11 @@ def _maybe_retry_tailscale_config(
     tailscale_state: _TailscaleRuntimeState,
     now: float,
     reconciler=reconcile_tailscale,
+    diagnostics=None,
 ) -> dict | None:
     if not tailscale_state.retry_due(now):
         return None
-    status = _reconcile_tailscale_config(tailscale_state.config, reconciler)
+    status = _reconcile_tailscale_config(tailscale_state.config, reconciler, diagnostics)
     tailscale_state.record_reconcile_status(status, now)
     return status
 
@@ -302,13 +322,16 @@ def _pull_config(
     manager: PrinterManager,
     tailscale_reconciler=reconcile_tailscale,
     tailscale_state: _TailscaleRuntimeState | None = None,
+    diagnostics=None,
 ) -> dict | None:
     """Fetch the printer list (config-down) and reconcile adapters. Best-effort:
     a transport blip just leaves the current adapters running until next time."""
     try:
         resp = get_json(cfg.config_url, bearer=credential)
     except TransportError as exc:
-        log.warning("config pull failed (will retry on next change): %s", exc)
+        safe = redact(str(exc))
+        _record_diagnostic(diagnostics, "config", f"config pull failed: {safe}")
+        log.warning("config pull failed (will retry on next change): %s", safe)
         return None
     if resp.status == 200:
         printers = resp.body.get("printers")
@@ -320,19 +343,27 @@ def _pull_config(
         tailscale_status = _reconcile_tailscale_config(
             tailscale_cfg,
             tailscale_reconciler,
+            diagnostics,
         )
         if tailscale_state is not None:
             tailscale_state.record_reconcile_status(tailscale_status, time.monotonic())
         log.info("config pulled: %d printers (configVersion=%s)", len(manager.statuses()), version)
         return tailscale_status
     elif resp.status == 401:
+        _record_diagnostic(diagnostics, "config", "config pull rejected 401")
         log.error("config pull rejected 401 — credential revoked. Re-enroll.")
     else:
-        log.warning("config pull unexpected %s: %s", resp.status, resp.body.get("error"))
+        safe = redact(resp.body.get("error"))
+        _record_diagnostic(diagnostics, "config", f"config pull unexpected {resp.status}: {safe}")
+        log.warning("config pull unexpected %s: %s", resp.status, safe)
     return None
 
 
 def run(cfg: Config) -> int:
+    diagnostics = Diagnostics(cloud_url=cfg.cloud_url, agent_version=__version__)
+    set_default(diagnostics)
+    install_log_handler(diagnostics)
+
     credential = read_credential()
     if not credential:
         raise SystemExit(
@@ -342,15 +373,21 @@ def run(cfg: Config) -> int:
         )
 
     interval = cfg.heartbeat_sec
-    manager = PrinterManager()
-    queue_status_reporter = make_queue_status_reporter(cfg, credential)
+    manager = PrinterManager(diagnostics=diagnostics)
+    queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
     pending_queue_reports: list[dict] = []
     tailscale_state = _TailscaleRuntimeState()
     tailscale_status: dict | None = None
     log.info("makeros-hub %s starting; heartbeat every %ss to %s", __version__, interval, cfg.cloud_url)
 
     # Pull the printer list up front so the first heartbeat already carries status.
-    pulled_tailscale_status = _pull_config(cfg, credential, manager, tailscale_state=tailscale_state)
+    pulled_tailscale_status = _pull_config(
+        cfg,
+        credential,
+        manager,
+        tailscale_state=tailscale_state,
+        diagnostics=diagnostics,
+    )
     if pulled_tailscale_status:
         tailscale_status = pulled_tailscale_status
 
@@ -359,21 +396,27 @@ def run(cfg: Config) -> int:
     ingest: IngestServer | None = None
     try:
         ingest = IngestServer(
-            make_cloud_submit(cfg, credential),
+            make_cloud_submit(cfg, credential, diagnostics=diagnostics),
             port=cfg.ingest_port,
             spool_dir=SPOOL_DIR,
             max_bytes=cfg.max_upload_mb * 1024 * 1024,
         )
         ingest.start()
     except OSError as exc:
-        log.error("OrcaSlicer ingest server failed to start on :%d (%s)", cfg.ingest_port, exc)
+        safe = redact(str(exc))
+        _record_diagnostic(diagnostics, "ingest", f"ingest server failed to start on :{cfg.ingest_port}: {safe}")
+        log.error("OrcaSlicer ingest server failed to start on :%d (%s)", cfg.ingest_port, safe)
         ingest = None
 
     try:
         while True:
             try:
                 now = time.monotonic()
-                retry_tailscale_status = _maybe_retry_tailscale_config(tailscale_state, now)
+                retry_tailscale_status = _maybe_retry_tailscale_config(
+                    tailscale_state,
+                    now,
+                    diagnostics=diagnostics,
+                )
                 if retry_tailscale_status:
                     tailscale_status = retry_tailscale_status
                 elif tailscale_state.should_read_status():
@@ -390,7 +433,7 @@ def run(cfg: Config) -> int:
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
-                    heartbeat_payload(statuses, jobs, tailscale_status),
+                    heartbeat_payload(statuses, jobs, tailscale_status, diagnostics=diagnostics),
                     bearer=credential,
                     retries=3,
                     backoff_base=2.0,
@@ -445,6 +488,7 @@ def run(cfg: Config) -> int:
                             credential,
                             manager,
                             tailscale_state=tailscale_state,
+                            diagnostics=diagnostics,
                         )
                         if pulled_tailscale_status:
                             tailscale_status = pulled_tailscale_status
@@ -456,15 +500,20 @@ def run(cfg: Config) -> int:
                     if isinstance(target, str) and target and maybe_update(__version__, target):
                         log.info("OTA: update to %s launched; the service will restart", target)
                 elif resp.status == 401:
+                    _record_diagnostic(diagnostics, "heartbeat", "heartbeat rejected 401")
                     log.error(
                         "heartbeat rejected 401 — this hub's credential was revoked or is "
                         "unknown. Re-enroll with a fresh token. Exiting."
                     )
                     return 2
                 else:
-                    log.warning("heartbeat unexpected %s: %s", resp.status, resp.body.get("error"))
+                    safe = redact(resp.body.get("error"))
+                    _record_diagnostic(diagnostics, "heartbeat", f"heartbeat unexpected {resp.status}: {safe}")
+                    log.warning("heartbeat unexpected %s: %s", resp.status, safe)
             except TransportError as exc:
-                log.warning("heartbeat transport error (will retry): %s", exc)
+                safe = redact(str(exc))
+                _record_diagnostic(diagnostics, "heartbeat", f"heartbeat transport error: {safe}")
+                log.warning("heartbeat transport error (will retry): %s", safe)
 
             time.sleep(interval)
     finally:

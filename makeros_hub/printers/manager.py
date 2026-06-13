@@ -21,6 +21,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
+from ..diagnostics import get_default, redact
+
 log = logging.getLogger("makeros-hub.printers")
 
 MAX_DISPATCHED_QUEUE_JOBS = 1000
@@ -33,9 +35,10 @@ def _fingerprint(p: dict) -> tuple:
 
 
 class PrinterManager:
-    def __init__(self) -> None:
+    def __init__(self, diagnostics=None) -> None:
         self._adapters: dict[str, Any] = {}
         self._fingerprints: dict[str, tuple] = {}
+        self._diagnostics = diagnostics or get_default()
         # Static status for printers the agent can't drive yet (klipper, or a
         # Bambu missing its connection facts) — surfaced so the admin sees why.
         self._static: dict[str, dict] = {}
@@ -49,6 +52,20 @@ class PrinterManager:
         # reports prune this bounded guard.
         self._dispatched_queue_jobs: OrderedDict[str, float] = OrderedDict()
         self.config_version: str | None = None
+
+    def _record_failure(self, message, extra_secrets=None) -> None:
+        if self._diagnostics is not None:
+            self._diagnostics.record("printers", message, extra_secrets=extra_secrets)
+
+    def _access_code_for(self, pid: str):
+        fp = self._fingerprints.get(pid)
+        if isinstance(fp, tuple) and len(fp) >= 4 and fp[3]:
+            return fp[3]
+        adapter = self._adapters.get(pid)
+        return getattr(adapter, "_access_code", None)
+
+    def _redact_printer_exception(self, exc, code=None) -> str:
+        return redact(str(exc), extra_secrets=[code] if code else None)
 
     def reconcile(self, printers: list[dict], version: str | None) -> None:
         self.config_version = version
@@ -82,6 +99,7 @@ class PrinterManager:
         if not (host and serial and code):
             # Incomplete config — can't connect. Make it visible, don't crash.
             self._stop(pid)
+            self._record_failure(f"printer {pid} incomplete_config")
             self._static[pid] = {
                 "printerId": pid,
                 "connectionState": "error",
@@ -97,7 +115,12 @@ class PrinterManager:
         try:
             from .bambu import BambuAdapter  # lazy: needs paho
         except ImportError as e:  # paho not installed
-            log.error("cannot start Bambu adapter for %s — paho-mqtt missing: %s", pid, e)
+            safe = self._redact_printer_exception(e, code)
+            log.error("cannot start Bambu adapter for %s — paho-mqtt missing: %s", pid, safe)
+            self._record_failure(
+                f"cannot start Bambu adapter for {pid}: paho-mqtt missing: {safe}",
+                extra_secrets=[code],
+            )
             self._static[pid] = {
                 "printerId": pid,
                 "connectionState": "error",
@@ -105,11 +128,23 @@ class PrinterManager:
             }
             return
         adapter = BambuAdapter(pid, host=host, serial=serial, access_code=code, model=p.get("model"))
-        adapter.start()
+        try:
+            adapter.start()
+        except Exception as e:  # noqa: BLE001 - one bad printer must not sink config-down
+            safe = self._redact_printer_exception(e, code)
+            log.warning("cannot start Bambu adapter for %s: %s", pid, safe)
+            self._record_failure(f"cannot start Bambu adapter for {pid}: {safe}", extra_secrets=[code])
+            self._static[pid] = {
+                "printerId": pid,
+                "connectionState": "error",
+                "errorReason": "agent_start_failed",
+            }
+            return
         self._adapters[pid] = adapter
         self._fingerprints[pid] = fp
 
     def _stop(self, pid: str) -> None:
+        code = self._access_code_for(pid)
         adapter = self._adapters.pop(pid, None)
         self._fingerprints.pop(pid, None)
         if adapter is not None:
@@ -122,7 +157,9 @@ class PrinterManager:
                     self._orphan_jobs.extend(rescued)
                     log.info("rescued %d unacked job(s) from %s before teardown", len(rescued), pid)
             except Exception as e:  # noqa: BLE001
-                log.warning("could not rescue pending jobs from %s: %s", pid, e)
+                safe = self._redact_printer_exception(e, code)
+                log.warning("could not rescue pending jobs from %s: %s", pid, safe)
+                self._record_failure(f"could not rescue pending jobs from {pid}: {safe}", extra_secrets=[code])
             adapter.stop()
 
     def statuses(self) -> list[dict]:
@@ -131,7 +168,10 @@ class PrinterManager:
             try:
                 out.append(adapter.status())
             except Exception as e:  # noqa: BLE001 — one bad adapter must not sink the heartbeat
-                log.warning("status read failed for %s: %s", pid, e)
+                code = self._access_code_for(pid)
+                safe = self._redact_printer_exception(e, code)
+                log.warning("status read failed for %s: %s", pid, safe)
+                self._record_failure(f"status read failed for {pid}: {safe}", extra_secrets=[code])
                 out.append({"printerId": pid, "connectionState": "error", "errorReason": "agent_status_error"})
         out.extend(self._static.values())
         return out
@@ -145,7 +185,10 @@ class PrinterManager:
             try:
                 out.extend(adapter.pending_jobs())
             except Exception as e:  # noqa: BLE001 — one adapter can't sink the loop
-                log.warning("pending_jobs failed for %s: %s", pid, e)
+                code = self._access_code_for(pid)
+                safe = self._redact_printer_exception(e, code)
+                log.warning("pending_jobs failed for %s: %s", pid, safe)
+                self._record_failure(f"pending_jobs failed for {pid}: {safe}", extra_secrets=[code])
         return out
 
     def ack_jobs(self, job_keys: list[str]) -> None:
@@ -158,7 +201,10 @@ class PrinterManager:
             try:
                 adapter.ack_jobs(job_keys)
             except Exception as e:  # noqa: BLE001
-                log.warning("ack_jobs failed for %s: %s", pid, e)
+                code = self._access_code_for(pid)
+                safe = self._redact_printer_exception(e, code)
+                log.warning("ack_jobs failed for %s: %s", pid, safe)
+                self._record_failure(f"ack_jobs failed for {pid}: {safe}", extra_secrets=[code])
 
     def _remember_dispatched_queue_job(self, queue_job_id: str) -> None:
         self._dispatched_queue_jobs[queue_job_id] = time.monotonic()
@@ -243,7 +289,13 @@ class PrinterManager:
                     queue_job_id=queue_job_id,
                 )
             except Exception as e:  # noqa: BLE001
-                log.warning("assignment dispatch failed for %s on %s: %s", queue_job_id, printer_id, e)
+                code = self._access_code_for(printer_id)
+                safe = self._redact_printer_exception(e, code)
+                log.warning("assignment dispatch failed for %s on %s: %s", queue_job_id, printer_id, safe)
+                self._record_failure(
+                    f"assignment dispatch failed for {queue_job_id} on {printer_id}: {safe}",
+                    extra_secrets=[code],
+                )
                 result = {"ok": False, "reason": "start_failed"}
             if not isinstance(result, dict):
                 result = {"ok": False, "reason": "start_failed"}
@@ -275,7 +327,10 @@ class PrinterManager:
                     ):
                         self._forget_dispatched_queue_job(report["queueJobId"])
             except Exception as e:  # noqa: BLE001
-                log.warning("collect_queue_progress failed for %s: %s", pid, e)
+                code = self._access_code_for(pid)
+                safe = self._redact_printer_exception(e, code)
+                log.warning("collect_queue_progress failed for %s: %s", pid, safe)
+                self._record_failure(f"collect_queue_progress failed for {pid}: {safe}", extra_secrets=[code])
         return reports
 
     def stop_all(self) -> None:
