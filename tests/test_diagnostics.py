@@ -182,7 +182,9 @@ class TestCollectDiagnostics(unittest.TestCase):
         with mock.patch.object(diagnostics, "binary_presence", side_effect=RuntimeError("boom")):
             payload = heartbeat_payload(diagnostics=diag)
 
-        self.assertEqual(payload["agentVersion"], "0.9.3")
+        import makeros_hub
+
+        self.assertEqual(payload["agentVersion"], makeros_hub.__version__)
         self.assertIn("diagnostics", payload)
         self.assertEqual(payload["diagnostics"]["systemFacts"]["agentVersion"], "0.9.3")
         self.assertEqual(payload["diagnostics"]["network"], diagnostics.NETWORK_DEFAULT)
