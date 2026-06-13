@@ -6,7 +6,7 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from makeros_hub import tailscale
+from makeros_hub import diagnostics, tailscale
 
 
 def result(argv, returncode=0, stdout="", stderr=""):
@@ -176,6 +176,34 @@ class TestTailscaleReconcile(unittest.TestCase):
         self.assertEqual(status["tailscaleStatus"], "error")
         self.assertIn("[redacted]", status["tailscaleStatusReason"])
         self.assertNotIn(key, json.dumps(status))
+
+    def test_setup_failure_records_sticky_tailscale_diagnostic(self):
+        key = "tskey-auth-supersecret"
+        diag = diagnostics.Diagnostics(enable_network=False)
+        old_default = diagnostics.get_default()
+        diagnostics.set_default(diag)
+        try:
+            runner = SequencedRunner(
+                result(["tailscale", "ip", "-4"], 1, stderr="Tailscale is stopped."),
+                result(["tailscale", "status"], 1, stderr="Tailscale is stopped."),
+                result(
+                    ["sudo", tailscale.TAILSCALE_SETUP_SCRIPT, "up", "--hostname", "hub-one"],
+                    1,
+                    stderr=f"apt failed using {key}",
+                ),
+            )
+
+            tailscale.reconcile_tailscale(
+                {"enabled": True, "authKey": key, "hostname": "hub-one"},
+                runner,
+            )
+        finally:
+            diagnostics.set_default(old_default)
+
+        snap = diag.errors.snapshot()
+        self.assertIn("tailscale", snap)
+        self.assertIn("tailscale up failed: apt failed", snap["tailscale"]["message"])
+        self.assertNotIn(key, json.dumps(snap))
 
 
 class TestTailscaleStatusParsing(unittest.TestCase):
