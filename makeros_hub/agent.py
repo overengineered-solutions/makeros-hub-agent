@@ -22,7 +22,7 @@ import socket
 import time
 
 from . import __version__
-from .config import SPOOL_DIR, Config, read_credential
+from .config import SPOOL_DIR, Config, parse_virtual_printer_config, read_credential
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import TransportError, get_json, post_json
 from .ingest import IngestServer
@@ -30,6 +30,7 @@ from .probes import PROBES, run_probe, set_effective_config
 from .printers.manager import PrinterManager
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
 from .update import maybe_update
+from .vprinter.manager import VirtualPrinterManager
 
 log = logging.getLogger("makeros-hub")
 
@@ -367,6 +368,7 @@ def _pull_config(
     manager: PrinterManager,
     tailscale_reconciler=reconcile_tailscale,
     tailscale_state: _TailscaleRuntimeState | None = None,
+    virtual_printer_manager: VirtualPrinterManager | None = None,
     diagnostics=None,
 ) -> dict | None:
     """Fetch the printer list (config-down) and reconcile adapters. Best-effort:
@@ -382,6 +384,14 @@ def _pull_config(
         printers = resp.body.get("printers")
         version = resp.body.get("version")
         manager.reconcile(printers if isinstance(printers, list) else [], version)
+        vp_config = parse_virtual_printer_config(resp.body.get("virtual_printer"))
+        if virtual_printer_manager is not None:
+            try:
+                virtual_printer_manager.reconcile_sync(vp_config)
+            except Exception as exc:  # noqa: BLE001 - config-down must not sink heartbeat
+                safe = redact(str(exc))
+                _record_diagnostic(diagnostics, "vprinter", f"virtual printer reconcile failed: {safe}")
+                log.warning("virtual printer reconcile failed: %s", safe)
         tailscale_cfg = resp.body.get("tailscale")
         if tailscale_state is not None:
             tailscale_state.remember_config(tailscale_cfg)
@@ -392,7 +402,12 @@ def _pull_config(
         )
         if tailscale_state is not None:
             tailscale_state.record_reconcile_status(tailscale_status, time.monotonic())
-        log.info("config pulled: %d printers (configVersion=%s)", len(manager.statuses()), version)
+        log.info(
+            "config pulled: %d printers, virtual_printer=%s (configVersion=%s)",
+            len(manager.statuses()),
+            "enabled" if vp_config is not None else "disabled",
+            version,
+        )
         return tailscale_status
     elif resp.status == 401:
         _record_diagnostic(diagnostics, "config", "config pull rejected 401")
@@ -420,6 +435,7 @@ def run(cfg: Config) -> int:
 
     interval = cfg.heartbeat_sec
     manager = PrinterManager(diagnostics=diagnostics)
+    vp_manager = VirtualPrinterManager(diagnostics=diagnostics)
     queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
     pending_queue_reports: list[dict] = []
     pending_probe_results: list[dict] = []
@@ -433,6 +449,7 @@ def run(cfg: Config) -> int:
         credential,
         manager,
         tailscale_state=tailscale_state,
+        virtual_printer_manager=vp_manager,
         diagnostics=diagnostics,
     )
     if pulled_tailscale_status:
@@ -545,6 +562,7 @@ def run(cfg: Config) -> int:
                             credential,
                             manager,
                             tailscale_state=tailscale_state,
+                            virtual_printer_manager=vp_manager,
                             diagnostics=diagnostics,
                         )
                         if pulled_tailscale_status:
@@ -581,6 +599,10 @@ def run(cfg: Config) -> int:
 
             time.sleep(interval)
     finally:
+        try:
+            vp_manager.stop_sync()
+        except Exception as exc:  # noqa: BLE001 - best-effort shutdown
+            log.warning("virtual printer shutdown failed: %s", redact(str(exc)))
         manager.stop_all()
         if ingest is not None:
             ingest.stop()

@@ -10,11 +10,15 @@ manual run can point at a different cloud without editing files.
 
 from __future__ import annotations
 
+import copy
+import ipaddress
+import logging
 import os
 import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 CONFIG_PATH = Path(os.environ.get("MAKEROS_HUB_CONFIG", "/etc/makeros-hub/config.toml"))
 CREDENTIAL_PATH = Path(
@@ -28,6 +32,9 @@ DEFAULT_INGEST_PORT = 8787
 # Cap a single sliced-file upload (sliced 3MFs run a few MB; 256MB is a generous
 # guard against a runaway/abusive upload OOMing the Pi).
 DEFAULT_MAX_UPLOAD_MB = 256
+VPRINTER_ACCESS_CODE_RE = re.compile(r"^[A-Za-z0-9]{8}$")
+
+log = logging.getLogger("makeros-hub.config")
 
 
 @dataclass
@@ -56,6 +63,183 @@ class Config:
     @property
     def queue_status_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/queue-status"
+
+
+@dataclass(frozen=True)
+class VirtualPrinterMember:
+    access_code: str
+    member_id: str
+
+
+@dataclass(frozen=True)
+class VirtualPrinterConfig:
+    enabled: bool
+    serial: str
+    model: str
+    name: str
+    fw: str
+    bind_ip: str
+    units: int
+    trays: int
+    ams_type: str
+    members: tuple[VirtualPrinterMember, ...]
+    pool: tuple[dict[str, Any], ...]
+
+
+def parse_virtual_printer_config(raw: Any) -> VirtualPrinterConfig | None:
+    """Parse the optional config-down virtual_printer block.
+
+    Shape errors disable the VP for this heartbeat rather than crashing the
+    agent. Access codes are intentionally never included in log messages.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        log.warning("virtual_printer config ignored: expected object")
+        return None
+    if raw.get("enabled") is not True:
+        return None
+
+    required = {
+        "serial": _required_str(raw, "serial"),
+        "model": _required_str(raw, "model"),
+        "name": _required_str(raw, "name"),
+        "fw": _required_str(raw, "fw"),
+        "bind_ip": _required_str(raw, "bind_ip"),
+    }
+    missing = [key for key, value in required.items() if value is None]
+    if missing:
+        log.warning("virtual_printer config ignored: missing/invalid %s", ",".join(missing))
+        return None
+
+    bind_ip = required["bind_ip"]
+    if not _is_ipv4(bind_ip):
+        log.warning("virtual_printer config ignored: bind_ip must be IPv4")
+        return None
+
+    units = _positive_int(raw.get("units", 4), default=4, maximum=4)
+    trays = _positive_int(raw.get("trays", 4), default=4, maximum=4)
+    if units is None or trays is None:
+        log.warning("virtual_printer config ignored: units/trays must be positive integers")
+        return None
+
+    ams_type = raw.get("ams_type", "n3f")
+    if not isinstance(ams_type, str) or ams_type not in {"n3f", "n3s", "ams"}:
+        log.warning("virtual_printer config ignored: ams_type is invalid")
+        return None
+
+    members = _parse_vprinter_members(raw.get("members"))
+    if not members:
+        log.warning("virtual_printer config ignored: members must include at least one valid entry")
+        return None
+
+    pool = _parse_vprinter_pool(raw.get("pool", []))
+    if pool is None:
+        log.warning("virtual_printer config ignored: pool must be a list of tray objects")
+        return None
+
+    return VirtualPrinterConfig(
+        enabled=True,
+        serial=required["serial"] or "",
+        model=required["model"] or "",
+        name=required["name"] or "",
+        fw=required["fw"] or "",
+        bind_ip=bind_ip or "",
+        units=units,
+        trays=trays,
+        ams_type=ams_type,
+        members=tuple(members),
+        pool=tuple(pool),
+    )
+
+
+def _required_str(raw: dict[str, Any], key: str) -> str | None:
+    value = raw.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _positive_int(value: Any, *, default: int, maximum: int) -> int | None:
+    if value in (None, ""):
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0 or parsed > maximum:
+        return None
+    return parsed
+
+
+def _is_ipv4(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError:
+        return False
+    return True
+
+
+def _parse_vprinter_members(raw: Any) -> list[VirtualPrinterMember]:
+    if not isinstance(raw, list):
+        return []
+    members: list[VirtualPrinterMember] = []
+    seen_codes: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        raw_access_code = item.get("access_code")
+        raw_member_id = item.get("member_id")
+        if not (isinstance(raw_access_code, str) and isinstance(raw_member_id, str)):
+            continue
+        access_code = raw_access_code.strip()
+        member_id = raw_member_id.strip()
+        if not access_code or not member_id or not VPRINTER_ACCESS_CODE_RE.fullmatch(access_code):
+            continue
+        if access_code in seen_codes:
+            continue
+        seen_codes.add(access_code)
+        members.append(VirtualPrinterMember(access_code=access_code, member_id=member_id))
+    return members
+
+
+def _parse_vprinter_pool(raw: Any) -> list[dict[str, Any]] | None:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return None
+    pool: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        tray = copy.deepcopy(item)
+        material = tray.get("material") or tray.get("tray_type")
+        if isinstance(material, str) and material.strip():
+            tray["tray_type"] = material.strip()
+        color = tray.get("color") or tray.get("tray_color")
+        if isinstance(color, str) and color.strip():
+            tray["tray_color"] = _normalize_vprinter_color(color)
+            tray.setdefault("cols", [tray["tray_color"]])
+        tray.setdefault("tray_info_idx", tray.get("filament_id") or tray.get("material_code") or "")
+        tray.setdefault("tray_sub_brands", tray.get("productName") or tray.get("product_name") or "")
+        tray.setdefault("nozzle_temp_min", str(tray.get("nozzle_temp_min", "190")))
+        tray.setdefault("nozzle_temp_max", str(tray.get("nozzle_temp_max", "230")))
+        tray.setdefault("remain", tray.get("remain", -1))
+        tray.setdefault("tag_uid", tray.get("tag_uid", "0000000000000000"))
+        tray.setdefault("tray_uuid", tray.get("tray_uuid", "00000000000000000000000000000000"))
+        pool.append(tray)
+    return pool
+
+
+def _normalize_vprinter_color(value: str) -> str:
+    cleaned = value.strip().lstrip("#").upper()
+    if len(cleaned) == 6 and all(ch in "0123456789ABCDEF" for ch in cleaned):
+        return cleaned + "FF"
+    if len(cleaned) == 8 and all(ch in "0123456789ABCDEF" for ch in cleaned):
+        return cleaned
+    return "FFFFFFFF"
 
 
 def load_config(cloud_url_override: str | None = None) -> Config:

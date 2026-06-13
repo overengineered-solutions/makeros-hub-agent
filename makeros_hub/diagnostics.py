@@ -15,7 +15,7 @@ import shutil
 import socket
 import time
 
-SUBSYSTEMS = ("tailscale", "printers", "heartbeat", "config", "update", "ingest")
+SUBSYSTEMS = ("tailscale", "printers", "heartbeat", "config", "update", "ingest", "vprinter")
 ERROR_MESSAGE_MAX = 280
 LOG_MESSAGE_MAX = 180
 LOG_RING_SIZE = 16
