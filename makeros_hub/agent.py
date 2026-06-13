@@ -16,8 +16,10 @@ need no agent redeploy. systemd `Restart=always` is the self-healing primitive.
 
 from __future__ import annotations
 
+import json
 import logging
 import platform
+import queue
 import socket
 import time
 
@@ -30,6 +32,7 @@ from .probes import PROBES, run_probe, set_effective_config
 from .printers.manager import PrinterManager
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
 from .update import maybe_update
+from .vprinter.capture import CapturedJob, build_vp_submit_body
 from .vprinter.manager import VirtualPrinterManager
 
 log = logging.getLogger("makeros-hub")
@@ -38,6 +41,13 @@ QUEUE_STATUS_SENT = "sent"
 QUEUE_STATUS_RETRY = "retry"
 QUEUE_STATUS_DROP = "drop"
 MAX_PROBES_PER_HEARTBEAT = 3
+VP_SUBMISSION_QUEUE_MAX = 256
+VP_SUBMISSIONS_PER_HEARTBEAT = 16
+# Per-submit timeout + a wall-clock budget for the whole per-heartbeat drain, so
+# vp-submit (which runs on the heartbeat thread) can never stall the heartbeat
+# enough to flap the hub offline. Healthy submits are sub-second.
+VP_SUBMIT_TIMEOUT = 8
+VP_DRAIN_BUDGET_SEC = 8
 
 
 def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
@@ -148,6 +158,145 @@ def _flush_queue_status_reports(reporter, reports: list[dict]) -> list[dict]:
             return reports[idx:]
         return reports[idx:]
     return []
+
+
+def _enqueue_vprinter_submission(submission_queue: queue.Queue[CapturedJob], job: CapturedJob) -> None:
+    try:
+        submission_queue.put_nowait(job)
+        return
+    except queue.Full:
+        dropped = getattr(submission_queue, "_makeros_dropped", 0) + 1
+        setattr(submission_queue, "_makeros_dropped", dropped)
+        try:
+            submission_queue.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            log.warning("vprinter.submit.queue_full dropped_oldest_count=%d", dropped)
+    try:
+        submission_queue.put_nowait(job)
+    except queue.Full:
+        dropped = getattr(submission_queue, "_makeros_dropped", 0) + 1
+        setattr(submission_queue, "_makeros_dropped", dropped)
+        log.warning("vprinter.submit.queue_full dropped_newest_count=%d", dropped)
+
+
+def _make_vprinter_capture_handler(submission_queue: queue.Queue[CapturedJob]):
+    def on_capture(job: CapturedJob) -> None:
+        log.info(
+            "vprinter.capture_observed member_id=%s filename=%s size=%d sha256=%s "
+            "use_ams=%s ams_mapping=%s required_filaments=%s submitted_at=%s",
+            job.member_id,
+            job.filename,
+            job.size,
+            job.file_sha256,
+            job.use_ams,
+            json.dumps(job.ams_mapping, sort_keys=True, default=str),
+            json.dumps(job.required_filaments, sort_keys=True),
+            job.submitted_at.isoformat(),
+        )
+        _enqueue_vprinter_submission(submission_queue, job)
+
+    return on_capture
+
+
+def _drop_vprinter_submissions(
+    submission_queue: queue.Queue[CapturedJob],
+    *,
+    max_jobs: int | None = None,
+) -> int:
+    dropped = 0
+    limit = None if max_jobs is None else max(0, int(max_jobs))
+    while limit is None or dropped < limit:
+        try:
+            submission_queue.get_nowait()
+        except queue.Empty:
+            break
+        dropped += 1
+    return dropped
+
+
+def _drain_vprinter_submissions(
+    submission_queue: queue.Queue[CapturedJob],
+    cfg: Config,
+    credential: str,
+    *,
+    model: str | None,
+    diagnostics=None,
+    poster=post_json,
+    max_jobs: int = VP_SUBMISSIONS_PER_HEARTBEAT,
+) -> int:
+    if not model:
+        dropped = _drop_vprinter_submissions(submission_queue)
+        if dropped:
+            log.warning("vprinter.submit.dropped_unconfigured count=%d", dropped)
+        return 0
+
+    submitted = 0
+    start = time.monotonic()
+    to_process = min(max(0, int(max_jobs)), submission_queue.qsize())
+    for _ in range(to_process):
+        # Bound the per-heartbeat drain so a slow/erroring cloud can't stall the
+        # heartbeat loop into looking offline — the backlog drains over the next
+        # beats instead. (Healthy submits are sub-second, so this never trips
+        # under a responsive cloud.)
+        if time.monotonic() - start > VP_DRAIN_BUDGET_SEC:
+            break
+        try:
+            job = submission_queue.get_nowait()
+        except queue.Empty:
+            break
+        body = build_vp_submit_body(job, model=model)
+        try:
+            resp = poster(cfg.vp_submit_url, body, bearer=credential, timeout=VP_SUBMIT_TIMEOUT)
+        except TransportError as exc:
+            safe = redact(str(exc))
+            _record_diagnostic(diagnostics, "vprinter", f"vp-submit transport: {safe}")
+            log.warning(
+                "vprinter.submit.retry transport member_id=%s filename=%s submission_uid=%s: %s",
+                job.member_id,
+                job.filename,
+                job.submission_uid,
+                safe,
+            )
+            _enqueue_vprinter_submission(submission_queue, job)
+            continue
+
+        if resp.status == 200 and resp.body.get("ok") is True:
+            submitted += 1
+            log.info(
+                "vprinter.submit.ok member_id=%s filename=%s submission_uid=%s jobId=%s",
+                job.member_id,
+                job.filename,
+                job.submission_uid,
+                resp.body.get("jobId"),
+            )
+            continue
+
+        if resp.status == 200 and resp.body.get("ok") is False:
+            reason = redact(resp.body.get("reason") or "rejected")
+            log.warning(
+                "vprinter.submit.rejected member_id=%s filename=%s submission_uid=%s reason=%s",
+                job.member_id,
+                job.filename,
+                job.submission_uid,
+                reason,
+            )
+            continue
+
+        safe = redact(resp.body.get("error") or resp.body.get("reason") or resp.body)
+        _record_diagnostic(diagnostics, "vprinter", f"vp-submit HTTP {resp.status}: {safe}")
+        log.warning(
+            "vprinter.submit.retry http_status=%s member_id=%s filename=%s submission_uid=%s: %s",
+            resp.status,
+            job.member_id,
+            job.filename,
+            job.submission_uid,
+            safe,
+        )
+        _enqueue_vprinter_submission(submission_queue, job)
+
+    return submitted
 
 
 def _uptime_sec() -> int | None:
@@ -384,7 +533,7 @@ def _pull_config(
         printers = resp.body.get("printers")
         version = resp.body.get("version")
         manager.reconcile(printers if isinstance(printers, list) else [], version)
-        vp_config = parse_virtual_printer_config(resp.body.get("virtual_printer"))
+        vp_config = parse_virtual_printer_config(_virtual_printer_config_block(resp.body))
         if virtual_printer_manager is not None:
             try:
                 virtual_printer_manager.reconcile_sync(vp_config)
@@ -419,6 +568,12 @@ def _pull_config(
     return None
 
 
+def _virtual_printer_config_block(body: dict) -> object:
+    if "virtualPrinter" in body:
+        return body.get("virtualPrinter")
+    return body.get("virtual_printer")
+
+
 def run(cfg: Config) -> int:
     set_effective_config(cfg)
     diagnostics = Diagnostics(cloud_url=cfg.cloud_url, agent_version=__version__)
@@ -435,7 +590,11 @@ def run(cfg: Config) -> int:
 
     interval = cfg.heartbeat_sec
     manager = PrinterManager(diagnostics=diagnostics)
-    vp_manager = VirtualPrinterManager(diagnostics=diagnostics)
+    vp_submission_queue: queue.Queue[CapturedJob] = queue.Queue(maxsize=VP_SUBMISSION_QUEUE_MAX)
+    vp_manager = VirtualPrinterManager(
+        on_capture=_make_vprinter_capture_handler(vp_submission_queue),
+        diagnostics=diagnostics,
+    )
     queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
     pending_queue_reports: list[dict] = []
     pending_probe_results: list[dict] = []
@@ -592,6 +751,13 @@ def run(cfg: Config) -> int:
                     safe = redact(resp.body.get("error"))
                     _record_diagnostic(diagnostics, "heartbeat", f"heartbeat unexpected {resp.status}: {safe}")
                     log.warning("heartbeat unexpected %s: %s", resp.status, safe)
+                _drain_vprinter_submissions(
+                    vp_submission_queue,
+                    cfg,
+                    credential,
+                    model=vp_manager.current_model(),
+                    diagnostics=diagnostics,
+                )
             except TransportError as exc:
                 safe = redact(str(exc))
                 _record_diagnostic(diagnostics, "heartbeat", f"heartbeat transport error: {safe}")

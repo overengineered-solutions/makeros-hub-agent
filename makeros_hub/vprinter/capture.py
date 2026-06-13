@@ -5,10 +5,11 @@ import hashlib
 import json
 import re
 import time
+import uuid
 import zipfile
 from collections import OrderedDict, deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -37,6 +38,7 @@ class ProjectFileIntent:
     use_ams: bool
     md5: str | None
     raw: dict[str, Any]
+    plate: int | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +52,12 @@ class CapturedJob:
     use_ams: bool
     required_filaments: list[dict[str, Any]]
     submitted_at: datetime
+    submission_uid: str = field(default_factory=lambda: uuid.uuid4().hex)
+    plate: int | None = None
+
+    @property
+    def file_sha256(self) -> str:
+        return self.sha256
 
 
 _CaptureKey = tuple[str, str]
@@ -301,7 +309,55 @@ def assemble_captured_job(
         use_ams=intent.use_ams,
         required_filaments=parse_required_filaments(upload.file_path),
         submitted_at=submitted_at or datetime.now(timezone.utc),
+        plate=intent.plate,
     )
+
+
+def build_vp_submit_body(job: CapturedJob, *, model: str) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "hubSubmissionUid": job.submission_uid,
+        "memberId": job.member_id,
+        "fileName": job.filename,
+        "fileSha256": job.file_sha256,
+        "fileSizeBytes": job.size,
+        "printerModel": model,
+        "useAms": job.use_ams,
+        # The cloud contract is amsMapping: number[]. When a print carries both
+        # ams_mapping + ams_mapping2 the capture stores a dict; flatten to the
+        # primary list so the body validates (ams_mapping2 / multi-AMS fidelity
+        # is deferred to the V3 matcher contract).
+        "amsMapping": _ams_mapping_list(job.ams_mapping),
+        "requiredFilaments": [_vp_submit_filament(item) for item in job.required_filaments],
+    }
+    if job.plate is not None:
+        body["plate"] = job.plate
+    return body
+
+
+def _ams_mapping_list(ams_mapping: Any) -> list[Any]:
+    if isinstance(ams_mapping, list):
+        return ams_mapping
+    if isinstance(ams_mapping, dict):
+        primary = ams_mapping.get("ams_mapping")
+        if isinstance(primary, list):
+            return primary
+    return []
+
+
+def _vp_submit_filament(item: dict[str, Any]) -> dict[str, Any]:
+    filament: dict[str, Any] = {}
+    if "slot" in item:
+        filament["slot"] = item["slot"]
+    filament_type = item.get("type") or item.get("material") or item.get("tray_type")
+    if filament_type is not None:
+        filament["type"] = filament_type
+    color = item.get("color") or item.get("tray_color")
+    if color is not None:
+        filament["color"] = color
+    tray_info_idx = item.get("trayInfoIdx") or item.get("tray_info_idx")
+    if tray_info_idx is not None:
+        filament["trayInfoIdx"] = tray_info_idx
+    return filament
 
 
 def parse_project_file_command(parsed: Any, member_id: str) -> ProjectFileIntent | None:
@@ -321,7 +377,23 @@ def parse_project_file_command(parsed: Any, member_id: str) -> ProjectFileIntent
         use_ams=_boolish(print_obj.get("use_ams")),
         md5=md5,
         raw=dict(print_obj),
+        plate=_resolve_plate(print_obj),
     )
+
+
+def _resolve_plate(print_obj: dict[str, Any]) -> int | None:
+    plate = _optional_int(print_obj.get("plate"))
+    if plate is not None:
+        return plate
+    # Bambu often encodes the plate only in `param`/`url`, e.g.
+    # "Metadata/plate_1.gcode" -> plate 1.
+    for key in ("param", "url"):
+        value = print_obj.get(key)
+        if isinstance(value, str):
+            match = re.search(r"plate_(\d+)", value)
+            if match:
+                return _optional_int(match.group(1))
+    return None
 
 
 def filename_from_project_file(print_obj: dict[str, Any]) -> str:
@@ -511,6 +583,16 @@ def _boolish(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return False
+
+
+def _optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _is_hex(value: str) -> bool:

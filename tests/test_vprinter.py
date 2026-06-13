@@ -8,6 +8,7 @@ import tempfile
 import unittest
 import uuid
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -17,9 +18,11 @@ from makeros_hub.vprinter.auth import AuthRateLimiter, MemberAuthSet
 from makeros_hub.vprinter.bind_server import END_MAGIC, START_MAGIC, decode_frame, encode_frame
 from makeros_hub.vprinter.capture import (
     CaptureCoordinator,
+    CapturedJob,
     ProjectFileIntent,
     UploadRecord,
     assemble_captured_job,
+    build_vp_submit_body,
     parse_project_file_command,
     parse_required_filaments,
     parse_slice_info_config,
@@ -38,8 +41,13 @@ from makeros_hub.vprinter.mqtt_broker import (
 from makeros_hub.vprinter.report import build_get_version, build_print_ack, build_push_status
 
 
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
 class TestVirtualPrinterConfig(unittest.TestCase):
     def test_parse_enabled_block_normalizes_members_and_pool(self):
+        code_hash = _code_hash("12345678")
         cfg = parse_virtual_printer_config(
             {
                 "enabled": True,
@@ -48,16 +56,41 @@ class TestVirtualPrinterConfig(unittest.TestCase):
                 "name": "VP A1",
                 "fw": "01.08.00.00",
                 "bind_ip": "100.64.0.10",
-                "members": [{"access_code": "12345678", "member_id": "m1"}],
+                "members": [{"access_code_sha256": code_hash, "member_id": "m1"}],
                 "pool": [{"material": "PLA", "color": "#abcdef", "tray_info_idx": "GFA00"}],
             }
         )
 
         self.assertIsNotNone(cfg)
         self.assertEqual(cfg.serial, "SER123")
+        self.assertEqual(cfg.members[0].access_code_sha256, code_hash)
         self.assertEqual(cfg.members[0].member_id, "m1")
         self.assertEqual(cfg.pool[0]["tray_type"], "PLA")
         self.assertEqual(cfg.pool[0]["tray_color"], "ABCDEFFF")
+
+    def test_parse_accepts_camel_case_config_and_member_fields(self):
+        code_hash = _code_hash("ABCDEFGH").upper()
+        cfg = parse_virtual_printer_config(
+            {
+                "enabled": True,
+                "serial": "SER123",
+                "model": "3DPrinter-X1-Carbon",
+                "name": "VP A1",
+                "fw": "01.08.00.00",
+                "bindIp": "100.64.0.10",
+                "units": 4,
+                "trays": 4,
+                "amsType": "n3f",
+                "members": [{"accessCodeSha256": f" {code_hash} ", "memberId": " m1 "}],
+                "pool": [{"tray_type": "PLA", "tray_info_idx": "GFL99"}],
+            }
+        )
+
+        self.assertIsNotNone(cfg)
+        self.assertEqual(cfg.bind_ip, "100.64.0.10")
+        self.assertEqual(cfg.ams_type, "n3f")
+        self.assertEqual(cfg.members, (VirtualPrinterMember(_code_hash("ABCDEFGH"), "m1"),))
+        self.assertEqual(cfg.pool[0]["tray_info_idx"], "GFL99")
 
     def test_parse_bad_shape_skips(self):
         self.assertIsNone(parse_virtual_printer_config(None))
@@ -66,7 +99,8 @@ class TestVirtualPrinterConfig(unittest.TestCase):
         self.assertIsNone(parse_virtual_printer_config({"enabled": 1}))
         self.assertIsNone(parse_virtual_printer_config({"enabled": True, "bind_ip": "bad"}))
 
-    def test_parse_validates_member_access_codes(self):
+    def test_parse_validates_member_access_code_hashes(self):
+        valid_hash = _code_hash("ABCD1234")
         cfg = parse_virtual_printer_config(
             {
                 "enabled": True,
@@ -76,17 +110,20 @@ class TestVirtualPrinterConfig(unittest.TestCase):
                 "fw": "01.08.00.00",
                 "bind_ip": "100.64.0.10",
                 "members": [
-                    {"access_code": " ABCD1234 ", "member_id": " m1 "},
-                    {"access_code": "short", "member_id": "short"},
-                    {"access_code": "1234567!", "member_id": "punct"},
-                    {"access_code": "123456789", "member_id": "long"},
-                    {"access_code": "        ", "member_id": "blank"},
+                    {"access_code_sha256": f" {valid_hash.upper()} ", "member_id": " m1 "},
+                    {"access_code_sha256": "f" * 63, "member_id": "short"},
+                    {"access_code_sha256": "g" * 64, "member_id": "badhex"},
+                    {"access_code_sha256": "f" * 65, "member_id": "long"},
+                    {"access_code_sha256": valid_hash, "member_id": "duplicate"},
+                    {"access_code_sha256": "        ", "member_id": "blank"},
+                    {"access_code_sha256": _code_hash("missing"), "member_id": ""},
+                    {"access_code_sha256": _code_hash("missing-id")},
                 ],
             }
         )
 
         self.assertIsNotNone(cfg)
-        self.assertEqual(cfg.members, (VirtualPrinterMember("ABCD1234", "m1"),))
+        self.assertEqual(cfg.members, (VirtualPrinterMember(valid_hash, "m1"),))
         self.assertIsNone(
             parse_virtual_printer_config(
                 {
@@ -96,7 +133,7 @@ class TestVirtualPrinterConfig(unittest.TestCase):
                     "name": "VP A1",
                     "fw": "01.08.00.00",
                     "bind_ip": "100.64.0.10",
-                    "members": [{"access_code": "invalid!", "member_id": "m1"}],
+                    "members": [{"access_code_sha256": "z" * 64, "member_id": "m1"}],
                 }
             )
         )
@@ -111,7 +148,7 @@ class TestVirtualPrinterConfig(unittest.TestCase):
                 "fw": "01.08.00.00",
                 "bind_ip": "100.64.0.10",
                 "units": 4,
-                "members": [{"access_code": "12345678", "member_id": "m1"}],
+                "members": [{"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}],
             }
         )
 
@@ -127,7 +164,7 @@ class TestVirtualPrinterConfig(unittest.TestCase):
                     "fw": "01.08.00.00",
                     "bind_ip": "100.64.0.10",
                     "units": 5,
-                    "members": [{"access_code": "12345678", "member_id": "m1"}],
+                    "members": [{"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}],
                 }
             )
         )
@@ -240,9 +277,9 @@ class TestMemberAuth(unittest.TestCase):
     def test_lookup_is_member_attributing_and_checks_all_codes(self):
         auth = MemberAuthSet(
             [
-                VirtualPrinterMember("11111111", "m1"),
-                VirtualPrinterMember("22222222", "m2"),
-                VirtualPrinterMember("33333333", "m3"),
+                VirtualPrinterMember(_code_hash("11111111"), "m1"),
+                VirtualPrinterMember(_code_hash("22222222"), "m2"),
+                VirtualPrinterMember(_code_hash("33333333"), "m3"),
             ]
         )
 
@@ -253,10 +290,32 @@ class TestMemberAuth(unittest.TestCase):
         self.assertEqual(result.member_id, "m2")
         self.assertEqual(compare.call_count, 3)
 
+    def test_wrong_empty_and_none_codes_do_not_match(self):
+        auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")])
+
+        self.assertIsNone(auth.lookup_member_id("wrongcode"))
+        self.assertIsNone(auth.lookup_member_id(""))
+        self.assertIsNone(auth.lookup_member_id(None))
+
+    def test_short_code_compares_every_member_but_never_matches_hash(self):
+        short_hash = _code_hash("short")
+        auth = MemberAuthSet(
+            [
+                VirtualPrinterMember(short_hash, "short-member"),
+                VirtualPrinterMember(_code_hash("12345678"), "m1"),
+            ]
+        )
+
+        with mock.patch("hmac.compare_digest", wraps=__import__("hmac").compare_digest) as compare:
+            result = auth.authenticate("short", "100.64.0.20")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(compare.call_count, 2)
+
     def test_rate_limit_is_per_ip_and_per_code(self):
         now = [1000.0]
         limiter = AuthRateLimiter(clock=lambda: now[0])
-        auth = MemberAuthSet([VirtualPrinterMember("12345678", "m1")], limiter=limiter)
+        auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")], limiter=limiter)
 
         for _ in range(5):
             self.assertFalse(auth.authenticate("badcode", "100.64.0.20").rate_limited)
@@ -282,7 +341,7 @@ class TestMemberAuth(unittest.TestCase):
 
     def test_mqtt_and_ftp_auth_failures_are_recorded_on_bypass_branches(self):
         limiter = AuthRateLimiter(limit=1)
-        auth = MemberAuthSet([VirtualPrinterMember("12345678", "m1")], limiter=limiter)
+        auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")], limiter=limiter)
         broker = MqttBroker(
             serial="SER123",
             auth=auth,
@@ -353,6 +412,104 @@ class TestSliceInfoParser(unittest.TestCase):
 
 
 class TestCaptureAssembly(unittest.TestCase):
+    def test_build_vp_submit_body_maps_cloud_contract_fields(self):
+        job = CapturedJob(
+            member_id="member-1",
+            filename="part.3mf",
+            file_path=Path("part.3mf"),
+            sha256="a" * 64,
+            size=123,
+            ams_mapping=[0, 1],
+            use_ams=True,
+            required_filaments=[
+                {"slot": 0, "material": "PLA", "color": "FFFFFFFF", "tray_info_idx": "GFL99"}
+            ],
+            submitted_at=datetime(2026, 6, 13, tzinfo=timezone.utc),
+            submission_uid="submission-1",
+            plate=1,
+        )
+
+        body = build_vp_submit_body(job, model="3DPrinter-X1-Carbon")
+
+        self.assertEqual(
+            body,
+            {
+                "hubSubmissionUid": "submission-1",
+                "memberId": "member-1",
+                "fileName": "part.3mf",
+                "fileSha256": "a" * 64,
+                "fileSizeBytes": 123,
+                "printerModel": "3DPrinter-X1-Carbon",
+                "useAms": True,
+                "amsMapping": [0, 1],
+                "requiredFilaments": [
+                    {"slot": 0, "type": "PLA", "color": "FFFFFFFF", "trayInfoIdx": "GFL99"}
+                ],
+                "plate": 1,
+            },
+        )
+        self.assertNotIn("accessCode", body)
+        self.assertNotIn("access_code", body)
+
+    def test_build_vp_submit_body_omits_absent_plate_and_uid_is_stable(self):
+        job = CapturedJob(
+            member_id="member-1",
+            filename="part.3mf",
+            file_path=Path("part.3mf"),
+            sha256="b" * 64,
+            size=456,
+            ams_mapping=[],
+            use_ams=False,
+            required_filaments=[],
+            submitted_at=datetime(2026, 6, 13, tzinfo=timezone.utc),
+        )
+
+        first = build_vp_submit_body(job, model="N1")
+        second = build_vp_submit_body(job, model="N1")
+
+        self.assertEqual(first["hubSubmissionUid"], second["hubSubmissionUid"])
+        self.assertEqual(len(first["hubSubmissionUid"]), 32)
+        self.assertNotIn("plate", first)
+
+    def test_build_vp_submit_body_flattens_dict_ams_mapping(self):
+        # A print carrying both ams_mapping + ams_mapping2 stores a dict on the
+        # job; the cloud contract is amsMapping: number[], so the body must send
+        # the primary list (else every AMS-2-Pro print 400s on the Zod parse).
+        job = CapturedJob(
+            member_id="member-1",
+            filename="part.3mf",
+            file_path=Path("part.3mf"),
+            sha256="c" * 64,
+            size=10,
+            ams_mapping={"ams_mapping": [0, 1, 2], "ams_mapping2": {"0": 0}},
+            use_ams=True,
+            required_filaments=[],
+            submitted_at=datetime(2026, 6, 13, tzinfo=timezone.utc),
+        )
+
+        body = build_vp_submit_body(job, model="3DPrinter-X1-Carbon")
+
+        self.assertIsInstance(body["amsMapping"], list)
+        self.assertEqual(body["amsMapping"], [0, 1, 2])
+
+    def test_parse_project_file_resolves_plate_from_param(self):
+        # Bambu often carries the plate only in `param` (Metadata/plate_N.gcode),
+        # not a literal `plate` field.
+        intent = parse_project_file_command(
+            {
+                "print": {
+                    "command": "project_file",
+                    "param": "Metadata/plate_3.gcode",
+                    "file": "part.3mf",
+                }
+            },
+            "member-1",
+        )
+
+        self.assertIsNotNone(intent)
+        assert intent is not None
+        self.assertEqual(intent.plate, 3)
+
     def test_project_file_parse_and_capture_after_upload(self):
         captured = []
         with tempfile.TemporaryDirectory() as d:
@@ -506,7 +663,7 @@ class TestFtpSession(unittest.TestCase):
     def test_pasv_before_login_is_rejected(self):
         async def run():
             with tempfile.TemporaryDirectory() as d:
-                auth = MemberAuthSet([VirtualPrinterMember("12345678", "m1")])
+                auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")])
                 session = _ftp_session(FtpConfig("100.64.0.10", Path(d), auth))
                 session.open_passive = mock.AsyncMock()
 
@@ -521,7 +678,7 @@ class TestFtpSession(unittest.TestCase):
         async def run():
             records = []
             with tempfile.TemporaryDirectory() as d:
-                auth = MemberAuthSet([VirtualPrinterMember("12345678", "m1")])
+                auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")])
                 session = _ftp_session(
                     FtpConfig("100.64.0.10", Path(d), auth, on_stored=records.append)
                 )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import hmac
 import time
 from collections import OrderedDict, deque
@@ -104,12 +105,15 @@ class MemberAuthSet:
         self.limiter = limiter or AuthRateLimiter()
 
     def lookup_member_id(self, access_code: str | None) -> str | None:
-        provided = access_code or ""
+        provided = access_code if isinstance(access_code, str) else ""
+        provided_hash = hashlib.sha256(provided.encode("utf-8")).hexdigest()
+        candidate = len(provided) >= 8
         matched: str | None = None
         for member in self.members:
-            # Do not short-circuit; every configured code gets the same compare
+            # Do not short-circuit; every configured hash gets the same compare
             # call regardless of where a match appears in the set.
-            if hmac.compare_digest(provided, member.access_code) and matched is None:
+            is_match = hmac.compare_digest(provided_hash, member.access_code_sha256)
+            if candidate and is_match and matched is None:
                 matched = member.member_id
         return matched
 

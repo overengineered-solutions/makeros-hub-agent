@@ -3,18 +3,23 @@
   python3 -m unittest discover -s tests
 """
 
+import hashlib
 import json
+import queue
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from makeros_hub import http
+from makeros_hub import diagnostics, http
 from makeros_hub.agent import (
     QUEUE_STATUS_DROP,
     QUEUE_STATUS_RETRY,
     QUEUE_STATUS_SENT,
     _TailscaleRuntimeState,
+    _drain_vprinter_submissions,
+    _enqueue_vprinter_submission,
     _flush_queue_status_reports,
     _maybe_retry_tailscale_config,
     _pull_config,
@@ -24,6 +29,26 @@ from makeros_hub.agent import (
     make_queue_status_reporter,
 )
 from makeros_hub.config import Config
+from makeros_hub.vprinter.capture import CapturedJob
+
+
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _captured_job(uid: str = "uid-1", filename: str = "part.3mf") -> CapturedJob:
+    return CapturedJob(
+        member_id="member-1",
+        filename=filename,
+        file_path=Path(filename),
+        sha256="a" * 64,
+        size=123,
+        ams_mapping=[0],
+        use_ams=True,
+        required_filaments=[{"slot": 0, "type": "PLA"}],
+        submitted_at=datetime(2026, 6, 13, tzinfo=timezone.utc),
+        submission_uid=uid,
+    )
 
 
 class TestHttpParse(unittest.TestCase):
@@ -51,6 +76,7 @@ class TestConfigUrls(unittest.TestCase):
         self.assertEqual(cfg.heartbeat_url, "https://host.example/api/print/hub/heartbeat")
         self.assertEqual(cfg.config_url, "https://host.example/api/print/hub/config")
         self.assertEqual(cfg.queue_status_url, "https://host.example/api/print/hub/queue-status")
+        self.assertEqual(cfg.vp_submit_url, "https://host.example/api/print/hub/vp-submit")
 
 
 class TestHeartbeatPayload(unittest.TestCase):
@@ -273,14 +299,19 @@ class TestConfigDownVirtualPrinter(unittest.TestCase):
                 {
                     "printers": [],
                     "version": "v1",
-                    "virtual_printer": {
+                    "virtualPrinter": {
                         "enabled": True,
                         "serial": "SER123",
                         "model": "N1",
                         "name": "VP A1",
                         "fw": "01.08.00.00",
-                        "bind_ip": "100.64.0.10",
-                        "members": [{"access_code": "12345678", "member_id": "m1"}],
+                        "bindIp": "100.64.0.10",
+                        "members": [
+                            {
+                                "accessCodeSha256": _code_hash("12345678"),
+                                "memberId": "m1",
+                            }
+                        ],
                         "pool": [{"material": "PLA", "color": "FFFFFFFF"}],
                     },
                 },
@@ -296,6 +327,7 @@ class TestConfigDownVirtualPrinter(unittest.TestCase):
 
         self.assertEqual(vp_manager.reconciled.serial, "SER123")
         self.assertEqual(vp_manager.reconciled.members[0].member_id, "m1")
+        self.assertEqual(vp_manager.reconciled.members[0].access_code_sha256, _code_hash("12345678"))
 
     def test_pull_config_disables_virtual_printer_when_block_absent(self):
         class Manager:
@@ -322,6 +354,54 @@ class TestConfigDownVirtualPrinter(unittest.TestCase):
             )
 
         vp_manager.reconcile_sync.assert_called_once_with(None)
+
+    def test_pull_config_accepts_snake_case_virtual_printer_fallback(self):
+        class Manager:
+            config_version = None
+
+            def reconcile(self, printers, version):
+                self.config_version = version
+
+            def statuses(self):
+                return []
+
+        vp_manager = mock.Mock()
+        cfg = Config(cloud_url="https://host.example")
+        with mock.patch(
+            "makeros_hub.agent.get_json",
+            return_value=http.Response(
+                200,
+                {
+                    "printers": [],
+                    "version": "v1",
+                    "virtual_printer": {
+                        "enabled": True,
+                        "serial": "SER123",
+                        "model": "N1",
+                        "name": "VP A1",
+                        "fw": "01.08.00.00",
+                        "bind_ip": "100.64.0.10",
+                        "members": [
+                            {
+                                "access_code_sha256": _code_hash("12345678"),
+                                "member_id": "m1",
+                            }
+                        ],
+                    },
+                },
+            ),
+        ):
+            _pull_config(
+                cfg,
+                "cred",
+                Manager(),
+                tailscale_reconciler=mock.Mock(return_value={"tailscaleStatus": "disabled"}),
+                virtual_printer_manager=vp_manager,
+            )
+
+        reconciled = vp_manager.reconcile_sync.call_args.args[0]
+        self.assertEqual(reconciled.serial, "SER123")
+        self.assertEqual(reconciled.members[0].member_id, "m1")
 
 
 class TestQueueStatusOutbox(unittest.TestCase):
@@ -373,6 +453,103 @@ class TestQueueStatusOutbox(unittest.TestCase):
             side_effect=http.TransportError("network down"),
         ):
             self.assertEqual(reporter(report), QUEUE_STATUS_RETRY)
+
+
+class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
+    def test_drain_ok_true_removes_job(self):
+        cfg = Config(cloud_url="https://host.example/")
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = _captured_job()
+        _enqueue_vprinter_submission(q, job)
+        calls = []
+
+        def poster(url, payload, *, bearer, timeout):
+            calls.append((url, payload, bearer, timeout))
+            return http.Response(200, {"ok": True, "jobId": "job-1", "state": "queued"})
+
+        submitted = _drain_vprinter_submissions(
+            q,
+            cfg,
+            "cred",
+            model="3DPrinter-X1-Carbon",
+            poster=poster,
+        )
+
+        self.assertEqual(submitted, 1)
+        self.assertTrue(q.empty())
+        self.assertEqual(calls[0][0], "https://host.example/api/print/hub/vp-submit")
+        self.assertEqual(calls[0][2], "cred")
+        # Short per-submit timeout so a slow cloud can't stall the heartbeat.
+        self.assertEqual(calls[0][3], 8)
+        self.assertEqual(calls[0][1]["hubSubmissionUid"], job.submission_uid)
+        self.assertEqual(calls[0][1]["memberId"], "member-1")
+        self.assertEqual(calls[0][1]["printerModel"], "3DPrinter-X1-Carbon")
+
+    def test_drain_ok_false_rejected_is_terminal(self):
+        cfg = Config(cloud_url="https://host.example")
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        _enqueue_vprinter_submission(q, _captured_job())
+
+        def poster(_url, _payload, *, bearer, timeout):
+            return http.Response(200, {"ok": False, "state": "rejected", "reason": "not eligible"})
+
+        submitted = _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
+
+        self.assertEqual(submitted, 0)
+        self.assertTrue(q.empty())
+
+    def test_drain_transport_error_reenqueues_and_records_vprinter_diagnostic(self):
+        cfg = Config(cloud_url="https://host.example")
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = _captured_job()
+        diag = diagnostics.Diagnostics(enable_network=False)
+        _enqueue_vprinter_submission(q, job)
+
+        def poster(_url, _payload, *, bearer, timeout):
+            raise http.TransportError("network down")
+
+        submitted = _drain_vprinter_submissions(
+            q,
+            cfg,
+            "cred",
+            model="N1",
+            diagnostics=diag,
+            poster=poster,
+        )
+
+        self.assertEqual(submitted, 0)
+        self.assertEqual(q.get_nowait().submission_uid, job.submission_uid)
+        self.assertIn("vp-submit transport", diag.errors.snapshot()["vprinter"]["message"])
+
+    def test_drain_non_200_reenqueues(self):
+        cfg = Config(cloud_url="https://host.example")
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = _captured_job()
+        _enqueue_vprinter_submission(q, job)
+
+        def poster(_url, _payload, *, bearer, timeout):
+            return http.Response(503, {"error": "try later"})
+
+        _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
+
+        self.assertEqual(q.get_nowait().submission_uid, job.submission_uid)
+
+    def test_enqueue_full_queue_drops_oldest(self):
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=2)
+        _enqueue_vprinter_submission(q, _captured_job("uid-1", "one.3mf"))
+        _enqueue_vprinter_submission(q, _captured_job("uid-2", "two.3mf"))
+        _enqueue_vprinter_submission(q, _captured_job("uid-3", "three.3mf"))
+
+        self.assertEqual([job.submission_uid for job in list(q.queue)], ["uid-2", "uid-3"])
+
+    def test_drain_without_active_model_drops_pending_jobs(self):
+        cfg = Config(cloud_url="https://host.example")
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        _enqueue_vprinter_submission(q, _captured_job())
+
+        _drain_vprinter_submissions(q, cfg, "cred", model=None)
+
+        self.assertTrue(q.empty())
 
 
 class TestEnroll(unittest.TestCase):
