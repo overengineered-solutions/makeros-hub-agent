@@ -4,8 +4,8 @@
 #
 #   sudo ./install.sh
 #
-# The printer-adapter slice (PR 5) adds the agent's first runtime dependency,
-# paho-mqtt (Bambu LAN telemetry), installed into a venv at $INSTALL_DIR/venv.
+# The printer-adapter slice adds runtime dependencies in the venv:
+# paho-mqtt (Bambu LAN telemetry) and cryptography (virtual-printer TLS certs).
 # Enrollment + heartbeat stay stdlib-only, so the agent still runs (printers just
 # report 'agent_missing_paho') even if the venv step is skipped — but the
 # installer sets it up so the Bambu adapter works out of the box.
@@ -62,6 +62,12 @@ if [ -x "$PYBIN" ]; then
   else
     echo "    !! paho-mqtt install failed (offline?) — adapters report 'agent_missing_paho'"
     echo "    !! until you run: sudo $PYBIN -m pip install 'paho-mqtt>=2.0,<3'"
+  fi
+  if "$PYBIN" -m pip install --quiet "cryptography>=42,<46"; then
+    echo "    cryptography installed"
+  else
+    echo "    !! cryptography install failed (offline?) — virtual printer reports dependency missing"
+    echo "    !! until you run: sudo $PYBIN -m pip install 'cryptography>=42,<46'"
   fi
   chmod -R a+rX "$VENV"
 fi

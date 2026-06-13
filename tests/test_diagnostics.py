@@ -79,6 +79,15 @@ class TestSubsystemErrorRing(unittest.TestCase):
             "real tailscale setup failure",
         )
 
+    def test_vprinter_is_registered_subsystem(self):
+        ring = diagnostics.SubsystemErrorRing()
+        ring.record("vprinter", "virtual printer failed")
+
+        self.assertEqual(
+            ring.snapshot()["vprinter"]["message"],
+            "virtual printer failed",
+        )
+
 
 class TestPresenceAndNetwork(unittest.TestCase):
     def tearDown(self):

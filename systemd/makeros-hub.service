@@ -9,6 +9,8 @@ Type=simple
 User=makeros-hub
 Group=makeros-hub
 Environment=PYTHONPATH=/opt/makeros-hub
+# Virtual-printer FTPS binds 990 without running the whole service as root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 # The venv python carries paho-mqtt (the Bambu adapter). install.sh creates it.
 # If it's ever absent the agent still enrolls + heartbeats — swap to
 # /usr/bin/python3 and printers report 'agent_missing_paho' until paho is added.

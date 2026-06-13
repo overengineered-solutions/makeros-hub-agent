@@ -246,6 +246,84 @@ class TestConfigDownTailscale(unittest.TestCase):
         self.assertLessEqual(state.retry_delay_sec, 300)
 
 
+class TestConfigDownVirtualPrinter(unittest.TestCase):
+    def test_pull_config_reconciles_virtual_printer_block(self):
+        class Manager:
+            config_version = None
+
+            def reconcile(self, printers, version):
+                self.config_version = version
+
+            def statuses(self):
+                return []
+
+        class VirtualPrinterManager:
+            def __init__(self):
+                self.reconciled = None
+
+            def reconcile_sync(self, config):
+                self.reconciled = config
+
+        vp_manager = VirtualPrinterManager()
+        cfg = Config(cloud_url="https://host.example")
+        with mock.patch(
+            "makeros_hub.agent.get_json",
+            return_value=http.Response(
+                200,
+                {
+                    "printers": [],
+                    "version": "v1",
+                    "virtual_printer": {
+                        "enabled": True,
+                        "serial": "SER123",
+                        "model": "N1",
+                        "name": "VP A1",
+                        "fw": "01.08.00.00",
+                        "bind_ip": "100.64.0.10",
+                        "members": [{"access_code": "12345678", "member_id": "m1"}],
+                        "pool": [{"material": "PLA", "color": "FFFFFFFF"}],
+                    },
+                },
+            ),
+        ):
+            _pull_config(
+                cfg,
+                "cred",
+                Manager(),
+                tailscale_reconciler=mock.Mock(return_value={"tailscaleStatus": "disabled"}),
+                virtual_printer_manager=vp_manager,
+            )
+
+        self.assertEqual(vp_manager.reconciled.serial, "SER123")
+        self.assertEqual(vp_manager.reconciled.members[0].member_id, "m1")
+
+    def test_pull_config_disables_virtual_printer_when_block_absent(self):
+        class Manager:
+            config_version = None
+
+            def reconcile(self, printers, version):
+                self.config_version = version
+
+            def statuses(self):
+                return []
+
+        vp_manager = mock.Mock()
+        cfg = Config(cloud_url="https://host.example")
+        with mock.patch(
+            "makeros_hub.agent.get_json",
+            return_value=http.Response(200, {"printers": [], "version": "v1"}),
+        ):
+            _pull_config(
+                cfg,
+                "cred",
+                Manager(),
+                tailscale_reconciler=mock.Mock(return_value={"tailscaleStatus": "disabled"}),
+                virtual_printer_manager=vp_manager,
+            )
+
+        vp_manager.reconcile_sync.assert_called_once_with(None)
+
+
 class TestQueueStatusOutbox(unittest.TestCase):
     def test_flush_drops_deterministic_4xx_and_continues(self):
         reports = [
