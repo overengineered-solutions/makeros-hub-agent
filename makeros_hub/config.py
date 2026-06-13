@@ -32,7 +32,7 @@ DEFAULT_INGEST_PORT = 8787
 # Cap a single sliced-file upload (sliced 3MFs run a few MB; 256MB is a generous
 # guard against a runaway/abusive upload OOMing the Pi).
 DEFAULT_MAX_UPLOAD_MB = 256
-VPRINTER_ACCESS_CODE_RE = re.compile(r"^[A-Za-z0-9]{8}$")
+VPRINTER_CODE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 log = logging.getLogger("makeros-hub.config")
 
@@ -64,10 +64,14 @@ class Config:
     def queue_status_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/queue-status"
 
+    @property
+    def vp_submit_url(self) -> str:
+        return self.cloud_url.rstrip("/") + "/api/print/hub/vp-submit"
+
 
 @dataclass(frozen=True)
 class VirtualPrinterMember:
-    access_code: str
+    access_code_sha256: str
     member_id: str
 
 
@@ -87,10 +91,10 @@ class VirtualPrinterConfig:
 
 
 def parse_virtual_printer_config(raw: Any) -> VirtualPrinterConfig | None:
-    """Parse the optional config-down virtual_printer block.
+    """Parse the optional config-down virtualPrinter/virtual_printer block.
 
     Shape errors disable the VP for this heartbeat rather than crashing the
-    agent. Access codes are intentionally never included in log messages.
+    agent. Access-code hashes are intentionally never included in log messages.
     """
     if raw is None:
         return None
@@ -105,7 +109,7 @@ def parse_virtual_printer_config(raw: Any) -> VirtualPrinterConfig | None:
         "model": _required_str(raw, "model"),
         "name": _required_str(raw, "name"),
         "fw": _required_str(raw, "fw"),
-        "bind_ip": _required_str(raw, "bind_ip"),
+        "bind_ip": _required_str(raw, "bind_ip", "bindIp"),
     }
     missing = [key for key, value in required.items() if value is None]
     if missing:
@@ -117,13 +121,13 @@ def parse_virtual_printer_config(raw: Any) -> VirtualPrinterConfig | None:
         log.warning("virtual_printer config ignored: bind_ip must be IPv4")
         return None
 
-    units = _positive_int(raw.get("units", 4), default=4, maximum=4)
-    trays = _positive_int(raw.get("trays", 4), default=4, maximum=4)
+    units = _positive_int(_get_field(raw, "units", default=4), default=4, maximum=4)
+    trays = _positive_int(_get_field(raw, "trays", default=4), default=4, maximum=4)
     if units is None or trays is None:
         log.warning("virtual_printer config ignored: units/trays must be positive integers")
         return None
 
-    ams_type = raw.get("ams_type", "n3f")
+    ams_type = _get_field(raw, "ams_type", "amsType", default="n3f")
     if not isinstance(ams_type, str) or ams_type not in {"n3f", "n3s", "ams"}:
         log.warning("virtual_printer config ignored: ams_type is invalid")
         return None
@@ -153,11 +157,25 @@ def parse_virtual_printer_config(raw: Any) -> VirtualPrinterConfig | None:
     )
 
 
-def _required_str(raw: dict[str, Any], key: str) -> str | None:
-    value = raw.get(key)
+def _required_str(raw: dict[str, Any], key: str, camel_key: str | None = None) -> str | None:
+    value = _get_field(raw, key, camel_key)
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def _get_field(
+    raw: dict[str, Any],
+    key: str,
+    camel_key: str | None = None,
+    *,
+    default: Any = None,
+) -> Any:
+    if key in raw:
+        return raw[key]
+    if camel_key is not None and camel_key in raw:
+        return raw[camel_key]
+    return default
 
 
 def _positive_int(value: Any, *, default: int, maximum: int) -> int | None:
@@ -186,22 +204,36 @@ def _parse_vprinter_members(raw: Any) -> list[VirtualPrinterMember]:
     if not isinstance(raw, list):
         return []
     members: list[VirtualPrinterMember] = []
-    seen_codes: set[str] = set()
+    seen_hashes: set[str] = set()
+    dropped = 0
     for item in raw:
         if not isinstance(item, dict):
+            dropped += 1
             continue
-        raw_access_code = item.get("access_code")
-        raw_member_id = item.get("member_id")
-        if not (isinstance(raw_access_code, str) and isinstance(raw_member_id, str)):
+        raw_code_hash = _get_field(item, "access_code_sha256", "accessCodeSha256")
+        raw_member_id = _get_field(item, "member_id", "memberId")
+        if not (isinstance(raw_code_hash, str) and isinstance(raw_member_id, str)):
+            dropped += 1
             continue
-        access_code = raw_access_code.strip()
+        access_code_sha256 = raw_code_hash.strip().lower()
         member_id = raw_member_id.strip()
-        if not access_code or not member_id or not VPRINTER_ACCESS_CODE_RE.fullmatch(access_code):
+        if (
+            not access_code_sha256
+            or not member_id
+            or not VPRINTER_CODE_HASH_RE.fullmatch(access_code_sha256)
+        ):
+            dropped += 1
             continue
-        if access_code in seen_codes:
+        if access_code_sha256 in seen_hashes:
+            dropped += 1
             continue
-        seen_codes.add(access_code)
-        members.append(VirtualPrinterMember(access_code=access_code, member_id=member_id))
+        seen_hashes.add(access_code_sha256)
+        members.append(
+            VirtualPrinterMember(access_code_sha256=access_code_sha256, member_id=member_id)
+        )
+    if dropped:
+        suffix = "y" if dropped == 1 else "ies"
+        log.warning("virtual_printer config dropped %d invalid member entr%s", dropped, suffix)
     return members
 
 

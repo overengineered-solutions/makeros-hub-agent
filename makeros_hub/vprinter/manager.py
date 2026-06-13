@@ -48,12 +48,14 @@ class VirtualPrinterManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._supervisor: _AsyncVirtualPrinterSupervisor | None = None
+        self._current_model: str | None = None
 
     async def start(self) -> None:
         self._ensure_loop()
 
     async def stop(self) -> None:
         if self._loop is None:
+            self._set_current_model(None)
             return
         future = self._submit(self._stop_in_loop())
         await asyncio.wrap_future(future)
@@ -61,6 +63,7 @@ class VirtualPrinterManager:
 
     async def reconcile(self, config: VirtualPrinterConfig | None) -> None:
         if config is None and self._loop is None:
+            self._set_current_model(None)
             return
         self._ensure_loop()
         future = self._submit(self._reconcile_in_loop(config))
@@ -70,6 +73,7 @@ class VirtualPrinterManager:
 
     def reconcile_sync(self, config: VirtualPrinterConfig | None, *, timeout: float = 20.0) -> None:
         if config is None and self._loop is None:
+            self._set_current_model(None)
             return
         self._ensure_loop()
         future = self._submit(self._reconcile_in_loop(config))
@@ -79,10 +83,19 @@ class VirtualPrinterManager:
 
     def stop_sync(self, *, timeout: float = 20.0) -> None:
         if self._loop is None:
+            self._set_current_model(None)
             return
         future = self._submit(self._stop_in_loop())
         future.result(timeout=timeout)
         self._stop_loop_thread()
+
+    def current_model(self) -> str | None:
+        with self._lock:
+            return self._current_model
+
+    def _set_current_model(self, model: str | None) -> None:
+        with self._lock:
+            self._current_model = model
 
     def _ensure_loop(self) -> None:
         with self._lock:
@@ -127,10 +140,12 @@ class VirtualPrinterManager:
         if self._supervisor is None:
             raise RuntimeError("virtual printer supervisor is not ready")
         await self._supervisor.reconcile(config)
+        self._set_current_model(self._supervisor.current_model())
 
     async def _stop_in_loop(self) -> None:
         if self._supervisor is not None:
             await self._supervisor.stop()
+        self._set_current_model(None)
 
     def _stop_loop_thread(self) -> None:
         with self._lock:
@@ -139,6 +154,7 @@ class VirtualPrinterManager:
             self._loop = None
             self._thread = None
             self._supervisor = None
+            self._current_model = None
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         if thread is not None and thread.is_alive():
@@ -194,6 +210,11 @@ class _AsyncVirtualPrinterSupervisor:
         if runtime is not None:
             await runtime.stop()
             log.info("virtual printer stopped")
+
+    def current_model(self) -> str | None:
+        if self.runtime is None:
+            return None
+        return self.runtime.config.model
 
     def _record_failure(self, message: str) -> None:
         if self.diagnostics is not None:
@@ -352,7 +373,7 @@ def _fingerprint(config: VirtualPrinterConfig) -> tuple[Any, ...]:
         config.units,
         config.trays,
         config.ams_type,
-        tuple((member.member_id, member.access_code) for member in config.members),
+        tuple((member.member_id, member.access_code_sha256) for member in config.members),
         json.dumps(list(config.pool), sort_keys=True, separators=(",", ":"), default=str),
     )
 
