@@ -90,26 +90,24 @@ case "$cmd" in
 
     tailscale_bin="$(find_tailscale)"
     if [ -z "$tailscale_bin" ] && ! is_dry_run; then
-      # The agent is pure-Python, so curl may be absent on a minimal Pi OS — find
-      # curl OR wget on PATH (not a hardcoded path), and CAPTURE the install output
-      # so a failure reports the real reason instead of an opaque "install failed".
-      dl="$(command -v curl || true)"
-      if [ -n "$dl" ]; then
-        install_out="$( { "$dl" -fsSL https://tailscale.com/install.sh | "$SH_BIN"; } 2>&1 )" || {
-          echo "tailscale setup: install failed: $(printf '%s' "$install_out" | tr '\n' ' ' | tail -c 280)" >&2
-          exit 1
-        }
+      # Fetch the Tailscale installer with whatever the Pi has. The agent is
+      # pure-Python, so curl/wget may both be absent on a minimal Pi OS — but
+      # python3 is ALWAYS present (the agent runs on it), so it's the guaranteed
+      # fallback. Capture output so a failure reports the real reason.
+      if command -v curl >/dev/null 2>&1; then
+        fetch_installer() { curl -fsSL "$1"; }
+      elif command -v wget >/dev/null 2>&1; then
+        fetch_installer() { wget -qO- "$1"; }
+      elif command -v python3 >/dev/null 2>&1; then
+        fetch_installer() { python3 -c 'import sys,urllib.request; sys.stdout.buffer.write(urllib.request.urlopen(sys.argv[1]).read())' "$1"; }
       else
-        dl="$(command -v wget || true)"
-        if [ -z "$dl" ]; then
-          echo "tailscale setup: install failed: neither curl nor wget on PATH (install one)" >&2
-          exit 1
-        fi
-        install_out="$( { "$dl" -qO- https://tailscale.com/install.sh | "$SH_BIN"; } 2>&1 )" || {
-          echo "tailscale setup: install failed: $(printf '%s' "$install_out" | tr '\n' ' ' | tail -c 280)" >&2
-          exit 1
-        }
+        echo "tailscale setup: install failed: no downloader (curl/wget/python3) on PATH" >&2
+        exit 1
       fi
+      install_out="$( { fetch_installer https://tailscale.com/install.sh | "$SH_BIN"; } 2>&1 )" || {
+        echo "tailscale setup: install failed: $(printf '%s' "$install_out" | tr '\n' ' ' | tail -c 280)" >&2
+        exit 1
+      }
       tailscale_bin="$(find_tailscale)"
     fi
     if [ -z "$tailscale_bin" ]; then
