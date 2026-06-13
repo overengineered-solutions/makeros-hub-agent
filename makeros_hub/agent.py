@@ -26,6 +26,7 @@ from .config import SPOOL_DIR, Config, read_credential
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import TransportError, get_json, post_json
 from .ingest import IngestServer
+from .probes import PROBES, run_probe, set_effective_config
 from .printers.manager import PrinterManager
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
 from .update import maybe_update
@@ -35,6 +36,7 @@ log = logging.getLogger("makeros-hub")
 QUEUE_STATUS_SENT = "sent"
 QUEUE_STATUS_RETRY = "retry"
 QUEUE_STATUS_DROP = "drop"
+MAX_PROBES_PER_HEARTBEAT = 3
 
 
 def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
@@ -175,6 +177,7 @@ def heartbeat_payload(
     printers: list[dict] | None = None,
     jobs: list[dict] | None = None,
     tailscale_status: dict | None = None,
+    probe_results: list[dict] | None = None,
     diagnostics=None,
 ) -> dict:
     payload = {
@@ -193,10 +196,52 @@ def heartbeat_payload(
             value = tailscale_status.get(key)
             if value not in (None, ""):
                 payload[key] = value
+    if probe_results:
+        payload["probeResults"] = list(probe_results)
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
     return payload
+
+
+def _run_pending_probes(
+    pending_probes,
+    *,
+    runner=run_probe,
+    max_probes: int = MAX_PROBES_PER_HEARTBEAT,
+    diagnostics=None,
+) -> list[dict]:
+    if not isinstance(pending_probes, list):
+        return []
+    results: list[dict] = []
+    for pending in pending_probes:
+        if len(results) >= max(0, int(max_probes)):
+            break
+        if not isinstance(pending, dict):
+            continue
+        name = pending.get("name")
+        if not isinstance(name, str) or name not in PROBES:
+            continue
+        try:
+            result = runner(name)
+            if not isinstance(result, dict):
+                raise RuntimeError("probe runner returned non-object")
+        except Exception as exc:  # noqa: BLE001 - one probe must not sink heartbeat
+            safe = redact(str(exc))
+            _record_diagnostic(diagnostics, "heartbeat", f"probe {name} failed: {safe}")
+            result = {
+                "name": name,
+                "status": "error",
+                "exitCode": None,
+                "error": safe,
+                "output": "",
+                "durationMs": 0,
+                "truncated": False,
+            }
+        item = {"requestId": pending.get("requestId"), "name": name}
+        item.update(result)
+        results.append(item)
+    return results
 
 
 def _tailscale_config_enabled(tailscale_cfg) -> bool:
@@ -360,6 +405,7 @@ def _pull_config(
 
 
 def run(cfg: Config) -> int:
+    set_effective_config(cfg)
     diagnostics = Diagnostics(cloud_url=cfg.cloud_url, agent_version=__version__)
     set_default(diagnostics)
     install_log_handler(diagnostics)
@@ -376,6 +422,7 @@ def run(cfg: Config) -> int:
     manager = PrinterManager(diagnostics=diagnostics)
     queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
     pending_queue_reports: list[dict] = []
+    pending_probe_results: list[dict] = []
     tailscale_state = _TailscaleRuntimeState()
     tailscale_status: dict | None = None
     log.info("makeros-hub %s starting; heartbeat every %ss to %s", __version__, interval, cfg.cloud_url)
@@ -433,13 +480,23 @@ def run(cfg: Config) -> int:
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
-                    heartbeat_payload(statuses, jobs, tailscale_status, diagnostics=diagnostics),
+                    heartbeat_payload(
+                        statuses,
+                        jobs,
+                        tailscale_status,
+                        probe_results=pending_probe_results,
+                        diagnostics=diagnostics,
+                    ),
                     bearer=credential,
                     retries=3,
                     backoff_base=2.0,
                 )
                 tailscale_state.mark_reported()
                 if resp.status == 200:
+                    reported_probe_count = len(pending_probe_results)
+                    pending_probe_results = []
+                    if reported_probe_count:
+                        log.info("reported %d probe result(s) to the cloud", reported_probe_count)
                     assignments = resp.body.get("assignments")
                     dispatch_reports = manager.dispatch_assignments(
                         assignments if isinstance(assignments, list) else [],
@@ -499,6 +556,13 @@ def run(cfg: Config) -> int:
                     target = resp.body.get("targetVersion")
                     if isinstance(target, str) and target and maybe_update(__version__, target):
                         log.info("OTA: update to %s launched; the service will restart", target)
+                    probe_results = _run_pending_probes(
+                        resp.body.get("pendingProbes"),
+                        diagnostics=diagnostics,
+                    )
+                    if probe_results:
+                        pending_probe_results.extend(probe_results)
+                        log.info("queued %d probe result(s) for the next heartbeat", len(probe_results))
                 elif resp.status == 401:
                     _record_diagnostic(diagnostics, "heartbeat", "heartbeat rejected 401")
                     log.error(
