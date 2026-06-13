@@ -19,6 +19,7 @@ from makeros_hub.agent import (
     _maybe_retry_tailscale_config,
     _pull_config,
     _reconcile_tailscale_config,
+    _run_pending_probes,
     heartbeat_payload,
     make_queue_status_reporter,
 )
@@ -75,6 +76,71 @@ class TestHeartbeatPayload(unittest.TestCase):
         self.assertEqual(p["tailscaleHostname"], "hub-one")
         self.assertEqual(p["tailscaleStatus"], "connected")
         self.assertNotIn("tailscaleStatusReason", p)
+
+    def test_probe_results_are_included_when_present(self):
+        p = heartbeat_payload(
+            probe_results=[
+                {
+                    "requestId": "r1",
+                    "name": "disk-free",
+                    "status": "ok",
+                    "exitCode": 0,
+                    "output": "ok",
+                    "durationMs": 1,
+                    "truncated": False,
+                }
+            ]
+        )
+
+        self.assertEqual(p["probeResults"][0]["requestId"], "r1")
+        self.assertEqual(p["probeResults"][0]["name"], "disk-free")
+
+    def test_pending_probe_response_becomes_next_payload(self):
+        runner = mock.Mock(
+            return_value={
+                "name": "disk-free",
+                "status": "ok",
+                "exitCode": 0,
+                "output": "ok",
+                "durationMs": 1,
+                "truncated": False,
+            }
+        )
+
+        results = _run_pending_probes([{"requestId": "r1", "name": "disk-free"}], runner=runner)
+        payload = heartbeat_payload(probe_results=results)
+
+        runner.assert_called_once_with("disk-free")
+        self.assertEqual(payload["probeResults"][0]["requestId"], "r1")
+        self.assertEqual(payload["probeResults"][0]["status"], "ok")
+
+    def test_pending_probe_validation_ignores_malformed_and_unknown(self):
+        runner = mock.Mock()
+
+        results = _run_pending_probes(
+            [
+                {"requestId": "bad1", "name": "; rm -rf /"},
+                {"requestId": "bad2", "name": 123},
+                "bad3",
+            ],
+            runner=runner,
+        )
+
+        self.assertEqual(results, [])
+        runner.assert_not_called()
+
+    def test_probe_runner_exception_does_not_break_heartbeat_payload(self):
+        secret = "tskey-auth-secret"
+
+        def runner(_name):
+            raise RuntimeError(f"boom {secret}")
+
+        results = _run_pending_probes([{"requestId": "r1", "name": "disk-free"}], runner=runner)
+        payload = heartbeat_payload(probe_results=results)
+
+        self.assertEqual(payload["probeResults"][0]["status"], "error")
+        self.assertNotIn(secret, json.dumps(payload))
+        self.assertIn("[redacted]", json.dumps(payload))
 
 
 class TestConfigDownTailscale(unittest.TestCase):

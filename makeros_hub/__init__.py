@@ -14,4 +14,4 @@ narrow root script and restarts — no SSH. `bootstrap.sh` collapses first-time
 setup to a single pasted command.
 """
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"
