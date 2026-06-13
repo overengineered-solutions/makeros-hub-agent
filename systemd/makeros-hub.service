@@ -25,7 +25,13 @@ RestartSec=5
 # set, sudo can't escalate even with a valid NOPASSWD rule, so OTA silently
 # fails ("no new privileges flag is set"). The narrow sudoers rule is the real
 # control here.
-ProtectSystem=full
+# NOTE: deliberately NO ProtectSystem — the agent legitimately installs/manages
+# system software (Tailscale via apt, and OTA self-update), which write to /usr
+# (e.g. /usr/share/keyrings, /usr/bin) and /etc. ProtectSystem=full mounts those
+# read-only, so even the sudo-scoped install fails ("Read-only file system" when
+# tee'ing the Tailscale APT keyring) — confirmed live via the diagnostics bundle.
+# The unprivileged service user + the narrow sudoers rules (update.sh /
+# tailscale-setup.sh only) are the real control. ProtectHome + PrivateTmp stay.
 ProtectHome=true
 PrivateTmp=true
 StateDirectory=makeros-hub
