@@ -26,9 +26,11 @@ from makeros_hub.agent import (
     _enqueue_vprinter_submission,
     _flush_queue_status_reports,
     _install_shutdown_signal_handlers,
+    _make_vprinter_capture_handler,
     _maybe_retry_tailscale_config,
     _maybe_retry_vprinter_config,
     _pull_config,
+    _rehydrate_vprinter_submissions,
     _reconcile_tailscale_config,
     _request_shutdown,
     _restore_shutdown_signal_handlers,
@@ -58,6 +60,24 @@ def _captured_job(uid: str = "uid-1", filename: str = "part.3mf") -> CapturedJob
         submitted_at=datetime(2026, 6, 13, tzinfo=timezone.utc),
         submission_uid=uid,
     )
+
+
+class _FakeVPrinterOutbox:
+    def __init__(self, jobs=()):
+        self.jobs = list(jobs)
+        self.persisted = []
+        self.removed = []
+        self.load_count = 0
+
+    def persist(self, job):
+        self.persisted.append(job)
+
+    def remove(self, submission_uid):
+        self.removed.append(submission_uid)
+
+    def load_all(self):
+        self.load_count += 1
+        return list(self.jobs)
 
 
 class TestHttpParse(unittest.TestCase):
@@ -511,10 +531,55 @@ class TestQueueStatusOutbox(unittest.TestCase):
 
 
 class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
+    def test_capture_handler_persists_before_enqueue(self):
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = _captured_job()
+        observed_qsizes = []
+
+        class FakeOutbox(_FakeVPrinterOutbox):
+            def persist(self, persisted_job):
+                observed_qsizes.append(q.qsize())
+                super().persist(persisted_job)
+
+        outbox = FakeOutbox()
+        handler = _make_vprinter_capture_handler(q, outbox)
+
+        handler(job)
+
+        self.assertEqual(observed_qsizes, [0])
+        self.assertEqual(outbox.persisted, [job])
+        self.assertIs(q.get_nowait(), job)
+
+    def test_capture_handler_persist_failure_still_enqueues(self):
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = _captured_job()
+
+        class FailingOutbox(_FakeVPrinterOutbox):
+            def persist(self, persisted_job):
+                raise OSError("disk full")
+
+        handler = _make_vprinter_capture_handler(q, FailingOutbox())
+        # A durability-write failure must NEVER drop the job — it falls back to
+        # the in-memory queue so it still submits this session.
+        handler(job)
+        self.assertIs(q.get_nowait(), job)
+
+    def test_rehydrate_enqueues_loaded_outbox_jobs(self):
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        jobs = [_captured_job("uid-1", "one.3mf"), _captured_job("uid-2", "two.3mf")]
+        outbox = _FakeVPrinterOutbox(jobs)
+
+        count = _rehydrate_vprinter_submissions(q, outbox)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(outbox.load_count, 1)
+        self.assertEqual([job.submission_uid for job in list(q.queue)], ["uid-1", "uid-2"])
+
     def test_drain_ok_true_removes_job(self):
         cfg = Config(cloud_url="https://host.example/")
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
         job = _captured_job()
+        outbox = _FakeVPrinterOutbox()
         _enqueue_vprinter_submission(q, job)
         calls = []
 
@@ -527,6 +592,7 @@ class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
             cfg,
             "cred",
             model="3DPrinter-X1-Carbon",
+            outbox=outbox,
             poster=poster,
         )
 
@@ -539,25 +605,37 @@ class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
         self.assertEqual(calls[0][1]["hubSubmissionUid"], job.submission_uid)
         self.assertEqual(calls[0][1]["memberId"], "member-1")
         self.assertEqual(calls[0][1]["printerModel"], "3DPrinter-X1-Carbon")
+        self.assertEqual(outbox.removed, [job.submission_uid])
 
     def test_drain_ok_false_rejected_is_terminal(self):
         cfg = Config(cloud_url="https://host.example")
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
-        _enqueue_vprinter_submission(q, _captured_job())
+        job = _captured_job()
+        outbox = _FakeVPrinterOutbox()
+        _enqueue_vprinter_submission(q, job)
 
         def poster(_url, _payload, *, bearer, timeout):
             return http.Response(200, {"ok": False, "state": "rejected", "reason": "not eligible"})
 
-        submitted = _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
+        submitted = _drain_vprinter_submissions(
+            q,
+            cfg,
+            "cred",
+            model="N1",
+            outbox=outbox,
+            poster=poster,
+        )
 
         self.assertEqual(submitted, 0)
         self.assertTrue(q.empty())
+        self.assertEqual(outbox.removed, [job.submission_uid])
 
     def test_drain_transport_error_reenqueues_and_records_vprinter_diagnostic(self):
         cfg = Config(cloud_url="https://host.example")
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
         job = _captured_job()
         diag = diagnostics.Diagnostics(enable_network=False)
+        outbox = _FakeVPrinterOutbox()
         _enqueue_vprinter_submission(q, job)
 
         def poster(_url, _payload, *, bearer, timeout):
@@ -569,6 +647,7 @@ class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
             "cred",
             model="N1",
             diagnostics=diag,
+            outbox=outbox,
             poster=poster,
         )
 
@@ -576,21 +655,32 @@ class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
         retried = q.get_nowait()
         self.assertEqual(retried.submission_uid, job.submission_uid)
         self.assertEqual(retried.attempts, 1)
+        self.assertEqual(outbox.persisted, [retried])
+        self.assertEqual(outbox.removed, [])
         self.assertIn("vp-submit transport", diag.errors.snapshot()["vprinter"]["message"])
 
     def test_drain_deterministic_400_deadletters_without_reenqueue(self):
         cfg = Config(cloud_url="https://host.example")
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
         job = _captured_job()
+        outbox = _FakeVPrinterOutbox()
         _enqueue_vprinter_submission(q, job)
 
         def poster(_url, _payload, *, bearer, timeout):
             return http.Response(400, {"error": "payload_shape_mismatch"})
 
         with self.assertLogs("makeros-hub", level="WARNING") as logs:
-            _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
+            _drain_vprinter_submissions(
+                q,
+                cfg,
+                "cred",
+                model="N1",
+                outbox=outbox,
+                poster=poster,
+            )
 
         self.assertTrue(q.empty())
+        self.assertEqual(outbox.removed, [job.submission_uid])
         self.assertIn("vprinter.submit.deadletter", "\n".join(logs.output))
 
     def test_drain_recoverable_4xx_retries_not_deadletter(self):
@@ -613,30 +703,42 @@ class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
         cfg = Config(cloud_url="https://host.example")
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
         job = _captured_job()
+        outbox = _FakeVPrinterOutbox()
         _enqueue_vprinter_submission(q, job)
 
         def poster(_url, _payload, *, bearer, timeout):
             return http.Response(503, {"error": "try later"})
 
-        _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
+        _drain_vprinter_submissions(q, cfg, "cred", model="N1", outbox=outbox, poster=poster)
 
         retried = q.get_nowait()
         self.assertEqual(retried.submission_uid, job.submission_uid)
         self.assertEqual(retried.attempts, 1)
+        self.assertEqual(outbox.persisted, [retried])
+        self.assertEqual(outbox.removed, [])
 
     def test_drain_max_attempts_deadletters_retryable_failure(self):
         cfg = Config(cloud_url="https://host.example")
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
         job = replace(_captured_job(), attempts=9)
+        outbox = _FakeVPrinterOutbox()
         _enqueue_vprinter_submission(q, job)
 
         def poster(_url, _payload, *, bearer, timeout):
             return http.Response(503, {"error": "try later"})
 
         with self.assertLogs("makeros-hub", level="WARNING") as logs:
-            _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
+            _drain_vprinter_submissions(
+                q,
+                cfg,
+                "cred",
+                model="N1",
+                outbox=outbox,
+                poster=poster,
+            )
 
         self.assertTrue(q.empty())
+        self.assertEqual(outbox.removed, [job.submission_uid])
         self.assertIn("vprinter.submit.deadletter", "\n".join(logs.output))
 
     def test_enqueue_full_queue_drops_oldest(self):
@@ -725,11 +827,105 @@ class TestRunLoopShutdown(unittest.TestCase):
                 Config(cloud_url="https://host.example", heartbeat_sec=1),
                 _stop_event=stop_event,
                 _install_signals=False,
+                _outbox=_FakeVPrinterOutbox(),
             )
 
         self.assertEqual(result, 0)
         self.assertGreaterEqual(len(drains), 1)
         self.assertEqual(drains[0], "N1")
+
+    def test_run_rehydrates_outbox_before_first_drain(self):
+        stop_event = threading.Event()
+        _request_shutdown(stop_event, signal.SIGTERM)
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = _captured_job()
+        outbox = _FakeVPrinterOutbox([job])
+        drain_seen = []
+
+        class FakeIngest:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class FakeVirtualPrinterManager:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def current_model(self):
+                return "N1"
+
+            def stop_sync(self):
+                pass
+
+        def drain(submission_queue, *_args, **_kwargs):
+            drain_seen.append([queued.submission_uid for queued in list(submission_queue.queue)])
+            return 0
+
+        with mock.patch("makeros_hub.agent.read_credential", return_value="cred"), mock.patch(
+            "makeros_hub.agent._pull_config", return_value={"tailscaleStatus": "disabled"}
+        ), mock.patch("makeros_hub.agent.IngestServer", FakeIngest), mock.patch(
+            "makeros_hub.agent.VirtualPrinterManager", FakeVirtualPrinterManager
+        ), mock.patch(
+            "makeros_hub.agent._drain_vprinter_submissions_safely", side_effect=drain
+        ):
+            result = run(
+                Config(cloud_url="https://host.example", heartbeat_sec=1),
+                _stop_event=stop_event,
+                _install_signals=False,
+                _submission_queue=q,
+                _outbox=outbox,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(outbox.load_count, 1)
+        self.assertEqual(drain_seen[0], [job.submission_uid])
+
+    def test_run_does_not_rehydrate_outbox_without_vprinter_model(self):
+        stop_event = threading.Event()
+        _request_shutdown(stop_event, signal.SIGTERM)
+        outbox = _FakeVPrinterOutbox([_captured_job()])
+
+        class FakeIngest:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class FakeVirtualPrinterManager:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def current_model(self):
+                return None
+
+            def stop_sync(self):
+                pass
+
+        with mock.patch("makeros_hub.agent.read_credential", return_value="cred"), mock.patch(
+            "makeros_hub.agent._pull_config", return_value={"tailscaleStatus": "disabled"}
+        ), mock.patch("makeros_hub.agent.IngestServer", FakeIngest), mock.patch(
+            "makeros_hub.agent.VirtualPrinterManager", FakeVirtualPrinterManager
+        ), mock.patch(
+            "makeros_hub.agent._drain_vprinter_submissions_safely", return_value=0
+        ):
+            result = run(
+                Config(cloud_url="https://host.example", heartbeat_sec=1),
+                _stop_event=stop_event,
+                _install_signals=False,
+                _outbox=outbox,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertEqual(outbox.load_count, 0)
 
     def test_shutdown_signal_event_runs_final_vprinter_drain(self):
         stop_event = threading.Event()
@@ -773,6 +969,7 @@ class TestRunLoopShutdown(unittest.TestCase):
                 _stop_event=stop_event,
                 _install_signals=False,
                 _submission_queue=q,
+                _outbox=_FakeVPrinterOutbox(),
             )
 
         self.assertEqual(result, 0)

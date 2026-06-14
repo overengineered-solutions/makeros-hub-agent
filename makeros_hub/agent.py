@@ -37,6 +37,7 @@ from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_
 from .update import maybe_update
 from .vprinter.capture import CapturedJob, build_vp_submit_body
 from .vprinter.manager import VirtualPrinterManager
+from .vprinter.outbox import VPrinterOutbox
 
 log = logging.getLogger("makeros-hub")
 
@@ -193,8 +194,23 @@ def _enqueue_vprinter_submission(submission_queue: queue.Queue[CapturedJob], job
         log.warning("vprinter.submit.queue_full dropped_newest_count=%d", dropped)
 
 
-def _make_vprinter_capture_handler(submission_queue: queue.Queue[CapturedJob]):
+def _make_vprinter_capture_handler(
+    submission_queue: queue.Queue[CapturedJob],
+    outbox: VPrinterOutbox | None = None,
+):
     def on_capture(job: CapturedJob) -> None:
+        if outbox is not None:
+            # Durability is best-effort: a persist failure (transient IO / full
+            # disk) must NEVER drop the job — fall back to the in-memory queue so
+            # it still submits this session. The retry path re-persists later.
+            try:
+                outbox.persist(job)
+            except Exception as exc:  # noqa: BLE001 - never lose a captured job on a durability write
+                log.warning(
+                    "vprinter.outbox.persist_failed submission_uid=%s: %s",
+                    job.submission_uid,
+                    redact(str(exc)),
+                )
         log.info(
             "vprinter.capture_observed member_id=%s filename=%s size=%d sha256=%s "
             "use_ams=%s ams_mapping=%s required_filaments=%s submitted_at=%s",
@@ -210,6 +226,19 @@ def _make_vprinter_capture_handler(submission_queue: queue.Queue[CapturedJob]):
         _enqueue_vprinter_submission(submission_queue, job)
 
     return on_capture
+
+
+def _rehydrate_vprinter_submissions(
+    submission_queue: queue.Queue[CapturedJob],
+    outbox: VPrinterOutbox,
+) -> int:
+    count = 0
+    for job in outbox.load_all():
+        _enqueue_vprinter_submission(submission_queue, job)
+        count += 1
+    if count:
+        log.info("vprinter.outbox.rehydrated count=%d", count)
+    return count
 
 
 def _drop_vprinter_submissions(
@@ -247,13 +276,20 @@ def _retry_or_deadletter_vprinter_submission(
     reason: str,
     *,
     diagnostics=None,
+    outbox: VPrinterOutbox | None = None,
     max_attempts: int = VP_SUBMISSION_MAX_ATTEMPTS,
 ) -> None:
     attempts = job.attempts + 1
     if attempts >= max(1, int(max_attempts)):
-        _deadletter_vprinter_submission(replace(job, attempts=attempts), reason, diagnostics)
+        terminal_job = replace(job, attempts=attempts)
+        _deadletter_vprinter_submission(terminal_job, reason, diagnostics)
+        if outbox is not None:
+            outbox.remove(terminal_job.submission_uid)
         return
-    _enqueue_vprinter_submission(submission_queue, replace(job, attempts=attempts))
+    retried_job = replace(job, attempts=attempts)
+    if outbox is not None:
+        outbox.persist(retried_job)
+    _enqueue_vprinter_submission(submission_queue, retried_job)
 
 
 def _drain_vprinter_submissions(
@@ -263,6 +299,7 @@ def _drain_vprinter_submissions(
     *,
     model: str | None,
     diagnostics=None,
+    outbox: VPrinterOutbox | None = None,
     poster=post_json,
     max_jobs: int = VP_SUBMISSIONS_PER_HEARTBEAT,
 ) -> int:
@@ -304,6 +341,7 @@ def _drain_vprinter_submissions(
                 job,
                 f"transport: {safe}",
                 diagnostics=diagnostics,
+                outbox=outbox,
             )
             continue
 
@@ -316,6 +354,8 @@ def _drain_vprinter_submissions(
                 job.submission_uid,
                 resp.body.get("jobId"),
             )
+            if outbox is not None:
+                outbox.remove(job.submission_uid)
             continue
 
         if resp.status == 200 and resp.body.get("ok") is False:
@@ -327,12 +367,16 @@ def _drain_vprinter_submissions(
                 job.submission_uid,
                 reason,
             )
+            if outbox is not None:
+                outbox.remove(job.submission_uid)
             continue
 
         safe = redact(resp.body.get("error") or resp.body.get("reason") or resp.body)
         _record_diagnostic(diagnostics, "vprinter", f"vp-submit HTTP {resp.status}: {safe}")
         if resp.status in VP_SUBMIT_DEADLETTER_STATUSES:
             _deadletter_vprinter_submission(job, f"HTTP {resp.status}: {safe}", diagnostics)
+            if outbox is not None:
+                outbox.remove(job.submission_uid)
             continue
         log.warning(
             "vprinter.submit.retry http_status=%s member_id=%s filename=%s submission_uid=%s: %s",
@@ -347,6 +391,7 @@ def _drain_vprinter_submissions(
             job,
             f"HTTP {resp.status}: {safe}",
             diagnostics=diagnostics,
+            outbox=outbox,
         )
 
     return submitted
@@ -715,6 +760,7 @@ def _drain_vprinter_submissions_safely(
     *,
     model: str | None,
     diagnostics=None,
+    outbox: VPrinterOutbox | None = None,
     poster=None,
     max_jobs: int = VP_SUBMISSIONS_PER_HEARTBEAT,
 ) -> int:
@@ -725,6 +771,7 @@ def _drain_vprinter_submissions_safely(
             credential,
             model=model,
             diagnostics=diagnostics,
+            outbox=outbox,
             poster=poster or post_json,
             max_jobs=max_jobs,
         )
@@ -772,6 +819,7 @@ def run(
     _stop_event: threading.Event | None = None,
     _install_signals: bool = True,
     _submission_queue: queue.Queue[CapturedJob] | None = None,
+    _outbox: VPrinterOutbox | None = None,
 ) -> int:
     set_effective_config(cfg)
     diagnostics = Diagnostics(cloud_url=cfg.cloud_url, agent_version=__version__)
@@ -793,8 +841,9 @@ def run(
         if _submission_queue is not None
         else queue.Queue(maxsize=VP_SUBMISSION_QUEUE_MAX)
     )
+    vp_outbox = _outbox if _outbox is not None else VPrinterOutbox()
     vp_manager = VirtualPrinterManager(
-        on_capture=_make_vprinter_capture_handler(vp_submission_queue),
+        on_capture=_make_vprinter_capture_handler(vp_submission_queue, vp_outbox),
         diagnostics=diagnostics,
     )
     queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
@@ -803,11 +852,19 @@ def run(
     tailscale_state = _TailscaleRuntimeState()
     vprinter_state = _VirtualPrinterRuntimeState()
     tailscale_status: dict | None = None
+    vp_outbox_rehydrated = False
     stop_event = _stop_event if _stop_event is not None else threading.Event()
     previous_signal_handlers = (
         _install_shutdown_signal_handlers(stop_event) if _install_signals else {}
     )
     log.info("makeros-hub %s starting; heartbeat every %ss to %s", __version__, interval, cfg.cloud_url)
+
+    def maybe_rehydrate_vprinter_outbox() -> None:
+        nonlocal vp_outbox_rehydrated
+        if vp_outbox_rehydrated or not vp_manager.current_model():
+            return
+        _rehydrate_vprinter_submissions(vp_submission_queue, vp_outbox)
+        vp_outbox_rehydrated = True
 
     # Pull the printer list up front so the first heartbeat already carries status.
     pulled_tailscale_status = _pull_config(
@@ -821,6 +878,7 @@ def run(
     )
     if pulled_tailscale_status:
         tailscale_status = pulled_tailscale_status
+    maybe_rehydrate_vprinter_outbox()
 
     # Start the OrcaSlicer ingest server (inbound HTTP on the LAN). Best-effort:
     # if the port is taken we log + continue (heartbeat/telemetry still work).
@@ -865,6 +923,7 @@ def run(
                     now,
                     diagnostics=diagnostics,
                 )
+                maybe_rehydrate_vprinter_outbox()
                 statuses = manager.statuses()
                 jobs = manager.pending_jobs()
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
@@ -941,6 +1000,7 @@ def run(
                         )
                         if pulled_tailscale_status:
                             tailscale_status = pulled_tailscale_status
+                        maybe_rehydrate_vprinter_outbox()
                     # Over-the-air self-update: the cloud names the release this
                     # hub should run. No-op unless it's a strictly-newer release
                     # tag and the cooldown has passed; on apply, the update
@@ -977,6 +1037,7 @@ def run(
                 credential,
                 model=vp_manager.current_model(),
                 diagnostics=diagnostics,
+                outbox=vp_outbox,
             )
             stop_event.wait(interval)
     finally:
@@ -986,6 +1047,7 @@ def run(
             credential,
             model=vp_manager.current_model(),
             diagnostics=diagnostics,
+            outbox=vp_outbox,
             max_jobs=VP_SUBMISSION_QUEUE_MAX,
         )
         try:
