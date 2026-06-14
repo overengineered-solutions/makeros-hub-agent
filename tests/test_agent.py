@@ -790,21 +790,26 @@ class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
         self.assertEqual(outbox.removed, [job.submission_uid])
         self.assertIn("vprinter.submit.deadletter", "\n".join(logs.output))
 
-    def test_drain_recoverable_4xx_retries_not_deadletter(self):
+    def test_drain_auth_outage_401_retries_without_attempt_or_outbox_removal(self):
         cfg = Config(cloud_url="https://host.example")
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        outbox = _FakeVPrinterOutbox()
         job = _captured_job()
         _enqueue_vprinter_submission(q, job)
 
         def poster(_url, _payload, *, bearer, timeout):
             return http.Response(401, {"error": "unauthorized"})
 
-        _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
-        # 401 is a recoverable hub-auth CONTEXT error (e.g. a rotated credential),
-        # not a job-intrinsic rejection — retry under the cap, never lose the job.
+        _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster, outbox=outbox)
+        # A 401/403 is a hub-level auth OUTAGE (revoked/rotated credential), not a
+        # job failure: the job is re-enqueued, the attempt count is NOT bumped (so
+        # it never hits the dead-letter cap during the outage), and the durable
+        # outbox record is preserved — captures survive until the credential is
+        # restored (re-enroll / rotation).
         retried = q.get_nowait()
         self.assertEqual(retried.submission_uid, job.submission_uid)
-        self.assertEqual(retried.attempts, 1)
+        self.assertEqual(retried.attempts, 0)
+        self.assertNotIn(job.submission_uid, outbox.removed)
 
     def test_drain_503_retries_with_attempt_increment(self):
         cfg = Config(cloud_url="https://host.example")
