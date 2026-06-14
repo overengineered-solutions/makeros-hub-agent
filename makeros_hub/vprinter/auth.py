@@ -104,6 +104,12 @@ class MemberAuthSet:
         self.members = tuple(members)
         self.limiter = limiter or AuthRateLimiter()
 
+    def replace_members(
+        self,
+        members: tuple[VirtualPrinterMember, ...] | list[VirtualPrinterMember],
+    ) -> None:
+        self.members = tuple(members)
+
     def lookup_member_id(self, access_code: str | None) -> str | None:
         provided = access_code if isinstance(access_code, str) else ""
         provided_hash = hashlib.sha256(provided.encode("utf-8")).hexdigest()

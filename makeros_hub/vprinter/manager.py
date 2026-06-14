@@ -169,7 +169,8 @@ class _AsyncVirtualPrinterSupervisor:
         self.on_capture = on_capture or _default_capture_logger
         self.diagnostics = diagnostics
         self.runtime: _VirtualPrinterRuntime | None = None
-        self.fingerprint: tuple[Any, ...] | None = None
+        self.identity_fp: tuple[Any, ...] | None = None
+        self.hot_state: tuple[Any, ...] | None = None
         self._lock = asyncio.Lock()
 
     async def reconcile(self, config: VirtualPrinterConfig | None) -> None:
@@ -180,9 +181,30 @@ class _AsyncVirtualPrinterSupervisor:
         if config is None or not config.enabled:
             await self._stop_locked()
             return
-        fingerprint = _fingerprint(config)
-        if self.runtime is not None and self.fingerprint == fingerprint:
-            return
+        identity = _identity_fingerprint(config)
+        hot = _hot_state(config)
+        if self.runtime is not None and self.identity_fp == identity:
+            if self.hot_state != hot:
+                try:
+                    await self.runtime.apply_hot(config)
+                except Exception as exc:  # noqa: BLE001 - config-down must not break heartbeat
+                    safe = redact(str(exc))
+                    self._record_failure(f"virtual printer hot-apply failed: {safe}")
+                    log.warning("virtual printer hot-apply failed: %s", safe)
+                else:
+                    self.hot_state = hot
+                    return
+            else:
+                return
+
+        await self._start_fresh_locked(config, identity, hot)
+
+    async def _start_fresh_locked(
+        self,
+        config: VirtualPrinterConfig,
+        identity: tuple[Any, ...],
+        hot: tuple[Any, ...],
+    ) -> None:
         await self._stop_locked()
         runtime = _VirtualPrinterRuntime(config, base_dir=self.base_dir, on_capture=self.on_capture)
         try:
@@ -200,7 +222,8 @@ class _AsyncVirtualPrinterSupervisor:
             await runtime.stop()
             return
         self.runtime = runtime
-        self.fingerprint = fingerprint
+        self.identity_fp = identity
+        self.hot_state = hot
         log.info(
             "virtual printer started serial=%s model=%s bind_ip=%s",
             config.serial,
@@ -215,7 +238,8 @@ class _AsyncVirtualPrinterSupervisor:
     async def _stop_locked(self) -> None:
         runtime = self.runtime
         self.runtime = None
-        self.fingerprint = None
+        self.identity_fp = None
+        self.hot_state = None
         if runtime is not None:
             await runtime.stop()
             log.info("virtual printer stopped")
@@ -352,6 +376,17 @@ class _VirtualPrinterRuntime:
             self.ftp = None
         self.capture.clear()
 
+    async def apply_hot(self, config: VirtualPrinterConfig) -> None:
+        self.config = config
+        self.auth.replace_members(config.members)
+        if self.broker is not None:
+            await self.broker.push_report_now()
+        log.info(
+            "virtual printer hot-applied (members=%d pool=%d)",
+            len(config.members),
+            len(config.pool),
+        )
+
     def _on_stored(self, upload: UploadRecord) -> None:
         if self.broker is not None:
             self.broker.set_print_state("FINISH", gcode_file=upload.filename, prepare_percent="100")
@@ -373,7 +408,7 @@ def _default_capture_logger(job: CapturedJob) -> None:
     )
 
 
-def _fingerprint(config: VirtualPrinterConfig) -> tuple[Any, ...]:
+def _identity_fingerprint(config: VirtualPrinterConfig) -> tuple[Any, ...]:
     return (
         config.serial,
         config.model,
@@ -383,6 +418,11 @@ def _fingerprint(config: VirtualPrinterConfig) -> tuple[Any, ...]:
         config.units,
         config.trays,
         config.ams_type,
+    )
+
+
+def _hot_state(config: VirtualPrinterConfig) -> tuple[Any, ...]:
+    return (
         tuple((member.member_id, member.access_code_sha256) for member in config.members),
         json.dumps(_pool_identity(config.pool), sort_keys=True, separators=(",", ":"), default=str),
     )

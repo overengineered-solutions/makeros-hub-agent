@@ -38,6 +38,7 @@ from makeros_hub.vprinter.capture import (
 from makeros_hub.vprinter.mqtt_broker import (
     ConnectPacket,
     MAX_MQTT_PACKET_BYTES,
+    MqttSession,
     MqttBroker,
     build_publish,
     decode_remaining_length_from_bytes,
@@ -46,7 +47,11 @@ from makeros_hub.vprinter.mqtt_broker import (
     parse_publish,
     _read_packet,
 )
-from makeros_hub.vprinter.manager import _AsyncVirtualPrinterSupervisor, _fingerprint
+from makeros_hub.vprinter.manager import (
+    _AsyncVirtualPrinterSupervisor,
+    _hot_state,
+    _identity_fingerprint,
+)
 from makeros_hub.vprinter.outbox import VPrinterOutbox, from_record
 from makeros_hub.vprinter.report import build_get_version, build_print_ack, build_push_status
 
@@ -179,7 +184,7 @@ class TestVirtualPrinterConfig(unittest.TestCase):
             )
         )
 
-    def test_fingerprint_uses_only_pool_identity_fields(self):
+    def test_hot_state_uses_only_pool_identity_fields(self):
         def make_cfg(**tray_overrides):
             tray = {
                 "tray_type": "PLA",
@@ -225,8 +230,9 @@ class TestVirtualPrinterConfig(unittest.TestCase):
         self.assertIsNotNone(base)
         self.assertIsNotNone(volatile_changed)
         self.assertIsNotNone(identity_changed)
-        self.assertEqual(_fingerprint(base), _fingerprint(volatile_changed))
-        self.assertNotEqual(_fingerprint(base), _fingerprint(identity_changed))
+        self.assertEqual(_identity_fingerprint(base), _identity_fingerprint(identity_changed))
+        self.assertEqual(_hot_state(base), _hot_state(volatile_changed))
+        self.assertNotEqual(_hot_state(base), _hot_state(identity_changed))
 
 
 class TestReportBuilders(unittest.TestCase):
@@ -377,6 +383,7 @@ class TestMqttCodec(unittest.TestCase):
 
             self.assertTrue(writer.closed)
             self.assertIsNone(broker._active_writer)
+            self.assertIsNone(broker._active_session)
             self.assertEqual(broker._client_tasks, set())
             self.assertIn(
                 (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
@@ -415,6 +422,39 @@ class TestMqttCodec(unittest.TestCase):
             # The fresh connect cleared the phantom job -> a clean idle printer.
             self.assertEqual(broker._gcode_state, "IDLE")
             self.assertEqual(broker._gcode_file, "")
+
+        asyncio.run(run())
+
+    def test_push_report_now_writes_active_session_and_noops_without_one(self):
+        async def run():
+            broker = _mqtt_broker()
+
+            await broker.push_report_now()
+
+            writer = _FakeWriter(("100.64.0.20", 1883))
+            broker._active_session = MqttSession(
+                writer=writer,
+                peer=writer.peer,
+                member_id="m1",
+                report_topic=broker.default_report_topic,
+                request_topic=broker.default_request_topic,
+                subscribed=True,
+            )
+
+            await broker.push_report_now()
+
+            self.assertEqual(len(writer.writes), 1)
+            remaining, consumed = decode_remaining_length_from_bytes(writer.writes[0][1:])
+            publish = parse_publish(
+                writer.writes[0][0],
+                writer.writes[0][1 + consumed : 1 + consumed + remaining],
+            )
+            self.assertEqual(publish.topic, "device/SER123/report")
+            self.assertEqual(json.loads(publish.payload)["print"]["command"], "push_status")
+
+            writer.close()
+            await broker.push_report_now()
+            self.assertEqual(len(writer.writes), 1)
 
         asyncio.run(run())
 
@@ -484,6 +524,20 @@ class TestMemberAuth(unittest.TestCase):
         self.assertFalse(limiter.is_limited("100.64.0.200", "bad99999"))
         self.assertEqual(len(limiter._by_ip), 0)
         self.assertEqual(len(limiter._by_code), 0)
+
+    def test_replace_members_swaps_codes_and_preserves_limiter(self):
+        limiter = AuthRateLimiter()
+        auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")], limiter=limiter)
+
+        self.assertTrue(auth.authenticate("12345678", "100.64.0.20").ok)
+
+        auth.replace_members([VirtualPrinterMember(_code_hash("87654321"), "m2")])
+
+        self.assertIs(auth.limiter, limiter)
+        self.assertFalse(auth.authenticate("12345678", "100.64.0.20").ok)
+        result = auth.authenticate("87654321", "100.64.0.20")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.member_id, "m2")
 
     def test_mqtt_and_ftp_auth_failures_are_recorded_on_bypass_branches(self):
         limiter = AuthRateLimiter(limit=1)
@@ -1059,6 +1113,171 @@ class TestVirtualPrinterSupervisor(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_hot_change_applies_without_runtime_restart(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as d:
+                instances = []
+
+                class FakeBroker:
+                    def __init__(self, auth):
+                        self.auth = auth
+                        self.pushes = 0
+
+                    async def push_report_now(self):
+                        self.pushes += 1
+
+                class FakeRuntime:
+                    def __init__(self, config, *, base_dir, on_capture):
+                        self.config = config
+                        self.auth = MemberAuthSet(config.members)
+                        self.broker = FakeBroker(self.auth)
+                        self.servers = [object()]
+                        self.starts = 0
+                        self.stops = 0
+                        self.hot_applies = 0
+                        instances.append(self)
+
+                    async def start(self):
+                        self.starts += 1
+
+                    async def stop(self):
+                        self.stops += 1
+
+                    async def apply_hot(self, config):
+                        self.hot_applies += 1
+                        self.config = config
+                        self.auth.replace_members(config.members)
+                        await self.broker.push_report_now()
+
+                supervisor = _AsyncVirtualPrinterSupervisor(
+                    base_dir=Path(d),
+                    on_capture=lambda _job: None,
+                )
+                cfg1 = _vp_config(
+                    "SER1",
+                    pool=[{"tray_type": "PLA", "tray_info_idx": "GFA00", "tray_color": "FFFFFFFF"}],
+                )
+                cfg2 = _vp_config(
+                    "SER1",
+                    members=[{"access_code_sha256": _code_hash("87654321"), "member_id": "m2"}],
+                    pool=[{"tray_type": "PETG", "tray_info_idx": "GFG00", "tray_color": "11223344"}],
+                )
+
+                with mock.patch("makeros_hub.vprinter.manager._VirtualPrinterRuntime", FakeRuntime):
+                    await supervisor.reconcile(cfg1)
+                    runtime = supervisor.runtime
+                    self.assertIsNotNone(runtime)
+                    assert runtime is not None
+                    servers = runtime.servers
+                    broker = runtime.broker
+
+                    await supervisor.reconcile(cfg2)
+
+                self.assertIs(supervisor.runtime, runtime)
+                self.assertIs(runtime.servers, servers)
+                self.assertIs(runtime.broker, broker)
+                self.assertEqual(len(instances), 1)
+                self.assertEqual(runtime.starts, 1)
+                self.assertEqual(runtime.stops, 0)
+                self.assertEqual(runtime.hot_applies, 1)
+                self.assertEqual(broker.pushes, 1)
+                self.assertEqual(broker.auth.members, cfg2.members)
+
+        asyncio.run(run())
+
+    def test_identity_change_restarts_runtime(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as d:
+                instances = []
+
+                class FakeRuntime:
+                    def __init__(self, config, *, base_dir, on_capture):
+                        self.config = config
+                        self.starts = 0
+                        self.stops = 0
+                        instances.append(self)
+
+                    async def start(self):
+                        self.starts += 1
+
+                    async def stop(self):
+                        self.stops += 1
+
+                    async def apply_hot(self, config):
+                        self.config = config
+
+                supervisor = _AsyncVirtualPrinterSupervisor(
+                    base_dir=Path(d),
+                    on_capture=lambda _job: None,
+                )
+                cfg1 = _vp_config("SER1")
+                cfg2 = _vp_config("SER1", bind_ip="100.64.0.11")
+
+                with mock.patch("makeros_hub.vprinter.manager._VirtualPrinterRuntime", FakeRuntime):
+                    await supervisor.reconcile(cfg1)
+                    first = supervisor.runtime
+                    await supervisor.reconcile(cfg2)
+                    second = supervisor.runtime
+
+                self.assertIsNot(first, second)
+                self.assertEqual(len(instances), 2)
+                self.assertEqual(instances[0].starts, 1)
+                self.assertEqual(instances[0].stops, 1)
+                self.assertEqual(instances[1].starts, 1)
+                self.assertEqual(instances[1].stops, 0)
+
+        asyncio.run(run())
+
+    def test_apply_hot_failure_falls_back_to_full_restart(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as d:
+                instances = []
+                diagnostics = mock.Mock()
+
+                class FakeRuntime:
+                    def __init__(self, config, *, base_dir, on_capture):
+                        self.config = config
+                        self.starts = 0
+                        self.stops = 0
+                        self.hot_applies = 0
+                        instances.append(self)
+
+                    async def start(self):
+                        self.starts += 1
+
+                    async def stop(self):
+                        self.stops += 1
+
+                    async def apply_hot(self, config):
+                        self.hot_applies += 1
+                        raise RuntimeError("hot boom")
+
+                supervisor = _AsyncVirtualPrinterSupervisor(
+                    base_dir=Path(d),
+                    on_capture=lambda _job: None,
+                    diagnostics=diagnostics,
+                )
+                cfg1 = _vp_config("SER1")
+                cfg2 = _vp_config(
+                    "SER1",
+                    members=[{"access_code_sha256": _code_hash("87654321"), "member_id": "m2"}],
+                )
+
+                with mock.patch("makeros_hub.vprinter.manager._VirtualPrinterRuntime", FakeRuntime):
+                    await supervisor.reconcile(cfg1)
+                    first = supervisor.runtime
+                    await supervisor.reconcile(cfg2)
+                    second = supervisor.runtime
+
+                self.assertIsNot(first, second)
+                self.assertEqual(len(instances), 2)
+                self.assertEqual(instances[0].hot_applies, 1)
+                self.assertEqual(instances[0].stops, 1)
+                self.assertEqual(instances[1].starts, 1)
+                diagnostics.record.assert_called_with("vprinter", "virtual printer hot-apply failed: hot boom")
+
+        asyncio.run(run())
+
 
 def _mqtt_string(value: str) -> bytes:
     raw = value.encode("utf-8")
@@ -1078,18 +1297,18 @@ def _mqtt_broker() -> MqttBroker:
     )
 
 
-def _vp_config(serial: str):
-    cfg = parse_virtual_printer_config(
-        {
-            "enabled": True,
-            "serial": serial,
-            "model": "N1",
-            "name": "VP A1",
-            "fw": "01.08.00.00",
-            "bind_ip": "100.64.0.10",
-            "members": [{"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}],
-        }
-    )
+def _vp_config(serial: str, **overrides):
+    raw = {
+        "enabled": True,
+        "serial": serial,
+        "model": "N1",
+        "name": "VP A1",
+        "fw": "01.08.00.00",
+        "bind_ip": "100.64.0.10",
+        "members": [{"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}],
+    }
+    raw.update(overrides)
+    cfg = parse_virtual_printer_config(raw)
     assert cfg is not None
     return cfg
 
