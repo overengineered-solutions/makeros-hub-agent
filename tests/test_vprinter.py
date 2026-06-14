@@ -47,6 +47,7 @@ from makeros_hub.vprinter.mqtt_broker import (
     _read_packet,
 )
 from makeros_hub.vprinter.manager import _AsyncVirtualPrinterSupervisor, _fingerprint
+from makeros_hub.vprinter.outbox import VPrinterOutbox, from_record
 from makeros_hub.vprinter.report import build_get_version, build_print_ack, build_push_status
 
 
@@ -802,6 +803,97 @@ class TestCaptureAssembly(unittest.TestCase):
 
         self.assertEqual(sum(len(q) for q in coordinator._uploads.values()), 1)
         self.assertEqual(sum(len(q) for q in coordinator._intents.values()), 0)
+
+
+class TestVPrinterOutbox(unittest.TestCase):
+    def test_persist_load_round_trips_job_metadata(self):
+        with tempfile.TemporaryDirectory() as d:
+            outbox = VPrinterOutbox(Path(d) / "vp-outbox")
+            job = CapturedJob(
+                member_id="member-1",
+                filename="part.3mf",
+                file_path=Path(d) / "part.3mf",
+                sha256="a" * 64,
+                size=123,
+                ams_mapping={"ams_mapping": [0], "ams_mapping2": {"0": 0}},
+                use_ams=True,
+                required_filaments=[{"slot": 0, "material": "PLA"}],
+                submitted_at=datetime(2026, 6, 13, 12, 30, tzinfo=timezone.utc),
+                submission_uid="0" * 32,
+                plate=2,
+                attempts=3,
+            )
+
+            outbox.persist(job)
+            loaded = outbox.load_all()
+
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0], job)
+            final_path = Path(d) / "vp-outbox" / f"{job.submission_uid}.json"
+            self.assertTrue(final_path.exists())
+            self.assertEqual(list((Path(d) / "vp-outbox").glob("*.tmp")), [])
+            record = json.loads(final_path.read_text(encoding="utf-8"))
+            self.assertEqual(record["submission_uid"], job.submission_uid)
+
+    def test_corrupt_record_is_quarantined_without_crashing_load(self):
+        with tempfile.TemporaryDirectory() as d:
+            outbox_dir = Path(d) / "vp-outbox"
+            outbox_dir.mkdir()
+            corrupt = outbox_dir / ("1" * 32 + ".json")
+            corrupt.write_text("{not json", encoding="utf-8")
+            outbox = VPrinterOutbox(outbox_dir)
+
+            with self.assertLogs("makeros-hub.vprinter.outbox", level="WARNING"):
+                loaded = outbox.load_all()
+
+            self.assertEqual(loaded, [])
+            self.assertFalse(corrupt.exists())
+            self.assertTrue((outbox_dir / (corrupt.name + ".corrupt")).exists())
+
+    def test_record_loader_tolerates_missing_and_extra_fields(self):
+        job = from_record(
+            {
+                "memberId": "member-2",
+                "fileName": "older.3mf",
+                "fileSha256": "b" * 64,
+                "fileSizeBytes": "456",
+                "useAms": "true",
+                "submittedAt": "2026-06-13T12:30:00Z",
+                "unknownFutureField": {"ok": True},
+            }
+        )
+
+        self.assertEqual(job.member_id, "member-2")
+        self.assertEqual(job.filename, "older.3mf")
+        self.assertEqual(job.file_path, Path("older.3mf"))
+        self.assertEqual(job.sha256, "b" * 64)
+        self.assertEqual(job.size, 456)
+        self.assertEqual(job.ams_mapping, [])
+        self.assertTrue(job.use_ams)
+        self.assertEqual(job.required_filaments, [])
+        self.assertEqual(job.attempts, 0)
+        self.assertEqual(len(job.submission_uid), 32)
+
+    def test_submission_uid_path_traversal_is_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            outbox = VPrinterOutbox(Path(d) / "vp-outbox")
+            job = CapturedJob(
+                member_id="member-1",
+                filename="part.3mf",
+                file_path=Path("part.3mf"),
+                sha256="a" * 64,
+                size=123,
+                ams_mapping=[],
+                use_ams=False,
+                required_filaments=[],
+                submitted_at=datetime(2026, 6, 13, tzinfo=timezone.utc),
+                submission_uid="../escape",
+            )
+
+            with self.assertRaises(ValueError):
+                outbox.persist(job)
+            with self.assertRaises(ValueError):
+                outbox.remove("../escape")
 
 
 class TestFtpSession(unittest.TestCase):
