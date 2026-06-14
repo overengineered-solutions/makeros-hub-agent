@@ -170,15 +170,20 @@ class _AsyncVirtualPrinterSupervisor:
         self.diagnostics = diagnostics
         self.runtime: _VirtualPrinterRuntime | None = None
         self.fingerprint: tuple[Any, ...] | None = None
+        self._lock = asyncio.Lock()
 
     async def reconcile(self, config: VirtualPrinterConfig | None) -> None:
+        async with self._lock:
+            await self._reconcile_locked(config)
+
+    async def _reconcile_locked(self, config: VirtualPrinterConfig | None) -> None:
         if config is None or not config.enabled:
-            await self.stop()
+            await self._stop_locked()
             return
         fingerprint = _fingerprint(config)
         if self.runtime is not None and self.fingerprint == fingerprint:
             return
-        await self.stop()
+        await self._stop_locked()
         runtime = _VirtualPrinterRuntime(config, base_dir=self.base_dir, on_capture=self.on_capture)
         try:
             await runtime.start()
@@ -204,6 +209,10 @@ class _AsyncVirtualPrinterSupervisor:
         )
 
     async def stop(self) -> None:
+        async with self._lock:
+            await self._stop_locked()
+
+    async def _stop_locked(self) -> None:
         runtime = self.runtime
         self.runtime = None
         self.fingerprint = None
@@ -237,12 +246,13 @@ class _VirtualPrinterRuntime:
         # Lazy imports keep the agent importable before cryptography is present.
         from .bind_server import BindReplyConfig, start_bind_server
         from .cert import create_server_ssl_context, ensure_certificates
-        from .ftp_server import FtpConfig, start_ftp_server
+        from .ftp_server import FtpConfig, start_ftp_server, sweep_uploads_dir
         from .mqtt_broker import MqttBroker
         from .report import build_get_version, build_print_ack, build_push_status
         from .ssdp import SsdpConfig, start_ssdp_responder
 
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        sweep_uploads_dir(self.base_dir / "uploads", log=log.warning)
         bundle = ensure_certificates(self.base_dir, self.config.serial, self.config.bind_ip)
         bind_config = BindReplyConfig(
             serial=self.config.serial,
@@ -374,8 +384,13 @@ def _fingerprint(config: VirtualPrinterConfig) -> tuple[Any, ...]:
         config.trays,
         config.ams_type,
         tuple((member.member_id, member.access_code_sha256) for member in config.members),
-        json.dumps(list(config.pool), sort_keys=True, separators=(",", ":"), default=str),
+        json.dumps(_pool_identity(config.pool), sort_keys=True, separators=(",", ":"), default=str),
     )
+
+
+def _pool_identity(pool: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
+    keys = ("tray_type", "tray_info_idx", "tray_sub_brands", "tray_color", "cols")
+    return [{key: tray.get(key) for key in keys if key in tray} for tray in pool]
 
 
 def _safe_serial(serial: str) -> str:

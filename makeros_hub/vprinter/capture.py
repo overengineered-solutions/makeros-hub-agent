@@ -54,6 +54,7 @@ class CapturedJob:
     submitted_at: datetime
     submission_uid: str = field(default_factory=lambda: uuid.uuid4().hex)
     plate: int | None = None
+    attempts: int = 0
 
     @property
     def file_sha256(self) -> str:
