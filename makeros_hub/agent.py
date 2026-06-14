@@ -18,13 +18,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import platform
 import queue
 import signal
+import shutil
 import socket
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import replace
+from pathlib import Path
 
 from . import __version__
 from .config import SPOOL_DIR, Config, parse_virtual_printer_config, read_credential
@@ -37,7 +41,7 @@ from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_
 from .update import maybe_update
 from .vprinter.capture import CapturedJob, build_vp_submit_body
 from .vprinter.manager import VirtualPrinterManager
-from .vprinter.outbox import VPrinterOutbox
+from .vprinter.outbox import VPrinterOutbox, validate_submission_uid
 
 log = logging.getLogger("makeros-hub")
 
@@ -61,6 +65,7 @@ VP_SUBMIT_TIMEOUT = 8
 VP_DRAIN_BUDGET_SEC = 8
 VPRINTER_RETRY_INITIAL_SEC = 30
 VPRINTER_RETRY_MAX_SEC = 300
+VP_CAPTURE_RECENT_UIDS_MAX = 64
 
 
 def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
@@ -194,10 +199,65 @@ def _enqueue_vprinter_submission(submission_queue: queue.Queue[CapturedJob], job
         log.warning("vprinter.submit.queue_full dropped_newest_count=%d", dropped)
 
 
+def _stage_vprinter_spool_file(job: CapturedJob, spool_dir: Path | str = SPOOL_DIR) -> bool:
+    uid = validate_submission_uid(job.submission_uid)
+    filename = _validate_spool_filename(job.filename)
+    dest_dir = Path(spool_dir) / uid
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest_path = dest_dir / filename
+    if dest_path.exists():
+        return False
+
+    tmp_path = dest_dir / f".{filename}.{threading.get_ident()}.{time.monotonic_ns()}.tmp"
+    try:
+        with Path(job.file_path).open("rb") as source, tmp_path.open("wb") as tmp:
+            shutil.copyfileobj(source, tmp)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        if dest_path.exists():
+            tmp_path.unlink(missing_ok=True)
+            return False
+        os.replace(tmp_path, dest_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def _validate_spool_filename(filename: str) -> str:
+    value = str(filename)
+    if (
+        not value
+        or value in (".", "..")
+        or value != os.path.basename(value)
+        or "/" in value
+        or "\\" in value
+    ):
+        raise ValueError(f"invalid virtual printer spool filename: {value!r}")
+    return value
+
+
+def _remember_recent_vprinter_uid(
+    recent_uids: OrderedDict[str, None],
+    submission_uid: str,
+    *,
+    limit: int = VP_CAPTURE_RECENT_UIDS_MAX,
+) -> None:
+    recent_uids[submission_uid] = None
+    recent_uids.move_to_end(submission_uid)
+    while len(recent_uids) > max(1, int(limit)):
+        recent_uids.popitem(last=False)
+
+
 def _make_vprinter_capture_handler(
     submission_queue: queue.Queue[CapturedJob],
     outbox: VPrinterOutbox | None = None,
+    *,
+    spool_dir: Path | str | None = None,
 ):
+    stage_spool_dir = SPOOL_DIR if spool_dir is None else Path(spool_dir)
+    recent_uids: OrderedDict[str, None] = OrderedDict()
+
     def on_capture(job: CapturedJob) -> None:
         if outbox is not None:
             # Durability is best-effort: a persist failure (transient IO / full
@@ -211,6 +271,21 @@ def _make_vprinter_capture_handler(
                     job.submission_uid,
                     redact(str(exc)),
                 )
+        if job.submission_uid in recent_uids:
+            log.info("vprinter.capture.duplicate uid=%s", job.submission_uid)
+        _remember_recent_vprinter_uid(recent_uids, job.submission_uid)
+        try:
+            staged = _stage_vprinter_spool_file(job, stage_spool_dir)
+        except Exception as exc:  # noqa: BLE001 - staging is best-effort; never drop captures
+            log.warning(
+                "vprinter.spool.stage_failed uid=%s file=%s: %s",
+                job.submission_uid,
+                job.filename,
+                redact(str(exc)),
+            )
+        else:
+            if staged:
+                log.info("vprinter.spool.staged uid=%s file=%s", job.submission_uid, job.filename)
         log.info(
             "vprinter.capture_observed member_id=%s filename=%s size=%d sha256=%s "
             "use_ams=%s ams_mapping=%s required_filaments=%s submitted_at=%s",

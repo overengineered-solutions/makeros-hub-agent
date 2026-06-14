@@ -35,6 +35,7 @@ from makeros_hub.agent import (
     _request_shutdown,
     _restore_shutdown_signal_handlers,
     _run_pending_probes,
+    _stage_vprinter_spool_file,
     heartbeat_payload,
     make_queue_status_reporter,
     run,
@@ -532,37 +533,143 @@ class TestQueueStatusOutbox(unittest.TestCase):
 
 class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
     def test_capture_handler_persists_before_enqueue(self):
-        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
-        job = _captured_job()
-        observed_qsizes = []
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source = base / "part.3mf"
+            source.write_bytes(b"content")
+            q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+            job = replace(_captured_job(), file_path=source, size=source.stat().st_size)
+            observed_qsizes = []
 
-        class FakeOutbox(_FakeVPrinterOutbox):
-            def persist(self, persisted_job):
-                observed_qsizes.append(q.qsize())
-                super().persist(persisted_job)
+            class FakeOutbox(_FakeVPrinterOutbox):
+                def persist(self, persisted_job):
+                    observed_qsizes.append(q.qsize())
+                    super().persist(persisted_job)
 
-        outbox = FakeOutbox()
-        handler = _make_vprinter_capture_handler(q, outbox)
+            outbox = FakeOutbox()
+            handler = _make_vprinter_capture_handler(q, outbox, spool_dir=base / "spool")
 
-        handler(job)
+            handler(job)
 
-        self.assertEqual(observed_qsizes, [0])
-        self.assertEqual(outbox.persisted, [job])
-        self.assertIs(q.get_nowait(), job)
+            self.assertEqual(observed_qsizes, [0])
+            self.assertEqual(outbox.persisted, [job])
+            self.assertIs(q.get_nowait(), job)
 
     def test_capture_handler_persist_failure_still_enqueues(self):
-        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
-        job = _captured_job()
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source = base / "part.3mf"
+            source.write_bytes(b"content")
+            q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+            job = replace(_captured_job(), file_path=source, size=source.stat().st_size)
 
-        class FailingOutbox(_FakeVPrinterOutbox):
-            def persist(self, persisted_job):
-                raise OSError("disk full")
+            class FailingOutbox(_FakeVPrinterOutbox):
+                def persist(self, persisted_job):
+                    raise OSError("disk full")
 
-        handler = _make_vprinter_capture_handler(q, FailingOutbox())
-        # A durability-write failure must NEVER drop the job — it falls back to
-        # the in-memory queue so it still submits this session.
-        handler(job)
-        self.assertIs(q.get_nowait(), job)
+            handler = _make_vprinter_capture_handler(
+                q,
+                FailingOutbox(),
+                spool_dir=base / "spool",
+            )
+            # A durability-write failure must NEVER drop the job — it falls back to
+            # the in-memory queue so it still submits this session.
+            handler(job)
+            self.assertIs(q.get_nowait(), job)
+
+    def test_stage_vprinter_spool_file_writes_atomically_and_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source = base / "source.3mf"
+            source.write_bytes(b"first")
+            job = replace(
+                _captured_job(uid="a" * 64),
+                file_path=source,
+                filename="part.3mf",
+                size=source.stat().st_size,
+            )
+            spool_dir = base / "spool"
+
+            staged = _stage_vprinter_spool_file(job, spool_dir)
+            source.write_bytes(b"second")
+            staged_again = _stage_vprinter_spool_file(job, spool_dir)
+
+            dest = spool_dir / job.submission_uid / job.filename
+            self.assertTrue(staged)
+            self.assertFalse(staged_again)
+            self.assertEqual(dest.read_bytes(), b"first")
+            self.assertEqual(list(dest.parent.glob("*.tmp")), [])
+
+    def test_stage_vprinter_spool_file_rejects_traversal_uid_and_filename(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source = base / "source.3mf"
+            source.write_bytes(b"content")
+            spool_dir = base / "spool"
+
+            with self.assertRaises(ValueError):
+                _stage_vprinter_spool_file(
+                    replace(_captured_job(uid="../bad"), file_path=source),
+                    spool_dir,
+                )
+            for bad_name in ("nested/part.3mf", "nested\\part.3mf", ".."):
+                with self.assertRaises(ValueError):
+                    _stage_vprinter_spool_file(
+                        replace(
+                            _captured_job(uid="b" * 64, filename=bad_name),
+                            file_path=source,
+                        ),
+                        spool_dir,
+                    )
+
+            self.assertFalse((base / "bad").exists())
+            self.assertFalse((spool_dir / ("b" * 64)).exists())
+
+    def test_capture_handler_stage_failure_still_enqueues(self):
+        with tempfile.TemporaryDirectory() as d:
+            q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+            job = replace(_captured_job(uid="c" * 64), file_path=Path(d) / "missing.3mf")
+            handler = _make_vprinter_capture_handler(
+                q,
+                _FakeVPrinterOutbox(),
+                spool_dir=Path(d) / "spool",
+            )
+
+            with self.assertLogs("makeros-hub", level="WARNING") as logs:
+                handler(job)
+
+            self.assertIs(q.get_nowait(), job)
+            self.assertIn("vprinter.spool.stage_failed", "\n".join(logs.output))
+
+    def test_capture_handler_duplicate_uid_logs_and_skips_restage_when_staged(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            source = base / "source.3mf"
+            source.write_bytes(b"first")
+            q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+            job = replace(
+                _captured_job(uid="d" * 64),
+                file_path=source,
+                filename="part.3mf",
+                size=source.stat().st_size,
+            )
+            handler = _make_vprinter_capture_handler(
+                q,
+                _FakeVPrinterOutbox(),
+                spool_dir=base / "spool",
+            )
+
+            handler(job)
+            source.write_bytes(b"second")
+            with self.assertLogs("makeros-hub", level="INFO") as logs:
+                handler(job)
+
+            dest = base / "spool" / job.submission_uid / job.filename
+            self.assertEqual(q.qsize(), 2)
+            self.assertEqual(dest.read_bytes(), b"first")
+            joined = "\n".join(logs.output)
+            self.assertIn("vprinter.capture.duplicate uid=" + job.submission_uid, joined)
+            self.assertNotIn("vprinter.spool.staged", joined)
 
     def test_rehydrate_enqueues_loaded_outbox_jobs(self):
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
