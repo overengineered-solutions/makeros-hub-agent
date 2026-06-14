@@ -54,6 +54,11 @@ from makeros_hub.vprinter.manager import (
 )
 from makeros_hub.vprinter.outbox import VPrinterOutbox, from_record
 from makeros_hub.vprinter.report import build_get_version, build_print_ack, build_push_status
+from makeros_hub.vprinter.ssdp import (
+    BambuSsdpProtocol,
+    SSDP_RATE_LIMIT_BURST,
+    SsdpConfig,
+)
 
 
 def _code_hash(code: str) -> str:
@@ -310,6 +315,90 @@ class TestBindFrame(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_bind_connection_cap_refuses_extra_connection(self):
+        async def run():
+            captured = {}
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+
+            async def fake_start_server(handler, *args, **kwargs):
+                captured["handler"] = handler
+                return _FakeServer()
+
+            async def fake_read_frame(_reader):
+                first_started.set()
+                await release_first.wait()
+                return {"login": {"command": "detect"}}
+
+            with (
+                mock.patch("asyncio.start_server", new=mock.AsyncMock(side_effect=fake_start_server)),
+                mock.patch("makeros_hub.vprinter.bind_server.read_frame", side_effect=fake_read_frame),
+            ):
+                await start_bind_server(
+                    "127.0.0.1",
+                    3000,
+                    mock.Mock(serial="SER123", model="N1", name="VP", fw="01"),
+                    lambda _msg: None,
+                    max_connections=1,
+                )
+
+                writer1 = _FakeWriter(("100.64.0.20", 5000))
+                task1 = asyncio.create_task(captured["handler"](asyncio.StreamReader(), writer1))
+                await first_started.wait()
+
+                writer2 = _FakeWriter(("100.64.0.21", 5001))
+                await captured["handler"](asyncio.StreamReader(), writer2)
+
+                self.assertTrue(writer2.closed)
+                self.assertFalse(writer1.closed)
+                release_first.set()
+                await task1
+                self.assertTrue(writer1.closed)
+
+        asyncio.run(run())
+
+
+class TestSsdpProtocol(unittest.TestCase):
+    def test_msearch_replies_and_throttles_bursts_per_source(self):
+        config = SsdpConfig(
+            ip="100.64.0.10",
+            serial="SER123",
+            model="N1",
+            name="VP",
+            fw="01.08.00.00",
+        )
+        transport = _FakeDatagramTransport()
+        protocol = BambuSsdpProtocol(config, lambda _msg: None)
+        protocol.connection_made(transport)
+        payload = (
+            b"M-SEARCH * HTTP/1.1\r\n"
+            b"HOST: 239.255.255.250:1900\r\n"
+            b'MAN: "ssdp:discover"\r\n'
+            b"MX: 1\r\n\r\n"
+        )
+
+        for _ in range(SSDP_RATE_LIMIT_BURST + 2):
+            protocol.datagram_received(payload, ("100.64.0.20", 1900))
+
+        self.assertEqual(len(transport.sent), SSDP_RATE_LIMIT_BURST)
+        self.assertTrue(transport.sent[0][0].startswith(b"HTTP/1.1 200 OK"))
+
+    def test_short_msearch_datagram_is_ignored(self):
+        config = SsdpConfig(
+            ip="100.64.0.10",
+            serial="SER123",
+            model="N1",
+            name="VP",
+            fw="01.08.00.00",
+        )
+        transport = _FakeDatagramTransport()
+        protocol = BambuSsdpProtocol(config, lambda _msg: None)
+        protocol.connection_made(transport)
+
+        protocol.datagram_received(b"M-SEARCH", ("100.64.0.20", 1900))
+
+        self.assertEqual(transport.sent, [])
+
 
 class TestMqttCodec(unittest.TestCase):
     def test_remaining_length_boundaries(self):
@@ -458,6 +547,58 @@ class TestMqttCodec(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_displaced_session_publish_cannot_mutate_print_state(self):
+        async def run():
+            captured = []
+            broker = _mqtt_broker(on_project_file=captured.append)
+            old_writer = _FakeWriter(("100.64.0.20", 1883))
+            new_writer = _FakeWriter(("100.64.0.21", 1883))
+            old_session = MqttSession(
+                writer=old_writer,
+                peer=old_writer.peer,
+                member_id="old-member",
+                report_topic=broker.default_report_topic,
+                request_topic=broker.default_request_topic,
+            )
+            new_session = MqttSession(
+                writer=new_writer,
+                peer=new_writer.peer,
+                member_id="new-member",
+                report_topic=broker.default_report_topic,
+                request_topic=broker.default_request_topic,
+            )
+            broker._active_session = new_session
+            broker.set_print_state("PREPARE", gcode_file="active.3mf", prepare_percent="42")
+            finish_task = asyncio.create_task(asyncio.sleep(60))
+            broker._finish_task = finish_task
+            publish = parse_publish(
+                0x30,
+                _mqtt_string(broker.default_request_topic)
+                + json.dumps(
+                    {
+                        "print": {
+                            "command": "project_file",
+                            "sequence_id": "9",
+                            "file": "stale.3mf",
+                        }
+                    }
+                ).encode("utf-8"),
+            )
+
+            await broker._handle_publish(old_session, publish)
+
+            self.assertEqual(broker._gcode_state, "PREPARE")
+            self.assertEqual(broker._gcode_file, "active.3mf")
+            self.assertEqual(broker._prepare_percent, "42")
+            self.assertIs(broker._finish_task, finish_task)
+            self.assertFalse(finish_task.done())
+            self.assertEqual(old_writer.writes, [])
+            self.assertEqual(captured, [])
+            finish_task.cancel()
+            await asyncio.gather(finish_task, return_exceptions=True)
+
+        asyncio.run(run())
+
 
 class TestMemberAuth(unittest.TestCase):
     def test_lookup_is_member_attributing_and_checks_all_codes(self):
@@ -510,6 +651,23 @@ class TestMemberAuth(unittest.TestCase):
         self.assertTrue(auth.authenticate("badcode", "100.64.0.21").rate_limited)
         now[0] += 61.0
         self.assertFalse(auth.authenticate("badcode", "100.64.0.20").rate_limited)
+
+    def test_rate_limited_auth_does_not_self_extend_lockout(self):
+        now = [1000.0]
+        limiter = AuthRateLimiter(limit=2, window_sec=10.0, clock=lambda: now[0])
+        auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")], limiter=limiter)
+
+        self.assertFalse(auth.authenticate("badcode", "100.64.0.20").rate_limited)
+        self.assertFalse(auth.authenticate("badcode", "100.64.0.20").rate_limited)
+        for _ in range(20):
+            now[0] += 0.25
+            self.assertTrue(auth.authenticate("badcode", "100.64.0.20").rate_limited)
+
+        now[0] = 1010.1
+        result = auth.authenticate("12345678", "100.64.0.20")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.member_id, "m1")
 
     def test_rate_limiter_prunes_and_caps_random_keys(self):
         now = [1000.0]
@@ -1104,6 +1262,46 @@ class TestFtpSession(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_ftp_session_cap_refuses_extra_control_connection(self):
+        async def run():
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+
+            class BlockingSession:
+                def __init__(self, reader, writer, config, ssl_context, log):
+                    self.writer = writer
+
+                async def run(self):
+                    first_started.set()
+                    await release_first.wait()
+
+                async def abort(self):
+                    self.writer.close()
+
+            with tempfile.TemporaryDirectory() as d:
+                auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")])
+                server = FtpServer(
+                    "127.0.0.1",
+                    990,
+                    FtpConfig("100.64.0.10", Path(d), auth, max_sessions=1),
+                    ssl_context=None,
+                    log=lambda _msg: None,
+                )
+                with mock.patch("makeros_hub.vprinter.ftp_server.FtpSession", BlockingSession):
+                    writer1 = _FakeWriter(("100.64.0.20", 5000))
+                    task1 = asyncio.create_task(server._handle(asyncio.StreamReader(), writer1))
+                    await first_started.wait()
+
+                    writer2 = _FakeWriter(("100.64.0.21", 5001))
+                    await server._handle(asyncio.StreamReader(), writer2)
+
+                    self.assertTrue(writer2.closed)
+                    self.assertFalse(writer1.closed)
+                    release_first.set()
+                    await task1
+
+        asyncio.run(run())
+
     def test_ftp_passive_listener_uses_reuse_address(self):
         async def run():
             with tempfile.TemporaryDirectory() as d:
@@ -1117,6 +1315,41 @@ class TestFtpSession(unittest.TestCase):
                 self.assertEqual(passive.port, 50000)
                 self.assertTrue(start.await_args.kwargs["reuse_address"])
                 await passive.close()
+
+        asyncio.run(run())
+
+    def test_ftp_passive_rejects_data_peer_mismatch_and_accepts_control_peer(self):
+        async def run():
+            captured = {}
+
+            async def fake_start_server(handler, *args, **kwargs):
+                captured["handler"] = handler
+                return _FakeServer()
+
+            with tempfile.TemporaryDirectory() as d:
+                auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")])
+                session = _ftp_session(
+                    FtpConfig("100.64.0.10", Path(d), auth, passive_start=50000, passive_end=50000),
+                    peer=("100.64.0.20", 12345),
+                )
+                with mock.patch("asyncio.start_server", new=mock.AsyncMock(side_effect=fake_start_server)):
+                    passive = await session.open_passive()
+
+                bad_writer = _FakeWriter(("100.64.0.99", 5001))
+                await captured["handler"](asyncio.StreamReader(), bad_writer)
+                self.assertTrue(bad_writer.closed)
+                self.assertFalse(passive.connection.done())
+
+                good_reader = asyncio.StreamReader()
+                good_writer = _FakeWriter(("100.64.0.20", 5002))
+                task = asyncio.create_task(captured["handler"](good_reader, good_writer))
+                reader, writer = await asyncio.wait_for(passive.connection, timeout=0.1)
+
+                self.assertIs(reader, good_reader)
+                self.assertIs(writer, good_writer)
+                self.assertFalse(good_writer.closed)
+                await passive.close()
+                await task
 
         asyncio.run(run())
 
@@ -1392,7 +1625,7 @@ def _mqtt_string(value: str) -> bytes:
     return len(raw).to_bytes(2, "big") + raw
 
 
-def _mqtt_broker() -> MqttBroker:
+def _mqtt_broker(on_project_file=None) -> MqttBroker:
     auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")])
     return MqttBroker(
         serial="SER123",
@@ -1400,7 +1633,7 @@ def _mqtt_broker() -> MqttBroker:
         report_builder=lambda *_args: {"print": {"command": "push_status"}},
         version_builder=lambda _seq: {"info": {"module": []}},
         ack_builder=lambda _seq, _file: {"print": {"command": "project_file"}},
-        on_project_file=None,
+        on_project_file=on_project_file,
         log=lambda _msg: None,
     )
 
@@ -1473,6 +1706,14 @@ class _FakeSocket:
 
     def setsockopt(self, level, optname, value):
         self.options.append((level, optname, value))
+
+
+class _FakeDatagramTransport:
+    def __init__(self):
+        self.sent = []
+
+    def sendto(self, data, addr):
+        self.sent.append((data, addr))
 
 
 class _FakeServer:

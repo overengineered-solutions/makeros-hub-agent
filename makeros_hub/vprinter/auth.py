@@ -125,7 +125,6 @@ class MemberAuthSet:
 
     def authenticate(self, access_code: str | None, ip: str | None = None) -> AuthResult:
         if self.limiter.is_limited(ip, access_code):
-            self.limiter.record_failure(ip, access_code)
             return AuthResult(ok=False, rate_limited=True)
         member_id = self.lookup_member_id(access_code)
         if member_id is not None:

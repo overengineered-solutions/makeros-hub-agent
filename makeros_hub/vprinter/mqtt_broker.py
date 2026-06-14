@@ -380,6 +380,9 @@ class MqttBroker:
         session.subscribed = any(topic == session.report_topic for topic, _qos in subscribe.topics)
 
     async def _handle_publish(self, session: MqttSession, publish: PublishPacket) -> None:
+        if not self._session_is_active(session):
+            self.log(f"MQTT ignoring PUBLISH from displaced session peer={session.peer}")
+            return
         text = publish.payload.decode("utf-8", errors="replace").rstrip("\x00 \r\n\t")
         parsed = _json_or_none(text)
         command = _command_name(parsed)
@@ -408,6 +411,8 @@ class MqttBroker:
             if isinstance(parsed, dict):
                 seq = str(parsed.get("print", {}).get("sequence_id", ""))
             await self._send_print_ack(session, seq, gfile)
+            if not self._session_is_active(session):
+                return
             if intent is not None and self.on_project_file is not None:
                 try:
                     self.on_project_file(intent)
@@ -431,6 +436,9 @@ class MqttBroker:
         await self._send_report(session, "hot_apply")
 
     async def _send_report(self, session: MqttSession, reason: str) -> None:
+        if not self._session_is_active(session):
+            self.log(f"MQTT skipping report for displaced session peer={session.peer}")
+            return
         report = self.report_builder(
             self._sequence,
             self._gcode_state,
@@ -449,6 +457,9 @@ class MqttBroker:
         )
 
     async def _send_version(self, session: MqttSession, sequence_id: str) -> None:
+        if not self._session_is_active(session):
+            self.log(f"MQTT skipping version response for displaced session peer={session.peer}")
+            return
         version = self.version_builder(sequence_id)
         payload = json.dumps(version, indent=4).encode("utf-8")
         packet = build_publish(session.report_topic, payload, qos=0)
@@ -461,6 +472,9 @@ class MqttBroker:
         )
 
     async def _send_print_ack(self, session: MqttSession, sequence_id: str, gcode_file: str) -> None:
+        if not self._session_is_active(session):
+            self.log(f"MQTT skipping print ack for displaced session peer={session.peer}")
+            return
         self.set_print_state("PREPARE", gcode_file=gcode_file, prepare_percent="0")
         ack = self.ack_builder(sequence_id, gcode_file)
         payload = json.dumps(ack, indent=4).encode("utf-8")
@@ -469,6 +483,9 @@ class MqttBroker:
             session.writer.write(packet)
             await _drain(session.writer)
         self.log(f"MQTT PUBLISH broker->client reason=project_file_ack file={gcode_file!r}")
+        if not self._session_is_active(session):
+            self.log(f"MQTT skipping finish schedule for displaced session peer={session.peer}")
+            return
         self._schedule_finish(gcode_file)
 
     def set_print_state(
@@ -511,6 +528,9 @@ class MqttBroker:
         self._gcode_state = "IDLE"
         self._gcode_file = ""
         self._prepare_percent = "0"
+
+    def _session_is_active(self, session: MqttSession) -> bool:
+        return self._active_session is session and not session.writer.is_closing()
 
 
 async def _read_packet(
