@@ -6,8 +6,11 @@
 import hashlib
 import json
 import queue
+import signal
 import tempfile
+import threading
 import unittest
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -18,15 +21,21 @@ from makeros_hub.agent import (
     QUEUE_STATUS_RETRY,
     QUEUE_STATUS_SENT,
     _TailscaleRuntimeState,
+    _VirtualPrinterRuntimeState,
     _drain_vprinter_submissions,
     _enqueue_vprinter_submission,
     _flush_queue_status_reports,
+    _install_shutdown_signal_handlers,
     _maybe_retry_tailscale_config,
+    _maybe_retry_vprinter_config,
     _pull_config,
     _reconcile_tailscale_config,
+    _request_shutdown,
+    _restore_shutdown_signal_handlers,
     _run_pending_probes,
     heartbeat_payload,
     make_queue_status_reporter,
+    run,
 )
 from makeros_hub.config import Config
 from makeros_hub.vprinter.capture import CapturedJob
@@ -270,6 +279,52 @@ class TestConfigDownTailscale(unittest.TestCase):
         reconciler.assert_called_once_with(state.config)
         self.assertEqual(state.next_retry_at, 90)
         self.assertLessEqual(state.retry_delay_sec, 300)
+
+
+class TestVirtualPrinterStartRetry(unittest.TestCase):
+    def test_enabled_start_failure_retries_without_config_change(self):
+        cfg = mock.Mock()
+        state = _VirtualPrinterRuntimeState()
+
+        class Manager:
+            def __init__(self):
+                self.calls = 0
+                self.model = None
+
+            def reconcile_sync(self, config):
+                self.calls += 1
+                self.reconciled = config
+                if self.calls == 2:
+                    self.model = "N1"
+
+            def current_model(self):
+                return self.model
+
+        manager = Manager()
+        state.remember_config(cfg)
+        state.record_reconcile_attempt(manager.current_model(), now=0)
+
+        self.assertFalse(_maybe_retry_vprinter_config(state, manager, now=29))
+        self.assertEqual(manager.calls, 0)
+
+        self.assertTrue(_maybe_retry_vprinter_config(state, manager, now=30))
+        self.assertEqual(manager.calls, 1)
+        self.assertIs(manager.reconciled, cfg)
+
+        self.assertTrue(_maybe_retry_vprinter_config(state, manager, now=90))
+        self.assertEqual(manager.calls, 2)
+        self.assertEqual(manager.current_model(), "N1")
+        self.assertEqual(state.next_retry_at, 0.0)
+
+    def test_disabled_vprinter_config_does_not_arm_retry(self):
+        state = _VirtualPrinterRuntimeState()
+        # A disabled config block (non-None) must NOT arm the retry timer — else
+        # needs_retry() (keyed on "current_model is None") would re-reconcile a
+        # deliberately-stopped VP every heartbeat.
+        state.remember_config(mock.Mock(enabled=False))
+        self.assertIsNone(state.config)
+        self.assertFalse(state.needs_retry(current_model=None))
+        self.assertFalse(state.retry_due(now=10_000.0, current_model=None))
 
 
 class TestConfigDownVirtualPrinter(unittest.TestCase):
@@ -518,10 +573,43 @@ class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
         )
 
         self.assertEqual(submitted, 0)
-        self.assertEqual(q.get_nowait().submission_uid, job.submission_uid)
+        retried = q.get_nowait()
+        self.assertEqual(retried.submission_uid, job.submission_uid)
+        self.assertEqual(retried.attempts, 1)
         self.assertIn("vp-submit transport", diag.errors.snapshot()["vprinter"]["message"])
 
-    def test_drain_non_200_reenqueues(self):
+    def test_drain_deterministic_400_deadletters_without_reenqueue(self):
+        cfg = Config(cloud_url="https://host.example")
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = _captured_job()
+        _enqueue_vprinter_submission(q, job)
+
+        def poster(_url, _payload, *, bearer, timeout):
+            return http.Response(400, {"error": "payload_shape_mismatch"})
+
+        with self.assertLogs("makeros-hub", level="WARNING") as logs:
+            _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
+
+        self.assertTrue(q.empty())
+        self.assertIn("vprinter.submit.deadletter", "\n".join(logs.output))
+
+    def test_drain_recoverable_4xx_retries_not_deadletter(self):
+        cfg = Config(cloud_url="https://host.example")
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = _captured_job()
+        _enqueue_vprinter_submission(q, job)
+
+        def poster(_url, _payload, *, bearer, timeout):
+            return http.Response(401, {"error": "unauthorized"})
+
+        _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
+        # 401 is a recoverable hub-auth CONTEXT error (e.g. a rotated credential),
+        # not a job-intrinsic rejection — retry under the cap, never lose the job.
+        retried = q.get_nowait()
+        self.assertEqual(retried.submission_uid, job.submission_uid)
+        self.assertEqual(retried.attempts, 1)
+
+    def test_drain_503_retries_with_attempt_increment(self):
         cfg = Config(cloud_url="https://host.example")
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
         job = _captured_job()
@@ -532,7 +620,24 @@ class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
 
         _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
 
-        self.assertEqual(q.get_nowait().submission_uid, job.submission_uid)
+        retried = q.get_nowait()
+        self.assertEqual(retried.submission_uid, job.submission_uid)
+        self.assertEqual(retried.attempts, 1)
+
+    def test_drain_max_attempts_deadletters_retryable_failure(self):
+        cfg = Config(cloud_url="https://host.example")
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = replace(_captured_job(), attempts=9)
+        _enqueue_vprinter_submission(q, job)
+
+        def poster(_url, _payload, *, bearer, timeout):
+            return http.Response(503, {"error": "try later"})
+
+        with self.assertLogs("makeros-hub", level="WARNING") as logs:
+            _drain_vprinter_submissions(q, cfg, "cred", model="N1", poster=poster)
+
+        self.assertTrue(q.empty())
+        self.assertIn("vprinter.submit.deadletter", "\n".join(logs.output))
 
     def test_enqueue_full_queue_drops_oldest(self):
         q: queue.Queue[CapturedJob] = queue.Queue(maxsize=2)
@@ -550,6 +655,129 @@ class TestVirtualPrinterSubmissionOutbox(unittest.TestCase):
         _drain_vprinter_submissions(q, cfg, "cred", model=None)
 
         self.assertTrue(q.empty())
+
+
+class TestRunLoopShutdown(unittest.TestCase):
+    def test_signal_handlers_set_shutdown_event_and_restore_previous_handlers(self):
+        stop_event = threading.Event()
+        installed = {}
+        previous_handlers = {
+            signal.SIGTERM: object(),
+            signal.SIGINT: object(),
+        }
+
+        def fake_signal(sig, handler):
+            installed[sig] = handler
+
+        with mock.patch("makeros_hub.agent.signal.getsignal", side_effect=previous_handlers.get), mock.patch(
+            "makeros_hub.agent.signal.signal", side_effect=fake_signal
+        ):
+            previous = _install_shutdown_signal_handlers(stop_event)
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+            _restore_shutdown_signal_handlers(previous)
+
+        self.assertTrue(stop_event.is_set())
+        self.assertEqual(previous, previous_handlers)
+        self.assertIs(installed[signal.SIGTERM], previous_handlers[signal.SIGTERM])
+        self.assertIs(installed[signal.SIGINT], previous_handlers[signal.SIGINT])
+
+    def test_heartbeat_transport_error_still_invokes_vprinter_drain(self):
+        stop_event = threading.Event()
+        drains = []
+
+        class FakeIngest:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class FakeVirtualPrinterManager:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def current_model(self):
+                return "N1"
+
+            def stop_sync(self):
+                pass
+
+        def drain(*_args, **kwargs):
+            drains.append(kwargs.get("model"))
+            stop_event.set()
+            return 0
+
+        with mock.patch("makeros_hub.agent.read_credential", return_value="cred"), mock.patch(
+            "makeros_hub.agent._pull_config", return_value={"tailscaleStatus": "disabled"}
+        ), mock.patch("makeros_hub.agent.IngestServer", FakeIngest), mock.patch(
+            "makeros_hub.agent.VirtualPrinterManager", FakeVirtualPrinterManager
+        ), mock.patch(
+            "makeros_hub.agent.tailscale_binary_exists", return_value=False
+        ), mock.patch(
+            "makeros_hub.agent.post_json", side_effect=http.TransportError("network down")
+        ), mock.patch(
+            "makeros_hub.agent._drain_vprinter_submissions_safely", side_effect=drain
+        ):
+            result = run(
+                Config(cloud_url="https://host.example", heartbeat_sec=1),
+                _stop_event=stop_event,
+                _install_signals=False,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertGreaterEqual(len(drains), 1)
+        self.assertEqual(drains[0], "N1")
+
+    def test_shutdown_signal_event_runs_final_vprinter_drain(self):
+        stop_event = threading.Event()
+        _request_shutdown(stop_event, signal.SIGTERM)
+        q: queue.Queue[CapturedJob] = queue.Queue(maxsize=4)
+        job = _captured_job()
+        _enqueue_vprinter_submission(q, job)
+        submitted = []
+
+        class FakeIngest:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class FakeVirtualPrinterManager:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def current_model(self):
+                return "N1"
+
+            def stop_sync(self):
+                pass
+
+        def poster(url, payload, *, bearer, timeout):
+            submitted.append((url, payload, bearer, timeout))
+            return http.Response(200, {"ok": True, "jobId": "job-1"})
+
+        with mock.patch("makeros_hub.agent.read_credential", return_value="cred"), mock.patch(
+            "makeros_hub.agent._pull_config", return_value={"tailscaleStatus": "disabled"}
+        ), mock.patch("makeros_hub.agent.IngestServer", FakeIngest), mock.patch(
+            "makeros_hub.agent.VirtualPrinterManager", FakeVirtualPrinterManager
+        ), mock.patch("makeros_hub.agent.post_json", side_effect=poster):
+            result = run(
+                Config(cloud_url="https://host.example", heartbeat_sec=1),
+                _stop_event=stop_event,
+                _install_signals=False,
+                _submission_queue=q,
+            )
+
+        self.assertEqual(result, 0)
+        self.assertTrue(q.empty())
+        self.assertEqual(submitted[0][1]["hubSubmissionUid"], job.submission_uid)
 
 
 class TestEnroll(unittest.TestCase):

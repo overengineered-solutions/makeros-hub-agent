@@ -83,7 +83,13 @@ async def start_bind_server(
             writer.close()
             await _wait_closed(writer)
 
-    return await asyncio.start_server(handle, host=host, port=port, ssl=ssl_context)
+    return await asyncio.start_server(
+        handle,
+        host=host,
+        port=port,
+        ssl=ssl_context,
+        reuse_address=True,
+    )
 
 
 def build_detect_reply(config: BindReplyConfig) -> dict[str, Any]:

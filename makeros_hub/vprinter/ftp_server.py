@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -17,6 +18,9 @@ FTP_CONTROL_TIMEOUT_SEC = 300.0
 FTP_DATA_CONNECT_TIMEOUT_SEC = 30.0
 FTP_CHUNK_TIMEOUT_SEC = 60.0
 FTP_CHUNK_SIZE = 65536
+UPLOAD_COMMITTED_TTL_SEC = 24 * 60 * 60
+UPLOAD_PART_TTL_SEC = 5 * 60
+UPLOAD_MAX_TOTAL_BYTES = 500 * 1024 * 1024
 
 
 @dataclass
@@ -79,6 +83,7 @@ class FtpServer:
             host=self.host,
             port=self.port,
             ssl=self.ssl_context,
+            reuse_address=True,
         )
         return self
 
@@ -372,6 +377,7 @@ class FtpSession:
                     host="0.0.0.0",
                     port=port,
                     ssl=self.ssl_context,
+                    reuse_address=True,
                 )
                 self.log(f"FTPS passive listener opened on {port}")
                 return PassiveDataServer(server, port, future, done)
@@ -431,6 +437,67 @@ def _unique_upload_paths(upload_dir: Path, filename: str) -> tuple[Path, Path]:
     return upload_dir / stored_name, upload_dir / f".{stored_name}.{os.getpid()}.part"
 
 
+def sweep_uploads_dir(
+    upload_dir: Path,
+    *,
+    committed_ttl_sec: float = UPLOAD_COMMITTED_TTL_SEC,
+    part_ttl_sec: float = UPLOAD_PART_TTL_SEC,
+    max_total_bytes: int = UPLOAD_MAX_TOTAL_BYTES,
+    now: float | None = None,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, int]:
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    current = time.time() if now is None else now
+    kept: list[tuple[float, Path, int]] = []
+    total = 0
+    removed_age = 0
+    removed_cap = 0
+    bytes_removed = 0
+
+    for path in upload_dir.iterdir():
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        if not path.is_file():
+            continue
+        age = max(0.0, current - stat.st_mtime)
+        is_part = path.name.startswith(".") and path.name.endswith(".part")
+        ttl = part_ttl_sec if is_part else committed_ttl_sec
+        if age >= ttl:
+            if _unlink_quietly(path):
+                removed_age += 1
+                bytes_removed += stat.st_size
+            continue
+        kept.append((stat.st_mtime, path, stat.st_size))
+        total += stat.st_size
+
+    if total > max_total_bytes:
+        for mtime, path, size in sorted(kept, key=lambda item: item[0]):
+            age = max(0.0, current - mtime)
+            if age < part_ttl_sec:
+                continue
+            if _unlink_quietly(path):
+                removed_cap += 1
+                bytes_removed += size
+                total -= size
+            if total <= max_total_bytes:
+                break
+
+    if (removed_age or removed_cap) and log is not None:
+        log(
+            "vprinter.uploads.sweep "
+            f"removed_age={removed_age} removed_cap={removed_cap} "
+            f"bytes_removed={bytes_removed} total_bytes={max(0, total)}"
+        )
+    return {
+        "removed_age": removed_age,
+        "removed_cap": removed_cap,
+        "bytes_removed": bytes_removed,
+        "total_bytes": max(0, total),
+    }
+
+
 def _display_command(verb: str, arg: str) -> str:
     if verb == "PASS":
         return "PASS <redacted>"
@@ -443,13 +510,14 @@ def _peer_ip(peer: object) -> str | None:
     return None
 
 
-def _unlink_quietly(path: Path) -> None:
+def _unlink_quietly(path: Path) -> bool:
     try:
         path.unlink()
+        return True
     except FileNotFoundError:
-        pass
+        return False
     except OSError:
-        pass
+        return False
 
 
 async def _wait_closed(writer: asyncio.StreamWriter) -> None:

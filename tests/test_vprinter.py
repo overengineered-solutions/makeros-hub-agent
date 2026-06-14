@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import socket
 import struct
 import tempfile
 import unittest
@@ -13,9 +15,15 @@ from pathlib import Path
 from unittest import mock
 
 from makeros_hub.config import VirtualPrinterMember, parse_virtual_printer_config
-from makeros_hub.vprinter.ftp_server import FtpConfig, FtpSession
+from makeros_hub.vprinter.ftp_server import FtpConfig, FtpServer, FtpSession, sweep_uploads_dir
 from makeros_hub.vprinter.auth import AuthRateLimiter, MemberAuthSet
-from makeros_hub.vprinter.bind_server import END_MAGIC, START_MAGIC, decode_frame, encode_frame
+from makeros_hub.vprinter.bind_server import (
+    END_MAGIC,
+    START_MAGIC,
+    decode_frame,
+    encode_frame,
+    start_bind_server,
+)
 from makeros_hub.vprinter.capture import (
     CaptureCoordinator,
     CapturedJob,
@@ -38,6 +46,7 @@ from makeros_hub.vprinter.mqtt_broker import (
     parse_publish,
     _read_packet,
 )
+from makeros_hub.vprinter.manager import _AsyncVirtualPrinterSupervisor, _fingerprint
 from makeros_hub.vprinter.report import build_get_version, build_print_ack, build_push_status
 
 
@@ -169,6 +178,55 @@ class TestVirtualPrinterConfig(unittest.TestCase):
             )
         )
 
+    def test_fingerprint_uses_only_pool_identity_fields(self):
+        def make_cfg(**tray_overrides):
+            tray = {
+                "tray_type": "PLA",
+                "tray_info_idx": "GFA00",
+                "tray_sub_brands": "MakerOS",
+                "tray_color": "FFFFFFFF",
+                "cols": ["FFFFFFFF"],
+                "remain": 100,
+                "nozzle_temp_min": "190",
+                "nozzle_temp_max": "230",
+                "tag_uid": "tag-1",
+                "tray_uuid": "uuid-1",
+            }
+            tray.update(tray_overrides)
+            return parse_virtual_printer_config(
+                {
+                    "enabled": True,
+                    "serial": "SER123",
+                    "model": "N1",
+                    "name": "VP A1",
+                    "fw": "01.08.00.00",
+                    "bind_ip": "100.64.0.10",
+                    "members": [{"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}],
+                    "pool": [tray],
+                }
+            )
+
+        base = make_cfg()
+        volatile_changed = make_cfg(
+            remain=42,
+            nozzle_temp_min="200",
+            nozzle_temp_max="250",
+            tag_uid="tag-2",
+            tray_uuid="uuid-2",
+        )
+        identity_changed = make_cfg(
+            tray_type="PETG",
+            tray_info_idx="GFG00",
+            tray_color="11223344",
+            cols=["11223344"],
+        )
+
+        self.assertIsNotNone(base)
+        self.assertIsNotNone(volatile_changed)
+        self.assertIsNotNone(identity_changed)
+        self.assertEqual(_fingerprint(base), _fingerprint(volatile_changed))
+        self.assertNotEqual(_fingerprint(base), _fingerprint(identity_changed))
+
 
 class TestReportBuilders(unittest.TestCase):
     def test_push_status_16_slots_two_filled_ams_2_pro(self):
@@ -230,6 +288,21 @@ class TestBindFrame(unittest.TestCase):
         with self.assertRaises(ValueError):
             decode_frame(bytes(frame))
 
+    def test_bind_listener_uses_reuse_address(self):
+        async def run():
+            with mock.patch("asyncio.start_server", new=mock.AsyncMock(return_value=_FakeServer())) as start:
+                server = await start_bind_server(
+                    "127.0.0.1",
+                    3000,
+                    mock.Mock(serial="SER123", model="N1", name="VP", fw="01"),
+                    lambda _msg: None,
+                )
+
+            self.assertIsInstance(server, _FakeServer)
+            self.assertTrue(start.await_args.kwargs["reuse_address"])
+
+        asyncio.run(run())
+
 
 class TestMqttCodec(unittest.TestCase):
     def test_remaining_length_boundaries(self):
@@ -269,6 +342,78 @@ class TestMqttCodec(unittest.TestCase):
             reader.feed_eof()
             with self.assertRaises(ValueError):
                 await _read_packet(reader)
+
+        asyncio.run(run())
+
+    def test_mqtt_listener_uses_reuse_address(self):
+        async def run():
+            broker = _mqtt_broker()
+            with mock.patch("asyncio.start_server", new=mock.AsyncMock(return_value=_FakeServer())) as start:
+                server = await broker.start("127.0.0.1", 8883, ssl_context=None)
+
+            self.assertIsInstance(server, _FakeServer)
+            self.assertTrue(start.await_args.kwargs["reuse_address"])
+
+        asyncio.run(run())
+
+    def test_silent_client_times_out_and_cleans_active_writer(self):
+        async def run():
+            broker = _mqtt_broker()
+            reader = asyncio.StreamReader()
+            payload = (
+                _mqtt_string("MQTT")
+                + bytes([4, 0xC2])
+                + (1).to_bytes(2, "big")
+                + _mqtt_string("orca-client")
+                + _mqtt_string("bblp")
+                + _mqtt_string("12345678")
+            )
+            reader.feed_data(b"\x10" + encode_remaining_length(len(payload)) + payload)
+            writer = _FakeWriter(("100.64.0.20", 1883), sock=_FakeSocket())
+
+            with mock.patch("makeros_hub.vprinter.mqtt_broker._mqtt_read_timeout", return_value=0.01):
+                await broker._handle_client(reader, writer)
+
+            self.assertTrue(writer.closed)
+            self.assertIsNone(broker._active_writer)
+            self.assertEqual(broker._client_tasks, set())
+            self.assertIn(
+                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+                writer.sock.options,
+            )
+
+        asyncio.run(run())
+
+    def test_reset_print_state_clears_lingering_job(self):
+        broker = _mqtt_broker()
+        broker.set_print_state("FINISH", gcode_file="Cube.gcode.3mf", prepare_percent="100")
+        broker._reset_print_state()
+        self.assertEqual(broker._gcode_state, "IDLE")
+        self.assertEqual(broker._gcode_file, "")
+        self.assertEqual(broker._prepare_percent, "0")
+        self.assertIsNone(broker._finish_task)
+
+    def test_fresh_connect_presents_idle_not_a_phantom_job(self):
+        async def run():
+            broker = _mqtt_broker()
+            # A prior session left a completed job in the broker's print state.
+            broker.set_print_state("FINISH", gcode_file="Cube.gcode.3mf", prepare_percent="100")
+            reader = asyncio.StreamReader()
+            payload = (
+                _mqtt_string("MQTT")
+                + bytes([4, 0xC2])
+                + (1).to_bytes(2, "big")
+                + _mqtt_string("orca-client")
+                + _mqtt_string("bblp")
+                + _mqtt_string("12345678")
+            )
+            reader.feed_data(b"\x10" + encode_remaining_length(len(payload)) + payload)
+            writer = _FakeWriter(("100.64.0.20", 1883), sock=_FakeSocket())
+            with mock.patch("makeros_hub.vprinter.mqtt_broker._mqtt_read_timeout", return_value=0.01):
+                await broker._handle_client(reader, writer)
+            # The fresh connect cleared the phantom job -> a clean idle printer.
+            self.assertEqual(broker._gcode_state, "IDLE")
+            self.assertEqual(broker._gcode_file, "")
 
         asyncio.run(run())
 
@@ -660,6 +805,67 @@ class TestCaptureAssembly(unittest.TestCase):
 
 
 class TestFtpSession(unittest.TestCase):
+    def test_sweep_uploads_removes_old_and_cap_excess_but_keeps_fresh(self):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d)
+            now = 10_000.0
+            old_committed = _write_upload(base / "old.3mf", b"old", now - 90_000)
+            old_part = _write_upload(base / ".old.3mf.123.part", b"part", now - 600)
+            cap_old_1 = _write_upload(base / "cap-old-1.3mf", b"a" * 60, now - 1_000)
+            cap_old_2 = _write_upload(base / "cap-old-2.3mf", b"b" * 60, now - 900)
+            fresh = _write_upload(base / "fresh.3mf", b"fresh" * 16, now)
+
+            result = sweep_uploads_dir(
+                base,
+                committed_ttl_sec=24 * 60 * 60,
+                part_ttl_sec=300,
+                max_total_bytes=100,
+                now=now,
+            )
+
+            self.assertFalse(old_committed.exists())
+            self.assertFalse(old_part.exists())
+            self.assertFalse(cap_old_1.exists())
+            self.assertFalse(cap_old_2.exists())
+            self.assertTrue(fresh.exists())
+            self.assertEqual(result["removed_age"], 2)
+            self.assertEqual(result["removed_cap"], 2)
+
+    def test_ftp_control_listener_uses_reuse_address(self):
+        async def run():
+            auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")])
+            with tempfile.TemporaryDirectory() as d:
+                server = FtpServer(
+                    "127.0.0.1",
+                    990,
+                    FtpConfig("100.64.0.10", Path(d), auth),
+                    ssl_context=None,
+                    log=lambda _msg: None,
+                )
+                with mock.patch("asyncio.start_server", new=mock.AsyncMock(return_value=_FakeServer())) as start:
+                    returned = await server.start()
+
+            self.assertIs(returned, server)
+            self.assertTrue(start.await_args.kwargs["reuse_address"])
+
+        asyncio.run(run())
+
+    def test_ftp_passive_listener_uses_reuse_address(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as d:
+                auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")])
+                session = _ftp_session(
+                    FtpConfig("100.64.0.10", Path(d), auth, passive_start=50000, passive_end=50000)
+                )
+                with mock.patch("asyncio.start_server", new=mock.AsyncMock(return_value=_FakeServer())) as start:
+                    passive = await session.open_passive()
+
+                self.assertEqual(passive.port, 50000)
+                self.assertTrue(start.await_args.kwargs["reuse_address"])
+                await passive.close()
+
+        asyncio.run(run())
+
     def test_pasv_before_login_is_rejected(self):
         async def run():
             with tempfile.TemporaryDirectory() as d:
@@ -707,9 +913,99 @@ class TestFtpSession(unittest.TestCase):
         asyncio.run(run())
 
 
+class TestVirtualPrinterSupervisor(unittest.TestCase):
+    def test_concurrent_reconciles_do_not_interleave(self):
+        async def run():
+            with tempfile.TemporaryDirectory() as d:
+                first_started = asyncio.Event()
+                release_first = asyncio.Event()
+                events = []
+
+                class FakeRuntime:
+                    def __init__(self, config, *, base_dir, on_capture):
+                        self.config = config
+                        events.append(("init", config.serial))
+
+                    async def start(self):
+                        events.append(("start", self.config.serial))
+                        if self.config.serial == "SER1":
+                            first_started.set()
+                            await release_first.wait()
+                        events.append(("started", self.config.serial))
+
+                    async def stop(self):
+                        events.append(("stop", self.config.serial))
+
+                supervisor = _AsyncVirtualPrinterSupervisor(
+                    base_dir=Path(d),
+                    on_capture=lambda _job: None,
+                )
+                cfg1 = _vp_config("SER1")
+                cfg2 = _vp_config("SER2")
+
+                with mock.patch("makeros_hub.vprinter.manager._VirtualPrinterRuntime", FakeRuntime):
+                    task1 = asyncio.create_task(supervisor.reconcile(cfg1))
+                    await first_started.wait()
+                    task2 = asyncio.create_task(supervisor.reconcile(cfg2))
+                    await asyncio.sleep(0)
+                    self.assertNotIn(("init", "SER2"), events)
+                    release_first.set()
+                    await asyncio.gather(task1, task2)
+
+            self.assertEqual(
+                events,
+                [
+                    ("init", "SER1"),
+                    ("start", "SER1"),
+                    ("started", "SER1"),
+                    ("stop", "SER1"),
+                    ("init", "SER2"),
+                    ("start", "SER2"),
+                    ("started", "SER2"),
+                ],
+            )
+
+        asyncio.run(run())
+
+
 def _mqtt_string(value: str) -> bytes:
     raw = value.encode("utf-8")
     return len(raw).to_bytes(2, "big") + raw
+
+
+def _mqtt_broker() -> MqttBroker:
+    auth = MemberAuthSet([VirtualPrinterMember(_code_hash("12345678"), "m1")])
+    return MqttBroker(
+        serial="SER123",
+        auth=auth,
+        report_builder=lambda *_args: {"print": {"command": "push_status"}},
+        version_builder=lambda _seq: {"info": {"module": []}},
+        ack_builder=lambda _seq, _file: {"print": {"command": "project_file"}},
+        on_project_file=None,
+        log=lambda _msg: None,
+    )
+
+
+def _vp_config(serial: str):
+    cfg = parse_virtual_printer_config(
+        {
+            "enabled": True,
+            "serial": serial,
+            "model": "N1",
+            "name": "VP A1",
+            "fw": "01.08.00.00",
+            "bind_ip": "100.64.0.10",
+            "members": [{"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}],
+        }
+    )
+    assert cfg is not None
+    return cfg
+
+
+def _write_upload(path: Path, data: bytes, mtime: float) -> Path:
+    path.write_bytes(data)
+    os.utime(path, (mtime, mtime))
+    return path
 
 
 def _ftp_session(config: FtpConfig, peer=("100.64.0.20", 12345)) -> FtpSession:
@@ -723,14 +1019,17 @@ def _ftp_session(config: FtpConfig, peer=("100.64.0.20", 12345)) -> FtpSession:
 
 
 class _FakeWriter:
-    def __init__(self, peer):
+    def __init__(self, peer, sock=None):
         self.peer = peer
+        self.sock = sock
         self.writes = []
         self.closed = False
 
     def get_extra_info(self, name):
         if name == "peername":
             return self.peer
+        if name == "socket":
+            return self.sock
         return None
 
     def write(self, data):
@@ -744,6 +1043,25 @@ class _FakeWriter:
 
     def is_closing(self):
         return self.closed
+
+    async def wait_closed(self):
+        return None
+
+
+class _FakeSocket:
+    def __init__(self):
+        self.options = []
+
+    def setsockopt(self, level, optname, value):
+        self.options.append((level, optname, value))
+
+
+class _FakeServer:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
 
     async def wait_closed(self):
         return None

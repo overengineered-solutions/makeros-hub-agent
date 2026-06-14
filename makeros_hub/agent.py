@@ -20,8 +20,11 @@ import json
 import logging
 import platform
 import queue
+import signal
 import socket
+import threading
 import time
+from dataclasses import replace
 
 from . import __version__
 from .config import SPOOL_DIR, Config, parse_virtual_printer_config, read_credential
@@ -43,11 +46,20 @@ QUEUE_STATUS_DROP = "drop"
 MAX_PROBES_PER_HEARTBEAT = 3
 VP_SUBMISSION_QUEUE_MAX = 256
 VP_SUBMISSIONS_PER_HEARTBEAT = 16
+VP_SUBMISSION_MAX_ATTEMPTS = 10
+# Job-INTRINSIC rejections only: the SAME job will never succeed on retry, so
+# drop it immediately instead of head-of-line-blocking the queue. Auth/route/
+# conflict errors (401/403/404/409) are CONTEXT failures that can recover (e.g. a
+# rotated hub credential or a redeploy), so they retry under the attempt cap
+# rather than instantly losing the member's captured job.
+VP_SUBMIT_DEADLETTER_STATUSES = {400, 413, 422}
 # Per-submit timeout + a wall-clock budget for the whole per-heartbeat drain, so
 # vp-submit (which runs on the heartbeat thread) can never stall the heartbeat
 # enough to flap the hub offline. Healthy submits are sub-second.
 VP_SUBMIT_TIMEOUT = 8
 VP_DRAIN_BUDGET_SEC = 8
+VPRINTER_RETRY_INITIAL_SEC = 30
+VPRINTER_RETRY_MAX_SEC = 300
 
 
 def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
@@ -216,6 +228,34 @@ def _drop_vprinter_submissions(
     return dropped
 
 
+def _deadletter_vprinter_submission(job: CapturedJob, reason: str, diagnostics=None) -> None:
+    safe = redact(reason)
+    _record_diagnostic(diagnostics, "vprinter", f"vp-submit deadletter: {safe}")
+    log.warning(
+        "vprinter.submit.deadletter member_id=%s filename=%s submission_uid=%s attempts=%d reason=%s",
+        job.member_id,
+        job.filename,
+        job.submission_uid,
+        job.attempts,
+        safe,
+    )
+
+
+def _retry_or_deadletter_vprinter_submission(
+    submission_queue: queue.Queue[CapturedJob],
+    job: CapturedJob,
+    reason: str,
+    *,
+    diagnostics=None,
+    max_attempts: int = VP_SUBMISSION_MAX_ATTEMPTS,
+) -> None:
+    attempts = job.attempts + 1
+    if attempts >= max(1, int(max_attempts)):
+        _deadletter_vprinter_submission(replace(job, attempts=attempts), reason, diagnostics)
+        return
+    _enqueue_vprinter_submission(submission_queue, replace(job, attempts=attempts))
+
+
 def _drain_vprinter_submissions(
     submission_queue: queue.Queue[CapturedJob],
     cfg: Config,
@@ -259,7 +299,12 @@ def _drain_vprinter_submissions(
                 job.submission_uid,
                 safe,
             )
-            _enqueue_vprinter_submission(submission_queue, job)
+            _retry_or_deadletter_vprinter_submission(
+                submission_queue,
+                job,
+                f"transport: {safe}",
+                diagnostics=diagnostics,
+            )
             continue
 
         if resp.status == 200 and resp.body.get("ok") is True:
@@ -286,6 +331,9 @@ def _drain_vprinter_submissions(
 
         safe = redact(resp.body.get("error") or resp.body.get("reason") or resp.body)
         _record_diagnostic(diagnostics, "vprinter", f"vp-submit HTTP {resp.status}: {safe}")
+        if resp.status in VP_SUBMIT_DEADLETTER_STATUSES:
+            _deadletter_vprinter_submission(job, f"HTTP {resp.status}: {safe}", diagnostics)
+            continue
         log.warning(
             "vprinter.submit.retry http_status=%s member_id=%s filename=%s submission_uid=%s: %s",
             resp.status,
@@ -294,7 +342,12 @@ def _drain_vprinter_submissions(
             job.submission_uid,
             safe,
         )
-        _enqueue_vprinter_submission(submission_queue, job)
+        _retry_or_deadletter_vprinter_submission(
+            submission_queue,
+            job,
+            f"HTTP {resp.status}: {safe}",
+            diagnostics=diagnostics,
+        )
 
     return submitted
 
@@ -478,6 +531,40 @@ class _TailscaleRuntimeState:
         return _tailscale_config_enabled(self.config) or tailscale_binary_exists()
 
 
+class _VirtualPrinterRuntimeState:
+    def __init__(self):
+        self.config = None
+        self.next_retry_at = 0.0
+        self.retry_delay_sec = VPRINTER_RETRY_INITIAL_SEC
+
+    def remember_config(self, vp_config) -> None:
+        # Only remember a config we actually want RUNNING. A disabled VP (or no
+        # config block) must not arm the retry timer — needs_retry() keys on
+        # "current_model is None", so a non-None *disabled* config would otherwise
+        # re-reconcile a deliberately-stopped VP every heartbeat.
+        wanted = vp_config if (vp_config is not None and getattr(vp_config, "enabled", False)) else None
+        self.config = wanted
+        if wanted is None:
+            self.next_retry_at = 0.0
+            self.retry_delay_sec = VPRINTER_RETRY_INITIAL_SEC
+
+    def needs_retry(self, current_model: str | None) -> bool:
+        return self.config is not None and current_model is None
+
+    def retry_due(self, now: float, current_model: str | None) -> bool:
+        if not self.needs_retry(current_model):
+            return False
+        return self.next_retry_at <= 0 or now >= self.next_retry_at
+
+    def record_reconcile_attempt(self, current_model: str | None, now: float) -> None:
+        if self.needs_retry(current_model):
+            self.next_retry_at = now + self.retry_delay_sec
+            self.retry_delay_sec = min(self.retry_delay_sec * 2, VPRINTER_RETRY_MAX_SEC)
+        else:
+            self.next_retry_at = 0.0
+            self.retry_delay_sec = VPRINTER_RETRY_INITIAL_SEC
+
+
 def _reconcile_tailscale_config(tailscale_cfg, reconciler=reconcile_tailscale, diagnostics=None) -> dict:
     try:
         status = reconciler(tailscale_cfg)
@@ -511,6 +598,43 @@ def _maybe_retry_tailscale_config(
     return status
 
 
+def _reconcile_vprinter_config(
+    vp_manager: VirtualPrinterManager,
+    vp_state: _VirtualPrinterRuntimeState,
+    vp_config,
+    *,
+    now: float,
+    diagnostics=None,
+) -> None:
+    vp_state.remember_config(vp_config)
+    try:
+        vp_manager.reconcile_sync(vp_config)
+    except Exception as exc:  # noqa: BLE001 - config-down must not sink heartbeat
+        safe = redact(str(exc))
+        _record_diagnostic(diagnostics, "vprinter", f"virtual printer reconcile failed: {safe}")
+        log.warning("virtual printer reconcile failed: %s", safe)
+    finally:
+        vp_state.record_reconcile_attempt(vp_manager.current_model(), now)
+
+
+def _maybe_retry_vprinter_config(
+    vp_state: _VirtualPrinterRuntimeState,
+    vp_manager: VirtualPrinterManager,
+    now: float,
+    diagnostics=None,
+) -> bool:
+    if not vp_state.retry_due(now, vp_manager.current_model()):
+        return False
+    _reconcile_vprinter_config(
+        vp_manager,
+        vp_state,
+        vp_state.config,
+        now=now,
+        diagnostics=diagnostics,
+    )
+    return True
+
+
 def _pull_config(
     cfg: Config,
     credential: str,
@@ -518,6 +642,7 @@ def _pull_config(
     tailscale_reconciler=reconcile_tailscale,
     tailscale_state: _TailscaleRuntimeState | None = None,
     virtual_printer_manager: VirtualPrinterManager | None = None,
+    virtual_printer_state: _VirtualPrinterRuntimeState | None = None,
     diagnostics=None,
 ) -> dict | None:
     """Fetch the printer list (config-down) and reconcile adapters. Best-effort:
@@ -535,12 +660,21 @@ def _pull_config(
         manager.reconcile(printers if isinstance(printers, list) else [], version)
         vp_config = parse_virtual_printer_config(_virtual_printer_config_block(resp.body))
         if virtual_printer_manager is not None:
-            try:
-                virtual_printer_manager.reconcile_sync(vp_config)
-            except Exception as exc:  # noqa: BLE001 - config-down must not sink heartbeat
-                safe = redact(str(exc))
-                _record_diagnostic(diagnostics, "vprinter", f"virtual printer reconcile failed: {safe}")
-                log.warning("virtual printer reconcile failed: %s", safe)
+            if virtual_printer_state is not None:
+                _reconcile_vprinter_config(
+                    virtual_printer_manager,
+                    virtual_printer_state,
+                    vp_config,
+                    now=time.monotonic(),
+                    diagnostics=diagnostics,
+                )
+            else:
+                try:
+                    virtual_printer_manager.reconcile_sync(vp_config)
+                except Exception as exc:  # noqa: BLE001 - config-down must not sink heartbeat
+                    safe = redact(str(exc))
+                    _record_diagnostic(diagnostics, "vprinter", f"virtual printer reconcile failed: {safe}")
+                    log.warning("virtual printer reconcile failed: %s", safe)
         tailscale_cfg = resp.body.get("tailscale")
         if tailscale_state is not None:
             tailscale_state.remember_config(tailscale_cfg)
@@ -574,7 +708,71 @@ def _virtual_printer_config_block(body: dict) -> object:
     return body.get("virtual_printer")
 
 
-def run(cfg: Config) -> int:
+def _drain_vprinter_submissions_safely(
+    submission_queue: queue.Queue[CapturedJob],
+    cfg: Config,
+    credential: str,
+    *,
+    model: str | None,
+    diagnostics=None,
+    poster=None,
+    max_jobs: int = VP_SUBMISSIONS_PER_HEARTBEAT,
+) -> int:
+    try:
+        return _drain_vprinter_submissions(
+            submission_queue,
+            cfg,
+            credential,
+            model=model,
+            diagnostics=diagnostics,
+            poster=poster or post_json,
+            max_jobs=max_jobs,
+        )
+    except Exception as exc:  # noqa: BLE001 - drain must not sink heartbeat/shutdown
+        safe = redact(str(exc))
+        _record_diagnostic(diagnostics, "vprinter", f"vp-submit drain failed: {safe}")
+        log.warning("vprinter.submit.drain_failed: %s", safe)
+        return 0
+
+
+def _request_shutdown(stop_event: threading.Event, signum: int | None = None) -> None:
+    if signum is None:
+        log.info("shutdown requested")
+    else:
+        log.info("shutdown requested by signal %s", signum)
+    stop_event.set()
+
+
+def _install_shutdown_signal_handlers(stop_event: threading.Event) -> dict[int, object]:
+    previous: dict[int, object] = {}
+
+    def handler(signum, _frame) -> None:
+        _request_shutdown(stop_event, signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            previous[sig] = signal.getsignal(sig)
+            signal.signal(sig, handler)
+        except (OSError, ValueError):
+            continue
+    return previous
+
+
+def _restore_shutdown_signal_handlers(previous: dict[int, object]) -> None:
+    for sig, handler in previous.items():
+        try:
+            signal.signal(sig, handler)
+        except (OSError, ValueError):
+            continue
+
+
+def run(
+    cfg: Config,
+    *,
+    _stop_event: threading.Event | None = None,
+    _install_signals: bool = True,
+    _submission_queue: queue.Queue[CapturedJob] | None = None,
+) -> int:
     set_effective_config(cfg)
     diagnostics = Diagnostics(cloud_url=cfg.cloud_url, agent_version=__version__)
     set_default(diagnostics)
@@ -590,7 +788,11 @@ def run(cfg: Config) -> int:
 
     interval = cfg.heartbeat_sec
     manager = PrinterManager(diagnostics=diagnostics)
-    vp_submission_queue: queue.Queue[CapturedJob] = queue.Queue(maxsize=VP_SUBMISSION_QUEUE_MAX)
+    vp_submission_queue: queue.Queue[CapturedJob] = (
+        _submission_queue
+        if _submission_queue is not None
+        else queue.Queue(maxsize=VP_SUBMISSION_QUEUE_MAX)
+    )
     vp_manager = VirtualPrinterManager(
         on_capture=_make_vprinter_capture_handler(vp_submission_queue),
         diagnostics=diagnostics,
@@ -599,7 +801,12 @@ def run(cfg: Config) -> int:
     pending_queue_reports: list[dict] = []
     pending_probe_results: list[dict] = []
     tailscale_state = _TailscaleRuntimeState()
+    vprinter_state = _VirtualPrinterRuntimeState()
     tailscale_status: dict | None = None
+    stop_event = _stop_event if _stop_event is not None else threading.Event()
+    previous_signal_handlers = (
+        _install_shutdown_signal_handlers(stop_event) if _install_signals else {}
+    )
     log.info("makeros-hub %s starting; heartbeat every %ss to %s", __version__, interval, cfg.cloud_url)
 
     # Pull the printer list up front so the first heartbeat already carries status.
@@ -609,6 +816,7 @@ def run(cfg: Config) -> int:
         manager,
         tailscale_state=tailscale_state,
         virtual_printer_manager=vp_manager,
+        virtual_printer_state=vprinter_state,
         diagnostics=diagnostics,
     )
     if pulled_tailscale_status:
@@ -632,7 +840,7 @@ def run(cfg: Config) -> int:
         ingest = None
 
     try:
-        while True:
+        while not stop_event.is_set():
             try:
                 now = time.monotonic()
                 retry_tailscale_status = _maybe_retry_tailscale_config(
@@ -651,6 +859,12 @@ def run(cfg: Config) -> int:
                         tailscale_state.record_observed_status(current_ts, now)
                 elif not tailscale_state.reconcile_status_pending:
                     tailscale_status = None
+                _maybe_retry_vprinter_config(
+                    vprinter_state,
+                    vp_manager,
+                    now,
+                    diagnostics=diagnostics,
+                )
                 statuses = manager.statuses()
                 jobs = manager.pending_jobs()
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
@@ -722,6 +936,7 @@ def run(cfg: Config) -> int:
                             manager,
                             tailscale_state=tailscale_state,
                             virtual_printer_manager=vp_manager,
+                            virtual_printer_state=vprinter_state,
                             diagnostics=diagnostics,
                         )
                         if pulled_tailscale_status:
@@ -751,20 +966,28 @@ def run(cfg: Config) -> int:
                     safe = redact(resp.body.get("error"))
                     _record_diagnostic(diagnostics, "heartbeat", f"heartbeat unexpected {resp.status}: {safe}")
                     log.warning("heartbeat unexpected %s: %s", resp.status, safe)
-                _drain_vprinter_submissions(
-                    vp_submission_queue,
-                    cfg,
-                    credential,
-                    model=vp_manager.current_model(),
-                    diagnostics=diagnostics,
-                )
             except TransportError as exc:
                 safe = redact(str(exc))
                 _record_diagnostic(diagnostics, "heartbeat", f"heartbeat transport error: {safe}")
                 log.warning("heartbeat transport error (will retry): %s", safe)
 
-            time.sleep(interval)
+            _drain_vprinter_submissions_safely(
+                vp_submission_queue,
+                cfg,
+                credential,
+                model=vp_manager.current_model(),
+                diagnostics=diagnostics,
+            )
+            stop_event.wait(interval)
     finally:
+        _drain_vprinter_submissions_safely(
+            vp_submission_queue,
+            cfg,
+            credential,
+            model=vp_manager.current_model(),
+            diagnostics=diagnostics,
+            max_jobs=VP_SUBMISSION_QUEUE_MAX,
+        )
         try:
             vp_manager.stop_sync()
         except Exception as exc:  # noqa: BLE001 - best-effort shutdown
@@ -772,3 +995,5 @@ def run(cfg: Config) -> int:
         manager.stop_all()
         if ingest is not None:
             ingest.stop()
+        _restore_shutdown_signal_handlers(previous_signal_handlers)
+    return 0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -14,6 +15,8 @@ MAX_REMAINING_LENGTH = 268_435_455
 MAX_MQTT_PACKET_BYTES = 4 * 1024 * 1024
 MQTT_CONNECT_TIMEOUT_SEC = 45.0
 MQTT_DRAIN_TIMEOUT_SEC = 5.0
+MQTT_KEEPALIVE_MIN_TIMEOUT_SEC = 30.0
+MQTT_KEEPALIVE_FALLBACK_TIMEOUT_SEC = 300.0
 
 
 @dataclass(frozen=True)
@@ -213,7 +216,13 @@ class MqttBroker:
         self._finish_task: asyncio.Task | None = None
 
     async def start(self, host: str, port: int, ssl_context) -> asyncio.AbstractServer:
-        return await asyncio.start_server(self._handle_client, host=host, port=port, ssl=ssl_context)
+        return await asyncio.start_server(
+            self._handle_client,
+            host=host,
+            port=port,
+            ssl=ssl_context,
+            reuse_address=True,
+        )
 
     async def close(self) -> None:
         if self._finish_task is not None and not self._finish_task.done():
@@ -238,6 +247,7 @@ class MqttBroker:
             self._client_tasks.add(task)
         peer = writer.get_extra_info("peername")
         peer_ip = _peer_ip(peer)
+        _enable_socket_keepalive(writer)
         if self._active_writer is not None and not self._active_writer.is_closing():
             self.log(f"MQTT replacing existing client with new client from {peer}")
             self._active_writer.close()
@@ -275,10 +285,23 @@ class MqttBroker:
                 report_topic=self.default_report_topic,
                 request_topic=self.default_request_topic,
             )
+            # Fresh session => present a clean idle printer (clears any phantom
+            # job left over from a prior connect) with the current AMS pool.
+            self._reset_print_state()
             await self._send_report(session, "connack")
             periodic_task = asyncio.create_task(self._periodic_reports(session))
+            read_timeout = _mqtt_read_timeout(connect.keep_alive)
             while True:
-                first_byte, payload = await _read_packet(reader)
+                try:
+                    first_byte, payload = await asyncio.wait_for(
+                        _read_packet(reader),
+                        timeout=read_timeout,
+                    )
+                except TimeoutError:
+                    self.log(
+                        f"MQTT client {peer} keepalive timeout after {read_timeout:.1f}s"
+                    )
+                    return
                 packet_type = first_byte & 0xF0
                 if packet_type == 0x80:
                     subscribe = parse_subscribe(payload)
@@ -466,6 +489,17 @@ class MqttBroker:
 
         self._finish_task = asyncio.create_task(_finish())
 
+    def _reset_print_state(self) -> None:
+        # A capture printer is always READY on a fresh connect: clear any
+        # lingering job state (and a pending FINISH) from a prior session so the
+        # Device tab shows an idle printer, not a phantom completed job.
+        if self._finish_task is not None and not self._finish_task.done():
+            self._finish_task.cancel()
+        self._finish_task = None
+        self._gcode_state = "IDLE"
+        self._gcode_file = ""
+        self._prepare_percent = "0"
+
 
 async def _read_packet(
     reader: asyncio.StreamReader,
@@ -485,6 +519,22 @@ async def _read_packet(
             return first[0], payload
         multiplier *= 128
     raise ValueError("malformed MQTT remaining length")
+
+
+def _mqtt_read_timeout(keep_alive: int) -> float:
+    if keep_alive > 0:
+        return max(keep_alive * 1.5, MQTT_KEEPALIVE_MIN_TIMEOUT_SEC)
+    return MQTT_KEEPALIVE_FALLBACK_TIMEOUT_SEC
+
+
+def _enable_socket_keepalive(writer: asyncio.StreamWriter) -> None:
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        pass
 
 
 def _is_pushall(parsed: Any) -> bool:
