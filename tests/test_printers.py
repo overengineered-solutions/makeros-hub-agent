@@ -45,15 +45,18 @@ class TestNormalizeStatus(unittest.TestCase):
         self.assertEqual(s["jobName"], "bracket.3mf")
         self.assertEqual(s["etaMinutes"], 90)  # MINUTES, not seconds
 
-    def test_finish_is_idle_failed_is_error(self):
-        self.assertEqual(
-            bambu_parse.normalize_status("p", self._merged(gcode_state="FINISH"), connection_state="connected")["state"],
-            "idle",
-        )
-        self.assertEqual(
-            bambu_parse.normalize_status("p", self._merged(gcode_state="FAILED"), connection_state="connected")["state"],
-            "error",
-        )
+    def test_finish_and_failed_are_both_idle(self):
+        # A finished OR failed job leaves the printer free again — a failed *job*
+        # is not a printer *fault* (real faults surface via HMS). Bed-occupancy
+        # safety for auto-routing is gated in the cloud, not by parking the
+        # printer in "error".
+        for gcode_state in ("FINISH", "FAILED"):
+            self.assertEqual(
+                bambu_parse.normalize_status(
+                    "p", self._merged(gcode_state=gcode_state), connection_state="connected"
+                )["state"],
+                "idle",
+            )
 
     def test_omits_absent_fields_and_state_when_not_connected(self):
         s = bambu_parse.normalize_status("p", {"print": {}}, connection_state="connecting")
