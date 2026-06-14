@@ -50,7 +50,13 @@ _GCODE_STATE = {
     "INIT": "idle",
     "IDLE": "idle",
     "FINISH": "idle",  # completed OK — printer is now idle/awaiting clear
-    "FAILED": "error",
+    # A failed/cancelled job leaves the printer FREE again, same as FINISH — a
+    # failed *job* is not a printer *fault* (real faults surface via HMS, not
+    # gcode_state). Parking it in "error" mislabels a ready printer as broken
+    # (this is why SimplyPrint showed it ready while we showed it errored). The
+    # failure is recorded as a job event; bed-occupancy safety for auto-routing
+    # is gated by the operator bed-clear ack in the cloud, not here.
+    "FAILED": "idle",
     "OFFLINE": "offline",
     "UNKNOWN": "idle",
 }
