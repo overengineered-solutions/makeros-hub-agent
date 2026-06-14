@@ -11,6 +11,7 @@ from typing import Any
 START_MAGIC = 0xA5A5
 END_MAGIC = 0xA7A7
 BIND_READ_TIMEOUT_SEC = 30.0
+MAX_CONCURRENT_BIND_CONNECTIONS = 8
 
 
 @dataclass(frozen=True)
@@ -61,10 +62,21 @@ async def start_bind_server(
     config: BindReplyConfig,
     log: Callable[[str], None],
     ssl_context=None,
+    max_connections: int = MAX_CONCURRENT_BIND_CONNECTIONS,
 ) -> asyncio.AbstractServer:
+    active_connections = 0
+    connection_limit = max(1, int(max_connections))
+
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        nonlocal active_connections
         peer = writer.get_extra_info("peername")
         label = "TLS bind" if ssl_context else "plain bind"
+        if active_connections >= connection_limit:
+            log(f"{label} connection refused at connection cap for {peer}")
+            writer.close()
+            await _wait_closed(writer)
+            return
+        active_connections += 1
         log(f"{label} connection from {peer}")
         try:
             request = await asyncio.wait_for(read_frame(reader), timeout=BIND_READ_TIMEOUT_SEC)
@@ -80,6 +92,7 @@ async def start_bind_server(
         except Exception as exc:
             log(f"{label} error from {peer}: {exc}")
         finally:
+            active_connections -= 1
             writer.close()
             await _wait_closed(writer)
 

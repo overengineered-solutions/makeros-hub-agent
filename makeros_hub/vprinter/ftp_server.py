@@ -14,6 +14,7 @@ from .capture import UploadRecord
 
 
 MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
+MAX_CONCURRENT_FTP_SESSIONS = 16
 FTP_CONTROL_TIMEOUT_SEC = 300.0
 FTP_DATA_CONNECT_TIMEOUT_SEC = 30.0
 FTP_CHUNK_TIMEOUT_SEC = 60.0
@@ -32,6 +33,7 @@ class FtpConfig:
     passive_end: int = 50009
     max_upload_bytes: int = MAX_UPLOAD_BYTES
     concurrent_uploads: int = 1
+    max_sessions: int = MAX_CONCURRENT_FTP_SESSIONS
     on_stored: Callable[[UploadRecord], None] | None = None
     upload_semaphore: asyncio.Semaphore = field(init=False)
 
@@ -75,6 +77,8 @@ class FtpServer:
         self.server: asyncio.AbstractServer | None = None
         self._sessions: set[FtpSession] = set()
         self._tasks: set[asyncio.Task] = set()
+        self._max_sessions = max(1, int(config.max_sessions))
+        self._active_sessions = 0
 
     async def start(self) -> "FtpServer":
         self.config.upload_dir.mkdir(parents=True, exist_ok=True)
@@ -100,15 +104,27 @@ class FtpServer:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("peername")
+        # Single-threaded asyncio: there is no await between the cap check and the
+        # increment, so a plain counter is race-free (no Semaphore-internals poke).
+        if self._active_sessions >= self._max_sessions:
+            self.log(f"FTPS connection refused at session cap for {peer}")
+            writer.close()
+            await _wait_closed(writer)
+            return
+        self._active_sessions += 1
         task = asyncio.current_task()
         if task is not None:
             self._tasks.add(task)
-        session = FtpSession(reader, writer, self.config, self.ssl_context, self.log)
-        self._sessions.add(session)
+        session: FtpSession | None = None
         try:
+            session = FtpSession(reader, writer, self.config, self.ssl_context, self.log)
+            self._sessions.add(session)
             await session.run()
         finally:
-            self._sessions.discard(session)
+            if session is not None:
+                self._sessions.discard(session)
+            self._active_sessions -= 1
             if task is not None:
                 self._tasks.discard(task)
 
@@ -363,7 +379,17 @@ class FtpSession:
                 bound_port: int = port,
             ) -> None:
                 peer = writer.get_extra_info("peername")
+                data_peer_ip = _peer_ip(peer)
                 self.log(f"FTPS data TLS connection from {peer} on passive port {bound_port}")
+                if self.peer_ip is not None and data_peer_ip != self.peer_ip:
+                    self.log(
+                        "vprinter.ftp.passive_peer_mismatch "
+                        f"control_peer_ip={self.peer_ip} data_peer_ip={data_peer_ip} "
+                        f"port={bound_port}"
+                    )
+                    writer.close()
+                    await _wait_closed(writer)
+                    return
                 if not fut.done():
                     fut.set_result((reader, writer))
                     await done_event.wait()
