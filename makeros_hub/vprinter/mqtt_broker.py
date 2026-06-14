@@ -208,6 +208,7 @@ class MqttBroker:
         self.default_request_topic = f"device/{serial}/request"
         self._sequence = 1
         self._active_writer: asyncio.StreamWriter | None = None
+        self._active_session: MqttSession | None = None
         self._client_tasks: set[asyncio.Task] = set()
         self._write_lock = asyncio.Lock()
         self._gcode_state = "IDLE"
@@ -236,6 +237,7 @@ class MqttBroker:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active_writer = None
+        self._active_session = None
 
     async def _handle_client(
         self,
@@ -251,6 +253,7 @@ class MqttBroker:
         if self._active_writer is not None and not self._active_writer.is_closing():
             self.log(f"MQTT replacing existing client with new client from {peer}")
             self._active_writer.close()
+            self._active_session = None
         self._active_writer = writer
         periodic_task: asyncio.Task | None = None
         session: MqttSession | None = None
@@ -285,6 +288,7 @@ class MqttBroker:
                 report_topic=self.default_report_topic,
                 request_topic=self.default_request_topic,
             )
+            self._active_session = session
             # Fresh session => present a clean idle printer (clears any phantom
             # job left over from a prior connect) with the current AMS pool.
             self._reset_print_state()
@@ -341,6 +345,8 @@ class MqttBroker:
                 await asyncio.gather(periodic_task, return_exceptions=True)
             if self._active_writer is writer:
                 self._active_writer = None
+            if self._active_session is session:
+                self._active_session = None
             writer.close()
             await _wait_closed(writer)
             if task is not None:
@@ -417,6 +423,12 @@ class MqttBroker:
                 await self._send_report(session, "periodic")
         except asyncio.CancelledError:
             pass
+
+    async def push_report_now(self) -> None:
+        session = self._active_session
+        if session is None or session.writer.is_closing():
+            return
+        await self._send_report(session, "hot_apply")
 
     async def _send_report(self, session: MqttSession, reason: str) -> None:
         report = self.report_builder(
