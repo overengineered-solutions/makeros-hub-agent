@@ -453,6 +453,21 @@ def _drain_vprinter_submissions(
             if outbox is not None:
                 outbox.remove(job.submission_uid)
             continue
+        if resp.status in (401, 403):
+            # Hub-level auth OUTAGE (revoked/rotated credential), NOT a job failure:
+            # re-enqueue WITHOUT counting toward the dead-letter cap and WITHOUT
+            # removing the durable outbox record, so captured jobs survive the
+            # outage until the credential is restored (re-enroll / rotation).
+            _record_diagnostic(diagnostics, "vprinter", f"vp-submit auth outage HTTP {resp.status}")
+            log.warning(
+                "vprinter.submit.auth_outage status=%s member_id=%s filename=%s submission_uid=%s",
+                resp.status,
+                job.member_id,
+                job.filename,
+                job.submission_uid,
+            )
+            _enqueue_vprinter_submission(submission_queue, job)
+            continue
         log.warning(
             "vprinter.submit.retry http_status=%s member_id=%s filename=%s submission_uid=%s: %s",
             resp.status,
@@ -1091,12 +1106,21 @@ def run(
                         pending_probe_results.extend(probe_results)
                         log.info("queued %d probe result(s) for the next heartbeat", len(probe_results))
                 elif resp.status == 401:
-                    _record_diagnostic(diagnostics, "heartbeat", "heartbeat rejected 401")
-                    log.error(
-                        "heartbeat rejected 401 — this hub's credential was revoked or is "
-                        "unknown. Re-enroll with a fresh token. Exiting."
+                    # Graceful-degradation, NOT exit: a 401 means this hub's
+                    # credential was revoked/rotated. Exiting here would tear down
+                    # the VP + printers and respawn into the SAME dead credential
+                    # every 5s (systemd Restart=always) — a permanent black-hole
+                    # with all listeners DOWN. Instead keep serving: the VP stays
+                    # up so members can still send (captures queue durably in the
+                    # on-disk outbox + survive vp-submit 401s), and we retry each
+                    # beat so a re-enroll / rotated credential self-heals.
+                    _record_diagnostic(
+                        diagnostics, "heartbeat", "heartbeat rejected 401 (degraded — re-enroll/rotate)"
                     )
-                    return 2
+                    log.error(
+                        "heartbeat rejected 401 — credential revoked/rotated. Staying UP in "
+                        "degraded mode (VP + captures preserved); re-enroll or rotate to recover."
+                    )
                 else:
                     safe = redact(resp.body.get("error"))
                     _record_diagnostic(diagnostics, "heartbeat", f"heartbeat unexpected {resp.status}: {safe}")
