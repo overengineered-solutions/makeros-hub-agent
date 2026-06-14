@@ -300,6 +300,12 @@ def assemble_captured_job(
     ams_mapping = intent.ams_mapping
     if intent.ams_mapping2 is not None:
         ams_mapping = {"ams_mapping": intent.ams_mapping, "ams_mapping2": intent.ams_mapping2}
+    submission_uid = _deterministic_submission_uid(
+        upload.member_id,
+        upload.sha256,
+        intent.plate,
+        ams_mapping,
+    )
     return CapturedJob(
         member_id=upload.member_id,
         filename=upload.filename,
@@ -310,6 +316,7 @@ def assemble_captured_job(
         use_ams=intent.use_ams,
         required_filaments=parse_required_filaments(upload.file_path),
         submitted_at=submitted_at or datetime.now(timezone.utc),
+        submission_uid=submission_uid,
         plate=intent.plate,
     )
 
@@ -343,6 +350,22 @@ def _ams_mapping_list(ams_mapping: Any) -> list[Any]:
         if isinstance(primary, list):
             return primary
     return []
+
+
+def _deterministic_submission_uid(
+    member_id: str,
+    file_sha256: str,
+    plate: int | None,
+    ams_mapping: Any,
+) -> str:
+    ams_mapping_json = json.dumps(
+        _ams_mapping_list(ams_mapping),
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    plate_value = "" if plate is None else str(plate)
+    payload = f"{member_id}\n{file_sha256}\n{plate_value}\n{ams_mapping_json}"
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _vp_submit_filament(item: dict[str, Any]) -> dict[str, Any]:

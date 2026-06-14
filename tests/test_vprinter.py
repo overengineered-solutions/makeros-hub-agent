@@ -612,6 +612,114 @@ class TestSliceInfoParser(unittest.TestCase):
 
 
 class TestCaptureAssembly(unittest.TestCase):
+    def test_assemble_submission_uid_is_deterministic_for_identical_logical_prints(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "part.3mf"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("Metadata/slice_info.config", "<config/>")
+            file_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+            upload = UploadRecord("member-1", "part.3mf", path, file_sha256, path.stat().st_size)
+            list_intent = ProjectFileIntent(
+                "member-1",
+                "part.3mf",
+                [0, 1],
+                None,
+                True,
+                None,
+                {},
+                plate=2,
+            )
+            dict_intent = ProjectFileIntent(
+                "member-1",
+                "part.3mf",
+                [0, 1],
+                {"0": 0},
+                True,
+                None,
+                {},
+                plate=2,
+            )
+
+            first = assemble_captured_job(upload, list_intent)
+            second = assemble_captured_job(upload, list_intent)
+            dict_form = assemble_captured_job(upload, dict_intent)
+
+        expected = hashlib.sha256(
+            f"member-1\n{file_sha256}\n2\n[0,1]".encode()
+        ).hexdigest()
+        self.assertEqual(first.submission_uid, expected)
+        self.assertEqual(first.submission_uid, second.submission_uid)
+        self.assertEqual(first.submission_uid, dict_form.submission_uid)
+        self.assertEqual(len(first.submission_uid), 64)
+        self.assertEqual(first.submission_uid, first.submission_uid.lower())
+
+    def test_assemble_submission_uid_changes_for_logical_print_inputs(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "part.3mf"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("Metadata/slice_info.config", "<config/>")
+            size = path.stat().st_size
+            base_upload = UploadRecord("member-1", "part.3mf", path, "a" * 64, size)
+            base_intent = ProjectFileIntent(
+                "member-1",
+                "part.3mf",
+                [0, 1],
+                None,
+                True,
+                None,
+                {},
+                plate=2,
+            )
+            base = assemble_captured_job(base_upload, base_intent).submission_uid
+            changed_file = assemble_captured_job(
+                UploadRecord("member-1", "part.3mf", path, "b" * 64, size),
+                base_intent,
+            ).submission_uid
+            changed_member = assemble_captured_job(
+                UploadRecord("member-2", "part.3mf", path, "a" * 64, size),
+                ProjectFileIntent(
+                    "member-2",
+                    "part.3mf",
+                    [0, 1],
+                    None,
+                    True,
+                    None,
+                    {},
+                    plate=2,
+                ),
+            ).submission_uid
+            changed_plate = assemble_captured_job(
+                base_upload,
+                ProjectFileIntent(
+                    "member-1",
+                    "part.3mf",
+                    [0, 1],
+                    None,
+                    True,
+                    None,
+                    {},
+                    plate=3,
+                ),
+            ).submission_uid
+            changed_mapping = assemble_captured_job(
+                base_upload,
+                ProjectFileIntent(
+                    "member-1",
+                    "part.3mf",
+                    [1, 0],
+                    None,
+                    True,
+                    None,
+                    {},
+                    plate=2,
+                ),
+            ).submission_uid
+
+        self.assertNotEqual(base, changed_file)
+        self.assertNotEqual(base, changed_member)
+        self.assertNotEqual(base, changed_plate)
+        self.assertNotEqual(base, changed_mapping)
+
     def test_build_vp_submit_body_maps_cloud_contract_fields(self):
         job = CapturedJob(
             member_id="member-1",
