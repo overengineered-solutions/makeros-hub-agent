@@ -121,7 +121,13 @@ def parse_virtual_printer_config(raw: Any) -> VirtualPrinterConfig | None:
         log.warning("virtual_printer config ignored: bind_ip must be IPv4")
         return None
 
-    units = _positive_int(_get_field(raw, "units", default=4), default=4, maximum=4)
+    # Real Bambu hardware tops out at 4 AMS units (X1C/P1S) = 16 slots, but a
+    # per-model VP deduping across a large fleet (e.g. 16 P2S each with an AMS)
+    # can need more than 16 unique filament slots. units max is raised to 8 (32
+    # slots) to PROBE whether stock OrcaSlicer renders >4 AMS units; trays stays
+    # 4 because a physical AMS unit is always 4 slots. Default stays 4, so this
+    # is inert until a VP's `units` is explicitly set higher.
+    units = _positive_int(_get_field(raw, "units", default=4), default=4, maximum=8)
     trays = _positive_int(_get_field(raw, "trays", default=4), default=4, maximum=4)
     if units is None or trays is None:
         log.warning("virtual_printer config ignored: units/trays must be positive integers")

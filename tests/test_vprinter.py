@@ -160,36 +160,26 @@ class TestVirtualPrinterConfig(unittest.TestCase):
             )
         )
 
-    def test_units_are_capped_to_four(self):
-        cfg = parse_virtual_printer_config(
-            {
-                "enabled": True,
-                "serial": "SER123",
-                "model": "N1",
-                "name": "VP A1",
-                "fw": "01.08.00.00",
-                "bind_ip": "100.64.0.10",
-                "units": 4,
-                "members": [{"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}],
-            }
-        )
+    def _vp(self, **overrides):
+        base = {
+            "enabled": True,
+            "serial": "SER123",
+            "model": "N1",
+            "name": "VP A1",
+            "fw": "01.08.00.00",
+            "bind_ip": "100.64.0.10",
+            "members": [{"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}],
+        }
+        base.update(overrides)
+        return parse_virtual_printer_config(base)
 
-        self.assertIsNotNone(cfg)
-        self.assertEqual(cfg.units, 4)
-        self.assertIsNone(
-            parse_virtual_printer_config(
-                {
-                    "enabled": True,
-                    "serial": "SER123",
-                    "model": "N1",
-                    "name": "VP A1",
-                    "fw": "01.08.00.00",
-                    "bind_ip": "100.64.0.10",
-                    "units": 5,
-                    "members": [{"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}],
-                }
-            )
-        )
+    def test_units_capped_at_8_trays_at_4(self):
+        # units max is raised to 8 (probing whether OrcaSlicer renders >4 AMS
+        # units); trays stays 4 because a physical AMS unit is always 4 slots.
+        self.assertEqual(self._vp(units=8).units, 8)  # 8 units accepted
+        self.assertIsNone(self._vp(units=9))  # over the units cap -> rejected
+        self.assertEqual(self._vp(trays=4).trays, 4)  # 4 trays accepted
+        self.assertIsNone(self._vp(trays=5))  # trays still capped at 4
 
     def test_hot_state_uses_only_pool_identity_fields(self):
         def make_cfg(**tray_overrides):
