@@ -38,6 +38,7 @@ from .http import TransportError, get_json, post_json
 from .ingest import IngestServer
 from .probes import PROBES, run_probe, set_effective_config
 from .printers.manager import PrinterManager
+from .printers.camera import CameraScheduler, collect_camera_frames
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
 from .update import maybe_update
 from .vprinter.capture import CapturedJob, build_vp_submit_body
@@ -518,6 +519,7 @@ def heartbeat_payload(
     tailscale_status: dict | None = None,
     probe_results: list[dict] | None = None,
     diagnostics=None,
+    camera_frames: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -537,6 +539,8 @@ def heartbeat_payload(
                 payload[key] = value
     if probe_results:
         payload["probeResults"] = list(probe_results)
+    if camera_frames:
+        payload["cameraFrames"] = list(camera_frames)
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
@@ -942,6 +946,15 @@ def run(
     pending_probe_results: list[dict] = []
     tailscale_state = _TailscaleRuntimeState()
     vprinter_state = _VirtualPrinterRuntimeState()
+    # Camera capture is OFF unless explicitly enabled (the cloud framework is
+    # default-off too). Flip MAKEROS_HUB_CAMERA_ENABLED=1 to start sending frames.
+    camera_scheduler = CameraScheduler()
+    camera_enabled = os.environ.get("MAKEROS_HUB_CAMERA_ENABLED", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     tailscale_status: dict | None = None
     vp_outbox_rehydrated = False
     stop_event = _stop_event if _stop_event is not None else threading.Event()
@@ -1043,6 +1056,31 @@ def run(
                             f"live AMS apply failed: {redact(str(exc))}",
                         )
                 jobs = manager.pending_jobs()
+                # Camera frames (opt-in). Phase-adaptive cadence + parallel,
+                # bounded capture — must never sink the heartbeat, so the whole
+                # thing is best-effort and a failure just sends no frame this beat.
+                camera_frames: list[dict] | None = None
+                if camera_enabled:
+                    try:
+                        targets = manager.camera_targets()
+                        # Drop scheduler state for printers no longer configured.
+                        camera_scheduler.forget(
+                            {t["printerId"] for t in targets if t.get("printerId")}
+                        )
+                        status_by_id = {
+                            s.get("printerId"): s for s in statuses if s.get("printerId")
+                        }
+                        camera_frames = collect_camera_frames(
+                            targets,
+                            status_by_id,
+                            camera_scheduler,
+                            time.monotonic(),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
+                        _record_diagnostic(
+                            diagnostics, "camera", f"frame collection failed: {redact(str(exc))}"
+                        )
+                        camera_frames = None
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
@@ -1052,6 +1090,7 @@ def run(
                         tailscale_status,
                         probe_results=pending_probe_results,
                         diagnostics=diagnostics,
+                        camera_frames=camera_frames,
                     ),
                     bearer=credential,
                     retries=3,

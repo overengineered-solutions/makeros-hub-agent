@@ -51,6 +51,10 @@ class PrinterManager:
         # resend must not re-upload or re-start the printer. Terminal progress
         # reports prune this bounded guard.
         self._dispatched_queue_jobs: OrderedDict[str, float] = OrderedDict()
+        # Per-printer camera-routing facts (vendor/model/host/accessCode/urls),
+        # rebuilt every reconcile. Lets the camera capturer pick the right source
+        # (Bambu :6000 / HTTP snapshot / …) without re-plumbing config-down.
+        self._camera_meta: dict[str, dict] = {}
         self.config_version: str | None = None
 
     def _record_failure(self, message, extra_secrets=None) -> None:
@@ -70,6 +74,21 @@ class PrinterManager:
     def reconcile(self, printers: list[dict], version: str | None) -> None:
         self.config_version = version
         desired_ids = {p["id"] for p in printers if isinstance(p.get("id"), str)}
+
+        # Rebuild camera-routing meta from the full desired list (no stale rows).
+        self._camera_meta = {
+            p["id"]: {
+                "printerId": p["id"],
+                "vendor": p.get("vendor"),
+                "model": p.get("model"),
+                "host": p.get("host"),
+                "accessCode": p.get("accessCode"),
+                "moonrakerUrl": p.get("moonrakerUrl"),
+                "cameraSnapshotUrl": p.get("cameraSnapshotUrl"),
+            }
+            for p in printers
+            if isinstance(p.get("id"), str)
+        }
 
         # Drop adapters / static entries for printers no longer in config.
         for pid in list(self._adapters):
@@ -175,6 +194,12 @@ class PrinterManager:
                 out.append({"printerId": pid, "connectionState": "error", "errorReason": "agent_status_error"})
         out.extend(self._static.values())
         return out
+
+    def camera_targets(self) -> list[dict]:
+        """Per-printer camera-routing facts (vendor/model/host/accessCode/urls)
+        for the camera capturer. One entry per configured printer; the capturer
+        decides which have a usable camera source and which don't."""
+        return list(self._camera_meta.values())
 
     def pending_jobs(self) -> list[dict]:
         """Unacked terminal jobs across all adapters + any rescued from
