@@ -15,6 +15,10 @@ MAX_REMAINING_LENGTH = 268_435_455
 MAX_MQTT_PACKET_BYTES = 4 * 1024 * 1024
 MQTT_CONNECT_TIMEOUT_SEC = 45.0
 MQTT_DRAIN_TIMEOUT_SEC = 5.0
+# Time-box socket close so a still-connected client can't stall teardown — see
+# _wait_closed. Must stay well under the 20s reconcile_sync timeout in the
+# PrinterManager so an identity-change restart (units/name/…) always completes.
+MQTT_CLOSE_TIMEOUT_SEC = 2.0
 MQTT_KEEPALIVE_MIN_TIMEOUT_SEC = 30.0
 MQTT_KEEPALIVE_FALLBACK_TIMEOUT_SEC = 300.0
 
@@ -652,7 +656,11 @@ async def _drain(writer: asyncio.StreamWriter) -> None:
 
 
 async def _wait_closed(writer: asyncio.StreamWriter) -> None:
+    # Bounded: on a TLS transport wait_closed() blocks until the peer completes
+    # the close handshake (close_notify). A still-connected client (OrcaSlicer
+    # holding the socket) may never send it promptly, which would otherwise stall
+    # an identity-change restart past the 20s reconcile timeout. Time-box it.
     try:
-        await writer.wait_closed()
+        await asyncio.wait_for(writer.wait_closed(), timeout=MQTT_CLOSE_TIMEOUT_SEC)
     except Exception:
         pass

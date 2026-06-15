@@ -25,6 +25,10 @@ MQTT_PORT = 8883
 FTPS_PORT = 990
 PASSIVE_START = 50000
 PASSIVE_END = 50009
+# Upper bound on runtime teardown (server wait_closed). Kept well under the
+# PrinterManager's 20s reconcile_sync timeout so an identity-change restart
+# (units/name/bind_ip/…) can't stall on a still-connected client.
+VP_TEARDOWN_TIMEOUT_SEC = 5.0
 
 
 class VirtualPrinterManager:
@@ -393,14 +397,40 @@ class _VirtualPrinterRuntime:
         self.ssdps.clear()
         for server in self.servers:
             server.close()
-        if self.servers:
-            await asyncio.gather(*(server.wait_closed() for server in self.servers), return_exceptions=True)
-        self.servers.clear()
+        # Cancel the broker's client-handler tasks BEFORE awaiting the servers'
+        # wait_closed(): asyncio.Server.wait_closed() can block on a live client
+        # (OrcaSlicer holding the MQTT socket), which would stall an
+        # identity-change restart past the 20s reconcile timeout. Closing the
+        # broker first cancels those handlers so wait_closed() returns promptly;
+        # the timeout is a backstop so teardown is always bounded.
         if self.broker is not None:
             await self.broker.close()
             self.broker = None
+        if self.servers:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(
+                        *(server.wait_closed() for server in self.servers),
+                        return_exceptions=True,
+                    ),
+                    timeout=VP_TEARDOWN_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                log.warning(
+                    "virtual printer servers did not close within %ss; proceeding",
+                    VP_TEARDOWN_TIMEOUT_SEC,
+                )
+        self.servers.clear()
         if self.ftp is not None:
-            await self.ftp.close()
+            # Hard backstop: ftp.close() bounds its own sub-waits, but wrap it too
+            # so no nested wait (sessions/passive listeners) can stall teardown.
+            try:
+                await asyncio.wait_for(self.ftp.close(), timeout=VP_TEARDOWN_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "virtual printer FTP did not close within %ss; proceeding",
+                    VP_TEARDOWN_TIMEOUT_SEC,
+                )
             self.ftp = None
         self.capture.clear()
 

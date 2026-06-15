@@ -18,6 +18,11 @@ MAX_CONCURRENT_FTP_SESSIONS = 16
 FTP_CONTROL_TIMEOUT_SEC = 300.0
 FTP_DATA_CONNECT_TIMEOUT_SEC = 30.0
 FTP_CHUNK_TIMEOUT_SEC = 60.0
+# Time-box socket/listener close so a held FTPS control/data socket (e.g. a
+# client mid-upload during a config-change restart) can't stall VP teardown past
+# the 20s reconcile timeout — mirrors the MQTT broker's MQTT_CLOSE_TIMEOUT_SEC.
+FTP_CLOSE_TIMEOUT_SEC = 2.0
+FTP_TEARDOWN_TIMEOUT_SEC = 5.0
 FTP_CHUNK_SIZE = 65536
 UPLOAD_COMMITTED_TTL_SEC = 24 * 60 * 60
 UPLOAD_PART_TTL_SEC = 5 * 60
@@ -57,7 +62,10 @@ class PassiveDataServer:
     async def close(self) -> None:
         self.done.set()
         self.server.close()
-        await self.server.wait_closed()
+        try:
+            await asyncio.wait_for(self.server.wait_closed(), timeout=FTP_CLOSE_TIMEOUT_SEC)
+        except Exception:
+            pass
 
 
 class FtpServer:
@@ -94,14 +102,26 @@ class FtpServer:
     async def close(self) -> None:
         if self.server is not None:
             self.server.close()
-            await self.server.wait_closed()
-        for session in list(self._sessions):
-            await session.abort()
+        # Abort sessions + cancel handler tasks BEFORE awaiting the listener's
+        # wait_closed(): a held FTPS control/data socket (a client mid-upload
+        # during a config-change restart) would otherwise block teardown past the
+        # 20s reconcile timeout (mirrors the MQTT broker fix). abort() and
+        # _wait_closed are themselves time-boxed.
+        sessions = list(self._sessions)
+        if sessions:
+            # Concurrently — each abort() is time-boxed, but awaiting up to 16
+            # sequentially could sum past the teardown bound.
+            await asyncio.gather(*(s.abort() for s in sessions), return_exceptions=True)
         tasks = [task for task in self._tasks if not task.done()]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if self.server is not None:
+            try:
+                await asyncio.wait_for(self.server.wait_closed(), timeout=FTP_TEARDOWN_TIMEOUT_SEC)
+            except Exception:
+                pass
 
     async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -547,7 +567,10 @@ def _unlink_quietly(path: Path) -> bool:
 
 
 async def _wait_closed(writer: asyncio.StreamWriter) -> None:
+    # Bounded (mirrors mqtt_broker._wait_closed): a TLS wait_closed() blocks on
+    # the peer's close_notify, which a still-connected client may never send —
+    # would otherwise stall an identity-change restart past the reconcile timeout.
     try:
-        await writer.wait_closed()
+        await asyncio.wait_for(writer.wait_closed(), timeout=FTP_CLOSE_TIMEOUT_SEC)
     except Exception:
         pass

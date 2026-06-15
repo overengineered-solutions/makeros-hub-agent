@@ -12,6 +12,10 @@ START_MAGIC = 0xA5A5
 END_MAGIC = 0xA7A7
 BIND_READ_TIMEOUT_SEC = 30.0
 MAX_CONCURRENT_BIND_CONNECTIONS = 8
+# Time-box socket close so an orphaned bind handler can't hang forever in
+# wait_closed() after a config-change restart (mirrors MQTT/FTP). Teardown
+# itself is already bounded by VP_TEARDOWN_TIMEOUT_SEC in the runtime.
+BIND_CLOSE_TIMEOUT_SEC = 2.0
 
 
 @dataclass(frozen=True)
@@ -127,7 +131,9 @@ async def close_server(server: asyncio.AbstractServer) -> None:
 
 
 async def _wait_closed(writer: asyncio.StreamWriter) -> None:
+    # Bounded (mirrors mqtt_broker/ftp_server): a TLS wait_closed() can block on
+    # the peer's close_notify; time-box it so an orphaned handler self-cleans.
     try:
-        await writer.wait_closed()
+        await asyncio.wait_for(writer.wait_closed(), timeout=BIND_CLOSE_TIMEOUT_SEC)
     except Exception:
         pass
