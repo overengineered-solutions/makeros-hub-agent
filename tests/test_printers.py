@@ -380,7 +380,9 @@ class TestAmsHmsBuilders(unittest.TestCase):
             ),
             [
                 {
-                    "unit": 1,
+                    # Leading non-dict "bad" is skipped; the first ACCEPTED unit
+                    # gets contiguous index 0 (not the raw array position 1).
+                    "unit": 0,
                     "trays": [{"slot": 2}],
                     "raw": {"id": "not-int", "tray": [{}, "bad", {"remain": "x"}]},
                 }
