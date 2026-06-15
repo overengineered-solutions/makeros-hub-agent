@@ -422,7 +422,15 @@ class _VirtualPrinterRuntime:
                 )
         self.servers.clear()
         if self.ftp is not None:
-            await self.ftp.close()
+            # Hard backstop: ftp.close() bounds its own sub-waits, but wrap it too
+            # so no nested wait (sessions/passive listeners) can stall teardown.
+            try:
+                await asyncio.wait_for(self.ftp.close(), timeout=VP_TEARDOWN_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "virtual printer FTP did not close within %ss; proceeding",
+                    VP_TEARDOWN_TIMEOUT_SEC,
+                )
             self.ftp = None
         self.capture.clear()
 

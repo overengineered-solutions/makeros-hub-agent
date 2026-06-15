@@ -62,7 +62,10 @@ class PassiveDataServer:
     async def close(self) -> None:
         self.done.set()
         self.server.close()
-        await self.server.wait_closed()
+        try:
+            await asyncio.wait_for(self.server.wait_closed(), timeout=FTP_CLOSE_TIMEOUT_SEC)
+        except Exception:
+            pass
 
 
 class FtpServer:
@@ -104,8 +107,11 @@ class FtpServer:
         # during a config-change restart) would otherwise block teardown past the
         # 20s reconcile timeout (mirrors the MQTT broker fix). abort() and
         # _wait_closed are themselves time-boxed.
-        for session in list(self._sessions):
-            await session.abort()
+        sessions = list(self._sessions)
+        if sessions:
+            # Concurrently — each abort() is time-boxed, but awaiting up to 16
+            # sequentially could sum past the teardown bound.
+            await asyncio.gather(*(s.abort() for s in sessions), return_exceptions=True)
         tasks = [task for task in self._tasks if not task.done()]
         for task in tasks:
             task.cancel()
