@@ -1022,21 +1022,26 @@ def run(
                 # config re-pull, no VP restart. Only reconciles on a display change
                 # (updated_config_if_pool_changed returns None otherwise → no churn).
                 if vp_manager is not None and vprinter_state.config is not None:
-                    live_vp = updated_config_if_pool_changed(vprinter_state.config, statuses)
-                    if live_vp is not None:
-                        vprinter_state.remember_config(live_vp)
-                        try:
+                    try:
+                        live_vp = updated_config_if_pool_changed(vprinter_state.config, statuses)
+                        if live_vp is not None:
+                            # Apply to the running VP FIRST; only mark it the
+                            # current config once the hot-apply succeeds. A failed
+                            # apply leaves config at the last-applied pool, so the
+                            # next heartbeat re-derives and retries instead of
+                            # silently remembering a pool that never reached the VP.
                             vp_manager.reconcile_sync(live_vp)
+                            vprinter_state.remember_config(live_vp)
                             log.info(
                                 "VP AMS live-mirror applied (%d trays from real printers)",
                                 len(live_vp.pool),
                             )
-                        except Exception as exc:  # noqa: BLE001 - must not sink heartbeat
-                            _record_diagnostic(
-                                diagnostics,
-                                "vprinter",
-                                f"live AMS apply failed: {redact(str(exc))}",
-                            )
+                    except Exception as exc:  # noqa: BLE001 - must not sink heartbeat
+                        _record_diagnostic(
+                            diagnostics,
+                            "vprinter",
+                            f"live AMS apply failed: {redact(str(exc))}",
+                        )
                 jobs = manager.pending_jobs()
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(

@@ -91,6 +91,44 @@ class TestLivePool(unittest.TestCase):
         s = [_status([{"slot": 0, "material": "PLA", "filamentId": "X", "colorHex": "26A69A"}])]
         self.assertEqual(vp_pool_from_statuses(s, 1, 4)[0]["tray_color"], "26A69AFF")
 
+    def test_lowercase_material_outputs_uppercase_tray_type(self):
+        # cloud normalizeMaterialKey uppercases; the VP must too (parity).
+        s = [_status([{"slot": 0, "material": "petg", "filamentId": "X", "colorHex": "00FF00FF"}])]
+        self.assertEqual(vp_pool_from_statuses(s, 1, 4)[0]["tray_type"], "PETG")
+
+    def test_missing_filament_id_falls_back_to_catalog(self):
+        # material-only tray -> catalog infoIdx + temps, exactly like the cloud
+        # (so identity matches config-down instead of diverging to "").
+        s = [_status([{"slot": 0, "material": "PETG", "colorHex": "00FF00FF"}])]
+        t = vp_pool_from_statuses(s, 1, 4)[0]
+        self.assertEqual(t["tray_info_idx"], "GFG99")
+        self.assertEqual(t["nozzle_temp_min"], "230")
+        self.assertEqual(t["nozzle_temp_max"], "260")
+
+    def test_cols_entries_are_normalized(self):
+        s = [
+            _status(
+                [
+                    {
+                        "slot": 0,
+                        "material": "PLA",
+                        "filamentId": "X",
+                        "colorHex": "26A69A",
+                        "colors": ["26a69a", "ff0000"],
+                    }
+                ]
+            )
+        ]
+        self.assertEqual(vp_pool_from_statuses(s, 1, 4)[0]["cols"], ["26A69AFF", "FF0000FF"])
+
+    def test_dedup_tie_break_is_deterministic_by_printer_id(self):
+        # same spool id+color in two printers, different productName -> the lower
+        # printerId wins regardless of input order (deterministic across heartbeats).
+        a = {"printerId": "p-a", **_status([{"slot": 0, "material": "PLA", "filamentId": "GFL99", "colorHex": "FFFFFFFF", "productName": "AAA"}])}
+        b = {"printerId": "p-b", **_status([{"slot": 0, "material": "PLA", "filamentId": "GFL99", "colorHex": "FFFFFFFF", "productName": "BBB"}])}
+        self.assertEqual(vp_pool_from_statuses([b, a], 1, 4)[0]["tray_sub_brands"], "AAA")
+        self.assertEqual(vp_pool_from_statuses([a, b], 1, 4)[0]["tray_sub_brands"], "AAA")
+
 
 class TestUpdatedConfig(unittest.TestCase):
     def test_no_display_change_returns_none(self):
@@ -112,6 +150,37 @@ class TestUpdatedConfig(unittest.TestCase):
         self.assertIsNotNone(new)
         self.assertEqual(new.pool[0]["tray_type"], "ABS")
         self.assertEqual(cfg.pool[0]["tray_type"], "PLA")  # original frozen config untouched
+
+    def test_lowercase_report_does_not_churn_against_uppercase_config(self):
+        # Regression for the parity bug: the cloud config-down stores an UPPERCASE
+        # tray_type ("PLA"); if the printer reports lowercase material + short
+        # color, the live-mirror must normalize identically and see no display
+        # change -> None (no needless ams.version bump every config-down).
+        cfg = _cfg(
+            [
+                {
+                    "tray_type": "PLA",
+                    "tray_info_idx": "GFL99",
+                    "tray_sub_brands": "Generic PLA",
+                    "tray_color": "FFFFFFFF",
+                    "cols": ["FFFFFFFF"],
+                }
+            ]
+        )
+        statuses = [
+            _status(
+                [
+                    {
+                        "slot": 0,
+                        "material": "pla",
+                        "filamentId": "GFL99",
+                        "colorHex": "ffffff",
+                        "productName": "Generic PLA",
+                    }
+                ]
+            )
+        ]
+        self.assertIsNone(updated_config_if_pool_changed(cfg, statuses))
 
     def test_none_config(self):
         self.assertIsNone(updated_config_if_pool_changed(None, []))
