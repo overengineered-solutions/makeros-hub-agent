@@ -195,7 +195,9 @@ class TestAmsHmsBuilders(unittest.TestCase):
             bambu_parse.build_ams(print_obj),
             [
                 {
-                    "unit": 3,
+                    # `unit` is the ENUMERATION index (0 for the only unit), not
+                    # the reported id "3" — the real id is preserved in `raw`.
+                    "unit": 0,
                     "trays": [
                         {
                             "slot": 0,
@@ -351,19 +353,23 @@ class TestAmsHmsBuilders(unittest.TestCase):
             ],
         )
 
-    def test_build_ams_multi_unit_preserves_ids(self):
+    def test_build_ams_enumerates_high_unit_ids_keeping_raw(self):
+        # The H2D's second AMS unit reports id 128 (the AMS-HT does too), which
+        # exceeds the cloud DTO's unit cap (0-15) and would drop the WHOLE report
+        # → printer stuck `pending`. build_ams emits the ENUMERATION index as
+        # `unit` so it stays in range, while `raw.id` preserves the real firmware
+        # id for the (deferred) per-nozzle H2D routing.
         print_obj = {
             "ams": {
                 "ams": [
                     {"id": "0", "tray": [{"tray_type": "PLA"}]},
-                    {"id": "1", "tray": [{"tray_type": "PETG"}]},
+                    {"id": "128", "tray": [{"tray_type": "PETG"}]},
                 ]
             }
         }
-        self.assertEqual(
-            [u["unit"] for u in bambu_parse.build_ams(print_obj)],
-            [0, 1],
-        )
+        units = bambu_parse.build_ams(print_obj)
+        self.assertEqual([u["unit"] for u in units], [0, 1])
+        self.assertEqual([u["raw"]["id"] for u in units], ["0", "128"])
 
     def test_build_ams_skips_garbage_without_crashing(self):
         self.assertIsNone(bambu_parse.build_ams({}))
@@ -374,7 +380,9 @@ class TestAmsHmsBuilders(unittest.TestCase):
             ),
             [
                 {
-                    "unit": 1,
+                    # Leading non-dict "bad" is skipped; the first ACCEPTED unit
+                    # gets contiguous index 0 (not the raw array position 1).
+                    "unit": 0,
                     "trays": [{"slot": 2}],
                     "raw": {"id": "not-int", "tray": [{}, "bad", {"remain": "x"}]},
                 }
@@ -384,7 +392,7 @@ class TestAmsHmsBuilders(unittest.TestCase):
             bambu_parse.build_ams({"ams": {"ams": [{"id": "2", "humidity": "4", "dry_time": "120"}]}}),
             [
                 {
-                    "unit": 2,
+                    "unit": 0,  # enumeration index; raw.id keeps the reported "2"
                     "trays": [],
                     "humidity": 4.0,
                     "dryTime": 120,
