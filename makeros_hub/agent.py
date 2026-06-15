@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import __version__
 from .config import SPOOL_DIR, Config, parse_virtual_printer_config, read_credential
+from .vprinter.live_pool import updated_config_if_pool_changed
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import TransportError, get_json, post_json
 from .ingest import IngestServer
@@ -1015,6 +1016,32 @@ def run(
                 )
                 maybe_rehydrate_vprinter_outbox()
                 statuses = manager.statuses()
+                # Live-mirror the VP's reported AMS from the agent's OWN read of the
+                # real printers — so OrcaSlicer's Device tab (the send-time source of
+                # truth) tracks reality every heartbeat: no cloud round-trip, no
+                # config re-pull, no VP restart. Only reconciles on a display change
+                # (updated_config_if_pool_changed returns None otherwise → no churn).
+                if vp_manager is not None and vprinter_state.config is not None:
+                    try:
+                        live_vp = updated_config_if_pool_changed(vprinter_state.config, statuses)
+                        if live_vp is not None:
+                            # Apply to the running VP FIRST; only mark it the
+                            # current config once the hot-apply succeeds. A failed
+                            # apply leaves config at the last-applied pool, so the
+                            # next heartbeat re-derives and retries instead of
+                            # silently remembering a pool that never reached the VP.
+                            vp_manager.reconcile_sync(live_vp)
+                            vprinter_state.remember_config(live_vp)
+                            log.info(
+                                "VP AMS live-mirror applied (%d trays from real printers)",
+                                len(live_vp.pool),
+                            )
+                    except Exception as exc:  # noqa: BLE001 - must not sink heartbeat
+                        _record_diagnostic(
+                            diagnostics,
+                            "vprinter",
+                            f"live AMS apply failed: {redact(str(exc))}",
+                        )
                 jobs = manager.pending_jobs()
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
