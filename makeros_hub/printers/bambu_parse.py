@@ -241,8 +241,13 @@ def build_ams(print_obj: dict) -> list[dict] | None:
         if not isinstance(unit, dict):
             continue
 
-        unit_id = _to_int(unit.get("id"))
-        unit_out: dict[str, Any] = {"unit": unit_idx if unit_id is None else unit_id, "trays": []}
+        # Use the ENUMERATION index, not the raw Bambu unit id. Standard AMS
+        # units are 0-3, but the H2D's second unit (and the AMS-HT) report id
+        # 128+, which exceeds the cloud DTO's unit cap (0-15) and would drop the
+        # WHOLE report → the printer stuck `pending`. The raw id stays in `raw`.
+        # (Per-nozzle AMS→nozzle routing for the H2D is handled by the dual-pool
+        # VP work, not this telemetry index.)
+        unit_out: dict[str, Any] = {"unit": unit_idx, "trays": []}
 
         # `humidity` is a 1-5 dryness LEVEL (verified live on the AMS 2 Pro);
         # `humidity_raw` is the actual percentage (e.g. "44"). Capture both — the
