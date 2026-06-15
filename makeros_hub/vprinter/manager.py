@@ -267,10 +267,30 @@ class _VirtualPrinterRuntime:
         self.ftp = None
         self.broker = None
         # Bambu's Device tab only re-reads the AMS when ams.version INCREMENTS.
-        # Seed from wall-clock so a restart always beats whatever OrcaSlicer last
-        # cached (unsticking a stale display), then bump on every pool change.
-        self._ams_version = int(time.time())
-        self._pool_sig = _pool_signature(config.pool)
+        # Persisted per-serial so it survives restarts: a same-second restart or
+        # an NTP step-backward must never regress the version, or OrcaSlicer would
+        # ignore the post-restart AMS. Seed strictly above BOTH wall-clock and the
+        # last persisted value, then bump on each displayed-pool change. Signature
+        # is over the displayed slots only (units*trays) — overflow trays are never
+        # emitted, so they must not churn the version.
+        self._ams_version = max(int(time.time()), self._read_persisted_ams_version() + 1)
+        self._pool_sig = _pool_signature(config.pool[: config.units * config.trays])
+
+    def _ams_version_path(self) -> Path:
+        return self.base_dir / "ams_version"
+
+    def _read_persisted_ams_version(self) -> int:
+        try:
+            return int(self._ams_version_path().read_text().strip())
+        except Exception:
+            return 0
+
+    def _persist_ams_version(self) -> None:
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self._ams_version_path().write_text(str(self._ams_version))
+        except Exception:
+            log.warning("could not persist ams_version for %s", self.config.serial)
 
     async def start(self) -> None:
         # Lazy imports keep the agent importable before cryptography is present.
@@ -282,6 +302,7 @@ class _VirtualPrinterRuntime:
         from .ssdp import SsdpConfig, start_ssdp_responder
 
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._persist_ams_version()  # save the seed so the next restart reads it
         sweep_uploads_dir(self.base_dir / "uploads", log=log.warning)
         bundle = ensure_certificates(self.base_dir, self.config.serial, self.config.bind_ip)
         bind_config = BindReplyConfig(
@@ -388,10 +409,11 @@ class _VirtualPrinterRuntime:
         # OrcaSlicer's Device tab re-reads the trays (and we don't churn it on
         # member-only changes). max(now, prev+1) keeps it strictly increasing
         # even for rapid successive changes within the same second.
-        new_sig = _pool_signature(config.pool)
+        new_sig = _pool_signature(config.pool[: config.units * config.trays])
         if new_sig != self._pool_sig:
             self._ams_version = max(int(time.time()), self._ams_version + 1)
             self._pool_sig = new_sig
+            self._persist_ams_version()
         self.config = config
         self.auth.replace_members(config.members)
         if self.broker is not None:

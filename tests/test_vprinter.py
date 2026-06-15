@@ -314,10 +314,10 @@ class TestAmsVersionBump(unittest.TestCase):
             }
         )
 
-    def _runtime(self, pool, members=()):
+    def _runtime(self, pool, members=(), base_dir=None):
         return _VirtualPrinterRuntime(
             self._config(pool, members),
-            base_dir=Path("/tmp/makeros-vp-test"),
+            base_dir=base_dir or Path(tempfile.mkdtemp()),
             on_capture=lambda *a, **k: None,
         )
 
@@ -352,6 +352,18 @@ class TestAmsVersionBump(unittest.TestCase):
         # Re-applying the same pool must NOT bump again.
         asyncio.run(rt.apply_hot(self._config([{"tray_type": "ABS", "tray_info_idx": "GFB00"}])))
         self.assertEqual(rt._ams_version, v1)
+
+    def test_version_persists_and_increases_across_restart(self):
+        base = Path(tempfile.mkdtemp())
+        pla = [{"tray_type": "PLA", "tray_info_idx": "GFA00"}]
+        rt1 = self._runtime(pla, base_dir=base)
+        asyncio.run(rt1.apply_hot(self._config([{"tray_type": "ABS", "tray_info_idx": "GFB00"}])))
+        v1 = rt1._ams_version  # bumped AND persisted to base/<serial>/ams_version
+
+        # "Restart": a fresh runtime for the same serial+dir must seed ABOVE the
+        # persisted value, even within the same wall-clock second.
+        rt2 = self._runtime(pla, base_dir=base)
+        self.assertGreater(rt2._ams_version, v1)
 
 
 class TestBindFrame(unittest.TestCase):
