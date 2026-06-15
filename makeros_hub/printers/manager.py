@@ -85,6 +85,9 @@ class PrinterManager:
                 "accessCode": p.get("accessCode"),
                 "moonrakerUrl": p.get("moonrakerUrl"),
                 "cameraSnapshotUrl": p.get("cameraSnapshotUrl"),
+                # Strict True only — a malformed/older payload sending a string
+                # like "false" must NOT enable capture (preserve default-off).
+                "cameraEnabled": p.get("cameraEnabled") is True,
             }
             for p in printers
             if isinstance(p.get("id"), str)

@@ -946,8 +946,10 @@ def run(
     pending_probe_results: list[dict] = []
     tailscale_state = _TailscaleRuntimeState()
     vprinter_state = _VirtualPrinterRuntimeState()
-    # Camera capture is OFF unless explicitly enabled (the cloud framework is
-    # default-off too). Flip MAKEROS_HUB_CAMERA_ENABLED=1 to start sending frames.
+    # Per-printer camera capture is normally driven by the admin toggle
+    # (cameraEnabled, via config-down). MAKEROS_HUB_CAMERA_ENABLED=1 is a GLOBAL
+    # override that force-enables capture on every camera-capable printer (handy
+    # for a one-off test); unset, only admin-enabled printers are captured.
     camera_scheduler = CameraScheduler()
     camera_enabled = os.environ.get("MAKEROS_HUB_CAMERA_ENABLED", "").strip().lower() in (
         "1",
@@ -1056,31 +1058,38 @@ def run(
                             f"live AMS apply failed: {redact(str(exc))}",
                         )
                 jobs = manager.pending_jobs()
-                # Camera frames (opt-in). Phase-adaptive cadence + parallel,
-                # bounded capture — must never sink the heartbeat, so the whole
-                # thing is best-effort and a failure just sends no frame this beat.
+                # Camera frames (opt-in). A printer is captured when EITHER the
+                # admin enabled it (cameraEnabled, via config-down) OR the global
+                # env override is set. Default-off: neither → no capture. Phase-
+                # adaptive cadence + parallel/bounded — best-effort, never sinks
+                # the heartbeat (a failure just sends no frame this beat).
                 camera_frames: list[dict] | None = None
-                if camera_enabled:
-                    try:
-                        targets = manager.camera_targets()
-                        # Drop scheduler state for printers no longer configured.
-                        camera_scheduler.forget(
-                            {t["printerId"] for t in targets if t.get("printerId")}
-                        )
+                try:
+                    all_targets = manager.camera_targets()
+                    eligible = [
+                        t for t in all_targets if camera_enabled or t.get("cameraEnabled")
+                    ]
+                    # Keep scheduler state ONLY for currently-eligible printers, so
+                    # a removed OR camera-disabled printer is forgotten — and
+                    # re-enabling one later grabs a fresh frame immediately.
+                    camera_scheduler.forget(
+                        {t["printerId"] for t in eligible if t.get("printerId")}
+                    )
+                    if eligible:
                         status_by_id = {
                             s.get("printerId"): s for s in statuses if s.get("printerId")
                         }
                         camera_frames = collect_camera_frames(
-                            targets,
+                            eligible,
                             status_by_id,
                             camera_scheduler,
                             time.monotonic(),
                         )
-                    except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
-                        _record_diagnostic(
-                            diagnostics, "camera", f"frame collection failed: {redact(str(exc))}"
-                        )
-                        camera_frames = None
+                except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
+                    _record_diagnostic(
+                        diagnostics, "camera", f"frame collection failed: {redact(str(exc))}"
+                    )
+                    camera_frames = None
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
