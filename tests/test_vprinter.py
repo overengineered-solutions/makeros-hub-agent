@@ -503,6 +503,29 @@ class TestSsdpProtocol(unittest.TestCase):
 
 
 class TestMqttCodec(unittest.TestCase):
+    def test_wait_closed_is_time_boxed(self):
+        # Regression: an identity-change restart (units/name/bind_ip/…) tears the
+        # runtime down. If a client (OrcaSlicer) holds the MQTT socket and never
+        # completes the TLS close, an unbounded writer.wait_closed() would stall
+        # teardown past the 20s reconcile timeout. _wait_closed must time-box it.
+        from makeros_hub.vprinter import mqtt_broker as mb
+
+        class _HangingWriter:
+            def close(self):
+                pass
+
+            async def wait_closed(self):
+                await asyncio.Event().wait()  # never resolves
+
+        async def run():
+            loop = asyncio.get_event_loop()
+            start = loop.time()
+            with mock.patch.object(mb, "MQTT_CLOSE_TIMEOUT_SEC", 0.05):
+                await mb._wait_closed(_HangingWriter())
+            return loop.time() - start
+
+        self.assertLess(asyncio.run(run()), 1.0)
+
     def test_remaining_length_boundaries(self):
         values = [0, 1, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152, 268_435_455]
         for value in values:
