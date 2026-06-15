@@ -55,12 +55,28 @@ class TestLivePool(unittest.TestCase):
             ),
         ]
         pool = vp_pool_from_statuses(statuses, units=1, trays=4)
-        self.assertEqual(len(pool), 3)  # GFL99 PLA, GFA07 PLA, GFB00 ABS
+        self.assertEqual(len(pool), 3)  # Generic PLA, GFA07 PLA, GFB00 ABS
         self.assertEqual(sorted(p["tray_type"] for p in pool), ["ABS", "PLA", "PLA"])
-        white = next(p for p in pool if p["tray_info_idx"] == "GFL99")
-        self.assertEqual(white["tray_color"], "FFFFFFFF")
-        self.assertEqual(white["tray_sub_brands"], "Generic PLA")
+        # Generic PLA (GFL99) is remapped to recognized Bambu PLA Basic (GFA00 +
+        # "PLA Basic" sub-brand) so OrcaSlicer renders PLA, not ABS.
+        white = next(p for p in pool if p["tray_color"] == "FFFFFFFF")
+        self.assertEqual(white["tray_info_idx"], "GFA00")
+        self.assertEqual(white["tray_sub_brands"], "PLA Basic")
         self.assertEqual(white["cols"], ["FFFFFFFF"])
+
+    def test_generic_pla_remapped_to_recognized_basic(self):
+        # Regression for the "2 ABS": OrcaSlicer can't resolve Generic PLA
+        # (tray_info_idx GFL99) -> renders ABS. Remap to Bambu PLA Basic
+        # (GFA00 + "PLA Basic" sub-brand) so the TYPE renders as PLA.
+        statuses = [
+            _status(
+                [{"slot": 0, "material": "PLA", "filamentId": "GFL99", "colorHex": "D5B6A4FF", "productName": "Generic PLA"}]
+            )
+        ]
+        pool = vp_pool_from_statuses(statuses, 1, 4)
+        self.assertEqual(pool[0]["tray_type"], "PLA")
+        self.assertEqual(pool[0]["tray_info_idx"], "GFA00")
+        self.assertEqual(pool[0]["tray_sub_brands"], "PLA Basic")
 
     def test_empty_inputs(self):
         self.assertEqual(vp_pool_from_statuses([_status([{"slot": 0}])], 1, 4), [])
@@ -124,8 +140,10 @@ class TestLivePool(unittest.TestCase):
     def test_dedup_tie_break_is_deterministic_by_printer_id(self):
         # same spool id+color in two printers, different productName -> the lower
         # printerId wins regardless of input order (deterministic across heartbeats).
-        a = {"printerId": "p-a", **_status([{"slot": 0, "material": "PLA", "filamentId": "GFL99", "colorHex": "FFFFFFFF", "productName": "AAA"}])}
-        b = {"printerId": "p-b", **_status([{"slot": 0, "material": "PLA", "filamentId": "GFL99", "colorHex": "FFFFFFFF", "productName": "BBB"}])}
+        # GFA07 (recognized, not remapped) so the real productName flows through
+        # and the tie-break is observable via tray_sub_brands.
+        a = {"printerId": "p-a", **_status([{"slot": 0, "material": "PLA", "filamentId": "GFA07", "colorHex": "FFFFFFFF", "productName": "AAA"}])}
+        b = {"printerId": "p-b", **_status([{"slot": 0, "material": "PLA", "filamentId": "GFA07", "colorHex": "FFFFFFFF", "productName": "BBB"}])}
         self.assertEqual(vp_pool_from_statuses([b, a], 1, 4)[0]["tray_sub_brands"], "AAA")
         self.assertEqual(vp_pool_from_statuses([a, b], 1, 4)[0]["tray_sub_brands"], "AAA")
 
@@ -160,8 +178,9 @@ class TestUpdatedConfig(unittest.TestCase):
             [
                 {
                     "tray_type": "PLA",
-                    "tray_info_idx": "GFL99",
-                    "tray_sub_brands": "Generic PLA",
+                    # Generic PLA GFL99 is remapped to recognized GFA00 + "PLA Basic".
+                    "tray_info_idx": "GFA00",
+                    "tray_sub_brands": "PLA Basic",
                     "tray_color": "FFFFFFFF",
                     "cols": ["FFFFFFFF"],
                 }

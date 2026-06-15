@@ -33,6 +33,27 @@ _FILAMENT_CATALOG: dict[str, dict[str, Any]] = {
 }
 _FALLBACK_FILAMENT = _FILAMENT_CATALOG["PLA"]
 
+# OrcaSlicer's Device tab can't resolve Bambu's GENERIC filament ids (e.g. Generic
+# PLA "GFL99") for the VP's model — even though the tray is otherwise IDENTICAL to
+# a real printer's (verified field-for-field 2026-06-15) — so it falls back to the
+# first type in the list, alphabetically ABS (the operator's "2 ABS" = 2 Generic
+# PLA spools). RECOGNIZED Bambu ids (GFA01 "PLA Matte" etc.) resolve fine, so remap
+# a generic id to its recognized Basic counterpart + matching sub-brand so the TYPE
+# renders correctly. The real spool is a PLA, so profile/temps stay right.
+_GENERIC_IDX_REMAP: dict[str, tuple[str, str]] = {
+    "GFL99": ("GFA00", "PLA Basic"),  # Generic PLA -> Bambu PLA Basic
+}
+
+
+def _resolve_idx(info_idx: str, product_name: str | None) -> tuple[str, str]:
+    """Return (tray_info_idx, tray_sub_brands): a recognized id (+ its sub-brand)
+    for a generic id OrcaSlicer can't resolve, else the id + the real product
+    name."""
+    remapped = _GENERIC_IDX_REMAP.get(info_idx)
+    if remapped is not None:
+        return remapped
+    return info_idx, product_name or ""
+
 
 def _clean_optional(value: Any) -> str | None:
     """cleanOptionalText: trimmed string, or None when blank."""
@@ -112,11 +133,15 @@ def vp_pool_from_statuses(
         nozzle_min = t.get("nozzleTempMin")
         nozzle_max = t.get("nozzleTempMax")
         remain = t.get("remainPct")
+        info_idx, sub_brands = _resolve_idx(
+            _clean_optional(t.get("filamentId")) or catalog["infoIdx"],
+            _clean_optional(t.get("productName")),
+        )
         pool.append(
             {
                 "tray_type": material,
-                "tray_info_idx": _clean_optional(t.get("filamentId")) or catalog["infoIdx"],
-                "tray_sub_brands": _clean_optional(t.get("productName")) or "",
+                "tray_info_idx": info_idx,
+                "tray_sub_brands": sub_brands,
                 "tray_color": color,
                 "cols": cols,
                 "nozzle_temp_min": str(
