@@ -213,25 +213,68 @@ MODEL_PRODUCT_NAMES = {
 }
 
 
+# A real Bambu AMS tray carries these calibration/state fields ALONGSIDE the
+# filament identity (tray_type / tray_info_idx / tray_color). OrcaSlicer's Device
+# tab uses them to RESOLVE a tray to a known filament. Without them it can still
+# resolve RFID-tagged Bambu filaments (they carry tray_info_idx + tray_sub_brands
+# the slicer matches against its DB), but for a GENERIC spool — tray_info_idx
+# "GFL99", empty sub_brands — it can't, and falls back to the FIRST filament in
+# the model's list (alphabetically ABS). That was the "phantom 2 ABS": our two
+# Generic-PLA spools rendering as ABS. Captured field-for-field from a real
+# A1-mini's Generic-PLA (GFL99) tray on 2026-06-15 (codex-night/gfl99_diff.py)
+# so the emulated trays carry the exact shape the Device tab expects.
+_REAL_TRAY_DEFAULTS: dict[str, Any] = {
+    "bed_temp": "0",
+    "bed_temp_type": "0",
+    "cali_idx": -1,
+    "ctype": 0,
+    "k": 0.02,
+    "n": 1,
+    "state": 3,
+    "total_len": 330000,
+    "tray_diameter": "0.00",
+    "tray_id_name": "",
+    "tray_temp": "0",
+    "tray_time": "0",
+    "tray_weight": "0",
+    "xcam_info": "000000000000000000000000",
+}
+
+
+def _with_real_tray_shape(tray: dict[str, Any]) -> dict[str, Any]:
+    """Add the calibration/state fields a real Bambu tray always carries so
+    OrcaSlicer's Device tab resolves the filament TYPE instead of defaulting an
+    unrecognized (Generic / GFL99) spool to the first list entry, ABS. Existing
+    keys win — only absent fields are filled."""
+    for key, value in _REAL_TRAY_DEFAULTS.items():
+        tray.setdefault(key, value)
+    return tray
+
+
 def _empty_tray(slot: int) -> dict[str, Any]:
+    # A bare {id} is the correct empty slot — OrcaSlicer renders these as blank
+    # just fine (operator-confirmed; the fleet shows many blanks correctly). The
+    # "phantom ABS" is NOT from empty slots; do not embellish this.
     return {"id": str(slot)}
 
 
 def _synthetic_tray(global_idx: int, slot: int, color: str) -> dict[str, Any]:
     material, info_idx, brand, min_temp, max_temp = MATERIALS[global_idx % len(MATERIALS)]
-    return {
-        "id": str(slot),
-        "tray_type": material,
-        "tray_info_idx": info_idx,
-        "tray_sub_brands": brand,
-        "tray_color": color,
-        "cols": [color],
-        "nozzle_temp_min": min_temp,
-        "nozzle_temp_max": max_temp,
-        "remain": 100,
-        "tag_uid": f"vp-{global_idx}",
-        "tray_uuid": "00000000000000000000000000000000",
-    }
+    return _with_real_tray_shape(
+        {
+            "id": str(slot),
+            "tray_type": material,
+            "tray_info_idx": info_idx,
+            "tray_sub_brands": brand,
+            "tray_color": color,
+            "cols": [color],
+            "nozzle_temp_min": min_temp,
+            "nozzle_temp_max": max_temp,
+            "remain": 100,
+            "tag_uid": f"vp-{global_idx}",
+            "tray_uuid": "00000000000000000000000000000000",
+        }
+    )
 
 
 def _coerce_pool_tray(tray: dict[str, Any], slot: int) -> dict[str, Any]:
@@ -252,7 +295,7 @@ def _coerce_pool_tray(tray: dict[str, Any], slot: int) -> dict[str, Any]:
     item.setdefault("remain", -1)
     item.setdefault("tag_uid", "0000000000000000")
     item.setdefault("tray_uuid", "00000000000000000000000000000000")
-    return item
+    return _with_real_tray_shape(item)
 
 
 def _normalize_color(value: str) -> str:

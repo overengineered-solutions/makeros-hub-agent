@@ -267,7 +267,35 @@ class TestReportBuilders(unittest.TestCase):
         self.assertTrue(all(unit["info"] == "2003" for unit in ams["ams"]))
         self.assertEqual(trays[0]["tray_type"], "PLA")
         self.assertEqual(trays[1]["tray_type"], "PETG")
+        # Empty slots are a bare {id} — OrcaSlicer renders these as blank fine.
         self.assertEqual(trays[2], {"id": "2"})
+
+    def test_filled_tray_carries_real_bambu_shape(self):
+        # Regression for the "phantom 2 ABS": a GENERIC spool (tray_info_idx
+        # GFL99, empty sub_brands) only renders as PLA in OrcaSlicer's Device tab
+        # if the tray carries the full calibration/state shape a real Bambu tray
+        # has. Without these, OrcaSlicer can't resolve the type and defaults to
+        # the first filament in the model list (alphabetically ABS).
+        report = build_push_status(
+            units=1,
+            trays=4,
+            filaments=[{"tray_type": "PLA", "tray_info_idx": "GFL99", "tray_color": "D5B6A4FF"}],
+        )
+        tray = report["print"]["ams"]["ams"][0]["tray"][0]
+        # identity preserved
+        self.assertEqual(tray["tray_type"], "PLA")
+        self.assertEqual(tray["tray_info_idx"], "GFL99")
+        # the shape fields captured from a real A1-mini Generic-PLA tray
+        for key in ("ctype", "cali_idx", "state", "n", "k", "total_len",
+                    "tray_diameter", "tray_id_name", "tray_weight", "tray_temp",
+                    "tray_time", "bed_temp", "bed_temp_type", "xcam_info"):
+            self.assertIn(key, tray, f"filled tray missing real-Bambu field {key!r}")
+        self.assertEqual(tray["ctype"], 0)
+        self.assertEqual(tray["state"], 3)
+        self.assertEqual(tray["cali_idx"], -1)
+        # empty slots stay bare — the shape fields must NOT leak onto them
+        empty = report["print"]["ams"]["ams"][0]["tray"][1]
+        self.assertEqual(empty, {"id": "1"})
 
     def test_push_status_ams_version_is_settable(self):
         # Bambu's Device tab only re-reads the AMS when ams.version increments.
