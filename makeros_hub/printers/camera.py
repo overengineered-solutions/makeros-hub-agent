@@ -25,6 +25,7 @@ from __future__ import annotations
 import base64
 import concurrent.futures
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Optional
 
@@ -43,6 +44,10 @@ def http_snapshot(
     """GET a single JPEG from a webcam snapshot URL (Moonraker/OctoPrint/etc.).
     Returns the bytes only if they look like a JPEG and are within the cap."""
     if not url:
+        return None
+    # Only fetch over http(s) — never let a config-supplied URL become file://,
+    # ftp://, etc. (local-file / scheme-confusion exfil into a "camera frame").
+    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
         return None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "makeros-hub-agent"})
@@ -202,8 +207,10 @@ def collect_camera_frames(
         except concurrent.futures.TimeoutError:
             pass  # keep whatever finished; the slow ones retry next beat
     finally:
-        # Do NOT block the heartbeat waiting on stragglers — each capture has its
-        # own socket/HTTP timeout, so a leftover thread finishes on its own and
-        # its result is simply discarded. (A `with` block would wait=True here.)
-        ex.shutdown(wait=False)
+        # Do NOT block the heartbeat waiting on stragglers — each capture is
+        # self-bounded (socket/HTTP timeout + total-byte cap). cancel_futures
+        # drops any not-yet-started captures (when due > max_workers); a running
+        # one finishes on its own and its result is discarded. (A `with` block
+        # would wait=True here and could add seconds to the beat.)
+        ex.shutdown(wait=False, cancel_futures=True)
     return frames

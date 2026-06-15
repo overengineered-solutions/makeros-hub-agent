@@ -91,6 +91,13 @@ class TestHttpSnapshot(unittest.TestCase):
     def test_empty_url(self):
         self.assertIsNone(camera.http_snapshot(""))
 
+    def test_rejects_non_http_scheme(self):
+        # file:// / ftp:// etc. must never be fetched (no urlopen call at all).
+        with mock.patch.object(camera.urllib.request, "urlopen") as m:
+            self.assertIsNone(camera.http_snapshot("file:///etc/passwd"))
+            self.assertIsNone(camera.http_snapshot("ftp://host/x.jpg"))
+            m.assert_not_called()
+
 
 class TestCapturePrinterFrame(unittest.TestCase):
     def test_bambu_routes_to_lan_capture(self):

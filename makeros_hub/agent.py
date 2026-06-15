@@ -1062,11 +1062,16 @@ def run(
                 camera_frames: list[dict] | None = None
                 if camera_enabled:
                     try:
+                        targets = manager.camera_targets()
+                        # Drop scheduler state for printers no longer configured.
+                        camera_scheduler.forget(
+                            {t["printerId"] for t in targets if t.get("printerId")}
+                        )
                         status_by_id = {
                             s.get("printerId"): s for s in statuses if s.get("printerId")
                         }
                         camera_frames = collect_camera_frames(
-                            manager.camera_targets(),
+                            targets,
                             status_by_id,
                             camera_scheduler,
                             time.monotonic(),

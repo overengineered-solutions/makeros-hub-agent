@@ -28,7 +28,10 @@ from typing import Optional
 
 CAMERA_PORT = 6000
 _AUTH_HEADER = struct.pack("<IIII", 0x40, 0x3000, 0, 0)
-_SOI = b"\xff\xd8\xff\xe0"  # JPEG start-of-image + APP0 (JFIF)
+# Generic JPEG start: SOI (FF D8) + the first marker byte (FF). Matches APP0/JFIF
+# (FF D8 FF E0) AND Exif/quant-table variants (FF E1 / DB) so a non-JFIF frame
+# isn't silently dropped.
+_SOI = b"\xff\xd8\xff"
 _EOI = b"\xff\xd9"  # JPEG end-of-image
 _DEFAULT_TIMEOUT = 4.0
 # A single 1280x720 MJPEG frame is ~100 KB; cap the read so a misbehaving/non-Bambu
@@ -69,21 +72,28 @@ def capture_frame(
 
 
 def _read_one_jpeg(sock: ssl.SSLSocket, max_bytes: int) -> Optional[bytes]:
-    """Accumulate 4 KB chunks until one complete SOI..EOI JPEG is buffered."""
+    """Accumulate 4 KB chunks until one complete SOI..EOI JPEG is buffered.
+    Bounded by TOTAL bytes read — not just current buffer size — so a peer that
+    never sends an SOI (or never an EOI) and just trickles bytes can't keep a
+    capture thread alive indefinitely; it's cut off once it has sent max_bytes."""
+    keep = len(_SOI) - 1
     buf = bytearray()
-    while len(buf) < max_bytes:
+    total = 0
+    while total < max_bytes:
         try:
             chunk = sock.recv(4096)
         except (OSError, ssl.SSLError):
             return None
         if not chunk:
             return None  # peer closed before a full frame
+        total += len(chunk)
         buf += chunk
         start = buf.find(_SOI)
         if start == -1:
-            # No SOI yet — keep only a tail in case the marker straddles chunks.
-            if len(buf) > 3:
-                del buf[: len(buf) - 3]
+            # No SOI yet — keep only a short tail in case the marker straddles
+            # chunks (total still counts the discarded bytes, so the cap holds).
+            if len(buf) > keep:
+                del buf[: len(buf) - keep]
             continue
         end = buf.find(_EOI, start + len(_SOI))
         if end != -1:
