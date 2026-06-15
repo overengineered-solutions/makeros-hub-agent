@@ -24,6 +24,7 @@ def build_push_status(
     gcode_state: str = "IDLE",
     gcode_file: str = "",
     prepare_percent: str = "0",
+    ams_version: int = 4,
 ) -> dict[str, Any]:
     if units <= 0:
         raise ValueError("units must be positive")
@@ -106,7 +107,11 @@ def build_push_status(
                 "tray_now": "255",
                 "tray_tar": "255",
                 "tray_pre": "255",
-                "version": 4,
+                # Bambu's Device tab only re-reads the AMS when this version
+                # INCREMENTS. It must move whenever the pool changes (and bump on
+                # restart) or OrcaSlicer latches the first AMS it ever saw and
+                # ignores both later reports and the manual refresh.
+                "version": ams_version,
                 "ams": ams_units,
             },
             "vt_tray": {

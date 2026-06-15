@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from concurrent.futures import Future
 from pathlib import Path
 from typing import Any
@@ -265,6 +266,31 @@ class _VirtualPrinterRuntime:
         self.ssdps: list[Any] = []
         self.ftp = None
         self.broker = None
+        # Bambu's Device tab only re-reads the AMS when ams.version INCREMENTS.
+        # Persisted per-serial so it survives restarts: a same-second restart or
+        # an NTP step-backward must never regress the version, or OrcaSlicer would
+        # ignore the post-restart AMS. Seed strictly above BOTH wall-clock and the
+        # last persisted value, then bump on each displayed-pool change. Signature
+        # is over the displayed slots only (units*trays) — overflow trays are never
+        # emitted, so they must not churn the version.
+        self._ams_version = max(int(time.time()), self._read_persisted_ams_version() + 1)
+        self._pool_sig = _pool_signature(config.pool[: config.units * config.trays])
+
+    def _ams_version_path(self) -> Path:
+        return self.base_dir / "ams_version"
+
+    def _read_persisted_ams_version(self) -> int:
+        try:
+            return int(self._ams_version_path().read_text().strip())
+        except Exception:
+            return 0
+
+    def _persist_ams_version(self) -> None:
+        try:
+            self.base_dir.mkdir(parents=True, exist_ok=True)
+            self._ams_version_path().write_text(str(self._ams_version))
+        except Exception:
+            log.warning("could not persist ams_version for %s", self.config.serial)
 
     async def start(self) -> None:
         # Lazy imports keep the agent importable before cryptography is present.
@@ -276,6 +302,7 @@ class _VirtualPrinterRuntime:
         from .ssdp import SsdpConfig, start_ssdp_responder
 
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._persist_ams_version()  # save the seed so the next restart reads it
         sweep_uploads_dir(self.base_dir / "uploads", log=log.warning)
         bundle = ensure_certificates(self.base_dir, self.config.serial, self.config.bind_ip)
         bind_config = BindReplyConfig(
@@ -295,6 +322,7 @@ class _VirtualPrinterRuntime:
                 gcode_state=gcode_state,
                 gcode_file=gcode_file,
                 prepare_percent=prepare_percent,
+                ams_version=self._ams_version,
             ),
             version_builder=lambda sequence_id: build_get_version(
                 model=self.config.model,
@@ -377,14 +405,24 @@ class _VirtualPrinterRuntime:
         self.capture.clear()
 
     async def apply_hot(self, config: VirtualPrinterConfig) -> None:
+        # Bump the AMS version only when the displayed pool actually changes, so
+        # OrcaSlicer's Device tab re-reads the trays (and we don't churn it on
+        # member-only changes). max(now, prev+1) keeps it strictly increasing
+        # even for rapid successive changes within the same second.
+        new_sig = _pool_signature(config.pool[: config.units * config.trays])
+        if new_sig != self._pool_sig:
+            self._ams_version = max(int(time.time()), self._ams_version + 1)
+            self._pool_sig = new_sig
+            self._persist_ams_version()
         self.config = config
         self.auth.replace_members(config.members)
         if self.broker is not None:
             await self.broker.push_report_now()
         log.info(
-            "virtual printer hot-applied (members=%d pool=%d)",
+            "virtual printer hot-applied (members=%d pool=%d ams_version=%d)",
             len(config.members),
             len(config.pool),
+            self._ams_version,
         )
 
     def _on_stored(self, upload: UploadRecord) -> None:
@@ -431,6 +469,12 @@ def _hot_state(config: VirtualPrinterConfig) -> tuple[Any, ...]:
 def _pool_identity(pool: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
     keys = ("tray_type", "tray_info_idx", "tray_sub_brands", "tray_color", "cols")
     return [{key: tray.get(key) for key in keys if key in tray} for tray in pool]
+
+
+def _pool_signature(pool: tuple[dict[str, Any], ...]) -> str:
+    """Stable string identity of the pool's displayed content — used to decide
+    whether the AMS version must bump (Bambu Device-tab refresh gate)."""
+    return json.dumps(_pool_identity(pool), sort_keys=True, separators=(",", ":"), default=str)
 
 
 def _safe_serial(serial: str) -> str:
