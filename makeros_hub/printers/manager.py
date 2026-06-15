@@ -85,6 +85,7 @@ class PrinterManager:
                 "accessCode": p.get("accessCode"),
                 "moonrakerUrl": p.get("moonrakerUrl"),
                 "cameraSnapshotUrl": p.get("cameraSnapshotUrl"),
+                "cameraEnabled": bool(p.get("cameraEnabled")),
             }
             for p in printers
             if isinstance(p.get("id"), str)
