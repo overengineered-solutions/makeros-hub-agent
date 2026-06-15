@@ -1066,13 +1066,15 @@ def run(
                 camera_frames: list[dict] | None = None
                 try:
                     all_targets = manager.camera_targets()
-                    # Drop scheduler state for printers no longer configured.
-                    camera_scheduler.forget(
-                        {t["printerId"] for t in all_targets if t.get("printerId")}
-                    )
                     eligible = [
                         t for t in all_targets if camera_enabled or t.get("cameraEnabled")
                     ]
+                    # Keep scheduler state ONLY for currently-eligible printers, so
+                    # a removed OR camera-disabled printer is forgotten — and
+                    # re-enabling one later grabs a fresh frame immediately.
+                    camera_scheduler.forget(
+                        {t["printerId"] for t in eligible if t.get("printerId")}
+                    )
                     if eligible:
                         status_by_id = {
                             s.get("printerId"): s for s in statuses if s.get("printerId")
