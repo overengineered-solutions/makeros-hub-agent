@@ -49,8 +49,10 @@ from makeros_hub.vprinter.mqtt_broker import (
 )
 from makeros_hub.vprinter.manager import (
     _AsyncVirtualPrinterSupervisor,
+    _VirtualPrinterRuntime,
     _hot_state,
     _identity_fingerprint,
+    _pool_signature,
 )
 from makeros_hub.vprinter.outbox import VPrinterOutbox, from_record
 from makeros_hub.vprinter.report import build_get_version, build_print_ack, build_push_status
@@ -267,6 +269,13 @@ class TestReportBuilders(unittest.TestCase):
         self.assertEqual(trays[1]["tray_type"], "PETG")
         self.assertEqual(trays[2], {"id": "2"})
 
+    def test_push_status_ams_version_is_settable(self):
+        # Bambu's Device tab only re-reads the AMS when ams.version increments.
+        self.assertEqual(build_push_status()["print"]["ams"]["version"], 4)
+        self.assertEqual(
+            build_push_status(ams_version=123456)["print"]["ams"]["version"], 123456
+        )
+
     def test_get_version_has_n3f_modules_and_ack_shape(self):
         version = build_get_version("N1", "SER123", units=4, sequence_id="abc", ams_type="n3f")
         modules = version["info"]["module"]
@@ -280,6 +289,69 @@ class TestReportBuilders(unittest.TestCase):
         self.assertEqual(ack["print"]["command"], "project_file")
         self.assertEqual(ack["print"]["result"], "SUCCESS")
         self.assertEqual(ack["print"]["gcode_state"], "PREPARE")
+
+
+class TestAmsVersionBump(unittest.TestCase):
+    """ams.version must move when the displayed pool changes (Bambu Device-tab
+    refresh gate) and start high enough that a restart unsticks a stale display."""
+
+    def _config(self, pool, members=()):
+        # The parser requires >=1 valid member; seed one when the test doesn't
+        # care about members (the pool is what drives the version).
+        members = list(members) or [
+            {"access_code_sha256": _code_hash("seedseed"), "member_id": "seed"}
+        ]
+        return parse_virtual_printer_config(
+            {
+                "enabled": True,
+                "serial": "SER123",
+                "model": "N1",
+                "name": "VP",
+                "fw": "01.08.00.00",
+                "bind_ip": "100.64.0.10",
+                "members": members,
+                "pool": pool,
+            }
+        )
+
+    def _runtime(self, pool, members=()):
+        return _VirtualPrinterRuntime(
+            self._config(pool, members),
+            base_dir=Path("/tmp/makeros-vp-test"),
+            on_capture=lambda *a, **k: None,
+        )
+
+    def test_seeded_high_so_a_restart_unsticks_a_stale_display(self):
+        rt = self._runtime([{"tray_type": "PLA", "tray_info_idx": "GFA00"}])
+        # Seeded from wall-clock -> far above the old hardcoded 4 a client cached,
+        # so the first report after a restart always reads as "newer".
+        self.assertGreater(rt._ams_version, 4)
+
+    def test_signature_ignores_members_and_volatile_fields(self):
+        a = _pool_signature(({"tray_type": "PLA", "tray_info_idx": "GFA00", "remain": 80},))
+        b = _pool_signature(({"tray_type": "PLA", "tray_info_idx": "GFA00", "remain": 5},))
+        c = _pool_signature(({"tray_type": "ABS", "tray_info_idx": "GFB00"},))
+        self.assertEqual(a, b)  # remain% is volatile, not identity
+        self.assertNotEqual(a, c)
+
+    def test_bumps_on_pool_change_only(self):
+        pla = [{"tray_type": "PLA", "tray_info_idx": "GFA00"}]
+        rt = self._runtime(pla)
+        v0 = rt._ams_version
+
+        # Member-only change must NOT bump (don't churn the Device tab).
+        member = {"access_code_sha256": _code_hash("12345678"), "member_id": "m1"}
+        asyncio.run(rt.apply_hot(self._config(pla, members=[member])))
+        self.assertEqual(rt._ams_version, v0)
+
+        # Pool change MUST bump, strictly increasing.
+        asyncio.run(rt.apply_hot(self._config([{"tray_type": "ABS", "tray_info_idx": "GFB00"}])))
+        self.assertGreater(rt._ams_version, v0)
+        v1 = rt._ams_version
+
+        # Re-applying the same pool must NOT bump again.
+        asyncio.run(rt.apply_hot(self._config([{"tray_type": "ABS", "tray_info_idx": "GFB00"}])))
+        self.assertEqual(rt._ams_version, v1)
 
 
 class TestBindFrame(unittest.TestCase):
