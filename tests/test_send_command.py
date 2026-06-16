@@ -51,18 +51,21 @@ def make_adapter():
 
 
 class TestSendCommand(unittest.TestCase):
-    def test_pause_publishes_to_request_topic(self):
-        adapter = make_adapter()
-        adapter._client = FakeClient(connected=True)
-        adapter._connack = "ok"
-        result = adapter.send_command("pause")
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(len(adapter._client.published), 1)
-        topic, payload = adapter._client.published[0]
-        self.assertEqual(topic, "device/SER123/request")
-        doc = json.loads(payload)
-        self.assertEqual(doc["print"]["command"], "pause")
-        self.assertIn("sequence_id", doc["print"])
+    def test_publishes_correct_payload_for_each_command(self):
+        for command in ("pause", "resume", "stop"):
+            adapter = make_adapter()
+            adapter._client = FakeClient(connected=True)
+            adapter._connack = "ok"
+            result = adapter.send_command(command)
+            self.assertEqual(result, {"ok": True}, command)
+            self.assertEqual(len(adapter._client.published), 1, command)
+            topic, payload = adapter._client.published[0]
+            self.assertEqual(topic, "device/SER123/request")
+            doc = json.loads(payload)
+            self.assertEqual(doc["print"]["command"], command)
+            # pybambu's proven shape: param "" + a string sequence_id.
+            self.assertEqual(doc["print"]["param"], "")
+            self.assertIsInstance(doc["print"]["sequence_id"], str)
 
     def test_unsupported_command_rejected_without_publish(self):
         adapter = make_adapter()

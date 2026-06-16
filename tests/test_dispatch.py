@@ -351,6 +351,24 @@ class TestDispatchCommands(unittest.TestCase):
         self.assertEqual(manager.dispatch_commands(None), [])
         self.assertEqual(fake.calls, [("pause", None)])
 
+    def test_caps_per_heartbeat_and_rate_limits_the_excess(self):
+        # R6.7: the cloud caps delivery at 5; a flood (here 18) means a buggy/
+        # compromised control plane. Execute the first 16, fail the rest as
+        # rate_limited (so the cloud still closes them out).
+        manager = PrinterManager()
+        fake = FakeCommandAdapter({"ok": True})
+        manager._adapters["p1"] = fake
+        cmds = [command(requestId=f"r{i}") for i in range(18)]
+        reports = manager.dispatch_commands(cmds)
+
+        self.assertEqual(len(reports), 18)
+        self.assertEqual(len(fake.calls), 16)  # only the first 16 actually published
+        ok = [r for r in reports if r["status"] == "ok"]
+        rate_limited = [r for r in reports if r.get("detail") == "rate_limited"]
+        self.assertEqual(len(ok), 16)
+        self.assertEqual(len(rate_limited), 2)
+        self.assertTrue(all(r["status"] == "failed" for r in rate_limited))
+
 
 if __name__ == "__main__":
     unittest.main()

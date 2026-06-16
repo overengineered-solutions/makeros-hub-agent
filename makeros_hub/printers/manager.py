@@ -259,15 +259,35 @@ class PrinterManager:
         command, map ok/failure to a {requestId, command, status, detail} report
         the cloud's ingestPrinterCommandResults consumes (status 'ok' -> done,
         anything else -> failed with the detail)."""
+        # R6.7 defense-in-depth: the cloud caps delivery at 5/heartbeat, so a
+        # larger burst means a buggy or compromised control plane. Process the
+        # first N and fail the rest as rate_limited so the cloud still closes
+        # them out (rather than the agent blindly publishing an unbounded flood
+        # of MQTT control messages).
+        max_per_heartbeat = 16
         reports: list[dict] = []
-        for item in pending_commands if isinstance(pending_commands, list) else []:
+        items = pending_commands if isinstance(pending_commands, list) else []
+        for index, item in enumerate(items):
             if not isinstance(item, dict):
                 continue
             request_id = item.get("requestId")
             printer_id = item.get("printerId")
             command = item.get("command")
             if not all(isinstance(v, str) and v for v in (request_id, printer_id, command)):
+                # The cloud only ever delivers validated rows, so a malformed
+                # item has no real command row to close — log it (not silent) and
+                # drop, since we can't emit a valid-command terminal result for it.
                 log.warning("skipping malformed command: %s", item)
+                continue
+            if index >= max_per_heartbeat:
+                reports.append(
+                    {
+                        "requestId": request_id,
+                        "command": command,
+                        "status": "failed",
+                        "detail": "rate_limited",
+                    }
+                )
                 continue
             params = item.get("params") if isinstance(item.get("params"), dict) else None
             adapter = self._adapters.get(printer_id)
