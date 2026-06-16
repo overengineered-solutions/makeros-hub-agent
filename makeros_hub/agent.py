@@ -1095,6 +1095,19 @@ def run(
                             camera_scheduler,
                             time.monotonic(),
                         )
+                        # R4.5 agent-side loudness — when failures > 0, mirror
+                        # the cloud's loud signal to the Pi-local diagnostics
+                        # board so an offline operator can triage without a
+                        # cloud round-trip. Summary only (one line/beat), with
+                        # bounded printerId echo so a 16-printer fleet doesn't
+                        # bloat the diag string. PrinterIds are non-PII.
+                        if camera_failures:
+                            _record_diagnostic(
+                                diagnostics,
+                                "camera",
+                                f"no frame from {len(camera_failures)}/{len(eligible)} eligible: "
+                                + ",".join(camera_failures[:5]),
+                            )
                 except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
                     _record_diagnostic(
                         diagnostics, "camera", f"frame collection failed: {redact(str(exc))}"

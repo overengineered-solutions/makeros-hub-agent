@@ -230,6 +230,29 @@ class TestCollectCameraFrames(unittest.TestCase):
         self.assertEqual([f["printerId"] for f in frames], ["p1"])
         self.assertEqual(failures, ["p2"])
 
+    def test_timed_out_printer_appears_in_failures_without_blocking(self):
+        # Codex review HIGH: the load-bearing path is the as_completed timeout
+        # branch — a slow/unreachable camera must not stall the heartbeat AND
+        # must appear in failures. Verified by wall-clock + result.
+        import time as _t
+        s = camera.CameraScheduler()
+        def cap(t):
+            if t["printerId"] == "p1":
+                return b"\xff\xd8\xff\xe0x\xff\xd9"
+            _t.sleep(0.3)  # well past overall_timeout
+            return b"\xff\xd8\xff\xe0x\xff\xd9"
+
+        t0 = _t.monotonic()
+        frames, failures = camera.collect_camera_frames(
+            self._targets(), {}, s, now=0.0, capture=cap, overall_timeout=0.05, max_workers=2
+        )
+        wall = _t.monotonic() - t0
+        # The slow printer's worker is still running, but shutdown(wait=False,
+        # cancel_futures=True) returns immediately — heartbeat is bounded.
+        self.assertLess(wall, 0.25, f"heartbeat blocked by slow capture: {wall:.3f}s")
+        self.assertEqual([f["printerId"] for f in frames], ["p1"])
+        self.assertEqual(failures, ["p2"])
+
 
 if __name__ == "__main__":
     unittest.main()
