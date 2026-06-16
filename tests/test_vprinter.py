@@ -258,7 +258,15 @@ class TestReportBuilders(unittest.TestCase):
         self.assertEqual(payload["sdcard"], True)
         self.assertEqual(payload["home_flag"], 256)
         self.assertEqual(ams["ams_exist_bits"], "f")
-        self.assertEqual(ams["tray_exist_bits"], "ffff")
+        # Only the 2 FILLED slots (global 0,1) are marked — not all 16. The AMS
+        # read/state flags a real printer reports (and that OrcaSlicer needs to
+        # trust a GENERIC spool's type instead of defaulting to ABS).
+        self.assertEqual(ams["tray_exist_bits"], "3")
+        self.assertEqual(ams["tray_read_done_bits"], "3")
+        self.assertEqual(ams["tray_is_bbl_bits"], "3")
+        self.assertEqual(ams["tray_reading_bits"], "0")
+        self.assertIs(ams["insert_flag"], True)
+        self.assertIs(ams["power_on_flag"], True)
         self.assertEqual(len(ams["ams"]), 4)
         self.assertEqual(sum(len(unit["tray"]) for unit in ams["ams"]), 16)
         self.assertTrue(all(unit["info"] == "2003" for unit in ams["ams"]))
@@ -300,6 +308,36 @@ class TestReportBuilders(unittest.TestCase):
         # empty slots stay bare — the shape fields must NOT leak onto them
         empty = report["print"]["ams"]["ams"][0]["tray"][1]
         self.assertEqual(empty, {"id": "1"})
+
+    def test_ams_read_done_bits_track_filled_slots_only(self):
+        # The Device-tab "phantom ABS" fix: a GENERIC spool is only trusted (and
+        # rendered as its real type, not ABS) when its slot is marked read-done.
+        # The bitmask must cover exactly the filled slots, across units, and NOT
+        # the empty ones — a real printer reports e.g. '9' (slots 0,3), not all.
+        report = build_push_status(
+            units=2,
+            trays=4,
+            serial="SER123",
+            # global slots 0,1,2 filled (unit 0), unit 1 entirely empty
+            filaments=[
+                {"tray_type": "PLA", "tray_info_idx": "GFL99", "tray_color": "FFFFFFFF"},
+                {"tray_type": "PLA", "tray_info_idx": "GFA01", "tray_color": "000000FF"},
+                {"tray_type": "PETG", "tray_info_idx": "GFG99", "tray_color": "11223344"},
+            ],
+        )
+        ams = report["print"]["ams"]
+        # slots 0,1,2 filled -> 0b111 = '7'; slot 3 + all of unit 1 empty
+        self.assertEqual(ams["tray_exist_bits"], "7")
+        self.assertEqual(ams["tray_read_done_bits"], "7")
+        self.assertEqual(ams["tray_is_bbl_bits"], "7")
+        self.assertEqual(ams["tray_reading_bits"], "0")
+        self.assertIs(ams["insert_flag"], True)
+        self.assertIs(ams["power_on_flag"], True)
+
+    def test_no_filaments_marks_no_slots_read_done(self):
+        # Synthetic mode (filaments=None) fills every slot, so all are read-done.
+        ams = build_push_status(units=1, trays=4, serial="S")["print"]["ams"]
+        self.assertEqual(ams["tray_read_done_bits"], "f")  # 4 synthetic slots filled
 
     def test_push_status_ams_version_is_settable(self):
         # Bambu's Device tab only re-reads the AMS when ams.version increments.

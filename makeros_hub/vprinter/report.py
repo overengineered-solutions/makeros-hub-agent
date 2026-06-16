@@ -65,14 +65,17 @@ def build_push_status(
     total_trays = units * trays
     colors = generate_colors(total_trays) if filaments is None else []
     ams_units = []
+    filled_indices: list[int] = []  # global slot indices that carry filament
     for unit_idx in range(units):
         tray_items = []
         for tray_idx in range(trays):
             global_idx = unit_idx * trays + tray_idx
             if filaments is None:
                 tray = _synthetic_tray(global_idx, tray_idx, colors[global_idx])
+                filled_indices.append(global_idx)
             elif global_idx < len(filaments):
                 tray = _coerce_pool_tray(filaments[global_idx], tray_idx)
+                filled_indices.append(global_idx)
             else:
                 tray = _empty_tray(tray_idx)
             tray_items.append(tray)
@@ -141,10 +144,26 @@ def build_push_status(
             "ams_rfid_status": 0,
             "ams": {
                 "ams_exist_bits": _bitmask_hex(units),
-                "tray_exist_bits": _bitmask_hex(total_trays),
+                # Bitmasks/flags a real AMS reports — only FILLED slots are marked
+                # (real prints e.g. '9' for slots 0,3, not 'ffff' for all). These
+                # were MISSING, and that's the Device-tab "phantom ABS" cause:
+                # tray_read_done_bits is the AMS saying "I have READ + identified
+                # the filament in these slots". A recognized Bambu id (GFA0x)
+                # resolves from its own id regardless, but a GENERIC spool (GFL99)
+                # has no global identity — OrcaSlicer only trusts the slot's
+                # reported type once the slot is read-done; otherwise it falls back
+                # to the first filament in the model list (alphabetically ABS).
+                # Captured from a live A1-mini: tray_*_bits = filled mask,
+                # tray_reading_bits '0', insert_flag/power_on_flag True.
+                "tray_exist_bits": _bits_from_indices(filled_indices),
+                "tray_is_bbl_bits": _bits_from_indices(filled_indices),
+                "tray_read_done_bits": _bits_from_indices(filled_indices),
+                "tray_reading_bits": "0",
                 "tray_now": "255",
                 "tray_tar": "255",
                 "tray_pre": "255",
+                "insert_flag": True,
+                "power_on_flag": True,
                 # Bambu's Device tab only re-reads the AMS when this version
                 # INCREMENTS. It must move whenever the pool changes (and bump on
                 # restart) or OrcaSlicer latches the first AMS it ever saw and
@@ -374,3 +393,14 @@ def _bitmask_hex(bit_count: int) -> str:
     if bit_count <= 0:
         return "0"
     return format((1 << bit_count) - 1, "x")
+
+
+def _bits_from_indices(indices: list[int]) -> str:
+    """Hex bitmask with exactly the given slot indices set (bit i = slot i). A real
+    AMS reports tray_exist/read_done/is_bbl as the FILLED-slot mask, e.g. '9' for
+    slots 0 and 3 — not every slot. Empty → '0'."""
+    mask = 0
+    for i in indices:
+        if i >= 0:
+            mask |= 1 << i
+    return format(mask, "x")
