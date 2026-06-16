@@ -177,33 +177,39 @@ class TestCollectCameraFrames(unittest.TestCase):
 
     def test_captures_due_printers_and_base64s(self):
         s = camera.CameraScheduler()  # fresh -> both due (first sighting)
-        frames = camera.collect_camera_frames(
+        frames, failures = camera.collect_camera_frames(
             self._targets(), {}, s, now=0.0, capture=lambda _t: b"\xff\xd8\xff\xe0x\xff\xd9"
         )
         self.assertEqual({f["printerId"] for f in frames}, {"p1", "p2"})
+        self.assertEqual(failures, [])  # all due captured -> no failures
         import base64 as b64
         self.assertEqual(b64.b64decode(frames[0]["jpegBase64"]), b"\xff\xd8\xff\xe0x\xff\xd9")
 
-    def test_none_frame_is_skipped(self):
+    def test_none_frame_is_reported_as_failure(self):
         s = camera.CameraScheduler()
-        frames = camera.collect_camera_frames(self._targets(), {}, s, now=0.0, capture=lambda _t: None)
+        frames, failures = camera.collect_camera_frames(
+            self._targets(), {}, s, now=0.0, capture=lambda _t: None
+        )
         self.assertEqual(frames, [])
+        # both DUE printers produced no frame -> surfaced as failures (R4.5)
+        self.assertEqual(set(failures), {"p1", "p2"})
 
-    def test_capture_exception_never_propagates(self):
+    def test_capture_exception_is_failure_not_propagated(self):
         s = camera.CameraScheduler()
 
         def boom(_t):
             raise RuntimeError("camera exploded")
 
-        frames = camera.collect_camera_frames(self._targets(), {}, s, now=0.0, capture=boom)
+        frames, failures = camera.collect_camera_frames(self._targets(), {}, s, now=0.0, capture=boom)
         self.assertEqual(frames, [])
+        self.assertEqual(set(failures), {"p1", "p2"})
 
-    def test_nothing_due_returns_empty(self):
+    def test_nothing_due_returns_empty_no_failures(self):
         s = camera.CameraScheduler()
         # prime both so they're not first-sighting
         for pid in ("p1", "p2"):
             s.should_capture(pid, "printing", 50, now=0.0)
-        frames = camera.collect_camera_frames(
+        frames, failures = camera.collect_camera_frames(
             self._targets(),
             {"p1": {"state": "printing", "progressPct": 50}, "p2": {"state": "printing", "progressPct": 50}},
             s,
@@ -211,6 +217,18 @@ class TestCollectCameraFrames(unittest.TestCase):
             capture=lambda _t: b"\xff\xd8\xff\xe0x\xff\xd9",
         )
         self.assertEqual(frames, [])
+        # nothing due is NOT a silent drop — failures only counts due-but-failed.
+        self.assertEqual(failures, [])
+
+    def test_partial_failure_reports_only_the_failed(self):
+        s = camera.CameraScheduler()
+        # p1 captures, p2 returns None
+        def cap(t):
+            return b"\xff\xd8\xff\xe0x\xff\xd9" if t["printerId"] == "p1" else None
+
+        frames, failures = camera.collect_camera_frames(self._targets(), {}, s, now=0.0, capture=cap)
+        self.assertEqual([f["printerId"] for f in frames], ["p1"])
+        self.assertEqual(failures, ["p2"])
 
 
 if __name__ == "__main__":

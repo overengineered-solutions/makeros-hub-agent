@@ -185,13 +185,15 @@ def collect_camera_frames(
     capture: Callable[[dict[str, Any]], Optional[bytes]] = capture_printer_frame,
     max_workers: int = 4,
     overall_timeout: float = 8.0,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[str]]:
     """For every printer DUE for a frame (per the scheduler + its live state),
-    capture in PARALLEL and return `[{printerId, jpegBase64}]`. Bounded by
-    `overall_timeout` so a slow/unreachable camera never stalls the heartbeat —
-    whatever finishes in time ships this beat, the rest are silently retried next
-    beat. Never raises; capturedAt is intentionally omitted (the cloud stamps
-    receipt time, avoiding agent/server clock skew)."""
+    capture in PARALLEL and return `([{printerId, jpegBase64}], failed_ids)`.
+    Bounded by `overall_timeout` so a slow/unreachable camera never stalls the
+    heartbeat — whatever finishes in time ships this beat, the rest are retried
+    next beat. `failed_ids` are the DUE printers that produced no frame this beat
+    (None capture, raise, or timed out) so the cloud can surface the silent-drop
+    instead of it vanishing (R4.5). Never raises; capturedAt is omitted (the
+    cloud stamps receipt time, avoiding agent/server clock skew)."""
     due = [
         t
         for t in targets
@@ -204,9 +206,10 @@ def collect_camera_frames(
         )
     ]
     if not due:
-        return []
+        return [], []
 
     frames: list[dict[str, str]] = []
+    captured: set[str] = set()
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(due)))
     try:
         fut_to_pid = {ex.submit(capture, t): t["printerId"] for t in due}
@@ -217,6 +220,7 @@ def collect_camera_frames(
                 except Exception:  # noqa: BLE001 - a bad capture never sinks the beat
                     jpeg = None
                 if jpeg:
+                    captured.add(fut_to_pid[fut])
                     frames.append(
                         {
                             "printerId": fut_to_pid[fut],
@@ -232,4 +236,8 @@ def collect_camera_frames(
         # one finishes on its own and its result is discarded. (A `with` block
         # would wait=True here and could add seconds to the beat.)
         ex.shutdown(wait=False, cancel_futures=True)
-    return frames
+    # DUE printers that produced no frame this beat (None / raised / timed out).
+    # Surfaced so the cloud can make the silent-drop loud (R4.5) — e.g. an X1/H2
+    # with Liveview off or ffmpeg missing shows up instead of just being absent.
+    failures = [t["printerId"] for t in due if t["printerId"] not in captured]
+    return frames, failures

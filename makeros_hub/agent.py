@@ -523,6 +523,7 @@ def heartbeat_payload(
     command_results: list[dict] | None = None,
     diagnostics=None,
     camera_frames: list[dict] | None = None,
+    camera_failures: list[str] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -546,6 +547,8 @@ def heartbeat_payload(
         payload["commandResults"] = list(command_results)
     if camera_frames:
         payload["cameraFrames"] = list(camera_frames)
+    if camera_failures:
+        payload["cameraFailures"] = list(camera_failures)
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
@@ -1070,6 +1073,7 @@ def run(
                 # adaptive cadence + parallel/bounded — best-effort, never sinks
                 # the heartbeat (a failure just sends no frame this beat).
                 camera_frames: list[dict] | None = None
+                camera_failures: list[str] | None = None
                 try:
                     all_targets = manager.camera_targets()
                     eligible = [
@@ -1085,7 +1089,7 @@ def run(
                         status_by_id = {
                             s.get("printerId"): s for s in statuses if s.get("printerId")
                         }
-                        camera_frames = collect_camera_frames(
+                        camera_frames, camera_failures = collect_camera_frames(
                             eligible,
                             status_by_id,
                             camera_scheduler,
@@ -1096,6 +1100,7 @@ def run(
                         diagnostics, "camera", f"frame collection failed: {redact(str(exc))}"
                     )
                     camera_frames = None
+                    camera_failures = None
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
@@ -1107,6 +1112,7 @@ def run(
                         command_results=pending_command_results,
                         diagnostics=diagnostics,
                         camera_frames=camera_frames,
+                        camera_failures=camera_failures,
                     ),
                     bearer=credential,
                     retries=3,
