@@ -252,6 +252,63 @@ class PrinterManager:
             and "\\" not in file_name
         )
 
+    def dispatch_commands(self, pending_commands) -> list[dict]:
+        """Execute cloud-delivered control commands (pause/resume/stop) against
+        the target adapters and return result reports for the next heartbeat.
+        Mirrors dispatch_assignments: look the adapter up by printerId, run the
+        command, map ok/failure to a {requestId, command, status, detail} report
+        the cloud's ingestPrinterCommandResults consumes (status 'ok' -> done,
+        anything else -> failed with the detail)."""
+        reports: list[dict] = []
+        for item in pending_commands if isinstance(pending_commands, list) else []:
+            if not isinstance(item, dict):
+                continue
+            request_id = item.get("requestId")
+            printer_id = item.get("printerId")
+            command = item.get("command")
+            if not all(isinstance(v, str) and v for v in (request_id, printer_id, command)):
+                log.warning("skipping malformed command: %s", item)
+                continue
+            params = item.get("params") if isinstance(item.get("params"), dict) else None
+            adapter = self._adapters.get(printer_id)
+            send = getattr(adapter, "send_command", None) if adapter is not None else None
+            if not callable(send):
+                reports.append(
+                    {
+                        "requestId": request_id,
+                        "command": command,
+                        "status": "failed",
+                        "detail": "printer_unavailable",
+                    }
+                )
+                continue
+            try:
+                result = send(command, params)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("command %s for %s raised: %s", command, printer_id, exc)
+                reports.append(
+                    {
+                        "requestId": request_id,
+                        "command": command,
+                        "status": "failed",
+                        "detail": "exception",
+                    }
+                )
+                continue
+            if isinstance(result, dict) and result.get("ok"):
+                reports.append({"requestId": request_id, "command": command, "status": "ok"})
+            else:
+                reason = result.get("reason") if isinstance(result, dict) else "unknown"
+                reports.append(
+                    {
+                        "requestId": request_id,
+                        "command": command,
+                        "status": "failed",
+                        "detail": str(reason),
+                    }
+                )
+        return reports
+
     def dispatch_assignments(self, assignments, spool_dir) -> list[dict]:
         """Start cloud-assigned queue jobs and return queue-status reports.
 

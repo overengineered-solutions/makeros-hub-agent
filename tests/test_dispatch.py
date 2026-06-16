@@ -281,5 +281,76 @@ class TestDispatchAssignments(unittest.TestCase):
         )
 
 
+class FakeCommandAdapter:
+    def __init__(self, result=None, raises=False):
+        self.result = result or {"ok": True}
+        self.raises = raises
+        self.calls = []
+
+    def send_command(self, command, params=None):
+        self.calls.append((command, params))
+        if self.raises:
+            raise RuntimeError("boom")
+        return dict(self.result)
+
+
+def command(**overrides):
+    data = {"requestId": "r1", "printerId": "p1", "command": "pause"}
+    data.update(overrides)
+    return data
+
+
+class TestDispatchCommands(unittest.TestCase):
+    def test_ok_command_reports_ok(self):
+        manager = PrinterManager()
+        fake = FakeCommandAdapter({"ok": True})
+        manager._adapters["p1"] = fake
+        reports = manager.dispatch_commands([command()])
+        self.assertEqual(reports, [{"requestId": "r1", "command": "pause", "status": "ok"}])
+        self.assertEqual(fake.calls, [("pause", None)])
+
+    def test_failure_reports_failed_with_detail(self):
+        manager = PrinterManager()
+        manager._adapters["p1"] = FakeCommandAdapter({"ok": False, "reason": "not_connected"})
+        reports = manager.dispatch_commands([command(command="stop")])
+        self.assertEqual(
+            reports,
+            [{"requestId": "r1", "command": "stop", "status": "failed", "detail": "not_connected"}],
+        )
+
+    def test_unknown_printer_reports_failed_unavailable(self):
+        reports = PrinterManager().dispatch_commands([command()])
+        self.assertEqual(
+            reports,
+            [
+                {
+                    "requestId": "r1",
+                    "command": "pause",
+                    "status": "failed",
+                    "detail": "printer_unavailable",
+                }
+            ],
+        )
+
+    def test_adapter_exception_reports_failed(self):
+        manager = PrinterManager()
+        manager._adapters["p1"] = FakeCommandAdapter(raises=True)
+        reports = manager.dispatch_commands([command()])
+        self.assertEqual(
+            reports,
+            [{"requestId": "r1", "command": "pause", "status": "failed", "detail": "exception"}],
+        )
+
+    def test_malformed_or_non_list_inputs_are_skipped(self):
+        manager = PrinterManager()
+        fake = FakeCommandAdapter()
+        manager._adapters["p1"] = fake
+        # a non-dict, a dict missing requestId/command — both dropped; the valid one runs
+        reports = manager.dispatch_commands(["notadict", {"printerId": "p1"}, command()])
+        self.assertEqual(reports, [{"requestId": "r1", "command": "pause", "status": "ok"}])
+        self.assertEqual(manager.dispatch_commands(None), [])
+        self.assertEqual(fake.calls, [("pause", None)])
+
+
 if __name__ == "__main__":
     unittest.main()
