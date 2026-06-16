@@ -39,6 +39,14 @@ ProtectHome=true
 PrivateTmp=true
 StateDirectory=makeros-hub
 ConfigurationDirectory=makeros-hub
+# V5 ONNX detector pushes steady-state RSS from ~80 MB to ~300-350 MB with
+# transient spikes during inference. MemoryHigh is a soft cap (kernel applies
+# memory pressure when crossed); MemoryMax is the hard kill threshold. Both
+# fit comfortably on a Pi 5 4GB and well within 8GB. If the operator runs the
+# agent on a Pi 4 2GB or smaller, the limits keep a runaway from OOM'ing the
+# rest of the box.
+MemoryHigh=500M
+MemoryMax=600M
 
 [Install]
 WantedBy=multi-user.target
