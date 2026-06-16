@@ -300,8 +300,17 @@ class TestReportBuilders(unittest.TestCase):
 
         self.assertEqual(version["info"]["sequence_id"], "abc")
         self.assertIn("ota", [module["name"] for module in modules])
-        self.assertEqual([m["name"] for m in modules if m["name"].startswith("n3f/")], ["n3f/0", "n3f/1", "n3f/2", "n3f/3"])
-        self.assertTrue(all(m["product_name"] == "AMS 2 Pro" for m in modules if m["name"].startswith("n3f/")))
+        n3f = [m for m in modules if m["name"].startswith("n3f/")]
+        self.assertEqual([m["name"] for m in n3f], ["n3f/0", "n3f/1", "n3f/2", "n3f/3"])
+        # Match a REAL AMS 2 Pro's advertisement (hw_ver N3F05, "AMS 2 Pro (N)",
+        # visible) so OrcaSlicer recognizes the AMS + resolves generic filaments —
+        # the "2 ABS" fix lives here, not in an id remap.
+        self.assertEqual(
+            [m["product_name"] for m in n3f],
+            ["AMS 2 Pro (1)", "AMS 2 Pro (2)", "AMS 2 Pro (3)", "AMS 2 Pro (4)"],
+        )
+        self.assertTrue(all(m["hw_ver"] == "N3F05" for m in n3f))
+        self.assertTrue(all(m["visible"] is True for m in n3f))
 
         ack = build_print_ack("9", "part.3mf")
         self.assertEqual(ack["print"]["command"], "project_file")
