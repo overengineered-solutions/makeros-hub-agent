@@ -39,6 +39,7 @@ from .ingest import IngestServer
 from .probes import PROBES, run_probe, set_effective_config
 from .printers.manager import PrinterManager
 from .printers.camera import CameraScheduler, collect_camera_frames
+from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
 from .update import maybe_update
 from .vprinter.capture import CapturedJob, build_vp_submit_body
@@ -524,6 +525,7 @@ def heartbeat_payload(
     diagnostics=None,
     camera_frames: list[dict] | None = None,
     camera_failures: list[str] | None = None,
+    failure_samples: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -549,6 +551,8 @@ def heartbeat_payload(
         payload["cameraFrames"] = list(camera_frames)
     if camera_failures:
         payload["cameraFailures"] = list(camera_failures)
+    if failure_samples:
+        payload["failureSamples"] = list(failure_samples)
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
@@ -960,6 +964,10 @@ def run(
     # override that force-enables capture on every camera-capable printer (handy
     # for a one-off test); unset, only admin-enabled printers are captured.
     camera_scheduler = CameraScheduler()
+    # V5 AI failure-watch — per-printer EWMA smoothing state (cold-start on a
+    # re-enable or a stale gap so a fresh print doesn't inherit the prior
+    # print's tail). The cloud applies the sensitivity-keyed threshold.
+    failure_smoother = FailureWatchSmoother()
     camera_enabled = os.environ.get("MAKEROS_HUB_CAMERA_ENABLED", "").strip().lower() in (
         "1",
         "true",
@@ -1114,6 +1122,52 @@ def run(
                     )
                     camera_frames = None
                     camera_failures = None
+
+                # V5 AI failure-watch — run inference + EWMA smoothing on this
+                # beat's frames for printers opted in via config-down (cloud
+                # also gates on the workspace feature; samples for non-opt-in
+                # printers are silently dropped here, never sent). Default
+                # detector is the no-op stub (returns 0.0) so the wire path
+                # ships zero-effect samples until the real ONNX model lands.
+                failure_samples: list[dict] | None = None
+                try:
+                    if camera_frames:
+                        all_targets = manager.camera_targets()
+                        # Decode each frame back from the b64 we just encoded
+                        # so the detector sees raw bytes. Cheap (b64 decode of
+                        # ~200 KB each); a more performant follow-up could
+                        # share the pre-encode buffer.
+                        import base64 as _b64
+                        frames_by_id = {
+                            f["printerId"]: _b64.b64decode(f["jpegBase64"])
+                            for f in camera_frames
+                            if isinstance(f.get("printerId"), str)
+                            and isinstance(f.get("jpegBase64"), str)
+                        }
+                        status_by_id = {
+                            s.get("printerId"): s for s in statuses if s.get("printerId")
+                        }
+                        samples, fw_dropped = collect_failure_samples(
+                            all_targets,
+                            status_by_id,
+                            frames_by_id,
+                            failure_smoother,
+                        )
+                        if samples:
+                            failure_samples = samples
+                        if fw_dropped:
+                            _record_diagnostic(
+                                diagnostics,
+                                "failure_watch",
+                                f"detector raised on {fw_dropped} eligible frame(s) this beat",
+                            )
+                except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
+                    _record_diagnostic(
+                        diagnostics,
+                        "failure_watch",
+                        f"sample collection failed: {redact(str(exc))}",
+                    )
+                    failure_samples = None
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
@@ -1126,6 +1180,7 @@ def run(
                         diagnostics=diagnostics,
                         camera_frames=camera_frames,
                         camera_failures=camera_failures,
+                        failure_samples=failure_samples,
                     ),
                     bearer=credential,
                     retries=3,
