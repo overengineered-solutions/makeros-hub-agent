@@ -200,3 +200,25 @@ def _write_private_key(path: Path, key: rsa.RSAPrivateKey) -> None:
 def _fingerprint(cert: x509.Certificate) -> str:
     digest = cert.fingerprint(hashes.SHA256())
     return ":".join(f"{byte:02X}" for byte in digest)
+
+
+def read_vp_ca(base_dir: Path, serial: str) -> tuple[str, str] | None:
+    """Read the on-disk CA cert for a VP serial and return
+    `(pem_text, fingerprint_sha256_colons_hex)` or None when the file is
+    missing or unreadable. Pure-IO helper used by the agent heartbeat to
+    upload the CA to the cloud (V4 Slice 2 — managed CA delivery).
+
+    Path matches what `ensure_certificates` writes:
+        `<base_dir>/<safe_serial>/certs/ca.crt`
+    """
+    safe_serial = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in serial)
+    ca_path = base_dir / safe_serial / "certs" / "ca.crt"
+    try:
+        pem_bytes = ca_path.read_bytes()
+    except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
+        return None
+    try:
+        cert = x509.load_pem_x509_certificate(pem_bytes)
+    except Exception:  # noqa: BLE001 - a malformed file is treated as missing
+        return None
+    return pem_bytes.decode("ascii", errors="strict"), _fingerprint(cert)

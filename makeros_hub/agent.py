@@ -531,6 +531,7 @@ def heartbeat_payload(
     camera_frames: list[dict] | None = None,
     camera_failures: list[str] | None = None,
     failure_samples: list[dict] | None = None,
+    vp_ca: tuple[str, str] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -558,6 +559,15 @@ def heartbeat_payload(
         payload["cameraFailures"] = list(camera_failures)
     if failure_samples:
         payload["failureSamples"] = list(failure_samples)
+    # V4 Slice 2 — managed CA delivery. When the agent has an enabled VP
+    # running, ship the CA PEM + sha256 fingerprint so the cloud can bundle
+    # it into the member's `.orca_printer` + installer. Cap the PEM at 8KB
+    # (RSA-2048 in PEM is ~1.3KB; 8KB is generous) so a corrupted file can't
+    # bloat the heartbeat. Ships only when both values are present.
+    if vp_ca is not None:
+        pem, fp = vp_ca
+        if isinstance(pem, str) and isinstance(fp, str) and 0 < len(pem) <= 8192 and fp:
+            payload["virtualPrinterCa"] = {"caCertPem": pem, "caFingerprintSha256": fp}
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
@@ -1238,6 +1248,32 @@ def run(
                         "boot in progress — falling back to stub for this beat",
                     )
 
+                # V4 Slice 2 — managed CA delivery. When the VP is enabled
+                # AND the on-disk CA exists, read its PEM + fingerprint and
+                # ship it on the heartbeat. The cloud stamps + bundles it
+                # into the member's `.orca_printer` so the trust step is
+                # automated instead of "paste this file into printer.cer".
+                # Best-effort: a read failure is silently None (the file is
+                # always present once the VP has reconciled at least once;
+                # a fresh hub before its first VP reconcile won't have it).
+                vp_ca: tuple[str, str] | None = None
+                if (
+                    vp_manager is not None
+                    and vprinter_state.config is not None
+                    and getattr(vprinter_state.config, "serial", None)
+                ):
+                    try:
+                        from .vprinter.cert import read_vp_ca as _read_vp_ca
+                        from .vprinter.manager import VP_BASE_DIR as _VP_BASE_DIR
+
+                        vp_ca = _read_vp_ca(_VP_BASE_DIR, vprinter_state.config.serial)
+                    except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
+                        _record_diagnostic(
+                            diagnostics,
+                            "vprinter",
+                            f"ca read failed: {redact(str(exc))}",
+                        )
+
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
@@ -1251,6 +1287,7 @@ def run(
                         camera_frames=camera_frames,
                         camera_failures=camera_failures,
                         failure_samples=failure_samples,
+                        vp_ca=vp_ca,
                     ),
                     bearer=credential,
                     retries=3,
