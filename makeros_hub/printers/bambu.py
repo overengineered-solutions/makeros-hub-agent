@@ -249,11 +249,12 @@ class BambuAdapter:
 
     def send_command(self, command: str, params: dict | None = None) -> dict:
         """Publish a LAN control command to device/<serial>/request — the same
-        channel as start_print. Today: pause/resume/stop (the universal Bambu
-        `print`-class commands; payload shape matches pybambu's, which is proven).
-        The cloud only ever delivers the allowlisted set, but we re-check here as
-        defense-in-depth. Returns {"ok": bool, "reason": str} like start_print."""
-        if command not in {"pause", "resume", "stop"}:
+        channel as start_print. pause/resume/stop (universal `print`-class
+        commands; pybambu's proven shape) + ams_dry (the `ams_filament_drying`
+        command for AMS 2 Pro / AMS HT; params {amsId, temp, durationHours}). The
+        cloud only delivers the allowlisted set + validates ams_dry params, but we
+        re-check here as defense-in-depth. Returns {"ok": bool, "reason": str}."""
+        if command not in {"pause", "resume", "stop", "ams_dry"}:
             return {"ok": False, "reason": "unsupported_command"}
         client = self._client
         connected = False
@@ -267,7 +268,35 @@ class BambuAdapter:
             return {"ok": False, "reason": "not_connected"}
 
         sequence_id = os.urandom(4).hex()
-        payload = {"print": {"sequence_id": sequence_id, "command": command, "param": ""}}
+        if command == "ams_dry":
+            p = params or {}
+            ams_id, temp, duration = p.get("amsId"), p.get("temp"), p.get("durationHours")
+            if not (
+                isinstance(ams_id, int)
+                and isinstance(temp, (int, float))
+                and isinstance(duration, (int, float))
+            ):
+                return {"ok": False, "reason": "invalid_dry_params"}
+            # The verified ams_filament_drying field set (BambuStudio source +
+            # pybambu): mode 1 = start; temp + cooling_temp ≥ 45 or it's ignored;
+            # duration in HOURS. The cloud already validated the ranges.
+            payload = {
+                "print": {
+                    "sequence_id": sequence_id,
+                    "command": "ams_filament_drying",
+                    "ams_id": int(ams_id),
+                    "mode": 1,
+                    "temp": int(temp),
+                    "cooling_temp": int(temp),
+                    "duration": int(duration),
+                    "humidity": 0,
+                    "rotate_tray": False,
+                    "filament": "",
+                    "close_power_conflict": False,
+                }
+            }
+        else:
+            payload = {"print": {"sequence_id": sequence_id, "command": command, "param": ""}}
         try:
             info = client.publish(self._request_topic, json.dumps(payload))
         except Exception as exc:  # noqa: BLE001

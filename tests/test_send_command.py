@@ -67,6 +67,43 @@ class TestSendCommand(unittest.TestCase):
             self.assertEqual(doc["print"]["param"], "")
             self.assertIsInstance(doc["print"]["sequence_id"], str)
 
+    def test_ams_dry_publishes_drying_payload(self):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True)
+        adapter._connack = "ok"
+        result = adapter.send_command(
+            "ams_dry", {"amsId": 2, "temp": 50, "durationHours": 8}
+        )
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(adapter._client.published), 1)
+        topic, payload = adapter._client.published[0]
+        self.assertEqual(topic, "device/SER123/request")
+        doc = json.loads(payload)["print"]
+        self.assertEqual(doc["command"], "ams_filament_drying")
+        self.assertEqual(doc["ams_id"], 2)
+        self.assertEqual(doc["mode"], 1)
+        self.assertEqual(doc["temp"], 50)
+        # cooling_temp mirrors temp so the cycle's cooldown stays >= the 45 floor.
+        self.assertEqual(doc["cooling_temp"], 50)
+        self.assertEqual(doc["duration"], 8)
+        self.assertIsInstance(doc["sequence_id"], str)
+
+    def test_ams_dry_without_params_rejected(self):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True)
+        adapter._connack = "ok"
+        # Missing params entirely.
+        self.assertEqual(
+            adapter.send_command("ams_dry"),
+            {"ok": False, "reason": "invalid_dry_params"},
+        )
+        # Present but malformed (amsId not an int).
+        self.assertEqual(
+            adapter.send_command("ams_dry", {"amsId": "x", "temp": 50, "durationHours": 8}),
+            {"ok": False, "reason": "invalid_dry_params"},
+        )
+        self.assertEqual(adapter._client.published, [])
+
     def test_unsupported_command_rejected_without_publish(self):
         adapter = make_adapter()
         adapter._client = FakeClient()
