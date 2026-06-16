@@ -420,7 +420,7 @@ class PrinterManager:
                 result = start_print(
                     local_path,
                     file_name,
-                    plate=plate,
+                    plate=plate_int,
                     use_ams=bool(assignment.get("useAms", False)),
                     ams_mapping=assignment.get("amsMapping"),
                     queue_job_id=queue_job_id,

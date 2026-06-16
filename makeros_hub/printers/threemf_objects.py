@@ -24,20 +24,32 @@ _MIN_OBJECTS = 2
 _MAX_OBJECTS = 64
 # A label can't bloat a report; the printer's own names are short.
 _MAX_NAME = 120
+# Bound the slice_info read before it reaches the XML parser — mirrors the VP
+# capture parser's guard (makeros_hub/vprinter/capture.py MAX_SLICE_INFO_BYTES)
+# so a crafted/huge or zip-bombed 3MF can't exhaust the Pi. ZipInfo.file_size is
+# the UNCOMPRESSED size, so this also caps a high-ratio zip bomb.
+_MAX_SLICE_INFO_BYTES = 10 * 1024 * 1024
 
 
 def parse_plate_objects(threemf_path, plate: int = 1) -> list[dict]:
     """Return ``[{"id": int, "name": str}]`` for the given 1-based plate.
 
-    Returns ``[]`` (never raises) when the file is unreadable, the plate isn't
-    found, per-object labelling is disabled, or the object count is outside
-    Bambu's 2..64 skip window — i.e. any case where skip-objects can't be used.
+    Returns ``[]`` (never raises — a broad guard, since this runs on the dispatch
+    path and must never block a print) when the file is unreadable, oversized,
+    the plate isn't found, per-object labelling is disabled, or the object count
+    is outside Bambu's 2..64 skip window — any case where skip can't be used.
     """
     try:
         with zipfile.ZipFile(threemf_path) as zf:
-            with zf.open(_SLICE_INFO) as fh:
-                root = ET.parse(fh).getroot()
-    except (KeyError, zipfile.BadZipFile, ET.ParseError, OSError, ValueError) as exc:
+            info = zf.getinfo(_SLICE_INFO)
+            if info.file_size > _MAX_SLICE_INFO_BYTES:
+                log.info(
+                    "3mf slice_info too large (%s bytes) — skipping objects", info.file_size
+                )
+                return []
+            raw = zf.read(info)
+        root = ET.fromstring(raw)
+    except Exception as exc:  # noqa: BLE001 — a malformed 3MF must never block dispatch
         log.info("3mf object parse skipped (%s): %s", threemf_path, exc)
         return []
 

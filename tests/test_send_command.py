@@ -147,6 +147,15 @@ class TestSendCommand(unittest.TestCase):
         # Verified vs BambuStudio command_task_partskip: command + int obj_list.
         self.assertEqual(doc, {"command": "skip_objects", "obj_list": [286, 287]})
 
+    def test_skip_objects_dedups_obj_list_preserving_order(self):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True)
+        adapter._connack = "ok"
+        result = adapter.send_command("skip_objects", {"objList": [287, 286, 287, 286]})
+        self.assertEqual(result, {"ok": True})
+        doc = json.loads(adapter._client.published[0][1])["print"]
+        self.assertEqual(doc["obj_list"], [287, 286])  # deduped, order preserved
+
     def test_skip_objects_invalid_params_rejected(self):
         adapter = make_adapter()
         adapter._client = FakeClient(connected=True)
@@ -157,6 +166,7 @@ class TestSendCommand(unittest.TestCase):
             {"objList": "286"},  # not a list
             {"objList": [286, "287"]},  # non-int element
             {"objList": [286, True]},  # bool element (bool ⊂ int)
+            {"objList": [286, -1]},  # negative id
             {"objList": list(range(65))},  # over the 64 ceiling
         ):
             self.assertEqual(

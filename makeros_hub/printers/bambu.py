@@ -326,14 +326,16 @@ class BambuAdapter:
                 not isinstance(obj_list, list)
                 or not obj_list
                 or len(obj_list) > 64
-                or any(not isinstance(o, int) or isinstance(o, bool) for o in obj_list)
+                or any(not isinstance(o, int) or isinstance(o, bool) or o < 0 for o in obj_list)
             ):
                 return {"ok": False, "reason": "invalid_skip_params"}
             payload = {
                 "print": {
                     "sequence_id": sequence_id,
                     "command": "skip_objects",
-                    "obj_list": [int(o) for o in obj_list],
+                    # Dedup, preserve order — the printer treats s_obj as a set,
+                    # so a duplicate id is a harmless no-op we don't need to send.
+                    "obj_list": list(dict.fromkeys(int(o) for o in obj_list)),
                 }
             }
         else:

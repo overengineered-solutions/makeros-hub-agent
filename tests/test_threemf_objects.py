@@ -102,6 +102,14 @@ class TestParsePlateObjects(unittest.TestCase):
         path = self._write(plate_xml(objs))
         self.assertEqual(parse_plate_objects(path, 1), [{"id": 7, "name": "good1"}, {"id": 8, "name": "good2"}])
 
+    def test_oversized_slice_info_yields_empty_no_parse(self):
+        # An uncompressed slice_info above the cap must be rejected BEFORE the XML
+        # parser sees it (zip-bomb / DoS guard). 'x'*11MB compresses tiny but its
+        # ZipInfo.file_size is >10MB, so the size gate trips.
+        big = "<config>" + ("x" * (11 * 1024 * 1024)) + "</config>"
+        path = self._write(big)
+        self.assertEqual(parse_plate_objects(path, 1), [])
+
     def test_missing_slice_info_yields_empty_no_raise(self):
         path = self._write(None)  # zip without slice_info.config
         self.assertEqual(parse_plate_objects(path, 1), [])
