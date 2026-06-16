@@ -271,15 +271,35 @@ class BambuAdapter:
         if command == "ams_dry":
             p = params or {}
             ams_id, temp, duration = p.get("amsId"), p.get("temp"), p.get("durationHours")
+            # The cloud (AmsDryParamsDTO) is the range SSOT; here we only assert
+            # basic shape as defense-in-depth. `bool` is a subclass of `int`, so
+            # exclude it explicitly (amsId=True would otherwise become 1), and
+            # require sane positives without re-encoding the cloud's tight bounds
+            # (avoids the two ends drifting apart).
+            def _num(x: object) -> bool:
+                return isinstance(x, (int, float)) and not isinstance(x, bool)
+
             if not (
                 isinstance(ams_id, int)
-                and isinstance(temp, (int, float))
-                and isinstance(duration, (int, float))
+                and not isinstance(ams_id, bool)
+                and ams_id >= 0
+                and _num(temp)
+                and temp > 0
+                and _num(duration)
+                and duration > 0
             ):
                 return {"ok": False, "reason": "invalid_dry_params"}
-            # The verified ams_filament_drying field set (BambuStudio source +
-            # pybambu): mode 1 = start; temp + cooling_temp ≥ 45 or it's ignored;
-            # duration in HOURS. The cloud already validated the ranges.
+            # ams_filament_drying — field set verified verbatim against the
+            # BambuStudio client (DevFilaSystemCtrl.cpp, the printer maker's own
+            # code) plus ha-bambulab #1448 and ~10 community implementations.
+            # mode 1 = OnTime (timed dry); duration in HOURS; temp in °C with a
+            # HARD >=45 floor (below is silently dropped — the cloud's
+            # AmsDryParamsDTO enforces 45-65). cooling_temp is the POST-dry
+            # cool-down target, NOT a floor: the source-of-truth client sends 0,
+            # so we mirror that (the "cooling_temp must be >=45" lore conflated it
+            # with temp). humidity matters only for mode 2; rotate_tray / filament
+            # / close_power_conflict are the real optional fields the official
+            # client always includes (filament "" = let the printer infer).
             payload = {
                 "print": {
                     "sequence_id": sequence_id,
@@ -287,7 +307,7 @@ class BambuAdapter:
                     "ams_id": int(ams_id),
                     "mode": 1,
                     "temp": int(temp),
-                    "cooling_temp": int(temp),
+                    "cooling_temp": 0,
                     "duration": int(duration),
                     "humidity": 0,
                     "rotate_tray": False,

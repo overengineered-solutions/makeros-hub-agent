@@ -79,14 +79,28 @@ class TestSendCommand(unittest.TestCase):
         topic, payload = adapter._client.published[0]
         self.assertEqual(topic, "device/SER123/request")
         doc = json.loads(payload)["print"]
-        self.assertEqual(doc["command"], "ams_filament_drying")
-        self.assertEqual(doc["ams_id"], 2)
-        self.assertEqual(doc["mode"], 1)
-        self.assertEqual(doc["temp"], 50)
-        # cooling_temp mirrors temp so the cycle's cooldown stays >= the 45 floor.
-        self.assertEqual(doc["cooling_temp"], 50)
-        self.assertEqual(doc["duration"], 8)
-        self.assertIsInstance(doc["sequence_id"], str)
+        seq = doc.pop("sequence_id")
+        self.assertIsInstance(seq, str)
+        self.assertTrue(seq)  # unique, non-empty per call (no static reuse)
+        # Full wire shape verified verbatim against BambuStudio's
+        # DevFilaSystemCtrl.cpp: cooling_temp is the post-dry cool target and the
+        # source-of-truth client sends 0 (the >=45 floor is on `temp`, enforced
+        # cloud-side); duration is in HOURS; mode 1 = timed dry.
+        self.assertEqual(
+            doc,
+            {
+                "command": "ams_filament_drying",
+                "ams_id": 2,
+                "mode": 1,
+                "temp": 50,
+                "cooling_temp": 0,
+                "duration": 8,
+                "humidity": 0,
+                "rotate_tray": False,
+                "filament": "",
+                "close_power_conflict": False,
+            },
+        )
 
     def test_ams_dry_without_params_rejected(self):
         adapter = make_adapter()
@@ -100,6 +114,20 @@ class TestSendCommand(unittest.TestCase):
         # Present but malformed (amsId not an int).
         self.assertEqual(
             adapter.send_command("ams_dry", {"amsId": "x", "temp": 50, "durationHours": 8}),
+            {"ok": False, "reason": "invalid_dry_params"},
+        )
+        # bool is a subclass of int — amsId=True must NOT pass as 1.
+        self.assertEqual(
+            adapter.send_command("ams_dry", {"amsId": True, "temp": 50, "durationHours": 8}),
+            {"ok": False, "reason": "invalid_dry_params"},
+        )
+        # non-positive temp / duration rejected.
+        self.assertEqual(
+            adapter.send_command("ams_dry", {"amsId": 0, "temp": 0, "durationHours": 8}),
+            {"ok": False, "reason": "invalid_dry_params"},
+        )
+        self.assertEqual(
+            adapter.send_command("ams_dry", {"amsId": 0, "temp": 50, "durationHours": 0}),
             {"ok": False, "reason": "invalid_dry_params"},
         )
         self.assertEqual(adapter._client.published, [])

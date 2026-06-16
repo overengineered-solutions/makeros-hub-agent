@@ -351,6 +351,29 @@ class TestDispatchCommands(unittest.TestCase):
         self.assertEqual(manager.dispatch_commands(None), [])
         self.assertEqual(fake.calls, [("pause", None)])
 
+    def test_redelivered_requestid_is_not_republished(self):
+        # Cloud delivery is one-shot, but defense-in-depth: a redelivered
+        # requestId must NOT re-publish (a second ams_dry would restart the
+        # dryer). The duplicate still re-reports ok so the cloud can close it.
+        manager = PrinterManager()
+        fake = FakeCommandAdapter({"ok": True})
+        manager._adapters["p1"] = fake
+        first = manager.dispatch_commands([command(requestId="r9", command="ams_dry")])
+        second = manager.dispatch_commands([command(requestId="r9", command="ams_dry")])
+        self.assertEqual(first, [{"requestId": "r9", "command": "ams_dry", "status": "ok"}])
+        self.assertEqual(second, [{"requestId": "r9", "command": "ams_dry", "status": "ok"}])
+        self.assertEqual(len(fake.calls), 1)  # published exactly once
+
+    def test_failed_command_is_not_deduped_so_a_resend_can_retry(self):
+        manager = PrinterManager()
+        fake = FakeCommandAdapter({"ok": False, "reason": "not_connected"})
+        manager._adapters["p1"] = fake
+        manager.dispatch_commands([command(requestId="r10", command="pause")])
+        fake.result = {"ok": True}
+        second = manager.dispatch_commands([command(requestId="r10", command="pause")])
+        self.assertEqual(second, [{"requestId": "r10", "command": "pause", "status": "ok"}])
+        self.assertEqual(len(fake.calls), 2)  # retried because the first failed
+
     def test_caps_per_heartbeat_and_rate_limits_the_excess(self):
         # R6.7: the cloud caps delivery at 5; a flood (here 18) means a buggy/
         # compromised control plane. Execute the first 16, fail the rest as
