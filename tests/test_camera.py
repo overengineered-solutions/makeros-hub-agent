@@ -26,11 +26,24 @@ class TestSourceKind(unittest.TestCase):
     def test_bambu_a1_is_lan(self):
         self.assertEqual(camera.camera_source_kind(_bambu()), "bambu-lan")
 
-    def test_bambu_x1_is_rtsp_placeholder(self):
-        self.assertEqual(camera.camera_source_kind(_bambu(model="X1 Carbon")), "rtsp-x1")
+    def test_bambu_rtsp_class_models(self):
+        # X1/H2/P2S stream RTSPS:322 → bambu-rtsp (ffmpeg path).
+        for model in ("X1 Carbon", "X1C", "X1E", "H2D", "H2S", "P2S", "X2D"):
+            self.assertEqual(
+                camera.camera_source_kind(_bambu(model=model)), "bambu-rtsp", model
+            )
+
+    def test_bambu_image_class_models(self):
+        # A1/P1 use the :6000 raw-JPEG path → bambu-lan.
+        for model in ("A1 mini", "A1", "P1P", "P1S"):
+            self.assertEqual(
+                camera.camera_source_kind(_bambu(model=model)), "bambu-lan", model
+            )
 
     def test_bambu_without_creds_is_none(self):
         self.assertIsNone(camera.camera_source_kind(_bambu(host="", accessCode="")))
+        # even an RTSP-class model needs host+code before we route it
+        self.assertIsNone(camera.camera_source_kind(_bambu(model="X1C", host="")))
 
     def test_klipper_with_explicit_url_is_http(self):
         self.assertEqual(
@@ -105,10 +118,14 @@ class TestCapturePrinterFrame(unittest.TestCase):
             self.assertEqual(camera.capture_printer_frame(_bambu()), b"BAMBU")
             m.assert_called_once_with("1.2.3.4", "AbCd1234")
 
-    def test_bambu_x1_no_frame_yet(self):
-        with mock.patch.object(camera, "_bambu_capture_frame") as m:
-            self.assertIsNone(camera.capture_printer_frame(_bambu(model="X1C")))
-            m.assert_not_called()
+    def test_bambu_rtsp_class_routes_to_rtsp_capture(self):
+        # X1C/H2D/P2S go to the ffmpeg RTSP grabber, NOT the :6000 one.
+        with mock.patch.object(camera, "_rtsp_capture_frame", return_value=b"RTSP") as rt, \
+            mock.patch.object(camera, "_bambu_capture_frame") as lan:
+            for model in ("X1C", "H2D", "P2S"):
+                self.assertEqual(camera.capture_printer_frame(_bambu(model=model)), b"RTSP", model)
+            lan.assert_not_called()
+            rt.assert_called_with("1.2.3.4", "AbCd1234")
 
     def test_klipper_routes_to_http(self):
         jpeg = b"\xff\xd8\xff\xe0k\xff\xd9"

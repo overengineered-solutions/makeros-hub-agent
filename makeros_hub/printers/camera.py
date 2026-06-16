@@ -7,8 +7,11 @@ small strategy dispatch rather than one hardcoded path:
                                       (bambu_camera.capture_frame). The A1 mini
                                       is the PS pilot; this is the path SimplyPrint
                                       uses over LAN.
-  - Bambu X1 / X1C / X1E            -> RTSP :322 (needs ffmpeg). NOT YET built ->
-                                      returns None so it degrades gracefully.
+  - Bambu X1 / X1C / X1E / X2D /
+    H2* / P2S                        -> RTSPS :322 H.264 via ffmpeg
+                                      (rtsp_camera.capture_frame). Needs ffmpeg on
+                                      the hub + "LAN Mode Liveview" ON; degrades to
+                                      None (no frame) if either is missing.
   - Klipper / Moonraker, OctoPrint,
     or any "other" with a webcam     -> plain HTTP JPEG snapshot (e.g. Moonraker
                                       `/webcam/?action=snapshot`, crowsnest,
@@ -30,6 +33,7 @@ import urllib.request
 from typing import Any, Callable, Optional
 
 from .bambu_camera import capture_frame as _bambu_capture_frame
+from .rtsp_camera import capture_frame as _rtsp_capture_frame
 
 _HTTP_TIMEOUT = 4.0
 _MAX_FRAME_BYTES = 2 * 1024 * 1024
@@ -60,8 +64,20 @@ def http_snapshot(
     return data
 
 
-def _is_bambu_x1(model: Any) -> bool:
-    return "X1" in str(model or "").upper()
+def _bambu_camera_transport(model: Any) -> Optional[str]:
+    """Which LAN camera transport a Bambu model uses (verified vs ha-bambulab
+    `models.py` CAMERA_RTSP/CAMERA_IMAGE + OpenBambuAPI `video.md`):
+      'rtsp'  -> RTSPS :322 H.264   (X1, X1C, X1E, X2D, H2*, P2S)
+      'image' -> raw-JPEG :6000     (A1, A1 mini, P1P, P1S)
+    None for an unrecognized model."""
+    m = str(model or "").upper().replace(" ", "").replace("-", "")
+    if not m:
+        return None
+    if any(k in m for k in ("X1", "X2D", "H2", "P2S")):
+        return "rtsp"
+    if "A1" in m or "P1" in m:
+        return "image"
+    return None
 
 
 def camera_source_kind(printer: dict[str, Any]) -> Optional[str]:
@@ -69,11 +85,13 @@ def camera_source_kind(printer: dict[str, Any]) -> Optional[str]:
     or None when we have no camera path for it."""
     vendor = str(printer.get("vendor") or "").lower()
     if vendor == "bambu":
-        if _is_bambu_x1(printer.get("model")):
-            return "rtsp-x1"  # not yet implemented
-        if printer.get("host") and printer.get("accessCode"):
-            return "bambu-lan"
-        return None
+        if not (printer.get("host") and printer.get("accessCode")):
+            return None
+        # RTSP-class (X1/H2/P2S) -> ffmpeg :322; everything else Bambu (A1/P1,
+        # or an unrecognized model) -> the :6000 raw-JPEG path as before.
+        if _bambu_camera_transport(printer.get("model")) == "rtsp":
+            return "bambu-rtsp"
+        return "bambu-lan"
     # Klipper / OctoPrint / other: an HTTP snapshot URL is the universal path.
     if _snapshot_url(printer):
         return "http-snapshot"
@@ -102,9 +120,10 @@ def capture_printer_frame(printer: dict[str, Any]) -> Optional[bytes]:
     kind = camera_source_kind(printer)
     if kind == "bambu-lan":
         return _bambu_capture_frame(str(printer.get("host")), str(printer.get("accessCode")))
+    if kind == "bambu-rtsp":
+        return _rtsp_capture_frame(str(printer.get("host")), str(printer.get("accessCode")))
     if kind == "http-snapshot":
         return http_snapshot(_snapshot_url(printer) or "")
-    # 'rtsp-x1' (TODO: ffmpeg) and None both degrade to no-frame.
     return None
 
 
