@@ -57,17 +57,17 @@ class TestLivePool(unittest.TestCase):
         pool = vp_pool_from_statuses(statuses, units=1, trays=4)
         self.assertEqual(len(pool), 3)  # Generic PLA, GFA07 PLA, GFB00 ABS
         self.assertEqual(sorted(p["tray_type"] for p in pool), ["ABS", "PLA", "PLA"])
-        # Generic PLA (GFL99) is remapped to recognized Bambu PLA Basic (GFA00 +
-        # "PLA Basic" sub-brand) so OrcaSlicer renders PLA, not ABS.
+        # Generic PLA (GFL99) flows through UNCHANGED — the get_version AMS fix
+        # (real hw_ver) makes OrcaSlicer resolve it natively as "Generic PLA".
         white = next(p for p in pool if p["tray_color"] == "FFFFFFFF")
-        self.assertEqual(white["tray_info_idx"], "GFA00")
-        self.assertEqual(white["tray_sub_brands"], "PLA Basic")
+        self.assertEqual(white["tray_info_idx"], "GFL99")
+        self.assertEqual(white["tray_sub_brands"], "Generic PLA")
         self.assertEqual(white["cols"], ["FFFFFFFF"])
 
-    def test_generic_pla_remapped_to_recognized_basic(self):
-        # Regression for the "2 ABS": OrcaSlicer can't resolve Generic PLA
-        # (tray_info_idx GFL99) -> renders ABS. Remap to Bambu PLA Basic
-        # (GFA00 + "PLA Basic" sub-brand) so the TYPE renders as PLA.
+    def test_generic_pla_flows_through_unchanged(self):
+        # The "2 ABS" fix is in get_version (real AMS hw_ver), NOT an id remap:
+        # the genuine Generic-PLA id + product name must reach OrcaSlicer so the
+        # Prepare tab shows "Generic PLA" (not a Bambu-branded preset).
         statuses = [
             _status(
                 [{"slot": 0, "material": "PLA", "filamentId": "GFL99", "colorHex": "D5B6A4FF", "productName": "Generic PLA"}]
@@ -75,8 +75,8 @@ class TestLivePool(unittest.TestCase):
         ]
         pool = vp_pool_from_statuses(statuses, 1, 4)
         self.assertEqual(pool[0]["tray_type"], "PLA")
-        self.assertEqual(pool[0]["tray_info_idx"], "GFA00")
-        self.assertEqual(pool[0]["tray_sub_brands"], "PLA Basic")
+        self.assertEqual(pool[0]["tray_info_idx"], "GFL99")
+        self.assertEqual(pool[0]["tray_sub_brands"], "Generic PLA")
 
     def test_empty_inputs(self):
         self.assertEqual(vp_pool_from_statuses([_status([{"slot": 0}])], 1, 4), [])
@@ -178,9 +178,8 @@ class TestUpdatedConfig(unittest.TestCase):
             [
                 {
                     "tray_type": "PLA",
-                    # Generic PLA GFL99 is remapped to recognized GFA00 + "PLA Basic".
-                    "tray_info_idx": "GFA00",
-                    "tray_sub_brands": "PLA Basic",
+                    "tray_info_idx": "GFL99",
+                    "tray_sub_brands": "Generic PLA",
                     "tray_color": "FFFFFFFF",
                     "cols": ["FFFFFFFF"],
                 }

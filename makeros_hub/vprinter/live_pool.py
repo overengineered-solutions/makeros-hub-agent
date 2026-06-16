@@ -33,16 +33,16 @@ _FILAMENT_CATALOG: dict[str, dict[str, Any]] = {
 }
 _FALLBACK_FILAMENT = _FILAMENT_CATALOG["PLA"]
 
-# OrcaSlicer's Device tab can't resolve Bambu's GENERIC filament ids (e.g. Generic
-# PLA "GFL99") for the VP's model — even though the tray is otherwise IDENTICAL to
-# a real printer's (verified field-for-field 2026-06-15) — so it falls back to the
-# first type in the list, alphabetically ABS (the operator's "2 ABS" = 2 Generic
-# PLA spools). RECOGNIZED Bambu ids (GFA01 "PLA Matte" etc.) resolve fine, so remap
-# a generic id to its recognized Basic counterpart + matching sub-brand so the TYPE
-# renders correctly. The real spool is a PLA, so profile/temps stay right.
-_GENERIC_IDX_REMAP: dict[str, tuple[str, str]] = {
-    "GFL99": ("GFA00", "PLA Basic"),  # Generic PLA -> Bambu PLA Basic
-}
+# Generic->recognized id remap — currently EMPTY. The "2 ABS" bug (Generic PLA
+# GFL99 rendering as ABS) was NOT a tray-fields or id problem: the VP advertised a
+# FAKE AMS hw_ver ("AMS_F000"), so OrcaSlicer didn't recognize the AMS as real and
+# couldn't resolve a GENERIC filament -> ABS. The real fix is in get_version
+# (report.py: advertise a real AMS 2 Pro hw_ver N3F05 etc.), which lets GFL99
+# resolve NATIVELY as "Generic PLA" (Prepare) + PLA (Device) like a direct
+# connection. Remapping the id was the WRONG lever — it mislabels the spool as a
+# Bambu-branded filament in the Prepare tab. Re-add a {generic_id: (recognized_id,
+# sub_brand)} entry ONLY if a specific generic id still falls back to ABS.
+_GENERIC_IDX_REMAP: dict[str, tuple[str, str]] = {}
 
 
 def _resolve_idx(info_idx: str, product_name: str | None) -> tuple[str, str]:

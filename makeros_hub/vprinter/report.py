@@ -153,16 +153,25 @@ def build_get_version(
         base("mc", "MC07", "00.00.10.00"),
     ]
     ams_product = {"n3f": "AMS 2 Pro", "n3s": "AMS HT", "ams": "AMS"}.get(ams_type, "AMS")
-    ams_hw = {"n3f": "AMS_F000", "n3s": "AMS_S000", "ams": "AMS08"}.get(ams_type, "AMS08")
+    # Match a REAL AMS module's advertised hw_ver/sw_ver/shape (captured live from
+    # an A1-mini's AMS 2 Pro: hw_ver=N3F05, sw_ver=03.00.21.29, product_name
+    # "AMS 2 Pro (N)", visible:true, loader_ver). OrcaSlicer must recognize the AMS
+    # as REAL to resolve a GENERIC filament (e.g. Generic PLA GFL99); the previous
+    # fake hw_ver "AMS_F000" defeated that, so generics fell back to ABS. Recognized
+    # filaments resolve regardless (they key off their own id) — only generics need
+    # the AMS itself recognized.
+    ams_hw = {"n3f": "N3F05", "n3s": "AMS_S000", "ams": "AMS08"}.get(ams_type, "AMS08")
+    ams_sw = {"n3f": "03.00.21.29"}.get(ams_type, "00.00.06.49")
     for idx in range(max(units, 0)):
         modules.append(
             {
                 "name": f"{ams_type}/{idx}",
-                "product_name": ams_product,
-                "sw_ver": "00.00.06.49",
-                "sw_new_ver": "",
+                "product_name": f"{ams_product} ({idx + 1})",
+                "sw_ver": ams_sw,
                 "hw_ver": ams_hw,
+                "loader_ver": "00.00.00.00",
                 "sn": f"{serial}-AMS{idx}",
+                "visible": True,
                 "flag": 0,
             }
         )
