@@ -518,6 +518,7 @@ def heartbeat_payload(
     jobs: list[dict] | None = None,
     tailscale_status: dict | None = None,
     probe_results: list[dict] | None = None,
+    command_results: list[dict] | None = None,
     diagnostics=None,
     camera_frames: list[dict] | None = None,
 ) -> dict:
@@ -539,6 +540,8 @@ def heartbeat_payload(
                 payload[key] = value
     if probe_results:
         payload["probeResults"] = list(probe_results)
+    if command_results:
+        payload["commandResults"] = list(command_results)
     if camera_frames:
         payload["cameraFrames"] = list(camera_frames)
     diag = collect_cheap_diagnostics(diagnostics)
@@ -944,6 +947,7 @@ def run(
     queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
     pending_queue_reports: list[dict] = []
     pending_probe_results: list[dict] = []
+    pending_command_results: list[dict] = []
     tailscale_state = _TailscaleRuntimeState()
     vprinter_state = _VirtualPrinterRuntimeState()
     # Per-printer camera capture is normally driven by the admin toggle
@@ -1098,6 +1102,7 @@ def run(
                         jobs,
                         tailscale_status,
                         probe_results=pending_probe_results,
+                        command_results=pending_command_results,
                         diagnostics=diagnostics,
                         camera_frames=camera_frames,
                     ),
@@ -1111,6 +1116,10 @@ def run(
                     pending_probe_results = []
                     if reported_probe_count:
                         log.info("reported %d probe result(s) to the cloud", reported_probe_count)
+                    reported_command_count = len(pending_command_results)
+                    pending_command_results = []
+                    if reported_command_count:
+                        log.info("reported %d command result(s) to the cloud", reported_command_count)
                     assignments = resp.body.get("assignments")
                     dispatch_reports = manager.dispatch_assignments(
                         assignments if isinstance(assignments, list) else [],
@@ -1180,6 +1189,14 @@ def run(
                     if probe_results:
                         pending_probe_results.extend(probe_results)
                         log.info("queued %d probe result(s) for the next heartbeat", len(probe_results))
+                    # Execute any control commands the cloud delivered (pause/
+                    # resume/stop) and queue their results for the next heartbeat.
+                    command_reports = manager.dispatch_commands(resp.body.get("pendingCommands"))
+                    if command_reports:
+                        pending_command_results.extend(command_reports)
+                        log.info(
+                            "executed %d printer command(s) from the heartbeat", len(command_reports)
+                        )
                 elif resp.status == 401:
                     # Graceful-degradation, NOT exit: a 401 means this hub's
                     # credential was revoked/rotated. Exiting here would tear down

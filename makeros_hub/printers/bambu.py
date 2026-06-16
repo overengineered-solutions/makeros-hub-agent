@@ -247,6 +247,42 @@ class BambuAdapter:
                 self._queue_progress.record_dispatch(queue_job_id, self._jobs.pending())
         return {"ok": True}
 
+    def send_command(self, command: str, params: dict | None = None) -> dict:
+        """Publish a LAN control command to device/<serial>/request — the same
+        channel as start_print. Today: pause/resume/stop (the universal Bambu
+        `print`-class commands; payload shape matches pybambu's, which is proven).
+        The cloud only ever delivers the allowlisted set, but we re-check here as
+        defense-in-depth. Returns {"ok": bool, "reason": str} like start_print."""
+        if command not in {"pause", "resume", "stop"}:
+            return {"ok": False, "reason": "unsupported_command"}
+        client = self._client
+        connected = False
+        if client is not None:
+            is_connected = getattr(client, "is_connected", None)
+            try:
+                connected = bool(is_connected()) if callable(is_connected) else self._connack == "ok"
+            except Exception:  # noqa: BLE001
+                connected = self._connack == "ok"
+        if client is None or not connected:
+            return {"ok": False, "reason": "not_connected"}
+
+        sequence_id = os.urandom(4).hex()
+        payload = {"print": {"sequence_id": sequence_id, "command": command, "param": ""}}
+        try:
+            info = client.publish(self._request_topic, json.dumps(payload))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("bambu %s %s publish failed: %s", self.printer_id, command, exc)
+            return {"ok": False, "reason": "command_failed"}
+        if getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS) != mqtt.MQTT_ERR_SUCCESS:
+            log.warning(
+                "bambu %s %s publish returned rc=%s",
+                self.printer_id,
+                command,
+                getattr(info, "rc", "unknown"),
+            )
+            return {"ok": False, "reason": "command_failed"}
+        return {"ok": True}
+
     def collect_queue_progress(self) -> list[dict]:
         """Drain queue-status reports inferred from observed printer telemetry."""
         with self._lock:

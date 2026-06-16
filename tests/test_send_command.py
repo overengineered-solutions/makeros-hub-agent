@@ -1,0 +1,90 @@
+"""Tests for BambuAdapter.send_command — LAN control commands (pause/resume/stop)."""
+
+import json
+import sys
+import types
+import unittest
+
+# The agent test env doesn't install paho-mqtt (the adapter module is normally
+# not imported under test). Stub the bits bambu.py touches at import + in
+# send_command so this test runs anywhere; guarded so the real paho wins on a hub.
+if "paho.mqtt.client" not in sys.modules:  # pragma: no cover - env shim
+    _mqtt = types.ModuleType("paho.mqtt.client")
+    _mqtt.MQTT_ERR_SUCCESS = 0
+    _mqtt.MQTTv311 = 4
+    _mqtt.CallbackAPIVersion = types.SimpleNamespace(VERSION2=2)
+    _mqtt.Client = type("Client", (), {})
+    _paho = types.ModuleType("paho")
+    _paho_mqtt = types.ModuleType("paho.mqtt")
+    _paho_mqtt.client = _mqtt
+    _paho.mqtt = _paho_mqtt
+    sys.modules["paho"] = _paho
+    sys.modules["paho.mqtt"] = _paho_mqtt
+    sys.modules["paho.mqtt.client"] = _mqtt
+
+from makeros_hub.printers.bambu import BambuAdapter  # noqa: E402
+
+
+class FakeInfo:
+    def __init__(self, rc=0):
+        self.rc = rc
+
+
+class FakeClient:
+    def __init__(self, connected=True, rc=0):
+        self._connected = connected
+        self._rc = rc
+        self.published = []
+
+    def is_connected(self):
+        return self._connected
+
+    def publish(self, topic, payload):
+        self.published.append((topic, payload))
+        return FakeInfo(self._rc)
+
+
+def make_adapter():
+    return BambuAdapter(
+        "p1", host="1.2.3.4", serial="SER123", access_code="code", model="A1 Mini"
+    )
+
+
+class TestSendCommand(unittest.TestCase):
+    def test_pause_publishes_to_request_topic(self):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True)
+        adapter._connack = "ok"
+        result = adapter.send_command("pause")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(adapter._client.published), 1)
+        topic, payload = adapter._client.published[0]
+        self.assertEqual(topic, "device/SER123/request")
+        doc = json.loads(payload)
+        self.assertEqual(doc["print"]["command"], "pause")
+        self.assertIn("sequence_id", doc["print"])
+
+    def test_unsupported_command_rejected_without_publish(self):
+        adapter = make_adapter()
+        adapter._client = FakeClient()
+        adapter._connack = "ok"
+        result = adapter.send_command("frobnicate")
+        self.assertEqual(result, {"ok": False, "reason": "unsupported_command"})
+        self.assertEqual(adapter._client.published, [])
+
+    def test_not_connected_does_not_publish(self):
+        adapter = make_adapter()
+        adapter._client = None
+        result = adapter.send_command("stop")
+        self.assertEqual(result, {"ok": False, "reason": "not_connected"})
+
+    def test_publish_rc_failure_reports_command_failed(self):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True, rc=1)
+        adapter._connack = "ok"
+        result = adapter.send_command("resume")
+        self.assertEqual(result, {"ok": False, "reason": "command_failed"})
+
+
+if __name__ == "__main__":
+    unittest.main()
