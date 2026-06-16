@@ -1,7 +1,37 @@
 from __future__ import annotations
 
 import colorsys
+import hashlib
 from typing import Any
+
+
+def _derive_hex(serial: str, tag: str, idx: int, length: int, upper: bool) -> str:
+    """Deterministic hex id from (serial, tag, idx) — STABLE across heartbeats
+    and restarts (no randomness), so an AMS's advertised hardware identity never
+    churns. sha256 keeps it collision-free across units/modules."""
+    digest = hashlib.sha256(f"{serial}:{tag}:{idx}".encode("utf-8")).hexdigest()[:length]
+    return digest.upper() if upper else digest
+
+
+def ams_unit_serial(serial: str, idx: int) -> str:
+    """The AMS unit's hardware id — shaped like a real ams_id (15 uppercase hex,
+    e.g. '19C06A541800179'). The SAME value is the get_version AMS module's `sn`
+    AND the push_status unit's `ams_id`; that module<->unit linkage is what lets
+    OrcaSlicer's Device tab resolve a GENERIC spool (recognized ids self-resolve
+    off their own id; a generic needs the AMS itself fully identified)."""
+    return _derive_hex(serial, "ams", idx, 15, upper=True)
+
+
+def ams_chip_id(serial: str, idx: int) -> str:
+    """The AMS unit's chip id — shaped like a real chip_id (31 lowercase hex,
+    e.g. '6dfc3b4d8444300d47323931fffffff')."""
+    return _derive_hex(serial, "chip", idx, 31, upper=False)
+
+
+def _module_serial(serial: str, name: str) -> str:
+    """A per-module serial for the modules a real printer gives their OWN sn
+    (mc, th) rather than the mainboard serial (ota, esp32 share the mainboard's)."""
+    return _derive_hex(serial, f"mod:{name}", 0, 15, upper=True)
 
 
 MATERIALS = [
@@ -25,6 +55,7 @@ def build_push_status(
     gcode_file: str = "",
     prepare_percent: str = "0",
     ams_version: int = 4,
+    serial: str = "",
 ) -> dict[str, Any]:
     if units <= 0:
         raise ValueError("units must be positive")
@@ -48,6 +79,13 @@ def build_push_status(
         ams_units.append(
             {
                 "id": str(unit_idx),
+                # Hardware identity a real AMS unit always carries. `ams_id` equals
+                # this unit's get_version AMS module `sn` (ams_unit_serial), giving
+                # OrcaSlicer the module<->unit linkage it needs to resolve a GENERIC
+                # spool in the Device tab. Stable per (serial, unit) so it never
+                # churns ams.version.
+                "ams_id": ams_unit_serial(serial, unit_idx),
+                "chip_id": ams_chip_id(serial, unit_idx),
                 "info": "2003",
                 "temp": "25.0",
                 "check": 1,
@@ -125,6 +163,24 @@ def build_push_status(
     }
 
 
+# Printer (non-AMS) modules, captured FIELD-FOR-FIELD from a live Bambu Lab
+# A1 mini's get_version on 2026-06-15. We mirror reality instead of hand-writing
+# approximations: the earlier guessed list (wrong hw_vers MC07/TH07, an invented
+# `rv1126` module, the mainboard serial on every module) left the Device tab
+# unable to resolve GENERIC filaments (they rendered ABS). Per tuple:
+#   name, hw_ver, sw_ver, loader_ver, is_mainboard (product_name=model + visible),
+#   own_serial (real printer gives mc/th their OWN sn; ota/esp32 share mainboard's)
+# Only the A1 mini is captured so far; other models reuse this base until their
+# own get_version is captured. sw_new_ver:"" is present on printer modules (real)
+# and ABSENT on the AMS module (also real — do not add it there).
+_A1_MINI_BASE_MODULES: list[tuple[str, str, str, str, bool, bool]] = [
+    ("ota", "OTA", "01.07.00.00", "00.00.00.00", True, False),
+    ("esp32", "AP05", "01.16.39.07", "00.00.00.00", False, False),
+    ("mc", "MC02", "00.00.35.57", "00.00.00.32", False, True),
+    ("th", "TH03", "00.00.07.72", "00.00.00.26", False, True),
+]
+
+
 def build_get_version(
     model: str,
     serial: str,
@@ -132,34 +188,32 @@ def build_get_version(
     sequence_id: int | str = "0",
     ams_type: str = "n3f",
 ) -> dict[str, Any]:
-    product = MODEL_PRODUCT_NAMES.get(model, "X1 Carbon")
+    model_display = MODEL_PRODUCT_NAMES.get(model, "X1 Carbon")
 
-    def base(name: str, hw_ver: str, sw_ver: str = "01.08.00.00") -> dict[str, Any]:
-        return {
-            "name": name,
-            "product_name": product,
-            "sw_ver": sw_ver,
-            "sw_new_ver": "",
-            "hw_ver": hw_ver,
-            "sn": serial,
-            "flag": 0,
-        }
+    modules: list[dict[str, Any]] = []
+    for name, hw_ver, sw_ver, loader_ver, is_mainboard, own_serial in _A1_MINI_BASE_MODULES:
+        modules.append(
+            {
+                "name": name,
+                # Real printers put "Bambu Lab <model>" on the mainboard (ota) and
+                # leave the other modules' product_name empty.
+                "product_name": f"Bambu Lab {model_display}" if is_mainboard else "",
+                "sw_ver": sw_ver,
+                "sw_new_ver": "",
+                "hw_ver": hw_ver,
+                "sn": _module_serial(serial, name) if own_serial else serial,
+                "loader_ver": loader_ver,
+                "visible": is_mainboard,
+                "flag": 0,
+            }
+        )
 
-    modules = [
-        base("ota", "OTA"),
-        base("esp32", "AP05", "01.07.22.25"),
-        base("rv1126", "AP05", "00.00.27.38"),
-        base("th", "TH07", "00.00.04.00"),
-        base("mc", "MC07", "00.00.10.00"),
-    ]
+    # One AMS module per unit. Its `sn` is the unit's `ams_id` (ams_unit_serial),
+    # so get_version and push_status agree on the AMS hardware identity — the
+    # linkage a real printer has and the Device tab needs to resolve a GENERIC
+    # spool. hw_ver/sw_ver/product_name match a real AMS 2 Pro (n3f). NOTE: no
+    # sw_new_ver key here — real AMS modules omit it.
     ams_product = {"n3f": "AMS 2 Pro", "n3s": "AMS HT", "ams": "AMS"}.get(ams_type, "AMS")
-    # Match a REAL AMS module's advertised hw_ver/sw_ver/shape (captured live from
-    # an A1-mini's AMS 2 Pro: hw_ver=N3F05, sw_ver=03.00.21.29, product_name
-    # "AMS 2 Pro (N)", visible:true, loader_ver). OrcaSlicer must recognize the AMS
-    # as REAL to resolve a GENERIC filament (e.g. Generic PLA GFL99); the previous
-    # fake hw_ver "AMS_F000" defeated that, so generics fell back to ABS. Recognized
-    # filaments resolve regardless (they key off their own id) — only generics need
-    # the AMS itself recognized.
     ams_hw = {"n3f": "N3F05", "n3s": "AMS_S000", "ams": "AMS08"}.get(ams_type, "AMS08")
     ams_sw = {"n3f": "03.00.21.29"}.get(ams_type, "00.00.06.49")
     for idx in range(max(units, 0)):
@@ -170,7 +224,7 @@ def build_get_version(
                 "sw_ver": ams_sw,
                 "hw_ver": ams_hw,
                 "loader_ver": "00.00.00.00",
-                "sn": f"{serial}-AMS{idx}",
+                "sn": ams_unit_serial(serial, idx),
                 "visible": True,
                 "flag": 0,
             }
