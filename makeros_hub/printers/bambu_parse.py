@@ -390,6 +390,16 @@ def normalize_status(
         if pe:
             out["printError"] = pe
 
+        # s_obj = the identify_ids the printer has been told to skip in the
+        # current print (BambuStudio reads this same field back). Surface it so
+        # the web UI can mark already-skipped objects; cap to the 64 skip-window
+        # ceiling, ints only (the cloud scopes display to an active print).
+        s_obj = print_obj.get("s_obj")
+        if isinstance(s_obj, list):
+            skipped = [o for o in s_obj if isinstance(o, int) and not isinstance(o, bool)]
+            if skipped:
+                out["skippedObjects"] = skipped[:64]
+
     return out
 
 

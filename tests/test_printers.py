@@ -45,6 +45,22 @@ class TestNormalizeStatus(unittest.TestCase):
         self.assertEqual(s["jobName"], "bracket.3mf")
         self.assertEqual(s["etaMinutes"], 90)  # MINUTES, not seconds
 
+    def test_s_obj_surfaces_as_skipped_objects(self):
+        s = bambu_parse.normalize_status(
+            "p", self._merged(gcode_state="RUNNING", s_obj=[286, 9, True, "x"]),
+            connection_state="connected",
+        )
+        # ints only (bool/str dropped); the cloud scopes display to active prints.
+        self.assertEqual(s["skippedObjects"], [286, 9])
+
+    def test_empty_or_absent_s_obj_omits_skipped_objects(self):
+        for s_obj in ([], None):
+            fields = {"gcode_state": "RUNNING"}
+            if s_obj is not None:
+                fields["s_obj"] = s_obj
+            s = bambu_parse.normalize_status("p", self._merged(**fields), connection_state="connected")
+            self.assertNotIn("skippedObjects", s)
+
     def test_finish_and_failed_are_both_idle(self):
         # A finished OR failed job leaves the printer free again — a failed *job*
         # is not a printer *fault* (real faults surface via HMS). Bed-occupancy

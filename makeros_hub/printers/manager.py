@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from ..diagnostics import get_default, redact
+from .threemf_objects import parse_plate_objects
 
 log = logging.getLogger("makeros-hub.printers")
 
@@ -405,12 +406,21 @@ class PrinterManager:
                 )
                 continue
 
-            reports.append({"queueJobId": queue_job_id, "state": "uploading"})
+            plate = assignment.get("plate") or 1
+            plate_int = plate if isinstance(plate, int) and not isinstance(plate, bool) else 1
+            # Enumerate the plate's skippable objects from the staged 3MF so the
+            # cloud can offer per-object cancel. Best-effort: a parse miss just
+            # omits the list (skip simply isn't offered for that job).
+            uploading: dict = {"queueJobId": queue_job_id, "state": "uploading"}
+            objects = parse_plate_objects(local_path, plate_int)
+            if objects:
+                uploading["objects"] = objects
+            reports.append(uploading)
             try:
                 result = start_print(
                     local_path,
                     file_name,
-                    plate=assignment.get("plate") or 1,
+                    plate=plate_int,
                     use_ams=bool(assignment.get("useAms", False)),
                     ams_mapping=assignment.get("amsMapping"),
                     queue_job_id=queue_job_id,
