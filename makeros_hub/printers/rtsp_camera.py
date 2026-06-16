@@ -7,14 +7,25 @@ H.264 can't be decoded with the stdlib, so we shell out to ffmpeg for a single
 keyframe → JPEG. ffmpeg is OPTIONAL: if it isn't installed, capture returns None
 (the caller degrades to no-frame) and a one-time warning is logged. Requires
 "LAN Mode Liveview" ON on the printer (gates :322) + the LAN access code (same
-code as MQTT/FTPS). Stdlib only (subprocess + shutil).
+code as MQTT/FTPS). Stdlib only (subprocess + select + shutil).
+
+Credential exposure (accepted): ffmpeg takes the RTSP URL — which embeds the LAN
+access code — in its argv, so the code is briefly visible in `ps`/`/proc` for
+the ≤timeout life of the process. This is an accepted exposure for this threat
+model: the hub is a single-tenant shop appliance (only the operator + this
+agent), the value is a LAN-local printer access code (not an API key/token) that
+already lives on the box for the MQTT/FTPS paths, and the process is short-lived.
+We do NOT log/echo it (R2.10 still holds for our own logging). A localhost RTSP
+auth-proxy would remove even the argv exposure but is out of scope here.
 """
 
 from __future__ import annotations
 
 import logging
+import select
 import shutil
 import subprocess
+import time
 from typing import Optional
 from urllib.parse import quote
 
@@ -22,8 +33,8 @@ log = logging.getLogger("makeros-hub.printers")
 
 RTSP_PORT = 322
 _DEFAULT_TIMEOUT = 10.0
-# A 720p H.264 keyframe → JPEG is ~50-300 KB; cap so a misbehaving peer can't
-# stream unbounded bytes into agent memory.
+# A 720p H.264 keyframe → JPEG is ~50-300 KB; cap so a misbehaving/hostile peer
+# on :322 can't stream unbounded bytes into agent memory.
 _MAX_FRAME_BYTES = 4 * 1024 * 1024
 _SOI = b"\xff\xd8\xff"  # JPEG start-of-image
 _EOI = b"\xff\xd9"  # JPEG end-of-image
@@ -40,31 +51,8 @@ def rtsp_url(host: str, access_code: str) -> str:
     return f"rtsps://bblp:{quote(access_code, safe='')}@{host}:{RTSP_PORT}/streaming/live/1"
 
 
-def capture_frame(
-    host: str,
-    access_code: str,
-    *,
-    timeout: float = _DEFAULT_TIMEOUT,
-    max_bytes: int = _MAX_FRAME_BYTES,
-    runner=subprocess.run,
-) -> Optional[bytes]:
-    """Return one JPEG frame from the printer's :322 RTSPS stream, or None on any
-    failure (no ffmpeg / Liveview off / unreachable / timeout / not-a-JPEG). The
-    caller treats None as 'no frame this beat', never an error. `runner` is
-    injectable for tests."""
-    global _warned_no_ffmpeg
-    if not host or not access_code:
-        return None
-    if not ffmpeg_available():
-        if not _warned_no_ffmpeg:
-            log.warning(
-                "ffmpeg not found — X1/H2/P2S camera capture disabled; "
-                "install it on the hub (sudo apt-get install -y ffmpeg)"
-            )
-            _warned_no_ffmpeg = True
-        return None
-
-    cmd = [
+def ffmpeg_argv(host: str, access_code: str) -> list[str]:
+    return [
         "ffmpeg",
         "-nostdin",
         "-loglevel",
@@ -83,15 +71,82 @@ def capture_frame(
         "mjpeg",
         "pipe:1",
     ]
+
+
+def _run_ffmpeg(cmd: list[str], timeout: float, max_bytes: int) -> tuple[bytes, Optional[int]]:
+    """Run ffmpeg, reading stdout INCREMENTALLY (select + read1) so memory is
+    bounded to max_bytes+1 regardless of how much the peer streams, and time is
+    bounded by `timeout`. stderr is discarded (not buffered). Returns
+    (stdout_bytes, returncode); returncode is None if we had to kill it (over
+    the byte cap or the deadline). Never raises for I/O — returns (b'', None)."""
     try:
-        proc = runner(cmd, capture_output=True, timeout=timeout)
-    except (subprocess.TimeoutExpired, OSError):
+        proc = subprocess.Popen(  # noqa: S603 - argv list, shell=False
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+    except OSError:
+        return b"", None
+    buf = bytearray()
+    deadline = time.monotonic() + timeout
+    assert proc.stdout is not None
+    try:
+        while len(buf) <= max_bytes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return bytes(buf), None  # deadline — caller rejects (rc None)
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            if not ready:
+                return bytes(buf), None  # timed out waiting for more output
+            chunk = proc.stdout.read1(65536)
+            if not chunk:
+                break  # EOF — ffmpeg finished writing
+            buf += chunk
+        else:
+            # Loop exited via the cap (len > max_bytes) — over-limit peer.
+            return bytes(buf), None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            rc = proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            rc = None
+        if proc.stdout is not None:
+            proc.stdout.close()
+    return bytes(buf), rc
+
+
+def capture_frame(
+    host: str,
+    access_code: str,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+    max_bytes: int = _MAX_FRAME_BYTES,
+    runner=_run_ffmpeg,
+) -> Optional[bytes]:
+    """Return one JPEG frame from the printer's :322 RTSPS stream, or None on any
+    failure (no ffmpeg / Liveview off / unreachable / timeout / nonzero exit /
+    not-a-JPEG / over the byte cap). The caller treats None as 'no frame this
+    beat', never an error. `runner` is injectable for tests."""
+    global _warned_no_ffmpeg
+    if not host or not access_code:
+        return None
+    if not ffmpeg_available():
+        if not _warned_no_ffmpeg:
+            log.warning(
+                "ffmpeg not found — X1/H2/P2S camera capture disabled; "
+                "install it on the hub (sudo apt-get install -y ffmpeg)"
+            )
+            _warned_no_ffmpeg = True
         return None
 
-    out = getattr(proc, "stdout", b"") or b""
+    out, returncode = runner(ffmpeg_argv(host, access_code), timeout, max_bytes)
+    # A nonzero/none exit (Liveview off, auth fail, timeout, killed-over-cap)
+    # never yields a trusted frame even if stdout happens to look JPEG-shaped.
+    if returncode != 0:
+        return None
     if not (0 < len(out) <= max_bytes) or out[:3] != _SOI or out[-2:] != _EOI:
         return None
-    return bytes(out)
+    return out
 
 
 # Manual on-device probe to confirm the path before relying on it:
