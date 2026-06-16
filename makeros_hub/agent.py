@@ -119,6 +119,8 @@ def make_queue_status_reporter(cfg: Config, credential: str, diagnostics=None):
             body["printerJobKey"] = status_report["printerJobKey"]
         if status_report.get("reason"):
             body["reason"] = status_report["reason"]
+        if status_report.get("objects"):
+            body["objects"] = status_report["objects"]
         try:
             resp = post_json(
                 cfg.queue_status_url,

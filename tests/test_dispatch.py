@@ -2,10 +2,24 @@
 
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from makeros_hub.printers.manager import PrinterManager
 from makeros_hub.printers.queue_progress import QueueProgressTracker
+
+
+def _write_3mf_with_objects(path: Path, plate: int, objects: list[tuple[int, str]]) -> None:
+    """Stage a 3MF whose slice_info.config carries skippable objects on `plate`."""
+    obj_xml = "".join(f'<object identify_id="{i}" name="{n}"/>' for i, n in objects)
+    slice_info = (
+        '<?xml version="1.0"?><config><plate>'
+        f'<metadata key="index" value="{plate}"/>'
+        '<metadata key="label_object_enabled" value="true"/>'
+        f"{obj_xml}</plate></config>"
+    )
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("Metadata/slice_info.config", slice_info)
 
 
 class FakeAdapter:
@@ -73,6 +87,33 @@ class TestDispatchAssignments(unittest.TestCase):
         self.assertIs(kwargs["use_ams"], True)
         self.assertEqual(kwargs["ams_mapping"], [0, 1])
         self.assertEqual(kwargs["queue_job_id"], "q1")
+
+    def test_uploading_report_carries_parsed_objects(self):
+        with tempfile.TemporaryDirectory() as d:
+            spool_file = Path(d) / "abcdef12" / "part.3mf"
+            spool_file.parent.mkdir()
+            # default assignment() plate is 2 — stage objects on plate 2.
+            _write_3mf_with_objects(spool_file, plate=2, objects=[(286, "Cube"), (287, "Sphere")])
+            manager = PrinterManager()
+            manager._adapters["p1"] = FakeAdapter({"ok": True})
+
+            reports = manager.dispatch_assignments([assignment()], d)
+
+        uploading = next(r for r in reports if r["state"] == "uploading")
+        self.assertEqual(uploading["objects"], [{"id": 286, "name": "Cube"}, {"id": 287, "name": "Sphere"}])
+
+    def test_uploading_report_omits_objects_when_not_skippable(self):
+        with tempfile.TemporaryDirectory() as d:
+            spool_file = Path(d) / "abcdef12" / "part.3mf"
+            spool_file.parent.mkdir()
+            spool_file.write_bytes(b"not a real 3mf")  # parser returns [] (no raise)
+            manager = PrinterManager()
+            manager._adapters["p1"] = FakeAdapter({"ok": True})
+
+            reports = manager.dispatch_assignments([assignment()], d)
+
+        uploading = next(r for r in reports if r["state"] == "uploading")
+        self.assertNotIn("objects", uploading)
 
     def test_file_missing_reports_held(self):
         with tempfile.TemporaryDirectory() as d:

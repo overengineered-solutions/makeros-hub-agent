@@ -250,11 +250,12 @@ class BambuAdapter:
     def send_command(self, command: str, params: dict | None = None) -> dict:
         """Publish a LAN control command to device/<serial>/request — the same
         channel as start_print. pause/resume/stop (universal `print`-class
-        commands; pybambu's proven shape) + ams_dry (the `ams_filament_drying`
-        command for AMS 2 Pro / AMS HT; params {amsId, temp, durationHours}). The
-        cloud only delivers the allowlisted set + validates ams_dry params, but we
-        re-check here as defense-in-depth. Returns {"ok": bool, "reason": str}."""
-        if command not in {"pause", "resume", "stop", "ams_dry"}:
+        commands; pybambu's proven shape) + ams_dry (`ams_filament_drying`;
+        params {amsId, temp, durationHours}) + skip_objects (cancel specific
+        objects mid-print; params {objList: [identify_id ints]}). The cloud only
+        delivers the allowlisted set + validates params, but we re-check here as
+        defense-in-depth. Returns {"ok": bool, "reason": str}."""
+        if command not in {"pause", "resume", "stop", "ams_dry", "skip_objects"}:
             return {"ok": False, "reason": "unsupported_command"}
         client = self._client
         connected = False
@@ -313,6 +314,26 @@ class BambuAdapter:
                     "rotate_tray": False,
                     "filament": "",
                     "close_power_conflict": False,
+                }
+            }
+        elif command == "skip_objects":
+            obj_list = (params or {}).get("objList")
+            # obj_list = the slicer's identify_id ints (verified vs BambuStudio
+            # command_task_partskip: `obj_list` is a plain int array). Exclude
+            # bools (bool ⊂ int). Bambu disables skip past 64 objects; the cloud
+            # validates the tighter bounds, this is the defense-in-depth floor.
+            if (
+                not isinstance(obj_list, list)
+                or not obj_list
+                or len(obj_list) > 64
+                or any(not isinstance(o, int) or isinstance(o, bool) for o in obj_list)
+            ):
+                return {"ok": False, "reason": "invalid_skip_params"}
+            payload = {
+                "print": {
+                    "sequence_id": sequence_id,
+                    "command": "skip_objects",
+                    "obj_list": [int(o) for o in obj_list],
                 }
             }
         else:
