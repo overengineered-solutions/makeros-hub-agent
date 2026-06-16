@@ -26,6 +26,7 @@ from ..diagnostics import get_default, redact
 log = logging.getLogger("makeros-hub.printers")
 
 MAX_DISPATCHED_QUEUE_JOBS = 1000
+MAX_DISPATCHED_COMMANDS = 1000
 _SUBMISSION_UID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
 
@@ -51,6 +52,13 @@ class PrinterManager:
         # resend must not re-upload or re-start the printer. Terminal progress
         # reports prune this bounded guard.
         self._dispatched_queue_jobs: OrderedDict[str, float] = OrderedDict()
+        # Same at-least-once guard for control commands. Cloud delivery is
+        # one-shot (queued->delivered is atomic; delivered rows are never
+        # re-selected), but a lost result report could in theory get the row
+        # redelivered — a second ams_dry mode=1 would restart the heater cycle.
+        # A successfully-dispatched requestId here makes a redelivery re-report
+        # ok without republishing. Bounded like _dispatched_queue_jobs.
+        self._dispatched_commands: OrderedDict[str, float] = OrderedDict()
         # Per-printer camera-routing facts (vendor/model/host/accessCode/urls),
         # rebuilt every reconcile. Lets the camera capturer pick the right source
         # (Bambu :6000 / HTTP snapshot / …) without re-plumbing config-down.
@@ -279,6 +287,13 @@ class PrinterManager:
                 # drop, since we can't emit a valid-command terminal result for it.
                 log.warning("skipping malformed command: %s", item)
                 continue
+            if request_id in self._dispatched_commands:
+                # Already executed this requestId in a prior beat — do NOT
+                # republish (a duplicate ams_dry mode=1 would restart the dryer).
+                # Re-report ok so the cloud can close out a row whose first
+                # result report was lost. Doesn't consume a rate-limit slot.
+                reports.append({"requestId": request_id, "command": command, "status": "ok"})
+                continue
             if index >= max_per_heartbeat:
                 reports.append(
                     {
@@ -316,6 +331,13 @@ class PrinterManager:
                 )
                 continue
             if isinstance(result, dict) and result.get("ok"):
+                # Record only successful dispatches so a failed one (e.g. a
+                # transient printer_unavailable) can still be retried if the cloud
+                # ever redelivers; bound it like the queue-job guard.
+                self._dispatched_commands[request_id] = time.monotonic()
+                self._dispatched_commands.move_to_end(request_id)
+                while len(self._dispatched_commands) > MAX_DISPATCHED_COMMANDS:
+                    self._dispatched_commands.popitem(last=False)
                 reports.append({"requestId": request_id, "command": command, "status": "ok"})
             else:
                 reason = result.get("reason") if isinstance(result, dict) else "unknown"
