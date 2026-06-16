@@ -15,7 +15,21 @@ import shutil
 import socket
 import time
 
-SUBSYSTEMS = ("tailscale", "printers", "heartbeat", "config", "update", "ingest", "vprinter")
+SUBSYSTEMS = (
+    "tailscale",
+    "printers",
+    "heartbeat",
+    "config",
+    "update",
+    "ingest",
+    "vprinter",
+    # V5 — registered so `_record_diagnostic(diagnostics, "camera"|"failure_watch"|"detector", ...)`
+    # in agent.py + onnx_detector.py survives `snapshot()` instead of being silently
+    # dropped on the unknown-subsystem floor.
+    "camera",
+    "failure_watch",
+    "detector",
+)
 ERROR_MESSAGE_MAX = 280
 LOG_MESSAGE_MAX = 180
 LOG_RING_SIZE = 16

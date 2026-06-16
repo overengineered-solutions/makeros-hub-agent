@@ -69,6 +69,25 @@ if [ -x "$PYBIN" ]; then
     echo "    !! cryptography install failed (offline?) — virtual printer reports dependency missing"
     echo "    !! until you run: sudo $PYBIN -m pip install 'cryptography>=42,<46'"
   fi
+  # V5 AI failure-watch — optional ONNX inference + image preprocess. The agent
+  # gracefully falls back to the no-op stub detector when these aren't
+  # installed (older hubs predate this), so an offline / failing install
+  # never breaks heartbeats. onnxruntime pulls numpy as a transitive dep.
+  # ~16 MB DL onnxruntime + ~6 MB Pillow = ~22 MB total; arm64 wheels for Pi.
+  # A touch-file marker under the StateDirectory records the OUTCOME so the
+  # agent can read it on boot + surface to the cloud diag (no PR-time wheel
+  # resolution surprise stays silent).
+  mkdir -p "$STATE_DIR"
+  if "$PYBIN" -m pip install --quiet "onnxruntime>=1.17,<2" "Pillow>=10,<13"; then
+    echo "    onnxruntime + Pillow installed (AI failure-watch ready)"
+    touch "$STATE_DIR/.install.onnxruntime.ok"
+    rm -f "$STATE_DIR/.install.onnxruntime.failed" 2>/dev/null || true
+  else
+    echo "    !! onnxruntime/Pillow install failed (offline?) — AI failure-watch falls back to stub"
+    echo "    !! until you run: sudo $PYBIN -m pip install 'onnxruntime>=1.17,<2' 'Pillow>=10,<13'"
+    touch "$STATE_DIR/.install.onnxruntime.failed"
+    rm -f "$STATE_DIR/.install.onnxruntime.ok" 2>/dev/null || true
+  fi
   chmod -R a+rX "$VENV"
 fi
 

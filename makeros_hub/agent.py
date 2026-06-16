@@ -39,7 +39,12 @@ from .ingest import IngestServer
 from .probes import PROBES, run_probe, set_effective_config
 from .printers.manager import PrinterManager
 from .printers.camera import CameraScheduler, collect_camera_frames
-from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples
+from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples, stub_detector
+from .printers.onnx_detector import (
+    DetectorHolder,
+    STUB_REWARN_INTERVAL_SEC,
+    build_detector_async,
+)
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
 from .update import maybe_update
 from .vprinter.capture import CapturedJob, build_vp_submit_body
@@ -968,6 +973,26 @@ def run(
     # re-enable or a stale gap so a fresh print doesn't inherit the prior
     # print's tail). The cloud applies the sensitivity-keyed threshold.
     failure_smoother = FailureWatchSmoother()
+    # Build the real ONNX YOLO detector if MODEL_URL + MODEL_SHA256 are pinned
+    # AND onnxruntime/Pillow are installed; else the holder stays empty and
+    # the framework falls back to the no-op stub (p=0 every sample — wire
+    # path stays live, cloud sees `tier=none` rows). Boot runs on a
+    # BACKGROUND THREAD so a slow CDN can't push the first heartbeat past
+    # the cloud's offline threshold. The heartbeat loop reads
+    # `detector_holder.detector()` at each beat — picks up the real detector
+    # the moment boot finishes, falls back to the stub before then.
+    detector_holder: DetectorHolder
+    _detector_boot_outcome_for_diag = {"value": None}  # captured for surfacing
+    _last_stub_warn_at = {"ts": 0.0}
+
+    def _on_detector_outcome(outcome: str, model_sha: str | None) -> None:
+        _detector_boot_outcome_for_diag["value"] = (outcome, model_sha)
+        if outcome == "active":
+            log.info("detector boot: ACTIVE (model=%s)", model_sha)
+        else:
+            log.info("detector boot: %s (running in stub mode)", outcome)
+
+    detector_holder = build_detector_async(on_outcome=_on_detector_outcome)
     camera_enabled = os.environ.get("MAKEROS_HUB_CAMERA_ENABLED", "").strip().lower() in (
         "1",
         "true",
@@ -1129,7 +1154,12 @@ def run(
                 # printers are silently dropped here, never sent). Default
                 # detector is the no-op stub (returns 0.0) so the wire path
                 # ships zero-effect samples until the real ONNX model lands.
+                # The DetectorHolder is read PER BEAT so a background boot
+                # finishing mid-session flips us from stub to active without
+                # an agent restart.
                 failure_samples: list[dict] | None = None
+                real_det = detector_holder.detector()
+                detector_callable = real_det if real_det is not None else stub_detector
                 try:
                     if camera_frames:
                         all_targets = manager.camera_targets()
@@ -1152,6 +1182,7 @@ def run(
                             status_by_id,
                             frames_by_id,
                             failure_smoother,
+                            detector=detector_callable,
                         )
                         if samples:
                             failure_samples = samples
@@ -1168,6 +1199,45 @@ def run(
                         f"sample collection failed: {redact(str(exc))}",
                     )
                     failure_samples = None
+
+                # Detector status → diagnostics. Recorded EVERY BEAT so the
+                # platform-admin /diag surface always shows the current mode.
+                # In stub mode, ALSO re-warn once per STUB_REWARN_INTERVAL_SEC
+                # so an operator who forgot to pin MODEL_URL doesn't see this
+                # vanish into a 'last week' log line.
+                if real_det is not None:
+                    n, med, mx = real_det.latency_summary()
+                    if n > 0:
+                        _record_diagnostic(
+                            diagnostics,
+                            "detector",
+                            f"active model={real_det.model_sha[:12]} "
+                            f"latency_ms median={med:.0f} max={mx:.0f} n={n}",
+                        )
+                    else:
+                        _record_diagnostic(
+                            diagnostics,
+                            "detector",
+                            f"active model={real_det.model_sha[:12]} (no samples yet)",
+                        )
+                elif detector_holder.ready:
+                    outcome = detector_holder.boot_outcome or "stub"
+                    now_mono = time.monotonic()
+                    if now_mono - _last_stub_warn_at["ts"] > STUB_REWARN_INTERVAL_SEC:
+                        _record_diagnostic(
+                            diagnostics,
+                            "detector",
+                            f"stub mode ({outcome}) — AI failure-watch inactive. "
+                            f"Pin MAKEROS_HUB_MODEL_URL+SHA256 to activate.",
+                        )
+                        _last_stub_warn_at["ts"] = now_mono
+                else:
+                    _record_diagnostic(
+                        diagnostics,
+                        "detector",
+                        "boot in progress — falling back to stub for this beat",
+                    )
+
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 resp = post_json(
                     cfg.heartbeat_url,
