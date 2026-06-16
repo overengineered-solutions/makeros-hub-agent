@@ -125,13 +125,68 @@ class PrinterManager:
             vendor = p.get("vendor")
             if vendor == "bambu":
                 self._reconcile_bambu(pid, p)
+            elif vendor == "klipper":
+                self._reconcile_klipper(pid, p)
             else:
-                # Klipper/other adapters land in a later slice.
+                # 'other' is the catch-all for non-Bambu non-Klipper printers
+                # the operator may add (raw OctoPrint, Marlin host, etc.).
+                # We don't drive these yet — surface clearly.
                 self._static[pid] = {
                     "printerId": pid,
                     "connectionState": "error",
                     "errorReason": f"{vendor}_not_supported_yet",
                 }
+
+    def _reconcile_klipper(self, pid: str, p: dict) -> None:
+        """Klipper printer: needs a Moonraker URL. Builds + starts a polling
+        KlipperAdapter; no MQTT/paho dependency. Same fingerprint shape as
+        Bambu so an admin edit (e.g. moved the printer to a new IP) triggers
+        a clean restart."""
+        moonraker_url = p.get("moonrakerUrl")
+        if not moonraker_url:
+            self._stop(pid)
+            self._record_failure(f"klipper printer {pid} missing moonrakerUrl")
+            self._static[pid] = {
+                "printerId": pid,
+                "connectionState": "error",
+                "errorReason": "incomplete_config",
+            }
+            return
+        self._static.pop(pid, None)
+        # Klipper fingerprint = (vendor, moonrakerUrl) — same shape contract
+        # as Bambu's (vendor, host, serial, accessCode) so reconcile() can
+        # treat them uniformly. Different from _fingerprint() so we compute
+        # it inline here.
+        fp = ("klipper", moonraker_url)
+        if self._fingerprints.get(pid) == fp and pid in self._adapters:
+            return
+        self._stop(pid)
+        try:
+            from .klipper import KlipperAdapter
+        except ImportError as e:
+            log.error("cannot import klipper adapter for %s: %s", pid, e)
+            self._record_failure(f"cannot import klipper adapter for {pid}: {e}")
+            self._static[pid] = {
+                "printerId": pid,
+                "connectionState": "error",
+                "errorReason": "agent_klipper_module_missing",
+            }
+            return
+        adapter = KlipperAdapter(pid, moonraker_url=moonraker_url)
+        try:
+            adapter.start()
+        except Exception as e:  # noqa: BLE001 - one bad printer can't sink config-down
+            safe = redact(str(e))
+            log.warning("cannot start klipper adapter for %s: %s", pid, safe)
+            self._record_failure(f"cannot start klipper adapter for {pid}: {safe}")
+            self._static[pid] = {
+                "printerId": pid,
+                "connectionState": "error",
+                "errorReason": "agent_start_failed",
+            }
+            return
+        self._adapters[pid] = adapter
+        self._fingerprints[pid] = fp
 
     def _reconcile_bambu(self, pid: str, p: dict) -> None:
         host, serial, code = p.get("host"), p.get("serial"), p.get("accessCode")

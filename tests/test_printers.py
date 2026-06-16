@@ -513,20 +513,47 @@ class TestSummarizeShape(unittest.TestCase):
 
 
 class TestManagerNonPahoPaths(unittest.TestCase):
-    def test_klipper_and_incomplete_bambu_report_clear_errors(self):
+    def test_klipper_with_moonraker_url_starts_polling(self):
+        # The Klipper adapter is now real — given a URL it spins up a
+        # polling thread + reports 'connecting' until the first poll lands.
+        # We stop the manager at the end so the daemon thread doesn't
+        # linger; the test point is the dispatch + initial state.
+        m = PrinterManager()
+        try:
+            m.reconcile(
+                [{"id": "k1", "vendor": "klipper", "moonrakerUrl": "http://127.0.0.1:1"}],
+                version="v1",
+            )
+            statuses = {s["printerId"]: s for s in m.statuses()}
+            # The adapter starts in 'connecting' until either the first poll
+            # succeeds (won't — port 1 is closed) or the CONNECT_TIMEOUT
+            # elapses + an error reason is captured. Either is acceptable.
+            self.assertIn(statuses["k1"]["connectionState"], ("connecting", "error"))
+            self.assertEqual(m.config_version, "v1")
+        finally:
+            m.reconcile([], version="v2")  # tears down the adapter cleanly
+
+    def test_klipper_without_moonraker_url_is_incomplete(self):
+        m = PrinterManager()
+        m.reconcile([{"id": "k1", "vendor": "klipper"}], version="v1")
+        statuses = {s["printerId"]: s for s in m.statuses()}
+        self.assertEqual(statuses["k1"]["connectionState"], "error")
+        self.assertEqual(statuses["k1"]["errorReason"], "incomplete_config")
+
+    def test_incomplete_bambu_reports_incomplete_config(self):
         m = PrinterManager()
         m.reconcile(
-            [
-                {"id": "k1", "vendor": "klipper", "moonrakerUrl": "http://x:7125"},
-                {"id": "b1", "vendor": "bambu", "host": None, "serial": None, "accessCode": None},
-            ],
+            [{"id": "b1", "vendor": "bambu", "host": None, "serial": None, "accessCode": None}],
             version="v1",
         )
         statuses = {s["printerId"]: s for s in m.statuses()}
-        self.assertEqual(statuses["k1"]["connectionState"], "error")
-        self.assertEqual(statuses["k1"]["errorReason"], "klipper_not_supported_yet")
         self.assertEqual(statuses["b1"]["errorReason"], "incomplete_config")
-        self.assertEqual(m.config_version, "v1")
+
+    def test_other_vendor_unsupported(self):
+        m = PrinterManager()
+        m.reconcile([{"id": "x1", "vendor": "other"}], version="v1")
+        statuses = {s["printerId"]: s for s in m.statuses()}
+        self.assertEqual(statuses["x1"]["errorReason"], "other_not_supported_yet")
 
     def test_removing_a_printer_drops_its_status(self):
         m = PrinterManager()
