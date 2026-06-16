@@ -55,7 +55,13 @@ from makeros_hub.vprinter.manager import (
     _pool_signature,
 )
 from makeros_hub.vprinter.outbox import VPrinterOutbox, from_record
-from makeros_hub.vprinter.report import build_get_version, build_print_ack, build_push_status
+from makeros_hub.vprinter.report import (
+    ams_chip_id,
+    ams_unit_serial,
+    build_get_version,
+    build_print_ack,
+    build_push_status,
+)
 from makeros_hub.vprinter.ssdp import (
     BambuSsdpProtocol,
     SSDP_RATE_LIMIT_BURST,
@@ -238,6 +244,7 @@ class TestReportBuilders(unittest.TestCase):
             units=4,
             trays=4,
             sequence_id=7,
+            serial="SER123",
             filaments=[
                 {"tray_type": "PLA", "tray_info_idx": "GFA00", "tray_color": "FFFFFFFF"},
                 {"material": "PETG", "color": "#11223344", "tray_info_idx": "GFG00"},
@@ -255,20 +262,27 @@ class TestReportBuilders(unittest.TestCase):
         self.assertEqual(len(ams["ams"]), 4)
         self.assertEqual(sum(len(unit["tray"]) for unit in ams["ams"]), 16)
         self.assertTrue(all(unit["info"] == "2003" for unit in ams["ams"]))
+        # Every AMS unit carries hardware identity (real units do). ams_id is
+        # stable + distinct per unit, matching its get_version module sn.
+        for idx, unit in enumerate(ams["ams"]):
+            self.assertEqual(unit["ams_id"], ams_unit_serial("SER123", idx))
+            self.assertEqual(unit["chip_id"], ams_chip_id("SER123", idx))
+        self.assertEqual(len({unit["ams_id"] for unit in ams["ams"]}), 4)
         self.assertEqual(trays[0]["tray_type"], "PLA")
         self.assertEqual(trays[1]["tray_type"], "PETG")
         # Empty slots are a bare {id} — OrcaSlicer renders these as blank fine.
         self.assertEqual(trays[2], {"id": "2"})
 
     def test_filled_tray_carries_real_bambu_shape(self):
-        # Regression for the "phantom 2 ABS": a GENERIC spool (tray_info_idx
-        # GFL99, empty sub_brands) only renders as PLA in OrcaSlicer's Device tab
-        # if the tray carries the full calibration/state shape a real Bambu tray
-        # has. Without these, OrcaSlicer can't resolve the type and defaults to
-        # the first filament in the model list (alphabetically ABS).
+        # A filled tray carries the full calibration/state shape a real Bambu tray
+        # has — a necessary baseline so the tray is byte-shaped like reality. (The
+        # actual Device-tab GENERIC resolver is the AMS module<->unit identity
+        # linkage, asserted separately; this test pins the tray fields don't
+        # regress and don't leak onto empty slots.)
         report = build_push_status(
             units=1,
             trays=4,
+            serial="SER123",
             filaments=[{"tray_type": "PLA", "tray_info_idx": "GFL99", "tray_color": "D5B6A4FF"}],
         )
         tray = report["print"]["ams"]["ams"][0]["tray"][0]
@@ -294,28 +308,70 @@ class TestReportBuilders(unittest.TestCase):
             build_push_status(ams_version=123456)["print"]["ams"]["version"], 123456
         )
 
-    def test_get_version_has_n3f_modules_and_ack_shape(self):
+    def test_get_version_mirrors_real_a1_mini_modules(self):
+        # Mirror a real Bambu Lab A1 mini's get_version field-for-field (captured
+        # 2026-06-15). The earlier hand-written list (wrong hw_vers, an invented
+        # `rv1126`, the mainboard serial on every module) left the Device tab
+        # unable to resolve GENERIC spools (rendered ABS).
         version = build_get_version("N1", "SER123", units=4, sequence_id="abc", ams_type="n3f")
         modules = version["info"]["module"]
+        by_name = {m["name"]: m for m in modules}
 
         self.assertEqual(version["info"]["sequence_id"], "abc")
-        self.assertIn("ota", [module["name"] for module in modules])
+        # Exactly the real printer-module set — no invented rv1126.
+        self.assertEqual(
+            [m["name"] for m in modules if not m["name"].startswith("n3f/")],
+            ["ota", "esp32", "mc", "th"],
+        )
+        self.assertNotIn("rv1126", by_name)
+        # Real hw_vers, not the guessed MC07/TH07.
+        self.assertEqual(by_name["mc"]["hw_ver"], "MC02")
+        self.assertEqual(by_name["th"]["hw_ver"], "TH03")
+        # Mainboard (ota) advertises the model + is visible; others are blank/hidden.
+        self.assertEqual(by_name["ota"]["product_name"], "Bambu Lab A1 mini")
+        self.assertIs(by_name["ota"]["visible"], True)
+        self.assertEqual(by_name["esp32"]["product_name"], "")
+        self.assertIs(by_name["esp32"]["visible"], False)
+        # ota/esp32 share the mainboard serial; mc/th get their own.
+        self.assertEqual(by_name["ota"]["sn"], "SER123")
+        self.assertEqual(by_name["esp32"]["sn"], "SER123")
+        self.assertNotEqual(by_name["mc"]["sn"], "SER123")
+        self.assertNotEqual(by_name["th"]["sn"], by_name["mc"]["sn"])
+        # Printer modules carry sw_new_ver; the AMS module does NOT (both real).
+        self.assertIn("sw_new_ver", by_name["ota"])
+
         n3f = [m for m in modules if m["name"].startswith("n3f/")]
         self.assertEqual([m["name"] for m in n3f], ["n3f/0", "n3f/1", "n3f/2", "n3f/3"])
-        # Match a REAL AMS 2 Pro's advertisement (hw_ver N3F05, "AMS 2 Pro (N)",
-        # visible) so OrcaSlicer recognizes the AMS + resolves generic filaments —
-        # the "2 ABS" fix lives here, not in an id remap.
         self.assertEqual(
             [m["product_name"] for m in n3f],
             ["AMS 2 Pro (1)", "AMS 2 Pro (2)", "AMS 2 Pro (3)", "AMS 2 Pro (4)"],
         )
         self.assertTrue(all(m["hw_ver"] == "N3F05" for m in n3f))
         self.assertTrue(all(m["visible"] is True for m in n3f))
+        self.assertTrue(all("sw_new_ver" not in m for m in n3f))
 
         ack = build_print_ack("9", "part.3mf")
         self.assertEqual(ack["print"]["command"], "project_file")
         self.assertEqual(ack["print"]["result"], "SUCCESS")
         self.assertEqual(ack["print"]["gcode_state"], "PREPARE")
+
+    def test_get_version_ams_module_sn_links_to_push_status_unit_ams_id(self):
+        # THE Device-tab generic-resolution fix: a real printer links each
+        # get_version AMS module `sn` to its push_status unit `ams_id`. Without
+        # that linkage OrcaSlicer can't resolve a GENERIC spool and falls back to
+        # ABS. Assert both sides agree for the same serial.
+        serial = "00M09VP263307879"
+        version = build_get_version("N1", serial, units=3, ams_type="n3f")
+        status = build_push_status(units=3, trays=4, serial=serial)
+
+        module_sns = [m["sn"] for m in version["info"]["module"] if m["name"].startswith("n3f/")]
+        unit_ams_ids = [u["ams_id"] for u in status["print"]["ams"]["ams"]]
+
+        self.assertEqual(len(module_sns), 3)
+        self.assertEqual(module_sns, unit_ams_ids)  # exact module<->unit linkage
+        # ids are well-shaped + distinct
+        self.assertTrue(all(len(s) == 15 and s.isupper() for s in unit_ams_ids))
+        self.assertEqual(len(set(unit_ams_ids)), 3)
 
 
 class TestAmsVersionBump(unittest.TestCase):

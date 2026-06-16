@@ -327,6 +327,7 @@ class _VirtualPrinterRuntime:
                 gcode_file=gcode_file,
                 prepare_percent=prepare_percent,
                 ams_version=self._ams_version,
+                serial=self.config.serial,
             ),
             version_builder=lambda sequence_id: build_get_version(
                 model=self.config.model,
