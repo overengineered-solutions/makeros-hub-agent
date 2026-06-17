@@ -120,14 +120,22 @@ chmod +x /usr/local/bin/makeros-hub
 
 echo "==> sudoers (the service user may run ONLY scoped hub root helpers)"
 SUDOERS=/etc/sudoers.d/makeros-hub
+# v0.39.0 adds the per-model VP IP allocator (Option A). It needs to:
+#   - add/remove individual /32 IPs on the primary interface (one per VP)
+#   - arping target addresses to detect collisions before claiming
+# Pattern wildcards keep the surface narrow — no shell, no privilege escalation,
+# no arbitrary iface, just the two ip-addr verbs + the read-only arping verb.
 {
   echo "$SERVICE_USER ALL=(root) NOPASSWD: $INSTALL_DIR/update.sh"
   echo "$SERVICE_USER ALL=(root) NOPASSWD: $INSTALL_DIR/tailscale-setup.sh"
+  echo "$SERVICE_USER ALL=(root) NOPASSWD: /sbin/ip addr add * dev *"
+  echo "$SERVICE_USER ALL=(root) NOPASSWD: /sbin/ip addr del * dev *"
+  echo "$SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/arping -c * -w * -I * *"
 } > "$SUDOERS.tmp"
 chmod 0440 "$SUDOERS.tmp"
 if visudo -cf "$SUDOERS.tmp" >/dev/null 2>&1; then
   mv -f "$SUDOERS.tmp" "$SUDOERS"
-  echo "    OTA self-update + Tailscale setup enabled (web-controlled)"
+  echo "    OTA self-update + Tailscale setup + per-VP IP allocation enabled (web-controlled)"
 else
   rm -f "$SUDOERS.tmp"
   echo "    !! sudoers validation failed — root helpers off (bootstrap/manual updates still work)"

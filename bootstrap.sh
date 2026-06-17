@@ -26,15 +26,18 @@ echo "$REF" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "bad --ref '$REF' (
 
 REPO="https://github.com/overengineered-solutions/makeros-hub-agent.git"
 
-echo "==> prerequisites (git, python3-venv, python3-pip, ffmpeg)"
+echo "==> prerequisites (git, python3-venv, python3-pip, ffmpeg, iputils-arping)"
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update -qq
   # ffmpeg is OPTIONAL — only the X1/H2/P2S RTSPS:322 camera path uses it (the
-  # agent degrades to no-frame if it's absent). Installed here so a fresh hub
-  # has it; an existing hub can add it with `sudo apt-get install -y ffmpeg`.
-  apt-get install -y -qq git python3-venv python3-pip ffmpeg
+  # agent degrades to no-frame if it's absent).
+  # iputils-arping is REQUIRED for v0.39.0+ per-VP IP allocator — `arping`
+  # checks for IP collisions before claiming an address on the LAN.
+  # iproute2 (/sbin/ip) ships by default on every Debian/Pi image; install -y
+  # is idempotent.
+  apt-get install -y -qq git python3-venv python3-pip ffmpeg iputils-arping iproute2
 elif ! command -v git >/dev/null 2>&1; then
-  echo "git not found and no apt-get — install git + python3-venv (+ ffmpeg for X1/H2/P2S cameras), then re-run." >&2
+  echo "git not found and no apt-get — install git + python3-venv (+ ffmpeg for X1/H2/P2S cameras; iputils-arping for the per-VP IP allocator), then re-run." >&2
   exit 1
 fi
 

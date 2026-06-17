@@ -533,6 +533,7 @@ def heartbeat_payload(
     failure_samples: list[dict] | None = None,
     vp_ca: tuple[str, str] | None = None,
     discovery_hits: list[dict] | None = None,
+    vp_bindings: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -575,6 +576,11 @@ def heartbeat_payload(
     # hits expired or the periodic worker hasn't run yet).
     if discovery_hits:
         payload["discoveryHits"] = list(discovery_hits)
+    # VP-binding reports — the IP allocator picked an IP for one or more
+    # per-model VPs (Option A). Cloud upserts these into
+    # virtual_printers.bind_ip. Empty/missing = no fresh allocations this tick.
+    if vp_bindings:
+        payload["vpBindings"] = list(vp_bindings)
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
@@ -818,6 +824,8 @@ def _pull_config(
     virtual_printer_manager: VirtualPrinterManager | None = None,
     virtual_printer_state: _VirtualPrinterRuntimeState | None = None,
     diagnostics=None,
+    ip_allocator=None,
+    pending_vp_bindings: list[dict] | None = None,
 ) -> dict | None:
     """Fetch the printer list (config-down) and reconcile adapters. Best-effort:
     a transport blip just leaves the current adapters running until next time."""
@@ -832,6 +840,20 @@ def _pull_config(
         printers = resp.body.get("printers")
         version = resp.body.get("version")
         manager.reconcile(printers if isinstance(printers, list) else [], version)
+        # Multi-VP config-down (v0.39.0+): if the cloud emits a `virtualPrinters`
+        # array, let the IP allocator fill in `bindIp` for any VP that
+        # arrived without one. Queue the allocations for the next heartbeat
+        # so the cloud writes them back into virtual_printers.bind_ip.
+        # The manager itself still consumes the singular `virtualPrinter`
+        # field this PR — multi-broker runtime ships in v0.40.0.
+        raw_multi_vp = _virtual_printers_config_block(resp.body)
+        if raw_multi_vp and ip_allocator is not None and pending_vp_bindings is not None:
+            _allocate_vp_bind_ips(
+                raw_multi_vp,
+                allocator=ip_allocator,
+                pending_bindings=pending_vp_bindings,
+                diagnostics=diagnostics,
+            )
         vp_config = parse_virtual_printer_config(_virtual_printer_config_block(resp.body))
         if virtual_printer_manager is not None:
             if virtual_printer_state is not None:
@@ -880,6 +902,84 @@ def _virtual_printer_config_block(body: dict) -> object:
     if "virtualPrinter" in body:
         return body.get("virtualPrinter")
     return body.get("virtual_printer")
+
+
+def _virtual_printers_config_block(body: dict) -> list:
+    """Multi-VP config-down (Option A). Cloud emits `virtualPrinters` (plural)
+    starting v0.39.0; older payloads only carry singular `virtualPrinter`."""
+    raw = body.get("virtualPrinters")
+    if isinstance(raw, list):
+        return raw
+    return []
+
+
+def _allocate_vp_bind_ips(
+    raw_configs: list,
+    *,
+    allocator,
+    pending_bindings: list[dict],
+    diagnostics=None,
+) -> list:
+    """For each per-model VP whose `bindIp` is null, ask the IpAllocator to
+    pick one + report back. The bindings get queued for the next heartbeat
+    (so the cloud writes them into virtual_printers.bind_ip), and the raw
+    config gets its `bindIp` filled in so the existing reconcile path can
+    use it. Failed allocations leave bindIp empty so the manager skips that
+    VP this cycle; the agent retries on the next config-down.
+
+    Idempotent: a VP already in the allocator's persistence file just
+    re-claims the same IP (no new lookups).
+    """
+    if not raw_configs or allocator is None:
+        return raw_configs
+    filled: list = []
+    for entry in raw_configs:
+        if not isinstance(entry, dict):
+            continue
+        bind_ip = entry.get("bind_ip") or entry.get("bindIp")
+        model = entry.get("model")
+        if not isinstance(model, str):
+            filled.append(entry)
+            continue
+        if isinstance(bind_ip, str) and bind_ip.strip():
+            # Existing IP — opportunistically re-claim so a Pi reboot
+            # re-establishes it. The allocator treats existing binding +
+            # re-claim as idempotent (returns success without changing).
+            filled.append(entry)
+            continue
+        try:
+            result = allocator.allocate_for(model)
+        except Exception as exc:  # noqa: BLE001 - never sink the config pull
+            _record_diagnostic(
+                diagnostics,
+                "vprinter",
+                f"ip allocator crashed for {model}: {redact(str(exc))}",
+            )
+            filled.append(entry)
+            continue
+        if result.ok and result.bind_ip:
+            updated = dict(entry)
+            updated["bind_ip"] = result.bind_ip
+            updated["bindIp"] = result.bind_ip
+            filled.append(updated)
+            pending_bindings.append(
+                {
+                    "model": model,
+                    "bindIp": result.bind_ip,
+                    "status": "allocated",
+                }
+            )
+        else:
+            pending_bindings.append(
+                {
+                    "model": model,
+                    "bindIp": None,
+                    "status": "failed",
+                    "error": result.error or "unknown",
+                }
+            )
+            filled.append(entry)
+    return filled
 
 
 def _drain_vprinter_submissions_safely(
@@ -979,6 +1079,16 @@ def run(
     pending_queue_reports: list[dict] = []
     pending_probe_results: list[dict] = []
     pending_command_results: list[dict] = []
+    # Per-model VP-binding queue (Option A) — the IP allocator pushes onto this
+    # when it claims an IP; the next heartbeat ships it as `vpBindings` and the
+    # cloud writes virtual_printers.bind_ip. Reset on successful POST.
+    pending_vp_bindings: list[dict] = []
+    # Lazy allocator — instantiated only when the cloud actually ships a
+    # multi-VP config-down (most workspaces still single-VP). Persistence at
+    # /var/lib/makeros-hub/vp-bindings.json so a Pi reboot re-claims the
+    # same IPs.
+    from .vprinter.ip_allocator import IpAllocator as _IpAllocator
+    ip_allocator = _IpAllocator()
     tailscale_state = _TailscaleRuntimeState()
     vprinter_state = _VirtualPrinterRuntimeState()
     # Per-printer camera capture is normally driven by the admin toggle
@@ -1040,6 +1150,8 @@ def run(
         virtual_printer_manager=vp_manager,
         virtual_printer_state=vprinter_state,
         diagnostics=diagnostics,
+        ip_allocator=ip_allocator,
+        pending_vp_bindings=pending_vp_bindings,
     )
     if pulled_tailscale_status:
         tailscale_status = pulled_tailscale_status
@@ -1312,6 +1424,7 @@ def run(
                         failure_samples=failure_samples,
                         vp_ca=vp_ca,
                         discovery_hits=discovery_hits,
+                        vp_bindings=pending_vp_bindings,
                     ),
                     bearer=credential,
                     retries=3,
@@ -1327,6 +1440,10 @@ def run(
                     pending_command_results = []
                     if reported_command_count:
                         log.info("reported %d command result(s) to the cloud", reported_command_count)
+                    reported_binding_count = len(pending_vp_bindings)
+                    pending_vp_bindings = []
+                    if reported_binding_count:
+                        log.info("reported %d VP binding(s) to the cloud", reported_binding_count)
                     assignments = resp.body.get("assignments")
                     dispatch_reports = manager.dispatch_assignments(
                         assignments if isinstance(assignments, list) else [],
@@ -1378,6 +1495,8 @@ def run(
                             virtual_printer_manager=vp_manager,
                             virtual_printer_state=vprinter_state,
                             diagnostics=diagnostics,
+                            ip_allocator=ip_allocator,
+                            pending_vp_bindings=pending_vp_bindings,
                         )
                         if pulled_tailscale_status:
                             tailscale_status = pulled_tailscale_status
