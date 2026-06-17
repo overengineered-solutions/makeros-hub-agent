@@ -840,33 +840,55 @@ def _pull_config(
         printers = resp.body.get("printers")
         version = resp.body.get("version")
         manager.reconcile(printers if isinstance(printers, list) else [], version)
-        # Multi-VP config-down (v0.39.0+): if the cloud emits a `virtualPrinters`
-        # array, let the IP allocator fill in `bindIp` for any VP that
-        # arrived without one. Queue the allocations for the next heartbeat
-        # so the cloud writes them back into virtual_printers.bind_ip.
-        # The manager itself still consumes the singular `virtualPrinter`
-        # field this PR — multi-broker runtime ships in v0.40.0.
+        # Multi-VP config-down (v0.40.0+): the cloud emits a `virtualPrinters`
+        # array (plural). For each VP without a bind_ip, run the IP allocator
+        # to claim one + queue the allocation for the next heartbeat
+        # (cloud writes virtual_printers.bind_ip from `vpBindings`).
         raw_multi_vp = _virtual_printers_config_block(resp.body)
         if raw_multi_vp and ip_allocator is not None and pending_vp_bindings is not None:
-            _allocate_vp_bind_ips(
+            raw_multi_vp = _allocate_vp_bind_ips(
                 raw_multi_vp,
                 allocator=ip_allocator,
                 pending_bindings=pending_vp_bindings,
                 diagnostics=diagnostics,
             )
-        vp_config = parse_virtual_printer_config(_virtual_printer_config_block(resp.body))
+        # Parse plural VP list (v0.40.0). If the cloud sends ONLY the legacy
+        # singular `virtualPrinter`, fall through to the singular parse so
+        # pre-v0.39.0 clouds still work.
+        multi_vp_configs: list = []
+        for raw_entry in raw_multi_vp:
+            parsed = parse_virtual_printer_config(raw_entry)
+            if parsed is not None:
+                multi_vp_configs.append(parsed)
+        legacy_vp_config = parse_virtual_printer_config(_virtual_printer_config_block(resp.body))
+
         if virtual_printer_manager is not None:
-            if virtual_printer_state is not None:
+            if multi_vp_configs:
+                # v0.40.0 multi-broker path — pass the full list to the manager
+                # which spins up ONE runtime per VP and shares a single SSDP
+                # listener across them. State-tracking (retry-on-failure)
+                # delegates to the multi-supervisor's per-runtime diff.
+                try:
+                    virtual_printer_manager.reconcile_sync(multi_vp_configs)
+                except Exception as exc:  # noqa: BLE001
+                    safe = redact(str(exc))
+                    _record_diagnostic(
+                        diagnostics,
+                        "vprinter",
+                        f"multi-VP reconcile failed: {safe}",
+                    )
+                    log.warning("multi-VP reconcile failed: %s", safe)
+            elif virtual_printer_state is not None:
                 _reconcile_vprinter_config(
                     virtual_printer_manager,
                     virtual_printer_state,
-                    vp_config,
+                    legacy_vp_config,
                     now=time.monotonic(),
                     diagnostics=diagnostics,
                 )
             else:
                 try:
-                    virtual_printer_manager.reconcile_sync(vp_config)
+                    virtual_printer_manager.reconcile_sync(legacy_vp_config)
                 except Exception as exc:  # noqa: BLE001 - config-down must not sink heartbeat
                     safe = redact(str(exc))
                     _record_diagnostic(diagnostics, "vprinter", f"virtual printer reconcile failed: {safe}")
@@ -881,10 +903,15 @@ def _pull_config(
         )
         if tailscale_state is not None:
             tailscale_state.record_reconcile_status(tailscale_status, time.monotonic())
+        vp_summary = (
+            f"multi:{len(multi_vp_configs)}"
+            if multi_vp_configs
+            else ("enabled" if legacy_vp_config is not None else "disabled")
+        )
         log.info(
             "config pulled: %d printers, virtual_printer=%s (configVersion=%s)",
             len(manager.statuses()),
-            "enabled" if vp_config is not None else "disabled",
+            vp_summary,
             version,
         )
         return tailscale_status

@@ -31,7 +31,24 @@ class SsdpConfig:
     fw: str
 
 
+# ---------------------------------------------------------------------------
+# v0.40.0 — SHARED multi-VP SSDP runtime.
+#
+# Linux multicast only allows one socket per (interface, group) to receive
+# packets. With multiple per-model VPs each binding their own SSDP responder
+# on multicast 239.255.255.250, only ONE socket would actually get M-SEARCH
+# traffic. The shared runtime owns the single multicast listener and answers
+# on behalf of every REGISTERED VP — one M-SEARCH triggers N unicast
+# responses (one per VP), and the NOTIFY loop cycles through every VP every
+# tick so all of them stay visible to Bambu Studio.
+# ---------------------------------------------------------------------------
+
+
 class SsdpRuntime:
+    """Single-VP runtime — kept for back-compat with the per-VP code path and
+    tests that pre-date v0.40.0. Wraps the same transport + notify task as the
+    shared runtime, just sized to one VP."""
+
     def __init__(self, transport: asyncio.DatagramTransport, notify_task: asyncio.Task) -> None:
         self.transport = transport
         self.notify_task = notify_task
@@ -42,7 +59,75 @@ class SsdpRuntime:
         self.transport.close()
 
 
+class SharedSsdpRuntime:
+    """Single multicast listener answering M-SEARCH + broadcasting NOTIFY
+    for ALL currently-registered VPs (v0.40.0 multi-broker). Vendors keyed
+    by serial — Bambu Studio identifies a printer by serial in the SSDP
+    payload, so each VP must have a distinct one (the agent's VP config
+    generator always synthesizes unique serials per row).
+
+    The shared listener binds the multicast group ONCE; per-VP register /
+    unregister mutate the registry without re-binding the socket."""
+
+    def __init__(self, transport: asyncio.DatagramTransport, notify_task: asyncio.Task) -> None:
+        self.transport = transport
+        self.notify_task = notify_task
+
+    async def close(self) -> None:
+        self.notify_task.cancel()
+        await asyncio.gather(self.notify_task, return_exceptions=True)
+        self.transport.close()
+
+
+class _SharedSsdpProtocol(asyncio.DatagramProtocol):
+    """Multicast listener with a mutable registry of `serial → SsdpConfig`.
+    On every M-SEARCH it sends a unicast 200 OK back for EACH registered VP."""
+
+    def __init__(self, log: Callable[[str], None]) -> None:
+        self.log = log
+        self.transport: asyncio.DatagramTransport | None = None
+        self._rate_limiter = SsdpRateLimiter()
+        self._registry: dict[str, SsdpConfig] = {}
+
+    # --- registry mutators (called from the manager) -----------------------
+    def register(self, config: SsdpConfig) -> None:
+        self._registry[config.serial] = config
+
+    def unregister(self, serial: str) -> None:
+        self._registry.pop(serial, None)
+
+    def configs(self) -> list[SsdpConfig]:
+        return list(self._registry.values())
+
+    # --- protocol callbacks -----------------------------------------------
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore[assignment]
+
+    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+        if len(data) < SSDP_MIN_MSEARCH_BYTES:
+            return
+        text = data.decode("utf-8", errors="replace")
+        if not _is_m_search(text) or self.transport is None:
+            return
+        if not self._rate_limiter.allow(addr[0]):
+            self.log(f"SSDP response throttled for {addr}")
+            return
+        configs = self.configs()
+        if not configs:
+            return
+        for config in configs:
+            response = build_ssdp_response(config).encode("utf-8")
+            self.transport.sendto(response, addr)
+        self.log(f"SSDP responded to {addr} for {len(configs)} VP(s)")
+
+    def error_received(self, exc: Exception) -> None:
+        self.log(f"SSDP socket error: {exc}")
+
+
 class BambuSsdpProtocol(asyncio.DatagramProtocol):
+    """Single-VP protocol (kept for back-compat). Identical semantics to the
+    shared protocol but bound to one config."""
+
     def __init__(self, config: SsdpConfig, log: Callable[[str], None]) -> None:
         self.config = config
         self.log = log
@@ -77,6 +162,8 @@ async def start_ssdp_responder(
     config: SsdpConfig,
     log: Callable[[str], None],
 ) -> SsdpRuntime:
+    """Single-VP SSDP responder (back-compat). Prefer `start_shared_ssdp`
+    for v0.40.0 multi-VP."""
     loop = asyncio.get_running_loop()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -97,6 +184,38 @@ async def start_ssdp_responder(
     )
     notify_task = asyncio.create_task(_notify_loop(transport, port, config, log))
     return SsdpRuntime(transport, notify_task)
+
+
+async def start_shared_ssdp(
+    port: int,
+    log: Callable[[str], None],
+    initial_configs: list[SsdpConfig] | None = None,
+) -> tuple[SharedSsdpRuntime, _SharedSsdpProtocol]:
+    """v0.40.0 — SHARED multicast listener. Returns the runtime plus the
+    protocol instance so the caller can register/unregister VPs at runtime.
+    Bind the single socket once; per-VP mutations don't re-bind."""
+    loop = asyncio.get_running_loop()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except (AttributeError, OSError):
+        pass
+    sock.bind(("", port))
+    try:
+        membership = socket.inet_aton(SSDP_GROUP) + socket.inet_aton("0.0.0.0")
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+    except OSError as exc:
+        log(f"SSDP multicast join failed, continuing unicast-only: {exc}")
+
+    protocol = _SharedSsdpProtocol(log)
+    transport, _ = await loop.create_datagram_endpoint(lambda: protocol, sock=sock)
+    if initial_configs:
+        for cfg in initial_configs:
+            protocol.register(cfg)
+    notify_task = asyncio.create_task(_shared_notify_loop(transport, port, protocol, log))
+    return SharedSsdpRuntime(transport, notify_task), protocol
 
 
 def build_ssdp_response(config: SsdpConfig) -> str:
@@ -180,11 +299,34 @@ async def _notify_loop(
     config: SsdpConfig,
     log: Callable[[str], None],
 ) -> None:
+    """Single-VP NOTIFY broadcast loop (back-compat)."""
     payload = build_ssdp_notify(config).encode("utf-8")
     try:
         while True:
             transport.sendto(payload, (SSDP_BROADCAST, port))
             log("SSDP NOTIFY broadcast sent")
+            await asyncio.sleep(NOTIFY_INTERVAL_SEC)
+    except asyncio.CancelledError:
+        pass
+
+
+async def _shared_notify_loop(
+    transport: asyncio.DatagramTransport,
+    port: int,
+    protocol: _SharedSsdpProtocol,
+    log: Callable[[str], None],
+) -> None:
+    """Multi-VP NOTIFY broadcast loop. Each interval, broadcast ONE notify
+    per registered VP. Bambu Studio's discovery logic dedups by serial so a
+    burst of N notifies presents N distinct printers."""
+    try:
+        while True:
+            configs = protocol.configs()
+            for cfg in configs:
+                payload = build_ssdp_notify(cfg).encode("utf-8")
+                transport.sendto(payload, (SSDP_BROADCAST, port))
+            if configs:
+                log(f"SSDP NOTIFY broadcast sent for {len(configs)} VP(s)")
             await asyncio.sleep(NOTIFY_INTERVAL_SEC)
     except asyncio.CancelledError:
         pass

@@ -52,7 +52,11 @@ class VirtualPrinterManager:
         self._lock = threading.Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
-        self._supervisor: _AsyncVirtualPrinterSupervisor | None = None
+        # v0.40.0 — uses the multi-supervisor (handles 1..N VPs, runs ONE
+        # shared SSDP listener across them). The class transparently handles
+        # the legacy single-VP case (one config in the list) so callers that
+        # previously passed `config | None` keep working via `_to_list`.
+        self._supervisor: _AsyncMultiVirtualPrinterSupervisor | None = None
         self._current_model: str | None = None
 
     async def start(self) -> None:
@@ -66,24 +70,29 @@ class VirtualPrinterManager:
         await asyncio.wrap_future(future)
         self._stop_loop_thread()
 
-    async def reconcile(self, config: VirtualPrinterConfig | None) -> None:
-        if config is None and self._loop is None:
+    async def reconcile(self, configs) -> None:
+        """Reconcile to the given VP set. Accepts either a single
+        VirtualPrinterConfig | None (legacy single-VP callers) or a
+        list[VirtualPrinterConfig] (v0.40.0 multi-VP)."""
+        normalized = _to_config_list(configs)
+        if not normalized and self._loop is None:
             self._set_current_model(None)
             return
         self._ensure_loop()
-        future = self._submit(self._reconcile_in_loop(config))
+        future = self._submit(self._reconcile_in_loop(normalized))
         await asyncio.wrap_future(future)
-        if config is None:
+        if not normalized:
             self._stop_loop_thread()
 
-    def reconcile_sync(self, config: VirtualPrinterConfig | None, *, timeout: float = 20.0) -> None:
-        if config is None and self._loop is None:
+    def reconcile_sync(self, configs, *, timeout: float = 20.0) -> None:
+        normalized = _to_config_list(configs)
+        if not normalized and self._loop is None:
             self._set_current_model(None)
             return
         self._ensure_loop()
-        future = self._submit(self._reconcile_in_loop(config))
+        future = self._submit(self._reconcile_in_loop(normalized))
         future.result(timeout=timeout)
-        if config is None:
+        if not normalized:
             self._stop_loop_thread()
 
     def stop_sync(self, *, timeout: float = 20.0) -> None:
@@ -111,7 +120,7 @@ class VirtualPrinterManager:
             def runner() -> None:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
-                self._supervisor = _AsyncVirtualPrinterSupervisor(
+                self._supervisor = _AsyncMultiVirtualPrinterSupervisor(
                     base_dir=self._base_dir,
                     on_capture=self._on_capture,
                     diagnostics=self._diagnostics,
@@ -141,10 +150,10 @@ class VirtualPrinterManager:
             raise RuntimeError("virtual printer event loop is not running")
         return asyncio.run_coroutine_threadsafe(coro, loop)
 
-    async def _reconcile_in_loop(self, config: VirtualPrinterConfig | None) -> None:
+    async def _reconcile_in_loop(self, configs: list[VirtualPrinterConfig]) -> None:
         if self._supervisor is None:
             raise RuntimeError("virtual printer supervisor is not ready")
-        await self._supervisor.reconcile(config)
+        await self._supervisor.reconcile(configs if configs else None)
         self._set_current_model(self._supervisor.current_model())
 
     async def _stop_in_loop(self) -> None:
@@ -166,6 +175,168 @@ class VirtualPrinterManager:
             thread.join(timeout=5.0)
             if thread.is_alive():
                 log.warning("virtual printer event loop thread did not stop within timeout")
+
+
+class _AsyncMultiVirtualPrinterSupervisor:
+    """v0.40.0 — manages N virtual-printer runtimes simultaneously, one per
+    enabled (hub, model) VP. Owns ONE shared SSDP multicast listener; each
+    runtime registers/unregisters with it so the listener answers M-SEARCH
+    on behalf of every active VP.
+
+    Identity key: the VP serial (cloud-assigned, unique per (hub, model) row).
+    A reconcile call diffs `incoming serials` vs `current serials` and:
+      - starts a fresh runtime for any NEW serial
+      - hot-applies for any SAME serial whose hot_state changed
+      - stops + drops any DROPPED serial
+    """
+
+    def __init__(self, *, base_dir: Path, on_capture, diagnostics=None) -> None:
+        self.base_dir = base_dir
+        self.on_capture = on_capture or _default_capture_logger
+        self.diagnostics = diagnostics
+        self.runtimes: dict[str, _VirtualPrinterRuntime] = {}
+        self.identity_fps: dict[str, tuple[Any, ...]] = {}
+        self.hot_states: dict[str, tuple[Any, ...]] = {}
+        self.shared_ssdp_runtime = None
+        self.shared_ssdp_protocol = None
+        self._lock = asyncio.Lock()
+
+    def current_models(self) -> list[str]:
+        return [r.config.model for r in self.runtimes.values()]
+
+    def current_model(self) -> str | None:
+        """Back-compat scalar for callers that previously expected one VP.
+        Returns the model of the first runtime when at least one is live."""
+        if not self.runtimes:
+            return None
+        # Stable order: codepoint-sorted model so callers don't see flapping.
+        for serial in sorted(self.runtimes.keys()):
+            return self.runtimes[serial].config.model
+        return None
+
+    async def reconcile(self, configs: list[VirtualPrinterConfig] | None) -> None:
+        async with self._lock:
+            await self._reconcile_locked(configs)
+
+    async def _reconcile_locked(self, configs: list[VirtualPrinterConfig] | None) -> None:
+        # Empty / None / all-disabled → tear down every live runtime.
+        if not configs:
+            await self._stop_locked_all()
+            return
+        enabled = [c for c in configs if c.enabled]
+        if not enabled:
+            await self._stop_locked_all()
+            return
+
+        # Ensure the shared SSDP runtime is up before any runtime needs to
+        # register. Lazy-start because most heartbeat ticks don't change the
+        # VP set; the listener stays alive across reconciles.
+        if self.shared_ssdp_protocol is None:
+            await self._start_shared_ssdp_locked()
+
+        incoming_serials = {c.serial for c in enabled}
+        # Stop runtimes whose serial is no longer in the incoming set.
+        for serial in list(self.runtimes.keys()):
+            if serial not in incoming_serials:
+                await self._stop_runtime_locked(serial)
+
+        # Diff: start fresh, hot-apply, or noop per VP.
+        for config in enabled:
+            identity = _identity_fingerprint(config)
+            hot = _hot_state(config)
+            existing = self.runtimes.get(config.serial)
+            if existing is not None and self.identity_fps.get(config.serial) == identity:
+                if self.hot_states.get(config.serial) != hot:
+                    try:
+                        await existing.apply_hot(config)
+                    except Exception as exc:  # noqa: BLE001
+                        safe = redact(str(exc))
+                        self._record_failure(
+                            f"VP {config.model} hot-apply failed: {safe}"
+                        )
+                    else:
+                        self.hot_states[config.serial] = hot
+                continue
+            await self._start_fresh_locked(config, identity, hot)
+
+    async def _start_shared_ssdp_locked(self) -> None:
+        from .ssdp import start_shared_ssdp
+
+        runtime, protocol = await start_shared_ssdp(SSDP_PORT, log.info)
+        self.shared_ssdp_runtime = runtime
+        self.shared_ssdp_protocol = protocol
+
+    async def _start_fresh_locked(
+        self,
+        config: VirtualPrinterConfig,
+        identity: tuple[Any, ...],
+        hot: tuple[Any, ...],
+    ) -> None:
+        # If a different runtime currently owns this serial (shouldn't happen —
+        # reconcile already filtered, but defensive), stop it first.
+        existing = self.runtimes.get(config.serial)
+        if existing is not None:
+            await self._stop_runtime_locked(config.serial)
+        runtime = _VirtualPrinterRuntime(
+            config,
+            base_dir=self.base_dir,
+            on_capture=self.on_capture,
+            shared_ssdp_protocol=self.shared_ssdp_protocol,
+        )
+        try:
+            await runtime.start()
+        except ImportError as exc:
+            safe = redact(str(exc))
+            self._record_failure(
+                f"VP {config.model} cannot start; dependency missing: {safe}"
+            )
+            log.error("virtual printer %s dependency missing: %s", config.model, safe)
+            await runtime.stop()
+            return
+        except Exception as exc:  # noqa: BLE001
+            safe = redact(str(exc))
+            self._record_failure(f"VP {config.model} start failed: {safe}")
+            log.warning("virtual printer %s start failed: %s", config.model, safe)
+            await runtime.stop()
+            return
+        self.runtimes[config.serial] = runtime
+        self.identity_fps[config.serial] = identity
+        self.hot_states[config.serial] = hot
+        log.info(
+            "virtual printer started serial=%s model=%s bind_ip=%s",
+            config.serial,
+            config.model,
+            config.bind_ip,
+        )
+
+    async def _stop_runtime_locked(self, serial: str) -> None:
+        runtime = self.runtimes.pop(serial, None)
+        self.identity_fps.pop(serial, None)
+        self.hot_states.pop(serial, None)
+        if runtime is not None:
+            await runtime.stop()
+            log.info("virtual printer stopped serial=%s", serial)
+
+    async def _stop_locked_all(self) -> None:
+        for serial in list(self.runtimes.keys()):
+            await self._stop_runtime_locked(serial)
+        # Tear down the shared SSDP listener too — no VPs to advertise.
+        if self.shared_ssdp_runtime is not None:
+            await self.shared_ssdp_runtime.close()
+            self.shared_ssdp_runtime = None
+            self.shared_ssdp_protocol = None
+
+    async def stop(self) -> None:
+        async with self._lock:
+            await self._stop_locked_all()
+
+    def _record_failure(self, message: str) -> None:
+        if self.diagnostics is None:
+            return
+        try:
+            self.diagnostics.record("vprinter", message)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class _AsyncVirtualPrinterSupervisor:
@@ -260,13 +431,27 @@ class _AsyncVirtualPrinterSupervisor:
 
 
 class _VirtualPrinterRuntime:
-    def __init__(self, config: VirtualPrinterConfig, *, base_dir: Path, on_capture) -> None:
+    def __init__(
+        self,
+        config: VirtualPrinterConfig,
+        *,
+        base_dir: Path,
+        on_capture,
+        shared_ssdp_protocol=None,
+    ) -> None:
         self.config = config
         self.base_dir = base_dir / _safe_serial(config.serial)
         self.on_capture = on_capture
         self.auth = MemberAuthSet(config.members)
         self.capture = CaptureCoordinator(on_capture, log.warning)
         self.servers: list[asyncio.AbstractServer] = []
+        # v0.40.0 — when a shared SSDP listener exists (multi-VP), this runtime
+        # REGISTERS its config with that shared listener instead of starting its
+        # own per-VP SSDP responder. Linux multicast only allows one socket per
+        # (interface, group), so per-VP SSDP responders would silently collide
+        # under multi-VP. Back-compat: when shared_ssdp_protocol=None we fall
+        # through to the old single-VP SSDP responder path.
+        self.shared_ssdp_protocol = shared_ssdp_protocol
         self.ssdps: list[Any] = []
         self.ftp = None
         self.broker = None
@@ -368,19 +553,24 @@ class _VirtualPrinterRuntime:
                     create_server_ssl_context(bundle),
                 )
             )
-            self.ssdps.append(
-                await start_ssdp_responder(
-                    SSDP_PORT,
-                    SsdpConfig(
-                        ip=self.config.bind_ip,
-                        serial=self.config.serial,
-                        model=self.config.model,
-                        name=self.config.name,
-                        fw=self.config.fw,
-                    ),
-                    log.info,
-                )
+            ssdp_config = SsdpConfig(
+                ip=self.config.bind_ip,
+                serial=self.config.serial,
+                model=self.config.model,
+                name=self.config.name,
+                fw=self.config.fw,
             )
+            if self.shared_ssdp_protocol is not None:
+                # v0.40.0 multi-VP path — register with the SHARED SSDP listener
+                # that the multi-supervisor owns. The shared listener answers
+                # M-SEARCH on behalf of every registered VP and broadcasts
+                # NOTIFY for each every interval.
+                self.shared_ssdp_protocol.register(ssdp_config)
+            else:
+                # Back-compat single-VP path — start an own per-VP responder.
+                self.ssdps.append(
+                    await start_ssdp_responder(SSDP_PORT, ssdp_config, log.info)
+                )
             self.ftp = await start_ftp_server(
                 bind_ip,
                 FTPS_PORT,
@@ -400,6 +590,11 @@ class _VirtualPrinterRuntime:
             raise
 
     async def stop(self) -> None:
+        # v0.40.0 — unregister from the shared SSDP listener so the multi-VP
+        # protocol stops advertising this serial; the shared listener itself
+        # keeps running for other VPs.
+        if self.shared_ssdp_protocol is not None:
+            self.shared_ssdp_protocol.unregister(self.config.serial)
         for ssdp in self.ssdps:
             await ssdp.close()
         self.ssdps.clear()
@@ -517,3 +712,15 @@ def _pool_signature(pool: tuple[dict[str, Any], ...]) -> str:
 
 def _safe_serial(serial: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in serial)
+
+
+def _to_config_list(configs) -> list[VirtualPrinterConfig]:
+    """Normalize the legacy single-VP API (config | None) into the v0.40.0
+    multi-VP list. None → []; VirtualPrinterConfig → [it]; list → list."""
+    if configs is None:
+        return []
+    if isinstance(configs, VirtualPrinterConfig):
+        return [configs]
+    if isinstance(configs, list):
+        return [c for c in configs if isinstance(c, VirtualPrinterConfig)]
+    return []
