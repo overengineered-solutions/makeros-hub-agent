@@ -32,6 +32,9 @@ SUBSYSTEMS = (
     "klipper",
     "failure_watch",
     "detector",
+    # LAN discovery sweep (Moonraker HTTP probe + Bambu SSDP listener) —
+    # subnet derivation failures, sweep budget timeouts, SSDP bind denies.
+    "lan_scan",
 )
 ERROR_MESSAGE_MAX = 280
 LOG_MESSAGE_MAX = 180

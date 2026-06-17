@@ -532,6 +532,7 @@ def heartbeat_payload(
     camera_failures: list[str] | None = None,
     failure_samples: list[dict] | None = None,
     vp_ca: tuple[str, str] | None = None,
+    discovery_hits: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -568,6 +569,12 @@ def heartbeat_payload(
         pem, fp = vp_ca
         if isinstance(pem, str) and isinstance(fp, str) and 0 < len(pem) <= 8192 and fp:
             payload["virtualPrinterCa"] = {"caCertPem": pem, "caFingerprintSha256": fp}
+    # LAN discovery — periodic sweep results (Moonraker + Bambu) the cloud
+    # uses to populate the "Detected on your LAN" dropdown in the admin
+    # AddPrinterForm. Empty/missing list = no fresh sweep yet (the cached
+    # hits expired or the periodic worker hasn't run yet).
+    if discovery_hits:
+        payload["discoveryHits"] = list(discovery_hits)
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
@@ -1275,6 +1282,22 @@ def run(
                         )
 
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
+                # LAN discovery — fire the periodic sweep (rate-limited inside,
+                # so we call it every heartbeat without doing real work most
+                # ticks) and ship the cached hits with this heartbeat. Wrapped
+                # because a misbehaving subnet probe must NEVER brick the loop.
+                discovery_hits: list[dict] = []
+                try:
+                    from . import discovery as _discovery
+
+                    _discovery.maybe_run_periodic_scan()
+                    discovery_hits = _discovery.hits_to_payload(_discovery.get_cached_hits())
+                except Exception as exc:  # noqa: BLE001 - sweep must not sink heartbeat
+                    _record_diagnostic(
+                        diagnostics,
+                        "lan_scan",
+                        f"sweep failed: {redact(str(exc))}",
+                    )
                 resp = post_json(
                     cfg.heartbeat_url,
                     heartbeat_payload(
@@ -1288,6 +1311,7 @@ def run(
                         camera_failures=camera_failures,
                         failure_samples=failure_samples,
                         vp_ca=vp_ca,
+                        discovery_hits=discovery_hits,
                     ),
                     bearer=credential,
                     retries=3,
