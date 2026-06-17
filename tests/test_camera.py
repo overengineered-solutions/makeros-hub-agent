@@ -140,20 +140,44 @@ class TestCapturePrinterFrame(unittest.TestCase):
 
 
 class TestCameraScheduler(unittest.TestCase):
+    """v0.41.0: should_capture is side-effect-free for time-tracking — it only
+    updates last_state for state-change detection. The caller must invoke
+    mark_captured(printer_id, now) AFTER a successful frame to stamp the
+    last-capture timer; failed captures stay due next beat so flaky printers
+    self-heal at heartbeat cadence instead of going dark for IDLE_S."""
+
     def test_first_sighting_then_throttled_then_due(self):
         s = camera.CameraScheduler()
         # first ever -> capture
         self.assertTrue(s.should_capture("p", "printing", 50, now=0.0))
-        # same state, within mid-print interval -> no
+        # The first should_capture has NOT stamped the timer (mark-on-success
+        # contract). Simulate the caller acknowledging the success.
+        s.mark_captured("p", now=0.0)
+        # Same state, within mid-print interval -> no
         self.assertFalse(s.should_capture("p", "printing", 50, now=10.0))
-        # past the mid-print interval -> yes
-        self.assertTrue(s.should_capture("p", "printing", 50, now=0.0 + camera.CameraScheduler.MID_PRINT_S))
+        # Past the mid-print interval -> yes again
+        self.assertTrue(
+            s.should_capture("p", "printing", 50, now=0.0 + camera.CameraScheduler.MID_PRINT_S)
+        )
 
     def test_state_change_forces_capture(self):
         s = camera.CameraScheduler()
         self.assertTrue(s.should_capture("p", "idle", None, now=0.0))
+        s.mark_captured("p", now=0.0)
         # idle -> printing a moment later: state change beats the idle interval
         self.assertTrue(s.should_capture("p", "printing", 1, now=1.0))
+
+    def test_failed_capture_stays_due_next_beat(self):
+        # The 2026-06-17 bug this fixes: pre-v0.41.0 every attempt stamped
+        # last_capture, so a Liveview-off printer went dark for IDLE_S=600s
+        # between retries. Now the caller only stamps on success → failed
+        # printers retry every beat.
+        s = camera.CameraScheduler()
+        self.assertTrue(s.should_capture("p", "idle", None, now=0.0))
+        # No mark_captured call (capture failed). Next beat at +40s:
+        self.assertTrue(s.should_capture("p", "idle", None, now=40.0))
+        # Still failing — next beat still due.
+        self.assertTrue(s.should_capture("p", "idle", None, now=80.0))
 
     def test_first_layer_is_denser_than_mid(self):
         s = camera.CameraScheduler()
@@ -165,7 +189,9 @@ class TestCameraScheduler(unittest.TestCase):
     def test_forget_drops_absent_printers(self):
         s = camera.CameraScheduler()
         s.should_capture("a", "idle", None, now=0.0)
+        s.mark_captured("a", now=0.0)
         s.should_capture("b", "idle", None, now=0.0)
+        s.mark_captured("b", now=0.0)
         s.forget({"a"})
         self.assertIn("a", s._last_capture)
         self.assertNotIn("b", s._last_capture)
@@ -185,14 +211,17 @@ class TestCollectCameraFrames(unittest.TestCase):
         import base64 as b64
         self.assertEqual(b64.b64decode(frames[0]["jpegBase64"]), b"\xff\xd8\xff\xe0x\xff\xd9")
 
-    def test_none_frame_is_reported_as_failure(self):
+    def test_none_frame_is_reported_as_failure_dict_shape(self):
         s = camera.CameraScheduler()
         frames, failures = camera.collect_camera_frames(
             self._targets(), {}, s, now=0.0, capture=lambda _t: None
         )
         self.assertEqual(frames, [])
-        # both DUE printers produced no frame -> surfaced as failures (R4.5)
-        self.assertEqual(set(failures), {"p1", "p2"})
+        # v0.41.0: failures is list[dict{printerId,reason,stderrTail}].
+        self.assertEqual({f["printerId"] for f in failures}, {"p1", "p2"})
+        for f in failures:
+            self.assertIn("reason", f)
+            self.assertIn("stderrTail", f)
 
     def test_capture_exception_is_failure_not_propagated(self):
         s = camera.CameraScheduler()
@@ -200,15 +229,22 @@ class TestCollectCameraFrames(unittest.TestCase):
         def boom(_t):
             raise RuntimeError("camera exploded")
 
-        frames, failures = camera.collect_camera_frames(self._targets(), {}, s, now=0.0, capture=boom)
+        frames, failures = camera.collect_camera_frames(
+            self._targets(), {}, s, now=0.0, capture=boom
+        )
         self.assertEqual(frames, [])
-        self.assertEqual(set(failures), {"p1", "p2"})
+        # Each printer has a failure dict; reason is 'unknown' for arbitrary
+        # exceptions (the legacy bytes-capture path doesn't categorize).
+        self.assertEqual({f["printerId"] for f in failures}, {"p1", "p2"})
+        self.assertTrue(all(f["reason"] == "unknown" for f in failures))
 
     def test_nothing_due_returns_empty_no_failures(self):
         s = camera.CameraScheduler()
-        # prime both so they're not first-sighting
+        # prime both via should_capture + mark_captured so they're no longer
+        # first-sighting (v0.41.0 split — mark separately).
         for pid in ("p1", "p2"):
             s.should_capture(pid, "printing", 50, now=0.0)
+            s.mark_captured(pid, now=0.0)
         frames, failures = camera.collect_camera_frames(
             self._targets(),
             {"p1": {"state": "printing", "progressPct": 50}, "p2": {"state": "printing", "progressPct": 50}},
@@ -226,14 +262,17 @@ class TestCollectCameraFrames(unittest.TestCase):
         def cap(t):
             return b"\xff\xd8\xff\xe0x\xff\xd9" if t["printerId"] == "p1" else None
 
-        frames, failures = camera.collect_camera_frames(self._targets(), {}, s, now=0.0, capture=cap)
+        frames, failures = camera.collect_camera_frames(
+            self._targets(), {}, s, now=0.0, capture=cap
+        )
         self.assertEqual([f["printerId"] for f in frames], ["p1"])
-        self.assertEqual(failures, ["p2"])
+        self.assertEqual([f["printerId"] for f in failures], ["p2"])
 
     def test_timed_out_printer_appears_in_failures_without_blocking(self):
         # Codex review HIGH: the load-bearing path is the as_completed timeout
         # branch — a slow/unreachable camera must not stall the heartbeat AND
-        # must appear in failures. Verified by wall-clock + result.
+        # must appear in failures. Verified by wall-clock + result. v0.41.0:
+        # the timed-out printer's failure dict carries reason='timeout'.
         import time as _t
         s = camera.CameraScheduler()
         def cap(t):
@@ -251,7 +290,23 @@ class TestCollectCameraFrames(unittest.TestCase):
         # cancel_futures=True) returns immediately — heartbeat is bounded.
         self.assertLess(wall, 0.25, f"heartbeat blocked by slow capture: {wall:.3f}s")
         self.assertEqual([f["printerId"] for f in frames], ["p1"])
-        self.assertEqual(failures, ["p2"])
+        self.assertEqual([f["printerId"] for f in failures], ["p2"])
+        self.assertEqual(failures[0]["reason"], "timeout")
+
+    def test_failed_capture_does_not_mark_scheduler(self):
+        # Direct regression test for the 2026-06-17 scheduler bug: pre-v0.41.0,
+        # a failed capture still stamped last_capture so a Liveview-off printer
+        # went dark for IDLE_S=600s between retries. Now the caller only marks
+        # on success → a printer whose first capture returns None stays due
+        # next beat.
+        s = camera.CameraScheduler()
+        camera.collect_camera_frames(
+            self._targets(), {}, s, now=0.0, capture=lambda _t: None
+        )
+        # Neither printer was successfully captured → scheduler has not stamped
+        # either, so both are still due on the next beat.
+        self.assertTrue(s.should_capture("p1", "idle", None, now=40.0))
+        self.assertTrue(s.should_capture("p2", "idle", None, now=40.0))
 
 
 if __name__ == "__main__":

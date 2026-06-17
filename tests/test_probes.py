@@ -132,5 +132,98 @@ class TestRunProbe(unittest.TestCase):
         self.assertNotIn("credential-secret", result["output"])
 
 
+class TestCameraTestProbe(unittest.TestCase):
+    """v0.41.0 'camera-test' probe — one-shot capture across eligible printers.
+
+    Returns a JSON-encoded {rows: [...]} so the cloud admin can render an
+    inline table with categorized per-printer outcomes. The probe is gated on
+    a registered provider — if none is wired (test or freshly-started agent),
+    it returns an empty {rows:[]} with an explanatory error rather than
+    crashing the heartbeat."""
+
+    def test_no_provider_registered_returns_empty_rows_and_error(self):
+        old = probes._CAMERA_TARGETS_PROVIDER
+        probes.set_camera_targets_provider(None)
+        try:
+            result = probes.run_probe("camera-test")
+        finally:
+            probes.set_camera_targets_provider(old)
+        self.assertEqual(result["status"], "ok")
+        import json
+        body = json.loads(result["output"])
+        self.assertEqual(body["rows"], [])
+        self.assertIn("not registered", body["error"])
+
+    def test_with_provider_iterates_and_categorizes_per_printer(self):
+        # Provider yields three printers; we monkey-patch the capture call
+        # to return success/auth-fail/timeout in turn so the table covers
+        # the categorized-reason contract end-to-end.
+        outcomes = [
+            (b"\xff\xd8\xff\xe0body\xff\xd9", None, ""),  # p1: OK
+            (None, "auth-fail", "401 Unauthorized"),  # p2: auth
+            (None, "timeout", ""),  # p3: timeout
+        ]
+        targets = [
+            {"printerId": "p1", "displayName": "Wade", "model": "P2S", "vendor": "bambu"},
+            {"printerId": "p2", "displayName": "Moya", "model": "P2S", "vendor": "bambu"},
+            {"printerId": "p3", "displayName": "Antoni", "model": "X1C", "vendor": "bambu"},
+        ]
+        iter_outcomes = iter(outcomes)
+
+        def fake_capture(_t):
+            return next(iter_outcomes)
+
+        old = probes._CAMERA_TARGETS_PROVIDER
+        probes.set_camera_targets_provider(lambda: targets)
+        with mock.patch(
+            "makeros_hub.printers.camera.capture_printer_frame_with_reason",
+            fake_capture,
+        ):
+            try:
+                result = probes.run_probe("camera-test")
+            finally:
+                probes.set_camera_targets_provider(old)
+        import json
+        body = json.loads(result["output"])
+        rows = body["rows"]
+        self.assertEqual([r["printerId"] for r in rows], ["p1", "p2", "p3"])
+        self.assertEqual([r["ok"] for r in rows], [True, False, False])
+        self.assertEqual([r["reason"] for r in rows], [None, "auth-fail", "timeout"])
+        self.assertEqual(rows[0]["displayName"], "Wade")
+        self.assertEqual(rows[0]["jpegBytes"], len(b"\xff\xd8\xff\xe0body\xff\xd9"))
+        self.assertEqual(rows[1]["stderrTail"], "401 Unauthorized")
+
+    def test_per_row_exception_is_isolated(self):
+        targets = [
+            {"printerId": "p1", "displayName": "Wade", "model": "P2S"},
+            {"printerId": "p2", "displayName": "Moya", "model": "P2S"},
+        ]
+        calls = {"n": 0}
+
+        def fake_capture(_t):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("camera exploded")
+            return (b"\xff\xd8\xff\xe0body\xff\xd9", None, "")
+
+        old = probes._CAMERA_TARGETS_PROVIDER
+        probes.set_camera_targets_provider(lambda: targets)
+        with mock.patch(
+            "makeros_hub.printers.camera.capture_printer_frame_with_reason",
+            fake_capture,
+        ):
+            try:
+                result = probes.run_probe("camera-test")
+            finally:
+                probes.set_camera_targets_provider(old)
+        import json
+        body = json.loads(result["output"])
+        rows = body["rows"]
+        # First row failed (exception), second succeeded — neither sinks the probe.
+        self.assertEqual(rows[0]["ok"], False)
+        self.assertEqual(rows[0]["reason"], "unknown")
+        self.assertEqual(rows[1]["ok"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

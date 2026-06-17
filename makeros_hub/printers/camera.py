@@ -33,7 +33,9 @@ import urllib.request
 from typing import Any, Callable, Optional
 
 from .bambu_camera import capture_frame as _bambu_capture_frame
+from .rtsp_camera import CaptureResult as _RtspResult
 from .rtsp_camera import capture_frame as _rtsp_capture_frame
+from .rtsp_camera import capture_frame_with_reason as _rtsp_capture_with_reason
 
 _HTTP_TIMEOUT = 4.0
 _MAX_FRAME_BYTES = 2 * 1024 * 1024
@@ -127,12 +129,54 @@ def capture_printer_frame(printer: dict[str, Any]) -> Optional[bytes]:
     return None
 
 
+def capture_printer_frame_with_reason(printer: dict[str, Any]) -> tuple[Optional[bytes], Optional[str], str]:
+    """Capture one frame AND return a categorized failure reason on no-frame.
+
+    Returns (jpeg_or_none, reason_or_none, stderr_tail). On success: (jpeg, None, "").
+    On failure: (None, reason, stderr_tail) where reason is a stable lowercase
+    string the cloud maps to operator-facing copy ('no-ffmpeg', 'liveview-off',
+    'auth-fail', 'unreachable', 'timeout', 'bad-jpeg', 'unknown', or
+    'no-camera-source' when the printer has no LAN-camera path at all).
+
+    Today only the RTSP path (X1/H2/P2S) returns a categorized reason — that's
+    where the silent-zero failure mode actually bites (per the 2026-06-17
+    workflow diagnose: 100% of fleet camera failures were on RTSPS-class
+    printers). The :6000 path (A1/P1) and HTTP-snapshot path still return a
+    generic 'unknown' on no-frame; future work can extend bambu_camera /
+    http_snapshot the same way without touching this signature."""
+    kind = camera_source_kind(printer)
+    if kind == "bambu-lan":
+        jpeg = _bambu_capture_frame(str(printer.get("host")), str(printer.get("accessCode")))
+        return (jpeg, None if jpeg else "unknown", "")
+    if kind == "bambu-rtsp":
+        result: _RtspResult = _rtsp_capture_with_reason(
+            str(printer.get("host")), str(printer.get("accessCode"))
+        )
+        if result.jpeg:
+            return (result.jpeg, None, "")
+        return (None, result.reason or "unknown", result.stderr_tail)
+    if kind == "http-snapshot":
+        jpeg = http_snapshot(_snapshot_url(printer) or "")
+        return (jpeg, None if jpeg else "unknown", "")
+    return (None, "no-camera-source", "")
+
+
 class CameraScheduler:
     """Phase-adaptive capture cadence, per printer. Captures densely at a state
     change + during the first/last few % of a print (where things go wrong),
     sparsely mid-print, and rarely while idle — so the board feels live without
     hammering the printer or the heartbeat. Pure given an injected monotonic
-    `now` (seconds). Stateful across beats (last-capture time + last state)."""
+    `now` (seconds). Stateful across beats (last-capture time + last state).
+
+    Mark-on-success contract (v0.41.0): `should_capture` ONLY reads/updates the
+    state-tracking dict; `mark_captured` stamps `last_capture` and is called by
+    the caller AFTER the capture actually returns a frame. A persistently-failing
+    printer therefore stays "due" every beat (the heartbeat is the natural
+    backoff: ~30-40s) instead of going dark for IDLE_S=600s. The agent's
+    overall_timeout=8s + max_workers=4 already bound the worst-case CPU spend
+    on a broken printer, so the more-aggressive retry is safe. Pre-v0.41.0 the
+    scheduler stamped on every attempt, which produced 10-minute blackouts on
+    Liveview-off printers (2026-06-17 PS Moya P2S regression)."""
 
     FIRST_OR_LAST_LAYER_S = 20.0  # dense: first ~5% / last ~5% of a print
     MID_PRINT_S = 90.0  # sparse: steady-state printing
@@ -145,17 +189,23 @@ class CameraScheduler:
     def should_capture(
         self, printer_id: str, state: Optional[str], progress_pct: Any, now: float
     ) -> bool:
+        """Decide whether to attempt a capture this beat. Side-effects ONLY the
+        last-state tracking — does NOT stamp last_capture. Callers must call
+        `mark_captured` AFTER a successful frame is in hand."""
         state = state or ""
         prev_state = self._last_state.get(printer_id)
         last = self._last_capture.get(printer_id)
         self._last_state[printer_id] = state
-        if last is None:  # first sighting
-            return self._mark(printer_id, now)
+        if last is None:  # first sighting — always due
+            return True
         if state != prev_state:  # state change is high-signal — grab one now
-            return self._mark(printer_id, now)
-        if now - last >= self._interval(state, progress_pct):
-            return self._mark(printer_id, now)
-        return False
+            return True
+        return now - last >= self._interval(state, progress_pct)
+
+    def mark_captured(self, printer_id: str, now: float) -> None:
+        """Stamp last_capture so the next beat respects the cadence interval.
+        Call only after a SUCCESSFUL capture; failures stay due next beat."""
+        self._last_capture[printer_id] = now
 
     def _interval(self, state: str, progress_pct: Any) -> float:
         if state == "printing":
@@ -164,10 +214,6 @@ class CameraScheduler:
                 return self.FIRST_OR_LAST_LAYER_S
             return self.MID_PRINT_S
         return self.IDLE_S
-
-    def _mark(self, printer_id: str, now: float) -> bool:
-        self._last_capture[printer_id] = now
-        return True
 
     def forget(self, keep_ids: set[str]) -> None:
         """Drop tracking for printers no longer present (called on reconcile)."""
@@ -183,17 +229,34 @@ def collect_camera_frames(
     now: float,
     *,
     capture: Callable[[dict[str, Any]], Optional[bytes]] = capture_printer_frame,
+    capture_with_reason: Callable[
+        [dict[str, Any]], tuple[Optional[bytes], Optional[str], str]
+    ] = capture_printer_frame_with_reason,
     max_workers: int = 4,
     overall_timeout: float = 8.0,
-) -> tuple[list[dict[str, str]], list[str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """For every printer DUE for a frame (per the scheduler + its live state),
-    capture in PARALLEL and return `([{printerId, jpegBase64}], failed_ids)`.
+    capture in PARALLEL and return `([{printerId, jpegBase64}], failures)`.
     Bounded by `overall_timeout` so a slow/unreachable camera never stalls the
     heartbeat — whatever finishes in time ships this beat, the rest are retried
-    next beat. `failed_ids` are the DUE printers that produced no frame this beat
-    (None capture, raise, or timed out) so the cloud can surface the silent-drop
-    instead of it vanishing (R4.5). Never raises; capturedAt is omitted (the
-    cloud stamps receipt time, avoiding agent/server clock skew)."""
+    next beat. `failures` is a list of per-printer dicts
+    `{printerId, reason, stderrTail}` so the cloud can surface the silent-drop
+    with a categorized cause ('liveview-off' / 'auth-fail' / 'unreachable' /
+    'timeout' / 'no-ffmpeg' / 'bad-jpeg' / 'unknown') instead of just a list of
+    printerIds vanishing (R4.5). Never raises; capturedAt is omitted (the cloud
+    stamps receipt time, avoiding agent/server clock skew).
+
+    Mark-on-success contract (v0.41.0): only successful captures stamp the
+    scheduler's last_capture, so flaky printers retry every beat instead of
+    going dark for IDLE_S=600s. The `capture` arg is preserved for tests that
+    only need the boolean success path; production wiring uses
+    `capture_with_reason` to surface categorized failures.
+
+    BACK-COMPAT: callers receiving the legacy `list[str]` shape (printerIds
+    only) can map(.get('printerId')) over the new failures list. The cloud
+    heartbeat route v0.41.0+ parses the dict shape; pre-v0.41.0 cloud builds
+    fall back gracefully if both shapes ever cross.
+    """
     due = [
         t
         for t in targets
@@ -208,25 +271,50 @@ def collect_camera_frames(
     if not due:
         return [], []
 
+    # Back-compat: if the caller passed only the legacy bytes-returning
+    # `capture` lambda (no `capture_with_reason`), wrap it. Tests that
+    # provide just `capture=` keep working unchanged; the heartbeat path
+    # in agent.py uses the default (capture_printer_frame_with_reason).
+    if (
+        capture is not capture_printer_frame
+        and capture_with_reason is capture_printer_frame_with_reason
+    ):
+        _legacy = capture
+
+        def _wrap_legacy(t: dict[str, Any]) -> tuple[Optional[bytes], Optional[str], str]:
+            jpeg = _legacy(t)
+            return (jpeg, None if jpeg else "unknown", "")
+
+        capture_with_reason = _wrap_legacy
+
     frames: list[dict[str, str]] = []
     captured: set[str] = set()
+    failure_by_pid: dict[str, dict[str, str]] = {}
     ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(due)))
     try:
-        fut_to_pid = {ex.submit(capture, t): t["printerId"] for t in due}
+        fut_to_pid = {ex.submit(capture_with_reason, t): t["printerId"] for t in due}
         try:
             for fut in concurrent.futures.as_completed(fut_to_pid, timeout=overall_timeout):
+                pid = fut_to_pid[fut]
                 try:
-                    jpeg = fut.result()
+                    jpeg, reason, stderr_tail = fut.result()
                 except Exception:  # noqa: BLE001 - a bad capture never sinks the beat
-                    jpeg = None
+                    jpeg, reason, stderr_tail = (None, "unknown", "")
                 if jpeg:
-                    captured.add(fut_to_pid[fut])
+                    captured.add(pid)
+                    scheduler.mark_captured(pid, now)
                     frames.append(
                         {
-                            "printerId": fut_to_pid[fut],
+                            "printerId": pid,
                             "jpegBase64": base64.b64encode(jpeg).decode("ascii"),
                         }
                     )
+                else:
+                    failure_by_pid[pid] = {
+                        "printerId": pid,
+                        "reason": reason or "unknown",
+                        "stderrTail": stderr_tail or "",
+                    }
         except concurrent.futures.TimeoutError:
             pass  # keep whatever finished; the slow ones retry next beat
     finally:
@@ -236,8 +324,16 @@ def collect_camera_frames(
         # one finishes on its own and its result is discarded. (A `with` block
         # would wait=True here and could add seconds to the beat.)
         ex.shutdown(wait=False, cancel_futures=True)
-    # DUE printers that produced no frame this beat (None / raised / timed out).
-    # Surfaced so the cloud can make the silent-drop loud (R4.5) — e.g. an X1/H2
-    # with Liveview off or ffmpeg missing shows up instead of just being absent.
-    failures = [t["printerId"] for t in due if t["printerId"] not in captured]
+    # DUE printers that produced no frame this beat — include a categorized
+    # reason 'timeout' for those still pending when overall_timeout hit, so
+    # the cloud's no_frame event always names a cause per printer.
+    failures: list[dict[str, str]] = []
+    for t in due:
+        pid = t["printerId"]
+        if pid in captured:
+            continue
+        f = failure_by_pid.get(pid)
+        if f is None:
+            f = {"printerId": pid, "reason": "timeout", "stderrTail": ""}
+        failures.append(f)
     return frames, failures
