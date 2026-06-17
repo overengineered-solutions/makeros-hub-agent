@@ -27,6 +27,9 @@ SUBSYSTEMS = (
     # in agent.py + onnx_detector.py survives `snapshot()` instead of being silently
     # dropped on the unknown-subsystem floor.
     "camera",
+    # Klipper / Moonraker adapter (poll failures, control errors, job
+    # buffer overflow) — surfaced on the cloud admin diag page.
+    "klipper",
     "failure_watch",
     "detector",
 )
