@@ -330,6 +330,10 @@ class TestKlipperAdapterIntegration(unittest.TestCase):
         stub.start()
         try:
             adapter = KlipperAdapter("printer-1", stub.url)
+            # Seed liveness so send_command's pre-check (added in PR-2 review)
+            # doesn't short-circuit to not_connected — the poll loop isn't
+            # running in this test.
+            adapter._last_poll_ok_at = time.monotonic()
             out = adapter.send_command("pause")
             self.assertEqual(out["ok"], True)
             self.assertEqual(out["command"], "pause")
@@ -347,6 +351,7 @@ class TestKlipperAdapterIntegration(unittest.TestCase):
         stub.start()
         try:
             adapter = KlipperAdapter("printer-1", stub.url)
+            adapter._last_poll_ok_at = time.monotonic()
             out = adapter.send_command("stop")
             self.assertEqual(out["ok"], True)
             self.assertIn("/printer/print/cancel", stub.captured_paths)
@@ -382,6 +387,7 @@ class TestKlipperControlErrors(unittest.TestCase):
         server, url = _start_stub_error_server()
         try:
             adapter = KlipperAdapter("printer-1", url)
+            adapter._last_poll_ok_at = time.monotonic()
             out = adapter.send_command("resume")
             self.assertEqual(out["ok"], False)
             self.assertEqual(out["reason"], "not_paused")
@@ -391,11 +397,35 @@ class TestKlipperControlErrors(unittest.TestCase):
             server.server_close()
 
     def test_unreachable_url_returns_unreachable_reason(self):
-        # Port 1 is closed — TCP connect refused.
+        # Port 1 is closed — TCP connect refused. Seed liveness so we
+        # actually exercise the POST path (otherwise the pre-check would
+        # short-circuit to not_connected before we hit the wire).
         adapter = KlipperAdapter("printer-1", "http://127.0.0.1:1")
+        adapter._last_poll_ok_at = time.monotonic()
         out = adapter.send_command("pause")
         self.assertEqual(out["ok"], False)
         self.assertIn(out["reason"], ("unreachable", "timeout"))
+
+    def test_send_command_no_recent_poll_returns_not_connected(self):
+        # Adversarial-review MED #15 added a liveness pre-check: when the
+        # poll loop hasn't seen a successful tick within STALE_SEC, control
+        # commands short-circuit to not_connected so the cloud doesn't burn
+        # HTTP_CONTROL_TIMEOUT_SEC of admin patience on a known-offline box.
+        adapter = KlipperAdapter("printer-1", "http://127.0.0.1:1")
+        out = adapter.send_command("pause")
+        self.assertEqual(out["ok"], False)
+        self.assertEqual(out["reason"], "not_connected")
+
+    def test_send_command_stale_poll_returns_not_connected(self):
+        # Same pre-check from the OTHER side: the adapter HAS polled
+        # successfully at some point but the last good tick is older than
+        # STALE_SEC, so the printer is presumed dropped. We use a very old
+        # monotonic value to simulate the gap.
+        adapter = KlipperAdapter("printer-1", "http://127.0.0.1:1")
+        adapter._last_poll_ok_at = time.monotonic() - 600.0
+        out = adapter.send_command("pause")
+        self.assertEqual(out["ok"], False)
+        self.assertEqual(out["reason"], "not_connected")
 
 
 # ---------------------------------------------------------------------------
@@ -670,6 +700,204 @@ class TestKlipperAdapterJobIngestEndToEnd(unittest.TestCase):
                 self.assertEqual(jobs[0]["filename"], "a.gcode")
             finally:
                 adapter.stop()
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Adversarial-review (PR-2) regression coverage
+#
+# These tests pin the behaviors introduced by the PR-2 adversarial review:
+# lifecycle restart-after-stop, hidden print-cycle detection via
+# `print_duration` reset, URLError unwrap to truthful directional reasons,
+# strict 200-body validation, widened HTTP error matcher. If one of these
+# regresses we want to know at unit-test time, not in prod admin diag.
+# ---------------------------------------------------------------------------
+
+
+class TestKlipperLifecycle(unittest.TestCase):
+    def test_start_after_stop_resumes_polling(self):
+        # PR-2 adversarial HIGH: stop() set self._stop; without start() also
+        # clearing it, the next start launched a thread that exited at the
+        # first while-check — adapter "looked" alive but never polled. Pin.
+        adapter = KlipperAdapter("printer-1", "http://127.0.0.1:1")
+        adapter.stop()
+        adapter.start()
+        # Give the new thread a moment to enter the loop, then prove it's
+        # alive AND _stop is cleared (the actual bug surface).
+        time.sleep(0.05)
+        try:
+            self.assertTrue(adapter._thread is not None and adapter._thread.is_alive())
+            self.assertFalse(adapter._stop.is_set())
+        finally:
+            adapter.stop()
+
+
+class TestKlipperJobTrackerCycleElision(unittest.TestCase):
+    """Hidden-cycle detection — print_duration reset edge inside one window."""
+
+    def _t(self):
+        from makeros_hub.printers.klipper import KlipperJobTracker
+
+        return KlipperJobTracker("p1")
+
+    def _printing(self, fn: str, dur: float):
+        return {
+            "print_stats": {
+                "state": "printing",
+                "filename": fn,
+                "print_duration": dur,
+            }
+        }
+
+    def test_print_cycle_within_one_window_same_file_closes_as_done(self):
+        # Operator hits "print again" — same file restarts inside one poll
+        # window. We never see 'complete' between the two 'printing' samples,
+        # but print_duration drops from ~1800 → ~3, which IS the reset edge.
+        # The prior print closes as 'done' (not 'cancelled'), then a fresh
+        # job opens.
+        t = self._t()
+        t.observe(self._printing("rocket.gcode", 1800.0), 0.0)
+        t.observe(self._printing("rocket.gcode", 3.0), 5.0)
+        # One terminal: the prior print, closed as done.
+        pending = t.pending()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["status"], "done")
+        self.assertEqual(pending[0]["filename"], "rocket.gcode")
+
+    def test_print_cycle_within_one_window_different_file_closes_as_cancelled(self):
+        # Cancel + immediate-restart-with-different-file inside one window.
+        # print_duration resets AND filename changes — prior was an abort.
+        t = self._t()
+        t.observe(self._printing("rocket.gcode", 1800.0), 0.0)
+        t.observe(self._printing("widget.gcode", 3.0), 5.0)
+        pending = t.pending()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["status"], "cancelled")
+        self.assertEqual(pending[0]["filename"], "rocket.gcode")
+
+    def test_print_duration_climbing_does_not_trigger_reset(self):
+        # Sanity: a healthy in-flight print where print_duration only ever
+        # increases must NOT trigger the reset path.
+        t = self._t()
+        t.observe(self._printing("rocket.gcode", 10.0), 0.0)
+        t.observe(self._printing("rocket.gcode", 15.0), 5.0)
+        t.observe(self._printing("rocket.gcode", 20.0), 10.0)
+        self.assertEqual(t.pending(), [])
+
+
+class TestKlipperUrlErrorClassification(unittest.TestCase):
+    """`_classify_url_error` — inner-reason unwrap to truthful directional codes."""
+
+    def _classify(self):
+        from makeros_hub.printers.klipper import _classify_url_error
+
+        return _classify_url_error
+
+    def test_timeout_error_inner_reason_returns_timeout(self):
+        classify = self._classify()
+        err = URLError(TimeoutError("timed out"))
+        self.assertEqual(classify(err), "timeout")
+
+    def test_socket_timeout_inner_reason_returns_timeout(self):
+        import socket as _socket
+
+        classify = self._classify()
+        err = URLError(_socket.timeout("timed out"))
+        self.assertEqual(classify(err), "timeout")
+
+    def test_gaierror_inner_reason_returns_dns_failure(self):
+        import socket as _socket
+
+        classify = self._classify()
+        err = URLError(_socket.gaierror("Name or service not known"))
+        self.assertEqual(classify(err), "dns_failure")
+
+    def test_connection_refused_inner_reason_returns_unreachable(self):
+        classify = self._classify()
+        err = URLError(ConnectionRefusedError("refused"))
+        self.assertEqual(classify(err), "unreachable")
+
+    def test_unknown_inner_reason_defaults_unreachable(self):
+        classify = self._classify()
+        err = URLError("opaque socket error")
+        self.assertEqual(classify(err), "unreachable")
+
+
+class TestKlipperWidenedHttpErrorMatcher(unittest.TestCase):
+    """`_classify_control_http_error` — observed Moonraker phrasings."""
+
+    def _classify(self):
+        from makeros_hub.printers.klipper import _classify_control_http_error
+
+        return _classify_control_http_error
+
+    def test_not_currently_paused_returns_not_paused(self):
+        classify = self._classify()
+        body = '{"error": {"message": "Print is not currently paused"}}'
+        self.assertEqual(classify(400, body), "not_paused")
+
+    def test_cannot_resume_returns_not_paused(self):
+        classify = self._classify()
+        body = '{"error": {"message": "Cannot resume — no paused print"}}'
+        self.assertEqual(classify(400, body), "not_paused")
+
+    def test_no_active_print_returns_not_printing(self):
+        classify = self._classify()
+        body = '{"error": {"message": "No active print"}}'
+        self.assertEqual(classify(400, body), "not_printing")
+
+    def test_klippy_busy_returns_klipper_error(self):
+        classify = self._classify()
+        body = '{"error": {"message": "klippy is busy: shutdown in progress"}}'
+        self.assertEqual(classify(400, body), "klipper_error")
+
+    def test_500_class_returns_klipper_error(self):
+        classify = self._classify()
+        self.assertEqual(classify(503, ""), "klipper_error")
+
+    def test_404_returns_endpoint_missing(self):
+        classify = self._classify()
+        self.assertEqual(classify(404, ""), "endpoint_missing")
+
+    def test_unknown_400_message_returns_invalid_state(self):
+        classify = self._classify()
+        body = '{"error": {"message": "weird unknown error"}}'
+        self.assertEqual(classify(400, body), "invalid_state")
+
+
+class StubMoonraker200NotOk(http.server.BaseHTTPRequestHandler):
+    """Returns HTTP 200 with a body that is JSON but result != 'ok'.
+    Used to verify the strict-200 result check (adversarial MED #9)."""
+
+    def do_POST(self):
+        body = b'{"result": "queued"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *_args, **_kw):
+        return
+
+
+class TestKlipperStrict200(unittest.TestCase):
+    def test_200_with_non_ok_result_returns_shape_mismatch(self):
+        # A proxy in front of Moonraker, or a future Moonraker version that
+        # adds an async control mode, could return 200 with a non-ok body.
+        # We want LOUD failure not silent success — admin needs to know.
+        server = http.server.HTTPServer(("127.0.0.1", 0), StubMoonraker200NotOk)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            adapter = KlipperAdapter("printer-1", f"http://127.0.0.1:{port}")
+            adapter._last_poll_ok_at = time.monotonic()
+            out = adapter.send_command("pause")
+            self.assertEqual(out["ok"], False)
+            self.assertEqual(out["reason"], "shape_mismatch")
+            self.assertEqual(out["httpStatus"], 200)
         finally:
             server.shutdown()
             server.server_close()
