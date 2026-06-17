@@ -69,6 +69,19 @@ PROBES: dict[str, ProbeSpec] = {
         max_output_bytes=16 * 1024,
         internal="agent-config",
     ),
+    # "Scan now" — the admin-triggered LAN discovery sweep. Internal probe
+    # (no subprocess) — it calls into makeros_hub.discovery.run_immediate_scan
+    # and returns the discovered hits (Moonraker + Bambu) as a JSON-encoded
+    # list in `output`. Bumped timeout: a sweep takes ~8s Moonraker + ~3s
+    # SSDP wall-clock; the budget here is the OUTER probe deadline before
+    # the dispatcher gives up on the result. 20s leaves headroom for jitter.
+    # max_output_bytes sized to fit ~100 hits with full displayInfo blobs.
+    "lan-scan": ProbeSpec(
+        (),
+        timeout=20.0,
+        max_output_bytes=128 * 1024,
+        internal="lan-scan",
+    ),
 }
 
 
@@ -137,6 +150,17 @@ def _run_internal_probe(name: str, spec: ProbeSpec, start: float) -> dict:
             raw_output = json.dumps(binary_presence(), sort_keys=True)
         elif spec.internal == "agent-config":
             raw_output = json.dumps(_agent_config_snapshot(), sort_keys=True)
+        elif spec.internal == "lan-scan":
+            # Forced fresh sweep, bypasses the periodic rate-limit. The same
+            # hits are also CACHED so the next heartbeat ships them under
+            # `discoveryHits` — no second sweep, the cloud sees the same set
+            # twice (once via the probe rawOutput, once via the heartbeat
+            # field). De-dup happens cloud-side.
+            from . import discovery  # local import — keeps probes.py import-cheap
+
+            raw_output = discovery.hits_to_json_for_probe(
+                discovery.run_immediate_scan()
+            )
         else:
             raise RuntimeError("unknown internal probe")
         output, truncated = _safe_output(raw_output, spec.max_output_bytes)

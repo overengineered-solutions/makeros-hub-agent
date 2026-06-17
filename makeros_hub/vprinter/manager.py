@@ -341,13 +341,20 @@ class _VirtualPrinterRuntime:
             log=log.info,
         )
 
+        # Bind each per-VP server to THIS VP's bind_ip (not 0.0.0.0) so multiple
+        # VPs (Option A — one per printer model) can coexist on the same Pi
+        # without port collisions. The original single-VP code bound 0.0.0.0
+        # because there was only ever one VP to listen on; multi-VP requires
+        # per-IP isolation. Reverse-compat is fine: a single-VP workspace just
+        # binds one IP and gets the same behavior as before.
+        bind_ip = self.config.bind_ip
         try:
             self.servers.append(
-                await start_bind_server("0.0.0.0", PLAIN_BIND_PORT, bind_config, log.info)
+                await start_bind_server(bind_ip, PLAIN_BIND_PORT, bind_config, log.info)
             )
             self.servers.append(
                 await start_bind_server(
-                    "0.0.0.0",
+                    bind_ip,
                     TLS_BIND_PORT,
                     bind_config,
                     log.info,
@@ -356,7 +363,7 @@ class _VirtualPrinterRuntime:
             )
             self.servers.append(
                 await self.broker.start(
-                    "0.0.0.0",
+                    bind_ip,
                     MQTT_PORT,
                     create_server_ssl_context(bundle),
                 )
@@ -375,7 +382,7 @@ class _VirtualPrinterRuntime:
                 )
             )
             self.ftp = await start_ftp_server(
-                "0.0.0.0",
+                bind_ip,
                 FTPS_PORT,
                 FtpConfig(
                     ip=self.config.bind_ip,
