@@ -36,7 +36,7 @@ from .vprinter.live_pool import updated_config_if_pool_changed
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import TransportError, get_json, post_json
 from .ingest import IngestServer
-from .probes import PROBES, run_probe, set_effective_config
+from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import PrinterManager
 from .printers.camera import CameraScheduler, collect_camera_frames
 from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples, stub_detector
@@ -505,6 +505,57 @@ def _uptime_sec() -> int | None:
         return None
 
 
+def _collect_pi_metrics(tick_wall_ms: int | None = None) -> dict:
+    """Cheap psutil-free resource snapshot for the cloud's hub-health tile.
+
+    Reads stdlib + /proc + /sys only — no third-party dep. Each source is
+    independently best-effort: if /proc/meminfo is missing or thermal_zone0
+    doesn't exist (non-Pi dev box), the key is just omitted. Stops the cloud
+    from having to guess 'is the Pi saturated' next time the operator reports
+    intermittency.
+
+    Returns a small dict, ready to ship under heartbeat.piMetrics:
+      loadAvg1m   : float — os.getloadavg()[0] (1-minute load average)
+      memUsedPct  : int   — (1 - MemAvailable/MemTotal) × 100 from /proc/meminfo
+      cpuTempC    : int   — /sys/class/thermal/thermal_zone0/temp / 1000
+      tickWallMs  : int   — caller-provided self-timing for the heartbeat tick
+    """
+    metrics: dict = {}
+    try:
+        # getloadavg is documented as 1m/5m/15m on POSIX. Round to 2dp so the
+        # cloud's last-seen jsonb stays compact.
+        metrics["loadAvg1m"] = round(os.getloadavg()[0], 2)
+    except (OSError, AttributeError):
+        pass
+    try:
+        with open("/proc/meminfo", encoding="utf-8") as fh:
+            total = avail = None
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    total = int(line.split()[1])
+                elif line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1])
+                if total is not None and avail is not None:
+                    break
+            if total and avail is not None and total > 0:
+                metrics["memUsedPct"] = max(0, min(100, int(round((1 - avail / total) * 100))))
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        with open("/sys/class/thermal/thermal_zone0/temp", encoding="utf-8") as fh:
+            raw = int(fh.read().strip())
+            # Most boards report millidegC; some Pi clones report degC×1. Clamp
+            # to a plausible 0-130°C window to drop obviously-bogus readings.
+            celsius = raw / 1000 if raw > 200 else raw
+            if 0 <= celsius <= 130:
+                metrics["cpuTempC"] = int(round(celsius))
+    except (OSError, ValueError):
+        pass
+    if isinstance(tick_wall_ms, int) and tick_wall_ms >= 0:
+        metrics["tickWallMs"] = tick_wall_ms
+    return metrics
+
+
 TAILSCALE_HEARTBEAT_FIELDS = (
     "tailscaleIp",
     "tailscaleHostname",
@@ -529,11 +580,12 @@ def heartbeat_payload(
     command_results: list[dict] | None = None,
     diagnostics=None,
     camera_frames: list[dict] | None = None,
-    camera_failures: list[str] | None = None,
+    camera_failures: list[dict] | list[str] | None = None,
     failure_samples: list[dict] | None = None,
     vp_ca: tuple[str, str] | None = None,
     discovery_hits: list[dict] | None = None,
     vp_bindings: list[dict] | None = None,
+    pi_metrics: dict | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -558,7 +610,19 @@ def heartbeat_payload(
     if camera_frames:
         payload["cameraFrames"] = list(camera_frames)
     if camera_failures:
+        # v0.41.0: the shape became list[dict{printerId,reason,stderrTail}] so
+        # the cloud's nativeprint.camera.no_frame event can carry a categorized
+        # cause per printer ('liveview-off' / 'auth-fail' / 'unreachable' / …)
+        # instead of an opaque list of printerIds. Old callers that still hand
+        # in list[str] pass through unchanged — the cloud heartbeat route is
+        # tolerant to either shape.
         payload["cameraFailures"] = list(camera_failures)
+    if isinstance(pi_metrics, dict) and pi_metrics:
+        # Bounded numeric metrics from the Pi for the cloud's hub-health tile.
+        # Keys: loadAvg1m, memUsedPct, cpuTempC, tickWallMs. Read with
+        # _collect_pi_metrics — all four are best-effort; any missing or
+        # unreadable source is silently omitted.
+        payload["piMetrics"] = pi_metrics
     if failure_samples:
         payload["failureSamples"] = list(failure_samples)
     # V4 Slice 2 — managed CA delivery. When the agent has an enabled VP
@@ -1092,6 +1156,13 @@ def run(
 
     interval = cfg.heartbeat_sec
     manager = PrinterManager(diagnostics=diagnostics)
+    # Wire the camera-test probe so it can enumerate the same printer list
+    # the heartbeat tick captures from. Filtered by cameraEnabled so the
+    # probe doesn't fire ffmpeg against printers the admin has explicitly
+    # toggled off.
+    set_camera_targets_provider(
+        lambda: [t for t in manager.camera_targets() if t.get("cameraEnabled")]
+    )
     vp_submission_queue: queue.Queue[CapturedJob] = (
         _submission_queue
         if _submission_queue is not None
@@ -1262,7 +1333,7 @@ def run(
                 # adaptive cadence + parallel/bounded — best-effort, never sinks
                 # the heartbeat (a failure just sends no frame this beat).
                 camera_frames: list[dict] | None = None
-                camera_failures: list[str] | None = None
+                camera_failures: list[dict] | None = None
                 try:
                     all_targets = manager.camera_targets()
                     eligible = [
@@ -1287,15 +1358,23 @@ def run(
                         # R4.5 agent-side loudness — when failures > 0, mirror
                         # the cloud's loud signal to the Pi-local diagnostics
                         # board so an offline operator can triage without a
-                        # cloud round-trip. Summary only (one line/beat), with
-                        # bounded printerId echo so a 16-printer fleet doesn't
-                        # bloat the diag string. PrinterIds are non-PII.
+                        # cloud round-trip. Summary line carries categorized
+                        # reasons (counts per reason) so a quick read of the
+                        # Pi-local diag tells the operator the dominant cause
+                        # without opening the cloud admin.
                         if camera_failures:
+                            reason_counts: dict[str, int] = {}
+                            for f in camera_failures:
+                                r = f.get("reason") or "unknown"
+                                reason_counts[r] = reason_counts.get(r, 0) + 1
+                            reason_summary = ", ".join(
+                                f"{r}={n}" for r, n in sorted(reason_counts.items())
+                            )
                             _record_diagnostic(
                                 diagnostics,
                                 "camera",
                                 f"no frame from {len(camera_failures)}/{len(eligible)} eligible: "
-                                + ",".join(camera_failures[:5]),
+                                + reason_summary,
                             )
                 except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
                     _record_diagnostic(
@@ -1437,6 +1516,18 @@ def run(
                         "lan_scan",
                         f"sweep failed: {redact(str(exc))}",
                     )
+                # Pi runtime snapshot — load1m / memUsedPct / cpuTempC. Cheap
+                # to read, never raises, missing keys silently dropped.
+                # Wrapped: a /proc read regression must not sink the heartbeat.
+                try:
+                    pi_metrics = _collect_pi_metrics()
+                except Exception as exc:  # noqa: BLE001
+                    _record_diagnostic(
+                        diagnostics,
+                        "pi_metrics",
+                        f"collect failed: {redact(str(exc))}",
+                    )
+                    pi_metrics = None
                 resp = post_json(
                     cfg.heartbeat_url,
                     heartbeat_payload(
@@ -1452,6 +1543,7 @@ def run(
                         vp_ca=vp_ca,
                         discovery_hits=discovery_hits,
                         vp_bindings=pending_vp_bindings,
+                        pi_metrics=pi_metrics,
                     ),
                     bearer=credential,
                     retries=3,

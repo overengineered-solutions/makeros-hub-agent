@@ -27,6 +27,7 @@ from makeros_hub.agent import (
     _flush_queue_status_reports,
     _install_shutdown_signal_handlers,
     _make_vprinter_capture_handler,
+    _collect_pi_metrics,
     _maybe_retry_tailscale_config,
     _maybe_retry_vprinter_config,
     _pull_config,
@@ -118,6 +119,46 @@ class TestHeartbeatPayload(unittest.TestCase):
             self.assertIn(key, p)
         self.assertEqual(p["printers"], [])
         self.assertEqual(p["jobs"], [])
+
+    def test_collect_pi_metrics_includes_tick_wall_ms_when_provided(self):
+        # tickWallMs is the only field with a caller-supplied input — the rest
+        # are read from /proc + /sys + os.getloadavg with their own best-effort
+        # error handling. This test pins the simple-case contract: passing
+        # tick_wall_ms forwards it; not passing it omits the key.
+        m = _collect_pi_metrics(tick_wall_ms=123)
+        self.assertEqual(m.get("tickWallMs"), 123)
+        m_no_tick = _collect_pi_metrics()
+        self.assertNotIn("tickWallMs", m_no_tick)
+
+    def test_collect_pi_metrics_negative_tick_is_dropped(self):
+        # A monotonic-clock regression (negative delta) is silently dropped so
+        # the cloud sees a missing field rather than a bogus negative value.
+        m = _collect_pi_metrics(tick_wall_ms=-5)
+        self.assertNotIn("tickWallMs", m)
+
+    def test_pi_metrics_ship_when_provided(self):
+        # v0.41.0: heartbeat carries piMetrics so the cloud can render a
+        # hub-health tile and answer "is the Pi saturated" without guessing.
+        p = heartbeat_payload(pi_metrics={"loadAvg1m": 1.23, "memUsedPct": 47, "cpuTempC": 58})
+        self.assertEqual(p["piMetrics"], {"loadAvg1m": 1.23, "memUsedPct": 47, "cpuTempC": 58})
+
+    def test_pi_metrics_absent_when_empty_or_none(self):
+        # Empty/None means a /proc read regression — silently omit so the
+        # field doesn't show up as bogus zeros in the cloud admin tile.
+        p = heartbeat_payload(pi_metrics=None)
+        self.assertNotIn("piMetrics", p)
+        p = heartbeat_payload(pi_metrics={})
+        self.assertNotIn("piMetrics", p)
+
+    def test_camera_failures_shape_v041(self):
+        # v0.41.0: failures shape became list[dict{printerId,reason,stderrTail}].
+        # The payload accepts and ships the dict shape unchanged.
+        failures = [
+            {"printerId": "p1", "reason": "liveview-off", "stderrTail": "404"},
+            {"printerId": "p2", "reason": "auth-fail", "stderrTail": "401"},
+        ]
+        p = heartbeat_payload(camera_failures=failures)
+        self.assertEqual(p["cameraFailures"], failures)
 
     def test_tailscale_fields_omit_absent_values(self):
         p = heartbeat_payload(
