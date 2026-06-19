@@ -615,8 +615,9 @@ def heartbeat_payload(
         # cause per printer ('liveview-off' / 'auth-fail' / 'unreachable' / …)
         # instead of an opaque list of printerIds. Old callers that still hand
         # in list[str] pass through unchanged — the cloud heartbeat route is
-        # tolerant to either shape.
-        payload["cameraFailures"] = list(camera_failures)
+        # tolerant to either shape. Cap at 64 (well above any real fleet) so a
+        # misbehaving caller can't bloat the heartbeat payload.
+        payload["cameraFailures"] = list(camera_failures)[:64]
     if isinstance(pi_metrics, dict) and pi_metrics:
         # Bounded numeric metrics from the Pi for the cloud's hub-health tile.
         # Keys: loadAvg1m, memUsedPct, cpuTempC, tickWallMs. Read with

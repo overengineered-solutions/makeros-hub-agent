@@ -24,9 +24,13 @@ from __future__ import annotations
 import socket
 import ssl
 import struct
+from dataclasses import dataclass
 from typing import Optional
 
 CAMERA_PORT = 6000
+# Bounded detail string surfaced alongside the categorized reason (no secret
+# risk — :6000 exceptions are connection errors, they don't echo the code).
+_DETAIL_TAIL = 200
 _AUTH_HEADER = struct.pack("<IIII", 0x40, 0x3000, 0, 0)
 # Generic JPEG start: SOI (FF D8) + the first marker byte (FF). Matches APP0/JFIF
 # (FF D8 FF E0) AND Exif/quant-table variants (FF E1 / DB) so a non-JFIF frame
@@ -45,16 +49,32 @@ def _auth_packet(access_code: str) -> bytes:
     return _AUTH_HEADER + username + code
 
 
-def capture_frame(
+@dataclass(frozen=True)
+class CaptureResult:
+    """Outcome of one :6000 capture. Mirrors rtsp_camera.CaptureResult's shape +
+    reason vocabulary so the cloud's no_frame copy map handles both paths
+    identically. On success: jpeg set, reason None. On failure: jpeg None,
+    reason categorized ('unreachable' / 'timeout' / 'tls-error' / 'liveview-off'
+    / 'bad-jpeg' / 'unknown'), detail a bounded non-secret excerpt."""
+
+    jpeg: Optional[bytes]
+    reason: Optional[str]
+    detail: str
+
+
+def capture_frame_with_reason(
     host: str,
     access_code: str,
     *,
     timeout: float = _DEFAULT_TIMEOUT,
     max_bytes: int = _MAX_FRAME_BYTES,
-) -> Optional[bytes]:
-    """Return one JPEG frame from the printer's :6000 camera, or None on failure."""
+) -> CaptureResult:
+    """Capture one :6000 frame, categorizing the failure on the exception/outcome
+    (there's no ffmpeg stderr here — the socket layer is the signal). Brings the
+    A1/P1 path to diagnostic parity with the RTSP path so an A1 failure (wrong
+    code / LAN-mode off / asleep) is actionable instead of a silent 'unknown'."""
     if not host or not access_code:
-        return None
+        return CaptureResult(None, "unreachable", "")
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
@@ -65,10 +85,41 @@ def capture_frame(
             raw.settimeout(timeout)
             with ctx.wrap_socket(raw, server_hostname=host) as tls:
                 tls.sendall(_auth_packet(access_code))
-                return _read_one_jpeg(tls, max_bytes)
-    except (OSError, ssl.SSLError, ValueError):
-        # ValueError guards an empty/odd host; OSError covers connect/timeout/reset.
-        return None
+                jpeg = _read_one_jpeg(tls, max_bytes)
+    except ssl.SSLError as exc:
+        return CaptureResult(None, "tls-error", str(exc)[:_DETAIL_TAIL])
+    except socket.timeout:
+        return CaptureResult(None, "timeout", "")
+    except ConnectionRefusedError:
+        return CaptureResult(None, "unreachable", "connection refused")
+    except (OSError, ValueError) as exc:
+        # OSError covers EHOSTUNREACH/ENETUNREACH/reset; ValueError an odd host.
+        return CaptureResult(None, "unreachable", str(exc)[:_DETAIL_TAIL])
+
+    if jpeg:
+        return CaptureResult(jpeg, None, "")
+    # Connected + authed but no JPEG framed before max_bytes / clean close. The
+    # dominant causes are LAN-Mode Liveview off or a wrong access code (the
+    # printer accepts the socket then closes without streaming). We can't tell
+    # them apart on :6000, so report the more-common operator cause and let the
+    # detail string carry the ambiguity.
+    return CaptureResult(
+        None, "liveview-off", "no frame (LAN-Mode Liveview off, or wrong access code)"
+    )
+
+
+def capture_frame(
+    host: str,
+    access_code: str,
+    *,
+    timeout: float = _DEFAULT_TIMEOUT,
+    max_bytes: int = _MAX_FRAME_BYTES,
+) -> Optional[bytes]:
+    """Return one JPEG frame from the printer's :6000 camera, or None on failure.
+    Back-compat shim around capture_frame_with_reason."""
+    return capture_frame_with_reason(
+        host, access_code, timeout=timeout, max_bytes=max_bytes
+    ).jpeg
 
 
 def _read_one_jpeg(sock: ssl.SSLSocket, max_bytes: int) -> Optional[bytes]:

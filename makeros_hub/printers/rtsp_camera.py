@@ -11,28 +11,37 @@ access code (same code as MQTT/FTPS). Stdlib only (subprocess + select + shutil)
 
 Credential exposure (accepted): ffmpeg takes the RTSP URL — which embeds the LAN
 access code — in its argv, so the code is briefly visible in `ps`/`/proc` for
-the ≤timeout life of the process. This is an accepted exposure for this threat
-model: the hub is a single-tenant shop appliance (only the operator + this
-agent), the value is a LAN-local printer access code (not an API key/token) that
-already lives on the box for the MQTT/FTPS paths, and the process is short-lived.
-We do NOT log/echo it (R2.10 still holds for our own logging). A localhost RTSP
-auth-proxy would remove even the argv exposure but is out of scope here.
+the ≤timeout life of the process. Accepted for this threat model: the hub is a
+single-tenant shop appliance, the value is a LAN-local printer access code (not
+an API key) that already lives on the box for MQTT/FTPS, and the process is
+short-lived. We never log/echo it (redacted from any stderr before it leaves).
 
-Observability (v0.41.0): on failure, capture_frame_with_reason returns a
-CaptureResult with a categorized `reason` ('no-ffmpeg' / 'liveview-off' /
-'auth-fail' / 'unreachable' / 'timeout' / 'bad-jpeg') and a bounded redacted
-`stderr_tail` (≤400 chars) so the cloud's `nativeprint.camera.no_frame` event
-can name the cause instead of just the printerId. Categorization is keyword-
-based against ffmpeg's stderr — see _categorize_stderr — and matches the
-patterns we've seen in practice on Bambu :322. The access code is redacted from
-stderr before it leaves this module.
+Socket timeout (v0.42.0): the prior v0.41.0 hard-coded `-stimeout`, which the
+Pi's ffmpeg (Bookworm 5.1) rejects at argv-parse time ("Error splitting the
+argument list: Option not found") — that broke ALL RTSP cameras the moment
+v0.41.0 deployed. `-stimeout` was renamed to `-timeout` on the RTSP demuxer in
+ffmpeg 5.0 and the alias dropped. We now (a) never hard-code an unprobed flag —
+`_supported_timeout_flag()` runs ffmpeg ONCE at first use to discover which
+socket-timeout flag this build actually accepts (preferring the portable
+AVIO-level `-rw_timeout`), and (b) degrade safely to the Python `select()`
+deadline if none is supported. An unrecognized flag can therefore never again
+silently break capture.
+
+Observability (v0.41.0+): on failure, capture_frame_with_reason returns a
+CaptureResult with a categorized `reason` and a bounded redacted `stderr_tail`
+so the cloud's `nativeprint.camera.no_frame` event names the cause. Reason
+strings are a stable contract mirrored by the cloud copy map at
+apps/web/app/(admin)/admin/3dprinting/hubs/printers-section.tsx (NoFrameHint).
 """
 
 from __future__ import annotations
 
+import functools
 import logging
+import os
 import select
 import shutil
+import signal
 import subprocess
 import time
 from dataclasses import dataclass
@@ -42,42 +51,48 @@ from urllib.parse import quote
 log = logging.getLogger("makeros-hub.printers")
 
 RTSP_PORT = 322
-_DEFAULT_TIMEOUT = 10.0
+# Per-capture wall-clock deadline. MUST stay below collect_camera_frames'
+# overall_timeout (8s) so a single wedged capture is bounded by ITS OWN
+# categorizable deadline rather than being abandoned (uncategorized) by the
+# pool. Layering: socket flag (4s) < per-capture deadline (5.5s) < pool (8s).
+_DEFAULT_TIMEOUT = 5.5
+# ffmpeg socket I/O timeout (µs) spliced before -i when the build supports a
+# socket-timeout flag. 4s < the 5.5s python deadline so ffmpeg self-exits
+# (cleanly, categorizable) before python has to SIGKILL it.
+_SOCKET_TIMEOUT_USEC = 4_000_000
 # A 720p H.264 keyframe → JPEG is ~50-300 KB; cap so a misbehaving/hostile peer
 # on :322 can't stream unbounded bytes into agent memory.
 _MAX_FRAME_BYTES = 4 * 1024 * 1024
-# Bounded stderr we capture for the cloud's no_frame event payload. ffmpeg's
-# error messages are tiny (sub-1KB) so 4KB is generous; we trim to STDERR_TAIL
-# chars on the way out so the audit log stays cheap to store.
+# Bounded stderr captured for the cloud's no_frame payload. ffmpeg with
+# -loglevel error emits sub-1KB; 4KB is generous. We keep DRAINING the pipe
+# past the cap (discarding) so a chatty child can't backpressure-stall us.
 _MAX_STDERR_BYTES = 4 * 1024
 STDERR_TAIL = 400
-# Socket I/O timeout passed to ffmpeg's `-stimeout` (microseconds). 5s catches
-# half-open TCP that the python-side select-deadline currently has to clean up
-# via SIGKILL; lower than _DEFAULT_TIMEOUT so the python timeout still wins on
-# a wedged ffmpeg process. Source: ffmpeg RTSP protocol docs + the workflow
-# diagnose recommendation 2026-06-17.
-_STIMEOUT_USEC = 5_000_000
 _SOI = b"\xff\xd8\xff"  # JPEG start-of-image
 _EOI = b"\xff\xd9"  # JPEG end-of-image
 _warned_no_ffmpeg = False
 
 
-# Categorized reason for the cloud's no_frame event payload. Keep these stable
-# — the cloud admin UI maps them to operator-facing copy ("Toggle LAN-Mode
-# Liveview ON on the printer LCD", etc.). Adding a new reason here means
-# adding its copy on the cloud side.
-NoFrameReason = str  # one of: no-ffmpeg / liveview-off / auth-fail / unreachable / timeout / bad-jpeg / unknown
+# Categorized reason for the cloud's no_frame event payload. STABLE CONTRACT —
+# the cloud admin UI maps each to operator-facing copy. Adding one here means
+# adding its copy on the cloud side (printers-section.tsx NoFrameHint).
+#   no-ffmpeg     — ffmpeg not installed on the hub (agent/host issue)
+#   ffmpeg-arg    — ffmpeg rejected our argv (AGENT BUG, never the operator's)
+#   liveview-off  — printer's LAN-Mode Liveview is off (RTSP 404 / stream gone)
+#   auth-fail     — LAN access code rejected (401/403)
+#   unreachable   — no route / refused / DNS / connection timed out
+#   tls-error     — TLS handshake/cert failure
+#   timeout       — our deadline or ffmpeg's socket timeout fired
+#   bad-jpeg      — ffmpeg returned 0 but the bytes aren't a valid JPEG
+#   unknown       — uncategorized (stderr_tail carries the raw cause)
+NoFrameReason = str
 
 
 @dataclass(frozen=True)
 class CaptureResult:
-    """Outcome of one capture attempt.
-
-    On success: jpeg is the JPEG bytes, reason is None, stderr_tail is "".
-    On failure: jpeg is None, reason is a categorized string, stderr_tail
-    is a redacted ≤STDERR_TAIL-char excerpt of ffmpeg's stderr (or "" if
-    we never invoked ffmpeg — e.g. no-ffmpeg / no-host).
-    """
+    """Outcome of one capture attempt. On success: jpeg set, reason None,
+    stderr_tail "". On failure: jpeg None, reason categorized, stderr_tail a
+    redacted ≤STDERR_TAIL-char excerpt (or "" when ffmpeg never ran)."""
 
     jpeg: Optional[bytes]
     reason: Optional[NoFrameReason]
@@ -86,6 +101,58 @@ class CaptureResult:
 
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+@functools.lru_cache(maxsize=1)
+def _supported_timeout_flag() -> tuple[str, ...]:
+    """Discover ONCE (cached for the process) which socket-timeout flag this
+    ffmpeg build accepts, by actually running ffmpeg with the candidate against
+    a trivial lavfi input and checking for an argv-parse rejection. Returns the
+    argv fragment to splice before -i (e.g. ('-rw_timeout','4000000')), or ()
+    if none are accepted — in which case we rely on the Python deadline alone.
+
+    Preference order: `-rw_timeout` (AVIO-level, one consistent meaning, present
+    since ffmpeg 3.x and on 5.1) → `-timeout` (RTSP-demuxer socket timeout on
+    ffmpeg ≥5, but overloaded/position-sensitive) → `-stimeout` (legacy, removed
+    on 5.x — last resort for very old builds). Directly RUN-probing (not grepping
+    `-h`) is what prevents a repeat of the v0.41.0 regression: we only ship a
+    flag this exact binary has proven it accepts."""
+    if not ffmpeg_available():
+        return ()
+    for flag in ("-rw_timeout", "-timeout", "-stimeout"):
+        argv = [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostdin",
+            flag,
+            str(_SOCKET_TIMEOUT_USEC),
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=16x16:d=0",
+            "-frames:v",
+            "0",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            return ()  # can't probe → degrade to python-deadline-only
+        err = (r.stderr or "").lower()
+        if (
+            "option not found" not in err
+            and "error splitting the argument list" not in err
+            and "unrecognized option" not in err
+        ):
+            log.info("rtsp camera: using socket-timeout flag %s", flag)
+            return (flag, str(_SOCKET_TIMEOUT_USEC))
+    log.warning(
+        "rtsp camera: no ffmpeg socket-timeout flag accepted; "
+        "relying on the per-capture deadline only"
+    )
+    return ()
 
 
 def rtsp_url(host: str, access_code: str) -> str:
@@ -104,11 +171,9 @@ def ffmpeg_argv(host: str, access_code: str) -> list[str]:
         # accepts the self-signed printer cert by default (no -tls_verify 1).
         "-rtsp_transport",
         "tcp",
-        # Socket I/O timeout (µs). Catches half-open TCP at the socket layer
-        # so the python-side select-deadline doesn't have to SIGKILL a wedged
-        # process. Must come BEFORE -i.
-        "-stimeout",
-        str(_STIMEOUT_USEC),
+        # Socket I/O timeout — only the flag this build PROVED it accepts (or
+        # nothing). Must precede -i. Empty tuple = degrade to the python deadline.
+        *_supported_timeout_flag(),
         "-i",
         rtsp_url(host, access_code),
         "-frames:v",
@@ -122,88 +187,105 @@ def ffmpeg_argv(host: str, access_code: str) -> list[str]:
 
 
 def _redact_access_code(text: str, access_code: str) -> str:
-    """Strip the LAN access code from ffmpeg stderr before it leaves this module.
-    ffmpeg always echoes the URL it tried to dial back into its error output, so
-    the credential would otherwise land in system_events.payload."""
+    """Strip the LAN access code from ffmpeg stderr before it leaves this module
+    — ffmpeg echoes the dial URL (which embeds the code) into its error output."""
     if not text or not access_code:
         return text
-    quoted = quote(access_code, safe="")
-    return text.replace(access_code, "***").replace(quoted, "***")
+    return text.replace(access_code, "***").replace(quote(access_code, safe=""), "***")
 
 
-def _categorize_stderr(stderr: str, returncode: Optional[int], deadline_hit: bool) -> NoFrameReason:
-    """Map ffmpeg stderr + returncode → one of the categorized reasons. The
-    operator-facing copy on the cloud side keys off this string, so the list
-    is a stable contract. Add a new reason only by also extending the cloud
-    map at apps/web/lib/print/camera-no-frame-copy.ts (mirrored)."""
-    if deadline_hit:
-        return "timeout"
+def _categorize_stderr(stderr: str, returncode: Optional[int], timed_out: bool) -> NoFrameReason:
+    """Map ffmpeg stderr + returncode + an explicit deadline flag → a stable
+    reason. `timed_out` is the runner's authoritative signal that OUR deadline
+    fired (not re-derived from wall-clock, which is brittle on a loaded Pi)."""
     blob = stderr.lower() if stderr else ""
-    # Network-layer failures first — these eclipse any application semantics.
+    # OUR bug first — an unrecognized/garbled flag. Nothing else looks like this,
+    # and it must never masquerade as an operator-fixable reason (this is exactly
+    # the v0.41.0 -stimeout outage, which showed as 'unknown × 7').
+    if (
+        "error splitting the argument list" in blob
+        or "option not found" in blob
+        or "unrecognized option" in blob
+        or "trailing option" in blob
+    ):
+        return "ffmpeg-arg"
+    if timed_out:
+        return "timeout"
+    # Network reachability (incl. ffmpeg's own "Connection timed out" on connect).
     if any(
-        marker in blob
-        for marker in (
+        m in blob
+        for m in (
             "no route to host",
             "network is unreachable",
             "connection refused",
             "name or service not known",
+            "failed to resolve",
             "host is down",
+            "connection timed out",
         )
     ):
         return "unreachable"
-    # Authentication failure — the access code on file doesn't match what the
-    # printer has stored.
-    if "401" in blob or "unauthorized" in blob or "authentication" in blob:
+    if "401 unauthorized" in blob or "403 forbidden" in blob:
         return "auth-fail"
-    # Liveview-off / RTSP server-not-listening — most common operator
-    # misconfiguration. Bambu's :322 closes the TCP socket cleanly when
-    # Liveview is OFF, ffmpeg sees this as connection-failed/EOF without
-    # a 401. The most reliable signature is "Server returned 404" /
-    # "rtsp/1.0 404" or "End of file" on read.
-    if any(
-        marker in blob
-        for marker in (
-            "404 not found",
-            "rtsp/1.0 404",
-            "stream not found",
-            "could not find rtsp option",
-            "describe failed",
-        )
+    # Liveview-off: Bambu :322 closes the stream / 404s the DESCRIBE when LAN
+    # Liveview is off. (Note: some firmwares simply refuse the TCP connect, which
+    # lands in 'unreachable' above — validate against a real OFF printer via the
+    # camera-test probe.) Require a 404/stream-gone signal, not a bare DESCRIBE
+    # failure (a DESCRIBE 500 is a different problem).
+    if (
+        "404 not found" in blob
+        or "rtsp/1.0 404" in blob
+        or "stream not found" in blob
+        or ("describe" in blob and "404" in blob)
     ):
         return "liveview-off"
-    # Common ffmpeg complaint when TLS handshake fails. Often correlates with
-    # Liveview-off on Bambu too, but we surface as its own reason so the cloud
-    # can show a different hint if it gets noisy.
-    if "tls" in blob and ("handshake" in blob or "ssl" in blob):
-        return "liveview-off"
-    if returncode is None:
-        # Deadline wasn't hit (already handled) but no rc either → killed.
+    if ("tls" in blob or "ssl" in blob) and ("handshake" in blob or "error" in blob):
+        return "tls-error"
+    # ffmpeg's own socket-timeout (rw_timeout) firing, distinct from connect.
+    if "operation timed out" in blob or "timed out" in blob:
         return "timeout"
+    if returncode is None:
+        return "timeout"  # killed (deadline/cap) with no actionable stderr
     return "unknown"
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the child's whole process group so a wedged ffmpeg (and any child
+    it spawned) dies immediately instead of being orphaned past the deadline.
+    Falls back to killing just the process if the group call fails."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            proc.kill()
+        except OSError:
+            pass
 
 
 def _run_ffmpeg(
     cmd: list[str], timeout: float, max_bytes: int
-) -> tuple[bytes, Optional[int], bytes]:
+) -> tuple[bytes, Optional[int], bytes, bool]:
     """Run ffmpeg, reading stdout INCREMENTALLY (select + read1) so memory is
-    bounded to max_bytes+1 regardless of how much the peer streams, and time is
-    bounded by `timeout`. stderr is captured to a bounded buffer (~_MAX_STDERR_BYTES)
-    so the caller can categorize the failure reason. Returns
-    (stdout_bytes, returncode, stderr_bytes); returncode is None if we had to
-    kill it (over the byte cap or the deadline). Never raises for I/O —
-    returns (b'', None, b'')."""
+    bounded to max_bytes+1, and time is bounded by `timeout`. stderr is captured
+    to a bounded buffer AND kept draining past the cap (so a chatty child can't
+    backpressure-stall stdout). Started in its own session so a wedged process
+    group can be SIGKILLed rather than orphaned. Returns
+    (stdout_bytes, returncode, stderr_bytes, timed_out); returncode is None when
+    we had to kill it (deadline or over-cap). Never raises for I/O."""
     try:
         proc = subprocess.Popen(  # noqa: S603 - argv list, shell=False
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
         )
     except OSError as exc:
-        # Bubble the OSError message as fake stderr so the caller can
-        # categorize (e.g. ffmpeg missing mid-flight); the wrapper has
-        # already gated on ffmpeg_available() so this is rare.
-        return b"", None, str(exc).encode("utf-8", errors="replace")
+        # Surface the OSError as pseudo-stderr so the caller can categorize.
+        return b"", None, str(exc).encode("utf-8", errors="replace"), False
     buf = bytearray()
     stderr_buf = bytearray()
     deadline = time.monotonic() + timeout
+    timed_out = False
     over_cap = False
     assert proc.stdout is not None
     assert proc.stderr is not None
@@ -211,10 +293,12 @@ def _run_ffmpeg(
         while len(buf) <= max_bytes:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                break  # deadline — kill below, no further reads
+                timed_out = True
+                break
             ready, _, _ = select.select([proc.stdout, proc.stderr], [], [], remaining)
             if not ready:
-                break  # timed out waiting for more output
+                timed_out = True
+                break
             saw_data = False
             if proc.stdout in ready:
                 chunk = proc.stdout.read1(65536)
@@ -224,44 +308,38 @@ def _run_ffmpeg(
             if proc.stderr in ready:
                 err_chunk = proc.stderr.read1(4096)
                 if err_chunk:
-                    # Bounded stderr buffer — stop appending once we hit the
-                    # cap so a misbehaving peer can't OOM us via stderr either.
+                    saw_data = True
+                    # Append up to the cap; beyond it KEEP READING (discard) so
+                    # the OS pipe never fills and backpressure-stalls the child.
                     room = _MAX_STDERR_BYTES - len(stderr_buf)
                     if room > 0:
                         stderr_buf += err_chunk[:room]
-                    saw_data = True
-            # No more data AND child exited → done.
             if not saw_data and proc.poll() is not None:
                 break
         else:
-            # Loop exited via the cap (len > max_bytes) — over-limit peer.
-            # Treat as "killed for cap" so callers never trust the bytes.
-            over_cap = True
+            over_cap = True  # exited the while via the byte cap — untrusted bytes
     finally:
         if proc.poll() is None:
-            proc.kill()
+            _kill_process_group(proc)
         try:
             rc = proc.wait(timeout=2)
         except subprocess.TimeoutExpired:
             rc = None
-        if over_cap:
-            # Force rc=None so the caller's contract holds: 0 = clean, >0 = ffmpeg
-            # error, None = killed (over cap / deadline). A SIGKILL exit code
-            # (-9) would otherwise be reported here on the cap path, which is
-            # the same operational outcome but breaks the `rc is None` check.
-            rc = None
-        # Drain any final stderr now that ffmpeg has stopped writing.
+        if over_cap or timed_out:
+            rc = None  # contract: 0 clean, >0 ffmpeg error, None killed
         try:
-            tail = proc.stderr.read(_MAX_STDERR_BYTES - len(stderr_buf))
-            if tail:
-                stderr_buf += tail
-        except Exception:  # noqa: BLE001 - stderr drain must never raise
+            room = _MAX_STDERR_BYTES - len(stderr_buf)
+            if room > 0:
+                tail = proc.stderr.read(room)
+                if tail:
+                    stderr_buf += tail
+        except Exception:  # noqa: BLE001 - final drain must never raise
             pass
         if proc.stdout is not None:
             proc.stdout.close()
         if proc.stderr is not None:
             proc.stderr.close()
-    return bytes(buf), rc, bytes(stderr_buf)
+    return bytes(buf), rc, bytes(stderr_buf), timed_out
 
 
 def capture_frame_with_reason(
@@ -272,11 +350,10 @@ def capture_frame_with_reason(
     max_bytes: int = _MAX_FRAME_BYTES,
     runner=_run_ffmpeg,
 ) -> CaptureResult:
-    """Like `capture_frame` but returns a categorized CaptureResult so callers
-    that surface the failure (the cloud no_frame event, the on-demand camera
-    test probe) can show the operator a concrete next step instead of "no
-    frame this beat". The same wrapper is used by both — capture_frame
-    discards the reason for back-compat."""
+    """Capture one frame, returning a categorized CaptureResult so callers that
+    surface the failure (the cloud no_frame event, the camera-test probe) can
+    show a concrete next step. `capture_frame` is the back-compat bytes-only
+    shim around this."""
     global _warned_no_ffmpeg
     if not host or not access_code:
         return CaptureResult(jpeg=None, reason="unreachable", stderr_tail="")
@@ -289,22 +366,20 @@ def capture_frame_with_reason(
             _warned_no_ffmpeg = True
         return CaptureResult(jpeg=None, reason="no-ffmpeg", stderr_tail="")
 
-    start = time.monotonic()
-    out, returncode, stderr_bytes = runner(ffmpeg_argv(host, access_code), timeout, max_bytes)
-    elapsed = time.monotonic() - start
-    deadline_hit = elapsed >= timeout - 0.05  # 50ms slop — select() polling jitter
+    out, returncode, stderr_bytes, timed_out = runner(
+        ffmpeg_argv(host, access_code), timeout, max_bytes
+    )
     stderr_text = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
-    redacted_stderr = _redact_access_code(stderr_text, access_code)
-    stderr_tail = redacted_stderr.strip().splitlines()[-1:][0] if redacted_stderr.strip() else ""
+    redacted = _redact_access_code(stderr_text, access_code).strip()
+    lines = redacted.splitlines()
+    stderr_tail = lines[-1] if lines else ""
     if len(stderr_tail) > STDERR_TAIL:
         stderr_tail = stderr_tail[-STDERR_TAIL:]
 
-    # A nonzero/none exit (Liveview off, auth fail, timeout, killed-over-cap)
-    # never yields a trusted frame even if stdout happens to look JPEG-shaped.
     if returncode != 0:
         return CaptureResult(
             jpeg=None,
-            reason=_categorize_stderr(redacted_stderr, returncode, deadline_hit),
+            reason=_categorize_stderr(redacted, returncode, timed_out),
             stderr_tail=stderr_tail,
         )
     if not (0 < len(out) <= max_bytes) or out[:3] != _SOI or out[-2:] != _EOI:
@@ -321,30 +396,25 @@ def capture_frame(
     runner=_run_ffmpeg,
 ) -> Optional[bytes]:
     """Return one JPEG frame from the printer's :322 RTSPS stream, or None on any
-    failure (no ffmpeg / Liveview off / unreachable / timeout / nonzero exit /
-    not-a-JPEG / over the byte cap). The caller treats None as 'no frame this
-    beat', never an error. `runner` is injectable for tests.
-
-    Back-compat shim around capture_frame_with_reason — preserved so external
-    callers (and the manual probe below) keep working unchanged."""
-    result = capture_frame_with_reason(
+    failure. Back-compat shim around capture_frame_with_reason."""
+    return capture_frame_with_reason(
         host, access_code, timeout=timeout, max_bytes=max_bytes, runner=runner
-    )
-    return result.jpeg
+    ).jpeg
 
 
-# Manual on-device probe to confirm the path before relying on it:
-#   python3 -m makeros_hub.printers.rtsp_camera <printer-ip> <access-code>
+# Manual on-device probe:  python3 -m makeros_hub.printers.rtsp_camera <ip> <code>
 if __name__ == "__main__":  # pragma: no cover - manual on-device probe
     import sys
 
     if len(sys.argv) != 3:
         print("usage: python3 -m makeros_hub.printers.rtsp_camera <ip> <access_code>")
         raise SystemExit(2)
+    print(f"socket-timeout flag: {_supported_timeout_flag() or '(none — python deadline only)'}")
     result = capture_frame_with_reason(sys.argv[1], sys.argv[2])
     if result.jpeg:
         print(
-            f"PASS :322 — captured {len(result.jpeg)} bytes (JPEG {result.jpeg[:4].hex()}..{result.jpeg[-2:].hex()})"
+            f"PASS :322 — captured {len(result.jpeg)} bytes "
+            f"(JPEG {result.jpeg[:4].hex()}..{result.jpeg[-2:].hex()})"
         )
     else:
         print(f"FAIL :322 — reason={result.reason} stderr_tail={result.stderr_tail!r}")

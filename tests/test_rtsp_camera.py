@@ -1,9 +1,10 @@
 """Tests for rtsp_camera — ffmpeg-backed X1/H2/P2S frame grab.
 
-v0.41.0 adds CaptureResult with a categorized failure `reason` and a bounded
-redacted `stderr_tail`. The runner contract therefore widens from
-`(cmd, timeout, max) -> (out, rc)` to `(cmd, timeout, max) -> (out, rc, stderr)`
-so the wrapper can surface ffmpeg's stderr without changing the stdout path.
+v0.42.0: the `-stimeout` regression is removed; a startup capability-probe picks
+the socket-timeout flag this ffmpeg build actually accepts (preferring
+`-rw_timeout`), degrading to the python deadline if none work. The runner
+contract is `(cmd, timeout, max) -> (out, rc, stderr, timed_out)` so the
+categorizer gets an authoritative deadline signal instead of a wall-clock guess.
 """
 
 import sys
@@ -15,12 +16,21 @@ from makeros_hub.printers import rtsp_camera
 _JPEG = b"\xff\xd8\xff\xe0" + b"body" + b"\xff\xd9"
 
 
-def _runner_returning(out, rc, stderr=b""):
-    return lambda cmd, timeout, max_bytes: (out, rc, stderr)
+def _runner_returning(out, rc, stderr=b"", timed_out=False):
+    return lambda cmd, timeout, max_bytes: (out, rc, stderr, timed_out)
 
 
 class TestCaptureFrame(unittest.TestCase):
-    """capture_frame (back-compat wrapper) via the injectable runner."""
+    """capture_frame (back-compat bytes-only shim) via the injectable runner."""
+
+    def setUp(self):
+        # ffmpeg_argv calls _supported_timeout_flag() which would RUN ffmpeg;
+        # pin it so argv is deterministic and no subprocess spawns in tests.
+        self._probe = mock.patch.object(
+            rtsp_camera, "_supported_timeout_flag", return_value=("-rw_timeout", "4000000")
+        )
+        self._probe.start()
+        self.addCleanup(self._probe.stop)
 
     def test_url_shape_and_code_quoting(self):
         self.assertEqual(
@@ -36,24 +46,38 @@ class TestCaptureFrame(unittest.TestCase):
         )
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
-    def test_argv_shape_includes_stimeout_before_input(self, _which):
-        # v0.41.0: ffmpeg -stimeout 5_000_000 MUST be before -i so RTSP socket
-        # I/O timeout is in force on the open phase. The exact order matters —
-        # ffmpeg silently ignores -stimeout when it appears after -i.
+    def test_argv_has_no_stimeout_and_probed_flag_before_input(self, _which):
         seen = {}
 
         def spy(cmd, timeout, max_bytes):
             seen["cmd"] = cmd
-            seen["timeout"] = timeout
-            return _JPEG, 0, b""
+            return _JPEG, 0, b"", False
 
-        rtsp_camera.capture_frame("1.2.3.4", "abcd1234", runner=spy, timeout=10)
+        rtsp_camera.capture_frame("1.2.3.4", "abcd1234", runner=spy)
         cmd = seen["cmd"]
-        self.assertIn("-stimeout", cmd)
-        self.assertEqual(cmd[cmd.index("-stimeout") + 1], "5000000")
-        # -stimeout must come before -i (ffmpeg ignores it otherwise).
-        self.assertLess(cmd.index("-stimeout"), cmd.index("-i"))
-        self.assertEqual(seen["timeout"], 10)
+        # The v0.41.0 regression flag must be GONE.
+        self.assertNotIn("-stimeout", cmd)
+        # The probed flag is spliced in, and BEFORE -i (ffmpeg ignores it after).
+        self.assertIn("-rw_timeout", cmd)
+        self.assertLess(cmd.index("-rw_timeout"), cmd.index("-i"))
+        self.assertEqual(cmd[cmd.index("-rw_timeout") + 1], "4000000")
+
+    @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
+    def test_argv_omits_flag_when_probe_returns_none(self, _which):
+        # When no socket-timeout flag is supported, argv carries none (we rely
+        # on the python deadline) — and crucially still has no -stimeout.
+        with mock.patch.object(rtsp_camera, "_supported_timeout_flag", return_value=()):
+            seen = {}
+
+            def spy(cmd, timeout, max_bytes):
+                seen["cmd"] = cmd
+                return _JPEG, 0, b"", False
+
+            rtsp_camera.capture_frame("h", "c", runner=spy)
+            cmd = seen["cmd"]
+            self.assertNotIn("-stimeout", cmd)
+            self.assertNotIn("-rw_timeout", cmd)
+            self.assertNotIn("-timeout", cmd)
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
     def test_nonzero_exit_rejected_even_with_jpeg_stdout(self, _which):
@@ -63,7 +87,6 @@ class TestCaptureFrame(unittest.TestCase):
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
     def test_killed_run_rejected(self, _which):
-        # rc None = killed (over cap / deadline) — never a trusted frame.
         self.assertIsNone(
             rtsp_camera.capture_frame("h", "c", runner=_runner_returning(_JPEG, None))
         )
@@ -79,7 +102,7 @@ class TestCaptureFrame(unittest.TestCase):
     def test_no_ffmpeg_returns_none_without_running(self, _which):
         called = []
         out = rtsp_camera.capture_frame(
-            "h", "c", runner=lambda *a: called.append(1) or (b"", 0, b"")
+            "h", "c", runner=lambda *a: called.append(1) or (b"", 0, b"", False)
         )
         self.assertIsNone(out)
         self.assertEqual(called, [])
@@ -90,157 +113,217 @@ class TestCaptureFrame(unittest.TestCase):
 
 
 class TestCaptureFrameWithReason(unittest.TestCase):
-    """capture_frame_with_reason — categorized failure surface (v0.41.0)."""
+    """capture_frame_with_reason — categorized failure surface."""
+
+    def setUp(self):
+        self._probe = mock.patch.object(
+            rtsp_camera, "_supported_timeout_flag", return_value=("-rw_timeout", "4000000")
+        )
+        self._probe.start()
+        self.addCleanup(self._probe.stop)
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
-    def test_success_has_no_reason_and_no_stderr_tail(self, _which):
-        result = rtsp_camera.capture_frame_with_reason(
-            "h", "c", runner=_runner_returning(_JPEG, 0, b"")
-        )
-        self.assertEqual(result.jpeg, _JPEG)
-        self.assertIsNone(result.reason)
-        self.assertEqual(result.stderr_tail, "")
+    def test_success_has_no_reason(self, _which):
+        r = rtsp_camera.capture_frame_with_reason("h", "c", runner=_runner_returning(_JPEG, 0))
+        self.assertEqual(r.jpeg, _JPEG)
+        self.assertIsNone(r.reason)
+        self.assertEqual(r.stderr_tail, "")
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value=None)
     def test_no_ffmpeg_categorized(self, _which):
-        result = rtsp_camera.capture_frame_with_reason("h", "c")
-        self.assertIsNone(result.jpeg)
-        self.assertEqual(result.reason, "no-ffmpeg")
+        r = rtsp_camera.capture_frame_with_reason("h", "c")
+        self.assertEqual(r.reason, "no-ffmpeg")
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
-    def test_404_describe_categorized_as_liveview_off(self, _which):
+    def test_ffmpeg_arg_error_is_categorized_not_unknown(self, _which):
+        # The exact v0.41.0 outage signature must self-identify, never 'unknown'.
+        stderr = b"Error splitting the argument list: Option not found\n"
+        r = rtsp_camera.capture_frame_with_reason("h", "c", runner=_runner_returning(b"", 1, stderr))
+        self.assertEqual(r.reason, "ffmpeg-arg")
+        self.assertIn("Option not found", r.stderr_tail)
+
+    @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
+    def test_404_describe_is_liveview_off(self, _which):
         stderr = b"[rtsp @ 0x1] method DESCRIBE failed: 404 Not Found\n"
-        result = rtsp_camera.capture_frame_with_reason(
-            "h", "c", runner=_runner_returning(b"", 1, stderr)
-        )
-        self.assertIsNone(result.jpeg)
-        self.assertEqual(result.reason, "liveview-off")
-        self.assertIn("404", result.stderr_tail)
+        r = rtsp_camera.capture_frame_with_reason("h", "c", runner=_runner_returning(b"", 1, stderr))
+        self.assertEqual(r.reason, "liveview-off")
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
-    def test_401_unauthorized_categorized_as_auth_fail(self, _which):
+    def test_401_is_auth_fail(self, _which):
         stderr = b"[rtsp @ 0x1] method DESCRIBE failed: 401 Unauthorized\n"
-        result = rtsp_camera.capture_frame_with_reason(
-            "h", "c", runner=_runner_returning(b"", 1, stderr)
-        )
-        self.assertEqual(result.reason, "auth-fail")
+        r = rtsp_camera.capture_frame_with_reason("h", "c", runner=_runner_returning(b"", 1, stderr))
+        self.assertEqual(r.reason, "auth-fail")
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
-    def test_no_route_to_host_categorized_as_unreachable(self, _which):
+    def test_no_route_is_unreachable(self, _which):
         stderr = b"[tcp @ 0x1] Connection to tcp://1.2.3.4:322 failed: No route to host\n"
-        result = rtsp_camera.capture_frame_with_reason(
-            "h", "c", runner=_runner_returning(b"", 1, stderr)
-        )
-        self.assertEqual(result.reason, "unreachable")
+        r = rtsp_camera.capture_frame_with_reason("h", "c", runner=_runner_returning(b"", 1, stderr))
+        self.assertEqual(r.reason, "unreachable")
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
-    def test_killed_with_no_stderr_categorized_as_timeout(self, _which):
-        # rc=None with no stderr signal → timeout (the python deadline killed it).
-        # Note: with the relaxed deadline_hit detector, the timeout path can land
-        # whenever rc is None and stderr offers nothing actionable.
-        result = rtsp_camera.capture_frame_with_reason(
-            "h", "c", runner=_runner_returning(b"", None, b"")
-        )
-        # Either timeout or unknown is acceptable for an rc=None+no-stderr case;
-        # both surface the no-frame to the operator. The categorizer prefers
-        # timeout when the wall-clock exceeded the budget.
-        self.assertIn(result.reason, ("timeout", "unknown"))
+    def test_tls_handshake_is_tls_error(self, _which):
+        stderr = b"[tls @ 0x1] Error during SSL handshake: sslv3 alert handshake failure\n"
+        r = rtsp_camera.capture_frame_with_reason("h", "c", runner=_runner_returning(b"", 1, stderr))
+        self.assertEqual(r.reason, "tls-error")
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
-    def test_bad_jpeg_when_ffmpeg_returns_zero_but_garbage(self, _which):
-        result = rtsp_camera.capture_frame_with_reason(
-            "h", "c", runner=_runner_returning(b"nope", 0, b"")
+    def test_deadline_flag_is_timeout(self, _which):
+        # timed_out=True is authoritative — even with empty stderr + rc None.
+        r = rtsp_camera.capture_frame_with_reason(
+            "h", "c", runner=_runner_returning(b"", None, b"", True)
         )
-        self.assertEqual(result.reason, "bad-jpeg")
+        self.assertEqual(r.reason, "timeout")
+
+    @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
+    def test_zero_exit_garbage_is_bad_jpeg(self, _which):
+        r = rtsp_camera.capture_frame_with_reason("h", "c", runner=_runner_returning(b"nope", 0))
+        self.assertEqual(r.reason, "bad-jpeg")
 
     @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
     def test_access_code_redacted_from_stderr_tail(self, _which):
-        # ffmpeg echoes the dial-target URL into stderr. The access code MUST
-        # be redacted before the result leaves this module — otherwise it
-        # leaks into system_events on the cloud side.
-        stderr = (
-            b"[rtsp @ 0x1] Connection refused for rtsps://bblp:s3cret-code@1.2.3.4:322\n"
-        )
-        result = rtsp_camera.capture_frame_with_reason(
+        stderr = b"Connection refused for rtsps://bblp:s3cret-code@1.2.3.4:322\n"
+        r = rtsp_camera.capture_frame_with_reason(
             "h", "s3cret-code", runner=_runner_returning(b"", 1, stderr)
         )
-        self.assertNotIn("s3cret-code", result.stderr_tail)
-        self.assertIn("***", result.stderr_tail)
+        self.assertNotIn("s3cret-code", r.stderr_tail)
+        self.assertIn("***", r.stderr_tail)
 
 
 class TestCategorizeStderr(unittest.TestCase):
-    """Direct test of _categorize_stderr to lock the keyword contract in."""
-
-    def test_deadline_hit_wins_over_any_stderr(self):
-        # The categorizer trusts the python-side deadline_hit signal first;
-        # whatever ffmpeg wrote to stderr is irrelevant when we hit the wall
-        # clock budget.
+    def test_ffmpeg_arg_wins_over_everything(self):
+        # Even if stderr also mentions 401, an arg-parse error is OUR bug first.
         self.assertEqual(
-            rtsp_camera._categorize_stderr("401 Unauthorized", 1, deadline_hit=True),
-            "timeout",
+            rtsp_camera._categorize_stderr("Option not found 401 unauthorized", 1, False),
+            "ffmpeg-arg",
         )
 
-    def test_empty_stderr_returncode_none_is_timeout(self):
+    def test_timed_out_flag_beats_stderr(self):
         self.assertEqual(
-            rtsp_camera._categorize_stderr("", None, deadline_hit=False), "timeout"
+            rtsp_camera._categorize_stderr("401 unauthorized", 1, True), "timeout"
         )
+
+    def test_connection_timed_out_is_unreachable(self):
+        self.assertEqual(
+            rtsp_camera._categorize_stderr("Connection timed out", 1, False), "unreachable"
+        )
+
+    def test_operation_timed_out_is_timeout(self):
+        self.assertEqual(
+            rtsp_camera._categorize_stderr("Operation timed out", 1, False), "timeout"
+        )
+
+    def test_rc_none_no_stderr_is_timeout(self):
+        self.assertEqual(rtsp_camera._categorize_stderr("", None, False), "timeout")
 
     def test_unknown_when_no_match(self):
         self.assertEqual(
-            rtsp_camera._categorize_stderr("something we don't recognize", 1, False),
-            "unknown",
+            rtsp_camera._categorize_stderr("something weird", 1, False), "unknown"
         )
+
+
+class TestSupportedTimeoutFlag(unittest.TestCase):
+    """The capability probe — run ffmpeg with each candidate, keep the first the
+    build accepts. This is the safeguard against another -stimeout-style break."""
+
+    def setUp(self):
+        rtsp_camera._supported_timeout_flag.cache_clear()
+        self.addCleanup(rtsp_camera._supported_timeout_flag.cache_clear)
+
+    @mock.patch.object(rtsp_camera.shutil, "which", return_value=None)
+    def test_no_ffmpeg_returns_empty(self, _which):
+        self.assertEqual(rtsp_camera._supported_timeout_flag(), ())
+
+    @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
+    def test_prefers_rw_timeout_when_accepted(self, _which):
+        def fake_run(argv, **kw):
+            # rw_timeout accepted (no arg-parse error in stderr).
+            return mock.Mock(stderr="frame=0", returncode=1)
+
+        with mock.patch.object(rtsp_camera.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(
+                rtsp_camera._supported_timeout_flag(), ("-rw_timeout", "4000000")
+            )
+
+    @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
+    def test_falls_through_to_timeout_when_rw_rejected(self, _which):
+        calls = {"n": 0}
+
+        def fake_run(argv, **kw):
+            calls["n"] += 1
+            # First candidate (-rw_timeout) rejected, second (-timeout) accepted.
+            if "-rw_timeout" in argv:
+                return mock.Mock(stderr="Option not found", returncode=1)
+            return mock.Mock(stderr="frame=0", returncode=1)
+
+        with mock.patch.object(rtsp_camera.subprocess, "run", side_effect=fake_run):
+            self.assertEqual(
+                rtsp_camera._supported_timeout_flag(), ("-timeout", "4000000")
+            )
+
+    @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
+    def test_returns_empty_when_all_rejected(self, _which):
+        with mock.patch.object(
+            rtsp_camera.subprocess,
+            "run",
+            return_value=mock.Mock(stderr="Option not found", returncode=1),
+        ):
+            self.assertEqual(rtsp_camera._supported_timeout_flag(), ())
 
 
 class TestRunFfmpegBounded(unittest.TestCase):
     """Exercise the REAL Popen+select bounded reader using python as a stand-in
-    'ffmpeg' that writes a controlled number of bytes to stdout."""
+    'ffmpeg'. Now returns a 4-tuple (out, rc, stderr, timed_out)."""
 
     @staticmethod
     def _emit(n: int) -> list[str]:
         return [sys.executable, "-c", f"import sys; sys.stdout.buffer.write(b'A'*{n})"]
 
-    def test_reads_full_small_output_with_rc0_and_empty_stderr(self):
-        out, rc, stderr = rtsp_camera._run_ffmpeg(self._emit(1000), timeout=5.0, max_bytes=1_000_000)
+    def test_reads_full_small_output_with_rc0(self):
+        out, rc, stderr, timed_out = rtsp_camera._run_ffmpeg(
+            self._emit(1000), timeout=5.0, max_bytes=1_000_000
+        )
         self.assertEqual(len(out), 1000)
         self.assertEqual(rc, 0)
         self.assertEqual(stderr, b"")
+        self.assertFalse(timed_out)
 
     def test_over_cap_is_bounded_and_killed(self):
-        # Emit 2 MB but cap at 64 KB — the reader must stop near the cap and
-        # report rc None (killed), NOT buffer all 2 MB.
-        out, rc, _ = rtsp_camera._run_ffmpeg(
+        out, rc, _stderr, _to = rtsp_camera._run_ffmpeg(
             self._emit(2 * 1024 * 1024), timeout=5.0, max_bytes=64 * 1024
         )
-        self.assertLessEqual(len(out), 64 * 1024 + 65536)  # bounded (one extra read chunk at most)
+        self.assertLessEqual(len(out), 64 * 1024 + 65536)
         self.assertIsNone(rc)
 
-    def test_stderr_captured_when_child_writes_it(self):
-        # Spawn a python that emits a known stderr line and a tiny jpeg-like
-        # stdout. The reader must capture both without truncating either.
+    def test_deadline_sets_timed_out(self):
+        # A child that sleeps past the deadline → timed_out True, rc None.
+        sleeper = [sys.executable, "-c", "import time; time.sleep(5)"]
+        out, rc, _stderr, timed_out = rtsp_camera._run_ffmpeg(
+            sleeper, timeout=0.3, max_bytes=1024
+        )
+        self.assertEqual(out, b"")
+        self.assertIsNone(rc)
+        self.assertTrue(timed_out)
+
+    def test_stderr_captured(self):
         cmd = [
             sys.executable,
             "-c",
-            (
-                "import sys;"
-                "sys.stderr.write('boom\\n');"
-                "sys.stdout.buffer.write(b'\\xff\\xd8\\xff\\xe0xx\\xff\\xd9')"
-            ),
+            "import sys; sys.stderr.write('boom\\n'); "
+            "sys.stdout.buffer.write(b'\\xff\\xd8\\xff\\xe0xx\\xff\\xd9')",
         ]
-        out, rc, stderr = rtsp_camera._run_ffmpeg(cmd, timeout=5.0, max_bytes=1_000_000)
+        out, rc, stderr, _to = rtsp_camera._run_ffmpeg(cmd, timeout=5.0, max_bytes=1_000_000)
         self.assertEqual(rc, 0)
         self.assertEqual(out[:3], b"\xff\xd8\xff")
         self.assertEqual(stderr.strip(), b"boom")
 
-    def test_bad_binary_returns_empty_none_with_oserror_in_stderr(self):
-        out, rc, stderr = rtsp_camera._run_ffmpeg(
+    def test_bad_binary_returns_empty_none_with_oserror_detail(self):
+        out, rc, stderr, timed_out = rtsp_camera._run_ffmpeg(
             ["/nonexistent/ffmpeg-xyz"], timeout=2.0, max_bytes=1024
         )
         self.assertEqual(out, b"")
         self.assertIsNone(rc)
-        # OSError message goes into the stderr-channel-equivalent so the
-        # categorizer has something to work with.
         self.assertTrue(stderr)
+        self.assertFalse(timed_out)
 
 
 if __name__ == "__main__":

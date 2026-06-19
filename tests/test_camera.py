@@ -309,5 +309,60 @@ class TestCollectCameraFrames(unittest.TestCase):
         self.assertTrue(s.should_capture("p2", "idle", None, now=40.0))
 
 
+class TestReasonRouting(unittest.TestCase):
+    """v0.42.0: capture_printer_frame_with_reason surfaces categorized reasons
+    from each transport (RTSP already did; :6000 + http now do too)."""
+
+    def _bambu(self, **over):
+        return {"vendor": "bambu", "model": "A1 mini", "host": "1.2.3.4", "accessCode": "c", **over}
+
+    def test_bambu_lan_surfaces_reason_on_failure(self):
+        from makeros_hub.printers.bambu_camera import CaptureResult as BR
+
+        with mock.patch.object(
+            camera, "_bambu_capture_with_reason",
+            return_value=BR(None, "liveview-off", "LAN-mode off"),
+        ):
+            jpeg, reason, detail = camera.capture_printer_frame_with_reason(self._bambu())
+        self.assertIsNone(jpeg)
+        self.assertEqual(reason, "liveview-off")
+        self.assertEqual(detail, "LAN-mode off")
+
+    def test_bambu_lan_success(self):
+        from makeros_hub.printers.bambu_camera import CaptureResult as BR
+
+        with mock.patch.object(
+            camera, "_bambu_capture_with_reason", return_value=BR(b"\xff\xd8\xff\xe0x\xff\xd9", None, "")
+        ):
+            jpeg, reason, _ = camera.capture_printer_frame_with_reason(self._bambu())
+        self.assertTrue(jpeg)
+        self.assertIsNone(reason)
+
+    def test_http_snapshot_http_error_is_categorized(self):
+        import urllib.error
+
+        printer = {"vendor": "klipper", "moonrakerUrl": "http://1.2.3.4:7125"}
+        err = urllib.error.HTTPError("http://x", 403, "Forbidden", {}, None)
+        with mock.patch.object(camera.urllib.request, "urlopen", side_effect=err):
+            jpeg, reason, detail = camera.capture_printer_frame_with_reason(printer)
+        self.assertIsNone(jpeg)
+        self.assertEqual(reason, "auth-fail")
+        self.assertIn("403", detail)
+
+    def test_no_camera_source(self):
+        jpeg, reason, _ = camera.capture_printer_frame_with_reason({"vendor": "other"})
+        self.assertIsNone(jpeg)
+        self.assertEqual(reason, "no-camera-source")
+
+
+class TestSchedulerBoundary(unittest.TestCase):
+    def test_exact_5_and_95_are_dense(self):
+        s = camera.CameraScheduler()
+        self.assertEqual(s._interval("printing", 5), camera.CameraScheduler.FIRST_OR_LAST_LAYER_S)
+        self.assertEqual(s._interval("printing", 95), camera.CameraScheduler.FIRST_OR_LAST_LAYER_S)
+        # Strictly between stays sparse.
+        self.assertEqual(s._interval("printing", 50), camera.CameraScheduler.MID_PRINT_S)
+
+
 if __name__ == "__main__":
     unittest.main()
