@@ -33,12 +33,59 @@ import urllib.request
 from typing import Any, Callable, Optional
 
 from .bambu_camera import capture_frame as _bambu_capture_frame
+from .bambu_camera import capture_frame_with_reason as _bambu_capture_with_reason
 from .rtsp_camera import CaptureResult as _RtspResult
 from .rtsp_camera import capture_frame as _rtsp_capture_frame
 from .rtsp_camera import capture_frame_with_reason as _rtsp_capture_with_reason
+from .rtsp_camera import _supported_timeout_flag as _rtsp_supported_timeout_flag
+
+
+def prime_camera_capabilities() -> None:
+    """Warm the ffmpeg socket-timeout capability probe at agent startup so the
+    first real capture beat doesn't pay the (cached) probe cost inside its
+    deadline budget (Codex MEDIUM). Best-effort — never raises."""
+    try:
+        _rtsp_supported_timeout_flag()
+    except Exception:  # noqa: BLE001 - warming is best-effort
+        pass
 
 _HTTP_TIMEOUT = 4.0
 _MAX_FRAME_BYTES = 2 * 1024 * 1024
+
+
+def _http_snapshot_with_reason(
+    url: str,
+    *,
+    timeout: float = _HTTP_TIMEOUT,
+    max_bytes: int = _MAX_FRAME_BYTES,
+) -> tuple[Optional[bytes], Optional[str], str]:
+    """GET a single JPEG from a webcam snapshot URL (Moonraker/OctoPrint/etc.),
+    returning a categorized reason on failure so a Klipper/OctoPrint camera is as
+    diagnosable as the Bambu paths. Reason vocabulary matches the cloud copy map."""
+    if not url:
+        return (None, "no-camera-source", "")
+    # Only fetch over http(s) — never let a config-supplied URL become file://,
+    # ftp://, etc. (local-file / scheme-confusion exfil into a "camera frame").
+    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
+        return (None, "unknown", "non-http snapshot url")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "makeros-hub-agent"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured LAN URL
+            data = resp.read(max_bytes + 1)
+    except urllib.error.HTTPError as exc:
+        reason = "auth-fail" if exc.code in (401, 403) else "unreachable"
+        return (None, reason, f"HTTP {exc.code}")
+    except TimeoutError:
+        return (None, "timeout", "")
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        # urlopen wraps a socket timeout as URLError(reason=TimeoutError) — keep
+        # it as 'timeout' rather than the generic 'unreachable' (Codex MEDIUM).
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
+            return (None, "timeout", "")
+        return (None, "unreachable", str(exc)[:200])
+    if not data or len(data) > max_bytes or not data.startswith(b"\xff\xd8"):
+        return (None, "bad-jpeg", "")
+    return (data, None, "")
 
 
 def http_snapshot(
@@ -48,22 +95,9 @@ def http_snapshot(
     max_bytes: int = _MAX_FRAME_BYTES,
 ) -> Optional[bytes]:
     """GET a single JPEG from a webcam snapshot URL (Moonraker/OctoPrint/etc.).
-    Returns the bytes only if they look like a JPEG and are within the cap."""
-    if not url:
-        return None
-    # Only fetch over http(s) — never let a config-supplied URL become file://,
-    # ftp://, etc. (local-file / scheme-confusion exfil into a "camera frame").
-    if urllib.parse.urlparse(url).scheme not in ("http", "https"):
-        return None
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "makeros-hub-agent"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured LAN URL
-            data = resp.read(max_bytes + 1)
-    except (OSError, urllib.error.URLError, ValueError):
-        return None
-    if not data or len(data) > max_bytes or not data.startswith(b"\xff\xd8"):
-        return None
-    return data
+    Returns the bytes only if they look like a JPEG and are within the cap.
+    Back-compat shim around _http_snapshot_with_reason."""
+    return _http_snapshot_with_reason(url, timeout=timeout, max_bytes=max_bytes)[0]
 
 
 def _bambu_camera_transport(model: Any) -> Optional[str]:
@@ -146,8 +180,12 @@ def capture_printer_frame_with_reason(printer: dict[str, Any]) -> tuple[Optional
     http_snapshot the same way without touching this signature."""
     kind = camera_source_kind(printer)
     if kind == "bambu-lan":
-        jpeg = _bambu_capture_frame(str(printer.get("host")), str(printer.get("accessCode")))
-        return (jpeg, None if jpeg else "unknown", "")
+        r = _bambu_capture_with_reason(
+            str(printer.get("host")), str(printer.get("accessCode"))
+        )
+        if r.jpeg:
+            return (r.jpeg, None, "")
+        return (None, r.reason or "unknown", r.detail)
     if kind == "bambu-rtsp":
         result: _RtspResult = _rtsp_capture_with_reason(
             str(printer.get("host")), str(printer.get("accessCode"))
@@ -156,8 +194,7 @@ def capture_printer_frame_with_reason(printer: dict[str, Any]) -> tuple[Optional
             return (result.jpeg, None, "")
         return (None, result.reason or "unknown", result.stderr_tail)
     if kind == "http-snapshot":
-        jpeg = http_snapshot(_snapshot_url(printer) or "")
-        return (jpeg, None if jpeg else "unknown", "")
+        return _http_snapshot_with_reason(_snapshot_url(printer) or "")
     return (None, "no-camera-source", "")
 
 
@@ -204,13 +241,24 @@ class CameraScheduler:
 
     def mark_captured(self, printer_id: str, now: float) -> None:
         """Stamp last_capture so the next beat respects the cadence interval.
-        Call only after a SUCCESSFUL capture; failures stay due next beat."""
+        Call only after a SUCCESSFUL capture; failures stay due next beat.
+
+        Threading note: mark_captured is called by the COLLECTOR thread (the one
+        driving collect_camera_frames' as_completed loop) after a future
+        resolves — NOT by the capture worker threads. should_capture also runs on
+        that same collector/heartbeat thread on the next beat, so these scheduler
+        dicts are only ever touched by one thread. (shutdown(wait=False) abandons
+        straggler workers, but they never call mark_captured, so they can't race
+        these dicts.) A future "stream frames as they finish from the workers"
+        refactor would need a lock here."""
         self._last_capture[printer_id] = now
 
     def _interval(self, state: str, progress_pct: Any) -> float:
         if state == "printing":
             p = progress_pct if isinstance(progress_pct, (int, float)) else None
-            if p is None or p < 5 or p > 95:
+            # Inclusive boundaries: exactly 5% / 95% count as first/last-layer
+            # (dense) — matches the "first ~5% / last ~5%" intent.
+            if p is None or p <= 5 or p >= 95:
                 return self.FIRST_OR_LAST_LAYER_S
             return self.MID_PRINT_S
         return self.IDLE_S
