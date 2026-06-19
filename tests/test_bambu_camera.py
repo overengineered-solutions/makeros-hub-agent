@@ -168,6 +168,17 @@ class TestCaptureFrameWithReason(unittest.TestCase):
         r = bambu_camera.capture_frame_with_reason("1.2.3.4", "code")
         self.assertEqual(r.reason, "timeout")
 
+    def test_recv_timeout_is_timeout_not_liveview_off(self):
+        # A stalled :6000 stream (recv timeout mid-frame) must surface as
+        # 'timeout', not collapse into the generic 'liveview-off' (Codex MEDIUM).
+        class _TLSRecvTimeout(_FakeTLS):
+            def recv(self, _n):
+                raise socket.timeout()
+
+        self._patch(ctx=_FakeCtx(_TLSRecvTimeout([])))
+        r = bambu_camera.capture_frame_with_reason("1.2.3.4", "code")
+        self.assertEqual(r.reason, "timeout")
+
     def test_host_unreachable_oserror(self):
         self._patch(connect=OSError("No route to host"))
         r = bambu_camera.capture_frame_with_reason("1.2.3.4", "code")

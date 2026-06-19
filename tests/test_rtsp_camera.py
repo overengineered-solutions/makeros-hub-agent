@@ -269,6 +269,18 @@ class TestSupportedTimeoutFlag(unittest.TestCase):
         ):
             self.assertEqual(rtsp_camera._supported_timeout_flag(), ())
 
+    @mock.patch.object(rtsp_camera.shutil, "which", return_value="/usr/bin/ffmpeg")
+    def test_rejects_when_flag_name_sits_between_option_and_not_found(self, _which):
+        # ffmpeg phrases it "Option <name> not found." with the flag NAME in the
+        # middle — a literal "option not found" substring check would FALSE-ACCEPT
+        # and re-ship the exact v0.41.0 regression. The regex must reject it.
+        with mock.patch.object(
+            rtsp_camera.subprocess,
+            "run",
+            return_value=mock.Mock(stderr="Option stimeout not found.", returncode=1),
+        ):
+            self.assertEqual(rtsp_camera._supported_timeout_flag(), ())
+
 
 class TestRunFfmpegBounded(unittest.TestCase):
     """Exercise the REAL Popen+select bounded reader using python as a stand-in

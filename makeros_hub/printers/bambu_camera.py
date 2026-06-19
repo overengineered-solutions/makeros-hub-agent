@@ -133,6 +133,10 @@ def _read_one_jpeg(sock: ssl.SSLSocket, max_bytes: int) -> Optional[bytes]:
     while total < max_bytes:
         try:
             chunk = sock.recv(4096)
+        except socket.timeout:
+            # Let a stalled read surface as 'timeout' (Codex MEDIUM) rather than
+            # collapsing into the generic no-frame → 'liveview-off' bucket.
+            raise
         except (OSError, ssl.SSLError):
             return None
         if not chunk:

@@ -39,6 +39,7 @@ from __future__ import annotations
 import functools
 import logging
 import os
+import re
 import select
 import shutil
 import signal
@@ -71,6 +72,17 @@ STDERR_TAIL = 400
 _SOI = b"\xff\xd8\xff"  # JPEG start-of-image
 _EOI = b"\xff\xd9"  # JPEG end-of-image
 _warned_no_ffmpeg = False
+
+# ffmpeg argv-parse rejection signatures. Broad on purpose (Codex HIGH): ffmpeg
+# phrases an unknown option as "Option <name> not found." with the flag NAME in
+# the middle, so a literal "option not found" substring check would MISS it and
+# false-accept a rejected flag — re-shipping the very regression this guards. The
+# regex matches the real forms. Used BOTH to reject a probe candidate and to
+# categorize a capture failure as 'ffmpeg-arg' (our bug, not the printer's).
+_ARG_ERR_RE = re.compile(
+    r"option\s.*\bnot found|could not find option|unrecognized option|"
+    r"error splitting the argument list|trailing option",
+)
 
 
 # Categorized reason for the cloud's no_frame event payload. STABLE CONTRACT —
@@ -137,15 +149,16 @@ def _supported_timeout_flag() -> tuple[str, ...]:
             "-",
         ]
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=5)
+            # 2s per candidate (≤6s total, once per process, ideally warmed at
+            # startup) so a cold first capture can't blow the 8s pool budget.
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=2)
         except (OSError, subprocess.TimeoutExpired):
             return ()  # can't probe → degrade to python-deadline-only
         err = (r.stderr or "").lower()
-        if (
-            "option not found" not in err
-            and "error splitting the argument list" not in err
-            and "unrecognized option" not in err
-        ):
+        # Accept the flag ONLY if ffmpeg did not reject it as unknown. The regex
+        # catches "Option <name> not found." etc. — a literal substring check
+        # here would false-accept and re-ship the regression (Codex HIGH).
+        if not _ARG_ERR_RE.search(err):
             log.info("rtsp camera: using socket-timeout flag %s", flag)
             return (flag, str(_SOCKET_TIMEOUT_USEC))
     log.warning(
@@ -202,12 +215,7 @@ def _categorize_stderr(stderr: str, returncode: Optional[int], timed_out: bool) 
     # OUR bug first — an unrecognized/garbled flag. Nothing else looks like this,
     # and it must never masquerade as an operator-fixable reason (this is exactly
     # the v0.41.0 -stimeout outage, which showed as 'unknown × 7').
-    if (
-        "error splitting the argument list" in blob
-        or "option not found" in blob
-        or "unrecognized option" in blob
-        or "trailing option" in blob
-    ):
+    if _ARG_ERR_RE.search(blob):
         return "ffmpeg-arg"
     if timed_out:
         return "timeout"
@@ -328,11 +336,17 @@ def _run_ffmpeg(
         if over_cap or timed_out:
             rc = None  # contract: 0 clean, >0 ffmpeg error, None killed
         try:
+            # NON-BLOCKING final drain (Codex MEDIUM): a blocking read() could
+            # stall past the deadline if a process-group child kept the stderr
+            # write-end open. select(0) + read1 only consumes what's already
+            # buffered and returns immediately.
             room = _MAX_STDERR_BYTES - len(stderr_buf)
-            if room > 0:
-                tail = proc.stderr.read(room)
-                if tail:
-                    stderr_buf += tail
+            if room > 0 and proc.stderr is not None:
+                ready, _, _ = select.select([proc.stderr], [], [], 0)
+                if ready:
+                    tail = proc.stderr.read1(room)
+                    if tail:
+                        stderr_buf += tail
         except Exception:  # noqa: BLE001 - final drain must never raise
             pass
         if proc.stdout is not None:

@@ -38,7 +38,7 @@ from .http import TransportError, get_json, post_json
 from .ingest import IngestServer
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import PrinterManager
-from .printers.camera import CameraScheduler, collect_camera_frames
+from .printers.camera import CameraScheduler, collect_camera_frames, prime_camera_capabilities
 from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples, stub_detector
 from .printers.onnx_detector import (
     DetectorHolder,
@@ -1195,6 +1195,9 @@ def run(
     # override that force-enables capture on every camera-capable printer (handy
     # for a one-off test); unset, only admin-enabled printers are captured.
     camera_scheduler = CameraScheduler()
+    # Warm the ffmpeg socket-timeout capability probe now (at boot) so the first
+    # camera beat doesn't pay the probe inside its capture deadline.
+    prime_camera_capabilities()
     # V5 AI failure-watch — per-printer EWMA smoothing state (cold-start on a
     # re-enable or a stale gap so a fresh print doesn't inherit the prior
     # print's tail). The cloud applies the sensitivity-keyed threshold.

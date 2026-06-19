@@ -37,6 +37,17 @@ from .bambu_camera import capture_frame_with_reason as _bambu_capture_with_reaso
 from .rtsp_camera import CaptureResult as _RtspResult
 from .rtsp_camera import capture_frame as _rtsp_capture_frame
 from .rtsp_camera import capture_frame_with_reason as _rtsp_capture_with_reason
+from .rtsp_camera import _supported_timeout_flag as _rtsp_supported_timeout_flag
+
+
+def prime_camera_capabilities() -> None:
+    """Warm the ffmpeg socket-timeout capability probe at agent startup so the
+    first real capture beat doesn't pay the (cached) probe cost inside its
+    deadline budget (Codex MEDIUM). Best-effort — never raises."""
+    try:
+        _rtsp_supported_timeout_flag()
+    except Exception:  # noqa: BLE001 - warming is best-effort
+        pass
 
 _HTTP_TIMEOUT = 4.0
 _MAX_FRAME_BYTES = 2 * 1024 * 1024
@@ -67,6 +78,10 @@ def _http_snapshot_with_reason(
     except TimeoutError:
         return (None, "timeout", "")
     except (OSError, urllib.error.URLError, ValueError) as exc:
+        # urlopen wraps a socket timeout as URLError(reason=TimeoutError) — keep
+        # it as 'timeout' rather than the generic 'unreachable' (Codex MEDIUM).
+        if isinstance(getattr(exc, "reason", None), TimeoutError):
+            return (None, "timeout", "")
         return (None, "unreachable", str(exc)[:200])
     if not data or len(data) > max_bytes or not data.startswith(b"\xff\xd8"):
         return (None, "bad-jpeg", "")
@@ -228,12 +243,14 @@ class CameraScheduler:
         """Stamp last_capture so the next beat respects the cadence interval.
         Call only after a SUCCESSFUL capture; failures stay due next beat.
 
-        Threading note: this is called from capture WORKER threads while
-        should_capture runs on the heartbeat thread. That is safe ONLY because
-        collect_camera_frames fully drains its workers before the heartbeat
-        loop computes the next beat's due-set — the scheduler is never read and
-        written concurrently. A future "stream frames as they finish" refactor
-        would need a lock around these two dicts."""
+        Threading note: mark_captured is called by the COLLECTOR thread (the one
+        driving collect_camera_frames' as_completed loop) after a future
+        resolves — NOT by the capture worker threads. should_capture also runs on
+        that same collector/heartbeat thread on the next beat, so these scheduler
+        dicts are only ever touched by one thread. (shutdown(wait=False) abandons
+        straggler workers, but they never call mark_captured, so they can't race
+        these dicts.) A future "stream frames as they finish from the workers"
+        refactor would need a lock here."""
         self._last_capture[printer_id] = now
 
     def _interval(self, state: str, progress_pct: Any) -> float:
