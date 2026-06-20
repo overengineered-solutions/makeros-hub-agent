@@ -549,6 +549,39 @@ class TestManagerNonPahoPaths(unittest.TestCase):
         statuses = {s["printerId"]: s for s in m.statuses()}
         self.assertEqual(statuses["b1"]["errorReason"], "incomplete_config")
 
+    def test_stuck_error_adapter_rebuilds_only_past_backoff(self):
+        # A wedged adapter (paho got a CONNACK auth-rejection it won't auto-retry)
+        # must be rebuilt so a RECOVERED printer self-heals — but only once per
+        # backoff window, and never for healthy / transiently-offline adapters.
+        m = PrinterManager()
+
+        class _FakeAdapter:
+            def __init__(self, state):
+                self._state = state
+
+            def status(self):
+                return {"connectionState": self._state}
+
+        # No adapter yet → (re)build it.
+        self.assertTrue(m._stuck_needs_retry("p1"))
+
+        # Healthy → leave the live connection alone.
+        m._adapters["p1"] = _FakeAdapter("connected")
+        self.assertFalse(m._stuck_needs_retry("p1"))
+
+        # Transient 'offline' → paho's reconnect handles it; don't churn.
+        m._adapters["p1"] = _FakeAdapter("offline")
+        self.assertFalse(m._stuck_needs_retry("p1"))
+
+        # Hard 'error' + past the backoff (0.0) → rebuild.
+        m._adapters["p1"] = _FakeAdapter("error")
+        m._stuck_retry_at["p1"] = 0.0
+        self.assertTrue(m._stuck_needs_retry("p1"))
+
+        # Hard 'error' but still inside the backoff window → wait.
+        m._stuck_retry_at["p1"] = 1e18
+        self.assertFalse(m._stuck_needs_retry("p1"))
+
     def test_other_vendor_unsupported(self):
         m = PrinterManager()
         m.reconcile([{"id": "x1", "vendor": "other"}], version="v1")

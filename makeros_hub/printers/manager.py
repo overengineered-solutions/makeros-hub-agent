@@ -28,6 +28,13 @@ log = logging.getLogger("makeros-hub.printers")
 
 MAX_DISPATCHED_QUEUE_JOBS = 1000
 MAX_DISPATCHED_COMMANDS = 1000
+# A paho client that got a CONNACK auth-rejection (or never completed its first
+# connect) does NOT reliably auto-retry — so an adapter built while a printer was
+# unreachable / mis-coded stays dead even after the printer RECOVERS (operator
+# resets LAN mode, fixes the access code, powers it back on). The manager tears
+# down + rebuilds such a wedged adapter at most this often so it SELF-HEALS with
+# no agent restart. Bounded to avoid thrashing a genuinely-dead printer.
+STUCK_ADAPTER_RETRY_S = 120.0
 _SUBMISSION_UID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
 
@@ -40,6 +47,10 @@ class PrinterManager:
     def __init__(self, diagnostics=None) -> None:
         self._adapters: dict[str, Any] = {}
         self._fingerprints: dict[str, tuple] = {}
+        # Earliest monotonic time to rebuild a wedged adapter (see
+        # STUCK_ADAPTER_RETRY_S). Set on every (re)build; checked when the
+        # fingerprint is unchanged so a recovered printer self-heals.
+        self._stuck_retry_at: dict[str, float] = {}
         self._diagnostics = diagnostics or get_default()
         # Static status for printers the agent can't drive yet (klipper, or a
         # Bambu missing its connection facts) — surfaced so the admin sees why.
@@ -203,8 +214,15 @@ class PrinterManager:
         self._static.pop(pid, None)
         fp = _fingerprint(p)
         if self._fingerprints.get(pid) == fp and pid in self._adapters:
-            return  # unchanged — keep the live connection
-        # New or changed connection facts → (re)build the adapter.
+            # Connection facts unchanged — normally keep the live connection. But
+            # an adapter wedged in a hard 'error' state (CONNACK auth-fail /
+            # never-connected, which paho won't auto-retry) is torn down + rebuilt
+            # periodically so a recovered printer reconnects on its own. Transient
+            # 'offline' drops are left to paho's own reconnect loop.
+            if not self._stuck_needs_retry(pid):
+                return
+            log.info("bambu %s wedged in error state — rebuilding adapter to retry", pid)
+        # New/changed connection facts, OR a stuck adapter being retried → rebuild.
         self._stop(pid)
         try:
             from .bambu import BambuAdapter  # lazy: needs paho
@@ -236,11 +254,30 @@ class PrinterManager:
             return
         self._adapters[pid] = adapter
         self._fingerprints[pid] = fp
+        self._stuck_retry_at[pid] = time.monotonic() + STUCK_ADAPTER_RETRY_S
+
+    def _stuck_needs_retry(self, pid: str) -> bool:
+        """True when the existing adapter is wedged in a hard 'error' state paho
+        won't recover from on its own (CONNACK auth-rejection or a connect that
+        never completed) AND we're past the rebuild backoff. A healthy or merely
+        'offline' (transient, paho-recoverable) adapter returns False; a missing
+        adapter returns True (build it)."""
+        adapter = self._adapters.get(pid)
+        if adapter is None:
+            return True
+        try:
+            state = adapter.status().get("connectionState")
+        except Exception:  # noqa: BLE001 — a status read must never sink reconcile
+            return False
+        if state != "error":
+            return False
+        return time.monotonic() >= self._stuck_retry_at.get(pid, 0.0)
 
     def _stop(self, pid: str) -> None:
         code = self._access_code_for(pid)
         adapter = self._adapters.pop(pid, None)
         self._fingerprints.pop(pid, None)
+        self._stuck_retry_at.pop(pid, None)
         if adapter is not None:
             # Rescue unacked terminal jobs BEFORE teardown — a config edit
             # (e.g. rotated access code) rebuilds the adapter and its buffer
