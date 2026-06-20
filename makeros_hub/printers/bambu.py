@@ -59,7 +59,11 @@ class BambuAdapter:
         self.printer_id = printer_id
         self.host = host
         self.serial = serial
-        self._access_code = access_code  # secret — never logged
+        # STRIP whitespace: a trailing space/newline (paste artifact when the
+        # operator re-enters the code) makes MQTT auth fail with the SAME visible
+        # code that Bambu Studio's clean entry accepts — the Antoni Gaudi
+        # 2026-06-20 mqtt_auth_failed that survived reboots + a fresh restart.
+        self._access_code = (access_code or "").strip()  # secret — never logged
         self.model = model
         self._lock = threading.Lock()
         self._data: dict[str, Any] = {}
