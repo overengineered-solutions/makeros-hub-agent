@@ -28,9 +28,11 @@ from makeros_hub.agent import (
     _install_shutdown_signal_handlers,
     _make_vprinter_capture_handler,
     _collect_pi_metrics,
+    _maybe_restart_on_nonce,
     _maybe_retry_tailscale_config,
     _maybe_retry_vprinter_config,
     _pull_config,
+    _reset_restart_nonce_state,
     _rehydrate_vprinter_submissions,
     _reconcile_tailscale_config,
     _request_shutdown,
@@ -1188,6 +1190,34 @@ class TestPersistCloudUrl(unittest.TestCase):
             txt = p.read_text(encoding="utf-8")
             self.assertIn('cloud_url = "https://www.makeros.net"', txt)
             self.assertIn("heartbeat_sec = 30", txt)
+
+
+class TestRestartNonce(unittest.TestCase):
+    def setUp(self):
+        _reset_restart_nonce_state()
+
+    def tearDown(self):
+        _reset_restart_nonce_state()
+
+    def test_adopt_first_then_restart_on_change(self):
+        exits = []
+        ef = lambda: exits.append(True)  # noqa: E731 — terse test stub
+        # First nonce ever seen → adopt WITHOUT restarting (no post-restart loop).
+        self.assertFalse(_maybe_restart_on_nonce("n1", exit_fn=ef))
+        self.assertEqual(exits, [])
+        # Unchanged → no restart.
+        self.assertFalse(_maybe_restart_on_nonce("n1", exit_fn=ef))
+        self.assertEqual(exits, [])
+        # Changed → restart (exit_fn fires).
+        self.assertTrue(_maybe_restart_on_nonce("n2", exit_fn=ef))
+        self.assertEqual(exits, [True])
+
+    def test_none_nonce_never_restarts(self):
+        exits = []
+        ef = lambda: exits.append(True)  # noqa: E731
+        self.assertFalse(_maybe_restart_on_nonce(None, exit_fn=ef))  # adopt None
+        self.assertFalse(_maybe_restart_on_nonce(None, exit_fn=ef))  # unchanged
+        self.assertEqual(exits, [])
 
 
 if __name__ == "__main__":

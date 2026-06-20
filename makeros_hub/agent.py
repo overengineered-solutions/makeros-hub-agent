@@ -880,6 +880,39 @@ def _maybe_retry_vprinter_config(
     return True
 
 
+# Cloud-triggered restart. The cloud sets print_hubs.restart_nonce (a fresh
+# token) when an admin clicks "Restart agent"; config-down echoes it as
+# `restartNonce`. We exit on a CHANGED nonce so systemd (Restart=always) brings
+# the agent back fresh — the universal escape hatch for a process-level wedge.
+# Loop-safe: the FIRST nonce we ever see is adopted WITHOUT restarting, so a
+# restart doesn't immediately re-trigger on the post-restart config pull.
+_restart_nonce_state: dict[str, Any] = {"seen": None, "initialized": False}
+
+
+def _reset_restart_nonce_state() -> None:
+    """Test-only: clear the process-singleton restart tracker."""
+    _restart_nonce_state["seen"] = None
+    _restart_nonce_state["initialized"] = False
+
+
+def _maybe_restart_on_nonce(nonce, *, exit_fn=None) -> bool:
+    """Exit (→ systemd restart) when the cloud's restart nonce CHANGES. Returns
+    True if it triggered an exit (the real exit_fn never returns; tests inject a
+    no-op). Adopt-on-startup means a fresh process never restarts on its first
+    observed nonce."""
+    st = _restart_nonce_state
+    if not st["initialized"]:
+        st["seen"] = nonce
+        st["initialized"] = True
+        return False
+    if nonce != st["seen"]:
+        log.warning("restart requested by cloud (restart nonce changed) — exiting for systemd restart")
+        st["seen"] = nonce
+        (exit_fn or (lambda: os._exit(0)))()
+        return True
+    return False
+
+
 def _pull_config(
     cfg: Config,
     credential: str,
@@ -904,6 +937,10 @@ def _pull_config(
     if resp.status == 200:
         printers = resp.body.get("printers")
         version = resp.body.get("version")
+        # Cloud-triggered restart (admin "Restart agent" button): exit on a
+        # changed nonce → systemd brings us back. Checked before reconcile — no
+        # point applying config we're about to drop on the restart.
+        _maybe_restart_on_nonce(resp.body.get("restartNonce"))
         manager.reconcile(printers if isinstance(printers, list) else [], version)
         # Multi-VP config-down (v0.40.0+): the cloud emits a `virtualPrinters`
         # array (plural). For each VP without a bind_ip, run the IP allocator
