@@ -19,7 +19,8 @@ per-vendor adapters, and reports rich telemetry every beat. Capabilities:
 
 1. **Enroll once** — exchange a one-time admin-minted token (`<cloud>/admin/3dprinting/hubs`)
    for a durable **per-hub bearer credential**, stored `0600`. Tokens + credentials are never
-   logged. In-band credential rotation (overlap window, no lockout) is supported.
+   logged. A revoked/rotated credential makes the next call 401; the agent stays up but
+   degraded (retrying each beat) and recovers once re-enrolled with the new credential.
 2. **Printers (multi-vendor)** — **Bambu** over LAN MQTT (`:8883`, one long-lived connection
    per printer; pause / resume / stop, AMS dry, per-object skip) and **Klipper / Moonraker**
    over HTTP poll (read + control + job ingest), both normalized to one wire DTO so the cloud
@@ -41,8 +42,9 @@ per-vendor adapters, and reports rich telemetry every beat. Capabilities:
 7. **LAN discovery** — a Moonraker HTTP sweep + a passive Bambu SSDP listener feed the admin's
    "detected on your LAN" add-printer dropdown.
 8. **Self-healing** — `Restart=always`; stuck-MQTT-adapter rebuild; cloud-triggered restart via
-   a config-down nonce; narrow **tag-only OTA self-update** (monotonic, cooldown); Tailscale for
-   remote hub access; Pi health metrics + on-demand allowlisted read-only diagnostic probes.
+   a config-down nonce; narrow **version-pinned OTA self-update** (validates a `vX.Y.Z`
+   release-tag name, monotonic, cooldown); Tailscale for remote hub access; Pi health metrics +
+   on-demand allowlisted read-only diagnostic probes.
 
 ## Quick start (Raspberry Pi) — one command
 
@@ -68,8 +70,8 @@ still works: `git clone --branch <tag> … && cd makeros-hub-agent && sudo ./ins
 `/etc/makeros-hub/config.toml` (non-secret): `cloud_url`, `heartbeat_sec`. Everything is
 overridable by env (`MAKEROS_HUB_CLOUD_URL`, `MAKEROS_HUB_HEARTBEAT_SEC`, …) and by
 `--cloud-url` on the CLI. The actual heartbeat cadence is dictated by the cloud in each
-response (no redeploy to change it). AI failure-watch activates only when `MODEL_URL` +
-`MODEL_SHA256` are both set.
+response (no redeploy to change it). AI failure-watch activates only when
+`MAKEROS_HUB_MODEL_URL` + `MAKEROS_HUB_MODEL_SHA256` are both set.
 
 ## Develop / test
 
@@ -90,7 +92,7 @@ makeros_hub/
   enroll.py            one-time token -> durable per-hub bearer credential (0600)
   config.py            config + credential storage + config-down
   http.py              stdlib JSON transport
-  update.py            narrow tag-only OTA self-update (monotonic, cooldown)
+  update.py            narrow version-pinned OTA self-update (vX.Y.Z, monotonic, cooldown)
   discovery.py / lan_scan.py / bambu_ssdp.py   LAN discovery (Moonraker sweep + passive Bambu SSDP)
   ingest.py / multipart.py                     OctoPrint-compatible :8787 host
   probes.py            allowlisted read-only diagnostic probes
@@ -122,5 +124,5 @@ update.sh              root-scoped OTA apply (sudoers-pinned to this one script)
 Bump `makeros_hub/__init__.py:__version__` (+ this `pyproject.toml`), push an annotated
 `vX.Y.Z` tag, and bump `LATEST_AGENT_VERSION` in the cloud
 (`apps/web/lib/print/agent-version.ts`). Auto-update hubs converge within a heartbeat; OTA
-accepts **only** well-formed `vX.Y.Z` tags of this repo, never downgrades, and runs under a
-sudoers rule scoped to `update.sh` alone. See [`SECURITY.md`](SECURITY.md).
+validates the target is a well-formed `vX.Y.Z` release-tag name, never downgrades, and applies
+under a sudoers rule scoped to `update.sh` alone. See [`SECURITY.md`](SECURITY.md).
