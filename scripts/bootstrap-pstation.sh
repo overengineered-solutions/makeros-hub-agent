@@ -17,7 +17,7 @@
 set -euo pipefail
 
 PSTATION_URL="https://procrastinationstation.net"
-PSTATION_TOKEN="__PSTATION_ENROLL_TOKEN__"
+PSTATION_TOKEN="UuBIZDi4ORGv1J017W34pSCYYMmhRfUnNSt_TH2UiDw"
 SERVICE_USER="makeros-hub"
 CONFIG="/etc/makeros-hub/config.toml"
 CRED="/var/lib/makeros-hub/credential"
