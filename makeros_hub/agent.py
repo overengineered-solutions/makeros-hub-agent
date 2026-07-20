@@ -1664,11 +1664,13 @@ def run(
                             tailscale_status = pulled_tailscale_status
                         maybe_rehydrate_vprinter_outbox()
                     # Over-the-air self-update: the cloud names the release this
-                    # hub should run. No-op unless it's a strictly-newer release
-                    # tag and the cooldown has passed; on apply, the update
-                    # script restarts the service onto the new version.
+                    # hub should run + (content-trust) the commit SHA that tag MUST
+                    # resolve to. No-op unless it's a strictly-newer release tag and
+                    # the cooldown has passed; on apply, the root script verifies the
+                    # SHA before installing, then restarts the service (systemd mode).
                     target = resp.body.get("targetVersion")
-                    if isinstance(target, str) and target and maybe_update(__version__, target):
+                    target_sha = resp.body.get("targetVersionSha256")
+                    if isinstance(target, str) and target and maybe_update(__version__, target, target_sha):
                         log.info("OTA: update to %s launched; the service will restart", target)
                     probe_results = _run_pending_probes(
                         resp.body.get("pendingProbes"),

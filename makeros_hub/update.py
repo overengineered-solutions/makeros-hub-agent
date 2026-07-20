@@ -42,6 +42,12 @@ STATE_PATH = Path(
 # Don't re-attempt the SAME target more often than this — avoids hammering a
 # broken release (failed update -> systemd restarts old agent -> sees target).
 ATTEMPT_COOLDOWN_SEC = 900
+COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+# Update transport (dual-review 2026-07-20 — Docker portability): 'systemd' (default; sudo root script → transient
+# unit → systemctl restart), 'exit' (container: record the target + exit EXIT_FOR_UPDATE_CODE so an orchestrator
+# repulls the pinned image — no sudo/systemd), or 'disabled' (never self-update).
+UPDATE_MODE = os.environ.get("MAKEROS_HUB_UPDATE_MODE", "systemd").strip().lower()
+EXIT_FOR_UPDATE_CODE = 75  # EX_TEMPFAIL — a defined "please repull me" exit code for the orchestrator
 
 
 def parse_version(s) -> tuple[int, int, int] | None:
@@ -56,6 +62,11 @@ def is_release_tag(s) -> bool:
     """A strict release tag: vMAJOR.MINOR.PATCH. The safety gate before we ever
     hand a value to git/the updater."""
     return isinstance(s, str) and bool(RELEASE_TAG_RE.match(s))
+
+
+def is_commit_sha(s) -> bool:
+    """A full 40-hex git commit SHA — the content-trust pin the cloud sends alongside a target tag."""
+    return isinstance(s, str) and bool(COMMIT_SHA_RE.match(s))
 
 
 def is_newer(target, current) -> bool:
@@ -84,36 +95,57 @@ def _write_state(d: dict) -> None:
         log.warning("could not persist update state: %s", e)
 
 
+def _request_exit(code: int) -> None:
+    """Exit the process so a container orchestrator repulls the pinned image. A seam so tests assert w/o exiting."""
+    raise SystemExit(code)
+
+
 def recently_attempted(target: str, now: float | None = None) -> bool:
     now = time.time() if now is None else now
     st = _read_state()
     return st.get("target") == target and (now - float(st.get("at", 0))) < ATTEMPT_COOLDOWN_SEC
 
 
-def apply_update(tag: str) -> bool:
-    """Trigger the root update script for a validated release tag. The script
-    re-launches the actual work in an independent systemd transient unit, so the
-    service restart it performs doesn't kill the update mid-flight. Returns True
-    if the trigger launched cleanly."""
+def apply_update(tag: str, expected_sha: str | None = None) -> bool:
+    """Trigger an update to a validated release tag. Behavior follows MAKEROS_HUB_UPDATE_MODE:
+      - 'systemd' (default): run the sudo root script, which (with expected_sha) verifies the tag resolves to
+        EXACTLY that commit before installing, then restarts via an independent transient unit.
+      - 'exit': record the target + exit EXIT_FOR_UPDATE_CODE so a container orchestrator repulls the pinned image.
+      - 'disabled': ignore.
+    `expected_sha` is the cloud's content-trust pin (the commit the tag MUST resolve to); a compromised git host
+    can't serve other code. Returns True only when a systemd trigger launched cleanly."""
     if not is_release_tag(tag):
         log.error("refusing to update to non-release tag %r", tag)
         return False
+    if expected_sha is not None and not is_commit_sha(expected_sha):
+        log.error("refusing update to %s: malformed target SHA %r", tag, expected_sha)
+        return False
+    if UPDATE_MODE == "disabled":
+        log.info("OTA: update to %s requested but MAKEROS_HUB_UPDATE_MODE=disabled — ignoring", tag)
+        return False
     _write_state({"target": tag, "at": time.time()})
-    log.warning("OTA: triggering update to %s via %s (service will restart)", tag, UPDATE_SCRIPT)
+    if UPDATE_MODE == "exit":
+        log.warning("OTA: MAKEROS_HUB_UPDATE_MODE=exit — recorded target %s; exiting %d for the orchestrator to "
+                    "repull the pinned image", tag, EXIT_FOR_UPDATE_CODE)
+        _request_exit(EXIT_FOR_UPDATE_CODE)
+        return False  # unreachable in prod (_request_exit raises); returns only under a test seam
+    trust = f" @ {expected_sha[:12]}…" if expected_sha else " (UNVERIFIED — cloud sent no target SHA)"
+    log.warning("OTA: triggering update to %s%s via %s (service will restart)", tag, trust, UPDATE_SCRIPT)
+    cmd = ["sudo", UPDATE_SCRIPT, tag] + ([expected_sha] if expected_sha else [])
     try:
-        subprocess.run(["sudo", UPDATE_SCRIPT, tag], check=True, timeout=120)
+        subprocess.run(cmd, check=True, timeout=120)
         return True
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
         log.error("OTA: update trigger to %s failed: %s", tag, e)
         return False
 
 
-def maybe_update(current_version: str, target_version) -> bool:
-    """Decide + (if appropriate) trigger an update. Returns True if an update was
-    launched. Honors the cooldown so a broken target can't loop."""
+def maybe_update(current_version: str, target_version, target_sha=None) -> bool:
+    """Decide + (if appropriate) trigger an update. `target_sha` (optional) is the cloud's content-trust pin.
+    Returns True if a systemd update launched; honors the cooldown so a broken target can't loop."""
     if not isinstance(target_version, str) or not should_update(current_version, target_version):
         return False
     if recently_attempted(target_version):
         log.info("OTA: target %s attempted recently — waiting out the cooldown", target_version)
         return False
-    return apply_update(target_version)
+    return apply_update(target_version, target_sha if is_commit_sha(target_sha) else None)

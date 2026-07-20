@@ -100,9 +100,14 @@ the one remote-code-execution path in the system, so it is deliberately narrow:
   unit so the service restart can't kill it mid-flight.
 - **Operator-controlled.** Auto-update is **off by default**, per hub; the admin opts in (or
   triggers a one-shot "Update now") from the dashboard.
-- **Roadmap:** signed release artifacts (minisign/Sigstore) + signature verification in the
-  update path, so even a compromised repo can't push code to tenant hardware. Until then the
-  control is pinned reviewed releases + the narrow sudoers surface above.
+- **Content-trust (implemented).** The cloud sends, alongside the target tag, the exact **commit SHA** that tag
+  must resolve to. The root update script runs `git rev-parse HEAD` after cloning and **refuses to install**
+  anything that doesn't match — so a compromised or re-pointed tag on the git host can't push other code (both the
+  cloud AND the git host would have to be compromised, consistently). Signed release artifacts (minisign/Sigstore)
+  remain a roadmap second factor.
+- **Portable update transport.** `MAKEROS_HUB_UPDATE_MODE` selects `systemd` (default — the sudo root script +
+  transient-unit restart above), `exit` (container: record the target + exit a defined code so the orchestrator
+  repulls the pinned image — no sudo/systemd), or `disabled` (never self-update).
 
 ## Reporting
 
