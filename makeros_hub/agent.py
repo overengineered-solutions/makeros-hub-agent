@@ -1181,6 +1181,11 @@ def _surface_last_bootstrap(diagnostics) -> None:
     path = os.environ.get("MAKEROS_HUB_BOOTSTRAP_LOG", "/var/lib/makeros-hub/last-bootstrap.log")
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
+            try:  # bounded read — only ever the tail, even if the file is unexpectedly large
+                fh.seek(0, 2)
+                fh.seek(max(0, fh.tell() - 4096))
+            except OSError:
+                pass
             data = fh.read().strip()
     except OSError:
         return

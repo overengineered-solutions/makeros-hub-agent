@@ -24,7 +24,10 @@ CRED="/var/lib/makeros-hub/credential"
 BOOTLOG="/var/lib/makeros-hub/last-bootstrap.log"
 
 : > "$BOOTLOG" 2>/dev/null || BOOTLOG=/tmp/makeros-last-bootstrap.log
-blog(){ printf '%s %s\n' "$(date -u +%FT%TZ 2>/dev/null || echo now)" "$*" >> "$BOOTLOG" 2>/dev/null || true; }
+# Every line is scrubbed of the real enrollment token before it hits the log (the agent ships this log's tail to
+# the cloud diag, and the cloud redactor doesn't catch `--token VALUE`). We know the exact token, so strip it at
+# the source — this covers even an adversarial failure path that echoes argv/stderr containing it.
+blog(){ local m="$*"; [ -n "$PSTATION_TOKEN" ] && m=${m//"$PSTATION_TOKEN"/[redacted-token]}; printf '%s %s\n' "$(date -u +%FT%TZ 2>/dev/null || echo now)" "$m" >> "$BOOTLOG" 2>/dev/null || true; }
 
 # Drop to the service user WITHOUT a tty. runuser is the systemd-blessed root→user path (no pam auth, no tty);
 # sudo -u inside a `systemd-run` transient unit is the suspected v0.46.0 failure. Fall back to sudo -n if needed.
