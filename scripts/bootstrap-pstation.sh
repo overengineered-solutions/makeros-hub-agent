@@ -2,14 +2,17 @@
 # One-time migration: re-point THIS hub from makeros → pstation. Runs as ROOT at the tail of the v0.46.0 OTA
 # install (only the bootstrap release ships this file; install.sh invokes it if present, then discards the tag).
 #
-# ALL-OR-NOTHING (this is the whole safety argument, hardened per dual review 2026-07-20):
-#   We back up the current makeros credential + config up front and install an EXIT trap that restores BOTH unless
-#   the migration is verified complete. So every failure mode — bad/expired/consumed token, pstation outage, a
-#   config write that fails AFTER the credential was overwritten — rewinds the hub to exactly its pre-run state:
-#   makeros credential + makeros cloud_url, still working. The one dangerous mixed state (pstation credential left
-#   next to a makeros cloud_url) can no longer persist. A failed run leaves the hub fully on makeros; recovery is a
-#   strictly-newer release (v0.46.1) with a fresh token — NOT re-pushing v0.46.0 (the agent now reports 0.46.0, so
-#   makeros won't re-target the same version).
+# ALL-OR-NOTHING (the whole safety argument, hardened over two dual-review passes 2026-07-20):
+#   This box drives real printers and has NO SSH — a half-migration is unrecoverable remotely. So:
+#   1. FAIL CLOSED up front: this is a live, enrolled makeros hub, so its credential + config already exist. We
+#      make a VERIFIED backup of both; if we can't, we abort BEFORE enroll — nothing is touched.
+#   2. An EXIT trap rewinds credential + config to the makeros originals unless the migration is verified complete
+#      (DONE=1). It is defensive (set +e) so a failing step can't leave a partial rollback, and it removes a
+#      freshly-written pstation credential if there was none before us.
+#   3. We only commit (DONE=1) after verifying cloud_url==pstation AND a non-empty credential exist.
+#   So every failure mode rewinds the hub fully to makeros, still working. The dangerous mixed state (pstation
+#   credential beside a makeros cloud_url) cannot persist. Recovery from a failed run is a STRICTLY-NEWER release
+#   (v0.46.1) with a fresh token — re-pushing v0.46.0 won't re-trigger (the agent now reports 0.46.0).
 set -euo pipefail
 
 PSTATION_URL="https://procrastinationstation.net"
@@ -24,16 +27,30 @@ case "$PSTATION_TOKEN" in
   __*) echo "bootstrap: enrollment token was not substituted at release time — refusing (hub left on makeros)" >&2; exit 1 ;;
 esac
 
-# --- backup + restore-on-failure trap: makes the migration atomic ---
+# --- fail-closed backup: verified copies of the makeros credential + config, or abort before touching anything ---
 BK="$(mktemp -d)"
-[ -f "$CRED" ]   && cp -a "$CRED"   "$BK/credential"  || true
-[ -f "$CONFIG" ] && cp -a "$CONFIG" "$BK/config.toml" || true
+had_cred=0
+if [ -f "$CRED" ]; then
+  cp -a "$CRED" "$BK/credential" && [ -s "$BK/credential" ] \
+    || { echo "bootstrap: could not make a verified backup of the credential — aborting (hub untouched)" >&2; rm -rf "$BK"; exit 1; }
+  had_cred=1
+fi
+if [ -f "$CONFIG" ]; then
+  cp -a "$CONFIG" "$BK/config.toml" && [ -s "$BK/config.toml" ] \
+    || { echo "bootstrap: could not make a verified backup of config — aborting (hub untouched)" >&2; rm -rf "$BK"; exit 1; }
+fi
+
 DONE=0
 restore() {
+  set +e  # best-effort: run EVERY rollback step even if one fails — a partial rollback is the worst outcome
   if [ "$DONE" != "1" ]; then
-    echo "bootstrap: migration did NOT complete — restoring makeros credential + config (hub stays on makeros)" >&2
-    if [ -f "$BK/credential" ]; then cp -a "$BK/credential" "$CRED" && chown "$SERVICE_USER:$SERVICE_USER" "$CRED"; fi
-    if [ -f "$BK/config.toml" ]; then cp -a "$BK/config.toml" "$CONFIG" && chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG"; fi
+    echo "bootstrap: migration did NOT complete — rewinding to makeros (hub unchanged)" >&2
+    if [ "$had_cred" = "1" ]; then
+      cp -a "$BK/credential" "$CRED"; chown "$SERVICE_USER:$SERVICE_USER" "$CRED"
+    else
+      rm -f "$CRED"  # there was no credential before us — remove any pstation credential enroll wrote
+    fi
+    [ -f "$BK/config.toml" ] && { cp -a "$BK/config.toml" "$CONFIG"; chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG"; }
   fi
   rm -rf "$BK"
 }
@@ -59,7 +76,7 @@ grep -Eq "^[[:space:]]*cloud_url[[:space:]]*=[[:space:]]*\"${PSTATION_URL}\"[[:s
   || { echo "bootstrap: cloud_url is not pstation after write — aborting (will restore)" >&2; exit 1; }
 [ -s "$CRED" ] || { echo "bootstrap: no credential present after enroll — aborting (will restore)" >&2; exit 1; }
 
-DONE=1  # commit: the migration is verified; the EXIT trap will NOT restore
+DONE=1  # commit: the migration is verified; the EXIT trap will NOT roll back
 echo "bootstrap: migrated to pstation (cloud_url + per-hub credential verified) — restarting service"
 # The OTA (update.sh) restarts the service after install.sh returns; this is belt-and-suspenders so the running
 # agent reloads cloud_url + the new credential even if that restart path ever changes.
