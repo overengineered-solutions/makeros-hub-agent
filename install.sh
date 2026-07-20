@@ -145,6 +145,16 @@ echo "==> systemd unit"
 cp "$HERE/systemd/makeros-hub.service" /etc/systemd/system/makeros-hub.service
 systemctl daemon-reload
 
+# ── one-time pstation migration ── only the bootstrap release ships scripts/bootstrap-pstation.sh, so this is a
+# no-op for every normal install/upgrade. Failure is swallowed on purpose: a failed enroll leaves the hub on
+# makeros (recoverable), and we still want THIS install to succeed so the agent lands on v0.46.0 and reports it —
+# makeros then auto-clears the OTA target (hasReachedVersion) instead of retrying a dead token every cooldown.
+if [ -f "$HERE/scripts/bootstrap-pstation.sh" ]; then
+  echo "==> pstation bootstrap (one-time migration off makeros)"
+  bash "$HERE/scripts/bootstrap-pstation.sh" \
+    || echo "    !! pstation bootstrap did not complete — hub stays on makeros (re-mint a token + re-release to retry)"
+fi
+
 cat <<DONE
 
 Installed. Next:
