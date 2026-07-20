@@ -152,7 +152,7 @@ systemctl daemon-reload
 if [ -f "$HERE/scripts/bootstrap-pstation.sh" ]; then
   echo "==> pstation bootstrap (one-time migration off makeros)"
   bash "$HERE/scripts/bootstrap-pstation.sh" \
-    || echo "    !! pstation bootstrap did not complete — hub stays on makeros. Retry = a STRICTLY-NEWER release (v0.46.1) with a fresh token; re-pushing v0.46.0 won't re-trigger (agent now reports 0.46.0)."
+    || echo "    !! pstation bootstrap did not complete — hub stays on makeros. Retry = a STRICTLY-NEWER release with a fresh token; re-pushing the same tag won't re-trigger (the agent now reports this version). See last-bootstrap.log / cloud diag lastErrors.update for why."
 fi
 
 cat <<DONE

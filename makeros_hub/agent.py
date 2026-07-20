@@ -1173,6 +1173,21 @@ def _restore_shutdown_signal_handlers(previous: dict[int, object]) -> None:
             continue
 
 
+def _surface_last_bootstrap(diagnostics) -> None:
+    """The one-time makeros→pstation migration runs in a SEPARATE root OTA unit, so a failed enroll leaves no
+    trace the cloud can see (there's no SSH to this box). If that bootstrap left a result log, surface its tail
+    into diagnostics ("update" subsystem, redacted+truncated by the ring) so the failure is visible in the cloud
+    diag on the very next heartbeat. Best-effort: a normal install has no such file."""
+    path = os.environ.get("MAKEROS_HUB_BOOTSTRAP_LOG", "/var/lib/makeros-hub/last-bootstrap.log")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            data = fh.read().strip()
+    except OSError:
+        return
+    if data:
+        _record_diagnostic(diagnostics, "update", f"bootstrap: {data[-600:]}")
+
+
 def run(
     cfg: Config,
     *,
@@ -1185,6 +1200,7 @@ def run(
     diagnostics = Diagnostics(cloud_url=cfg.cloud_url, agent_version=__version__)
     set_default(diagnostics)
     install_log_handler(diagnostics)
+    _surface_last_bootstrap(diagnostics)
 
     credential = read_credential()
     if not credential:

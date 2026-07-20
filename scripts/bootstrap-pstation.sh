@@ -1,75 +1,90 @@
 #!/usr/bin/env bash
-# One-time migration: re-point THIS hub from makeros → pstation. Runs as ROOT at the tail of the v0.46.0 OTA
+# One-time migration: re-point THIS hub from makeros → pstation. Runs as ROOT at the tail of the v0.46.1 OTA
 # install (only the bootstrap release ships this file; install.sh invokes it if present, then discards the tag).
 #
-# RECOVERABLE BY CONSTRUCTION for every shell-visible failure (hardened over three dual-review passes 2026-07-20):
-#   This box drives real printers and has NO SSH — a half-migration is unrecoverable remotely. So:
-#   1. FAIL CLOSED up front: this is a live, enrolled makeros hub, so its credential + config already exist. We
-#      make a VERIFIED backup of both; if we can't, we abort BEFORE enroll — nothing is touched.
-#   2. An EXIT trap rewinds credential + config to the makeros originals unless the migration is verified complete
-#      (DONE=1). It is defensive (set +e) so a failing step can't leave a partial rollback, and it removes a
-#      freshly-written pstation credential if there was none before us.
-#   3. We only commit (DONE=1) after verifying cloud_url==pstation AND a non-empty credential exist, then sync().
-#   Every enroll/config/verify failure rewinds the hub fully to makeros, still working. Recovery from a failed run
-#   is a STRICTLY-NEWER release (v0.46.1) with a fresh token — re-pushing v0.46.0 won't re-trigger (agent now
-#   reports 0.46.0).
-#   RESIDUAL (dual review): the EXIT trap can't run on abrupt power loss / SIGKILL / kernel panic. The mixed state
-#   (pstation credential beside a makeros cloud_url) is only exposed in the ~1ms window between the agent's own
-#   write_credential() and persist_cloud_url() (consecutive statements in `enroll`; config is writable, so it
-#   flips there — this shell sed is a backstop). A crash in that sub-ms window would strand the hub → physical
-#   recovery, the SAME class as any OTA on a no-SSH box. Truly closing it needs a combined atomic credential+URL
-#   state in the agent runtime; deliberately not doing that here (bigger risk to the print-driving code than the
-#   window it removes).
+# v0.46.1 vs v0.46.0 (v0.46.0's enroll failed remotely with no visible cause — no SSH to the box):
+#   * PRIVILEGE DROP: use `runuser -u` (the systemd-correct root→user drop, no pam/tty) instead of `sudo -u`,
+#     which is the prime suspect for the v0.46.0 failure inside the transient OTA unit. Falls back to `sudo -n`.
+#   * SELF-DIAGNOSING: everything is logged to $BOOTLOG (incl. a reachability probe to pstation + the exact enroll
+#     error). The agent reads that file on its next start and surfaces its tail into the cloud diag
+#     (lastErrors.update), so a failed remote migration is finally visible without SSH.
+#
+# RECOVERABLE BY CONSTRUCTION for every shell-visible failure (unchanged from the 3 dual-review passes):
+#   fail-closed verified backup of credential+config → EXIT trap rewinds both unless verified-complete (DONE=1) →
+#   commit only after cloud_url==pstation AND a non-empty credential, then sync(). A failed run leaves the hub
+#   fully on makeros. Residual: the EXIT trap can't run on abrupt power loss (~1ms window; accepted). Retry after a
+#   failure is a STRICTLY-NEWER release (the agent reports this version, so makeros won't re-target the same tag).
 set -euo pipefail
 
 PSTATION_URL="https://procrastinationstation.net"
-PSTATION_TOKEN="Z01sFzr9fEtOWDe9y_IwyMeQSPZx1qAhuhr1zaMGCHk"
+PSTATION_TOKEN="__PSTATION_ENROLL_TOKEN__"
 SERVICE_USER="makeros-hub"
 CONFIG="/etc/makeros-hub/config.toml"
 CRED="/var/lib/makeros-hub/credential"
+BOOTLOG="/var/lib/makeros-hub/last-bootstrap.log"
 
-# Guard: if the placeholder wasn't substituted at release time, do nothing (leave the hub on makeros) rather than
-# firing enroll with a bogus token. Loud + non-zero so install.sh logs it; the hub is untouched either way.
+: > "$BOOTLOG" 2>/dev/null || BOOTLOG=/tmp/makeros-last-bootstrap.log
+blog(){ printf '%s %s\n' "$(date -u +%FT%TZ 2>/dev/null || echo now)" "$*" >> "$BOOTLOG" 2>/dev/null || true; }
+
+# Drop to the service user WITHOUT a tty. runuser is the systemd-blessed root→user path (no pam auth, no tty);
+# sudo -u inside a `systemd-run` transient unit is the suspected v0.46.0 failure. Fall back to sudo -n if needed.
+as_service_user(){
+  if command -v runuser >/dev/null 2>&1; then runuser -u "$SERVICE_USER" -- "$@"
+  else sudo -n -u "$SERVICE_USER" "$@"; fi
+}
+
+blog "v0.46.1 bootstrap start: euid=$(id -u 2>/dev/null) user=$(id -un 2>/dev/null) runuser=$(command -v runuser || echo none) sudo=$(command -v sudo || echo none)"
+
 case "$PSTATION_TOKEN" in
-  __*) echo "bootstrap: enrollment token was not substituted at release time — refusing (hub left on makeros)" >&2; exit 1 ;;
+  __*) blog "REFUSE: enrollment token not substituted at release time"; echo "bootstrap: token not substituted — hub left on makeros" >&2; exit 1 ;;
 esac
 
-# --- fail-closed backup: verified copies of the makeros credential + config, or abort before touching anything ---
+# --- fail-closed verified backup: makeros credential + config, or abort before touching anything ---
 BK="$(mktemp -d)"
 had_cred=0
 if [ -f "$CRED" ]; then
   cp -a "$CRED" "$BK/credential" && [ -s "$BK/credential" ] \
-    || { echo "bootstrap: could not make a verified backup of the credential — aborting (hub untouched)" >&2; rm -rf "$BK"; exit 1; }
+    || { blog "ABORT: credential backup failed"; echo "bootstrap: credential backup failed — hub untouched" >&2; rm -rf "$BK"; exit 1; }
   had_cred=1
 fi
 if [ -f "$CONFIG" ]; then
   cp -a "$CONFIG" "$BK/config.toml" && [ -s "$BK/config.toml" ] \
-    || { echo "bootstrap: could not make a verified backup of config — aborting (hub untouched)" >&2; rm -rf "$BK"; exit 1; }
+    || { blog "ABORT: config backup failed"; echo "bootstrap: config backup failed — hub untouched" >&2; rm -rf "$BK"; exit 1; }
 fi
 
 DONE=0
-restore() {
-  set +e  # best-effort: run EVERY rollback step even if one fails — a partial rollback is the worst outcome
+restore(){
+  set +e  # best-effort: run EVERY rollback step even if one fails
   if [ "$DONE" != "1" ]; then
-    echo "bootstrap: migration did NOT complete — rewinding to makeros (hub unchanged)" >&2
-    if [ "$had_cred" = "1" ]; then
-      cp -a "$BK/credential" "$CRED"; chown "$SERVICE_USER:$SERVICE_USER" "$CRED"
-    else
-      rm -f "$CRED"  # there was no credential before us — remove any pstation credential enroll wrote
-    fi
+    blog "REWIND to makeros (migration did not complete)"
+    if [ "$had_cred" = "1" ]; then cp -a "$BK/credential" "$CRED"; chown "$SERVICE_USER:$SERVICE_USER" "$CRED"; else rm -f "$CRED"; fi
     [ -f "$BK/config.toml" ] && { cp -a "$BK/config.toml" "$CONFIG"; chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG"; }
   fi
   rm -rf "$BK"
+  # make the diagnostic log readable by the agent (makeros-hub) so it can surface it to the cloud
+  chmod 0644 "$BOOTLOG" 2>/dev/null; chown "$SERVICE_USER:$SERVICE_USER" "$BOOTLOG" 2>/dev/null
 }
 trap restore EXIT
 
-echo "bootstrap: enrolling this hub with pstation ($PSTATION_URL) …"
-# Runs as the service user so the credential lands 0600 owned by makeros-hub (a root-written credential would be
-# unreadable by the agent). --force overwrites the existing makeros credential; enroll writes it ONLY on HTTP 200.
-sudo -u "$SERVICE_USER" /usr/local/bin/makeros-hub enroll \
-  --token "$PSTATION_TOKEN" --cloud-url "$PSTATION_URL" --force
+# Reachability probe (bogus token → expect http=400/token_invalid if the Pi can reach pstation). Distinguishes a
+# network/TLS problem from an enroll/permission problem when I read this back from the cloud diag.
+if command -v curl >/dev/null 2>&1; then
+  blog "reachability: $(curl -sS -m 15 -o /dev/null -w 'http=%{http_code} tls_verify=%{ssl_verify_result} t=%{time_total}s' -X POST "$PSTATION_URL/api/print/hub/enroll" -H 'content-type: application/json' -d '{"token":"reachability-probe","agent":{"version":"probe","os":"probe","hostname":"probe"}}' 2>&1 || echo "curl-failed rc=$?")"
+else
+  blog "reachability: (curl not present)"
+fi
 
-# Flip cloud_url as root (enroll's own persist is best-effort). Reached only after a successful enroll (set -e).
+blog "enroll: dropping to $SERVICE_USER via $(command -v runuser >/dev/null 2>&1 && echo runuser || echo sudo) …"
+if enroll_err=$(as_service_user /usr/local/bin/makeros-hub enroll --token "$PSTATION_TOKEN" --cloud-url "$PSTATION_URL" --force 2>&1); then
+  blog "enroll: OK"
+else
+  rc=$?
+  blog "enroll: FAILED rc=$rc :: $enroll_err"
+  echo "bootstrap: enroll failed rc=$rc — hub stays on makeros" >&2
+  exit "$rc"
+fi
+
+# Flip cloud_url as root (enroll's own persist is best-effort). Reached only after a successful enroll.
 if grep -Eq '^[[:space:]]*cloud_url[[:space:]]*=' "$CONFIG" 2>/dev/null; then
   sed -i -E "s|^[[:space:]]*cloud_url[[:space:]]*=.*|cloud_url = \"$PSTATION_URL\"|" "$CONFIG"
 else
@@ -77,15 +92,14 @@ else
 fi
 chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG"
 
-# VERIFY the committed end state before we tell the trap to stand down: config must point at pstation AND a
-# credential file must exist + be non-empty. If either is wrong, exit non-zero → the trap rewinds to makeros.
+# Verify committed end state before standing the trap down.
 grep -Eq "^[[:space:]]*cloud_url[[:space:]]*=[[:space:]]*\"${PSTATION_URL}\"[[:space:]]*$" "$CONFIG" \
-  || { echo "bootstrap: cloud_url is not pstation after write — aborting (will restore)" >&2; exit 1; }
-[ -s "$CRED" ] || { echo "bootstrap: no credential present after enroll — aborting (will restore)" >&2; exit 1; }
+  || { blog "ABORT: cloud_url not pstation after write"; echo "bootstrap: cloud_url not pstation — will restore" >&2; exit 1; }
+[ -s "$CRED" ] || { blog "ABORT: no credential after enroll"; echo "bootstrap: no credential — will restore" >&2; exit 1; }
 
-sync  # flush credential + config to disk so the migrated state is durable before we commit + restart
-DONE=1  # commit: the migration is verified; the EXIT trap will NOT roll back
-echo "bootstrap: migrated to pstation (cloud_url + per-hub credential verified) — restarting service"
-# The OTA (update.sh) restarts the service after install.sh returns; this is belt-and-suspenders so the running
-# agent reloads cloud_url + the new credential even if that restart path ever changes.
+sync
+DONE=1
+blog "MIGRATED to pstation (verified)"
+rm -f "$BOOTLOG" 2>/dev/null || true  # success: the Pi is on pstation now; no diagnostic needed
+echo "bootstrap: migrated to pstation (cloud_url + credential verified) — restarting service"
 systemctl restart makeros-hub 2>/dev/null || true
