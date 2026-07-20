@@ -592,11 +592,13 @@ def heartbeat_payload(
         "os": f"{platform.system()} {platform.release()}",
         "hostname": socket.gethostname(),
         "uptimeSec": _uptime_sec(),
-        "printers": printers or [],
+        # Cap every list field so a misbehaving adapter can't bloat the heartbeat (dual-review 2026-07-20;
+        # cameraFailures[:64] + VP CA 8KB were already bounded — this brings the rest in line).
+        "printers": (printers or [])[:256],
         # Terminal jobs observed since the last confirmed send — the cloud
         # ingests them into print_jobs (observe-only until a printer is
         # billing-authoritative) and dedupes on jobKey, so re-sends are safe.
-        "jobs": jobs or [],
+        "jobs": (jobs or [])[:256],
     }
     if isinstance(tailscale_status, dict):
         for key in TAILSCALE_HEARTBEAT_FIELDS:
@@ -604,11 +606,11 @@ def heartbeat_payload(
             if value not in (None, ""):
                 payload[key] = value
     if probe_results:
-        payload["probeResults"] = list(probe_results)
+        payload["probeResults"] = list(probe_results)[:64]
     if command_results:
-        payload["commandResults"] = list(command_results)
+        payload["commandResults"] = list(command_results)[:64]
     if camera_frames:
-        payload["cameraFrames"] = list(camera_frames)
+        payload["cameraFrames"] = list(camera_frames)[:32]
     if camera_failures:
         # v0.41.0: the shape became list[dict{printerId,reason,stderrTail}] so
         # the cloud's nativeprint.camera.no_frame event can carry a categorized
@@ -625,7 +627,7 @@ def heartbeat_payload(
         # unreadable source is silently omitted.
         payload["piMetrics"] = pi_metrics
     if failure_samples:
-        payload["failureSamples"] = list(failure_samples)
+        payload["failureSamples"] = list(failure_samples)[:64]
     # V4 Slice 2 — managed CA delivery. When the agent has an enabled VP
     # running, ship the CA PEM + sha256 fingerprint so the cloud can bundle
     # it into the member's `.orca_printer` + installer. Cap the PEM at 8KB
@@ -640,12 +642,12 @@ def heartbeat_payload(
     # AddPrinterForm. Empty/missing list = no fresh sweep yet (the cached
     # hits expired or the periodic worker hasn't run yet).
     if discovery_hits:
-        payload["discoveryHits"] = list(discovery_hits)
+        payload["discoveryHits"] = list(discovery_hits)[:128]
     # VP-binding reports — the IP allocator picked an IP for one or more
     # per-model VPs (Option A). Cloud upserts these into
     # virtual_printers.bind_ip. Empty/missing = no fresh allocations this tick.
     if vp_bindings:
-        payload["vpBindings"] = list(vp_bindings)
+        payload["vpBindings"] = list(vp_bindings)[:64]
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
