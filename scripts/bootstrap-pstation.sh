@@ -2,17 +2,24 @@
 # One-time migration: re-point THIS hub from makeros → pstation. Runs as ROOT at the tail of the v0.46.0 OTA
 # install (only the bootstrap release ships this file; install.sh invokes it if present, then discards the tag).
 #
-# ALL-OR-NOTHING (the whole safety argument, hardened over two dual-review passes 2026-07-20):
+# RECOVERABLE BY CONSTRUCTION for every shell-visible failure (hardened over three dual-review passes 2026-07-20):
 #   This box drives real printers and has NO SSH — a half-migration is unrecoverable remotely. So:
 #   1. FAIL CLOSED up front: this is a live, enrolled makeros hub, so its credential + config already exist. We
 #      make a VERIFIED backup of both; if we can't, we abort BEFORE enroll — nothing is touched.
 #   2. An EXIT trap rewinds credential + config to the makeros originals unless the migration is verified complete
 #      (DONE=1). It is defensive (set +e) so a failing step can't leave a partial rollback, and it removes a
 #      freshly-written pstation credential if there was none before us.
-#   3. We only commit (DONE=1) after verifying cloud_url==pstation AND a non-empty credential exist.
-#   So every failure mode rewinds the hub fully to makeros, still working. The dangerous mixed state (pstation
-#   credential beside a makeros cloud_url) cannot persist. Recovery from a failed run is a STRICTLY-NEWER release
-#   (v0.46.1) with a fresh token — re-pushing v0.46.0 won't re-trigger (the agent now reports 0.46.0).
+#   3. We only commit (DONE=1) after verifying cloud_url==pstation AND a non-empty credential exist, then sync().
+#   Every enroll/config/verify failure rewinds the hub fully to makeros, still working. Recovery from a failed run
+#   is a STRICTLY-NEWER release (v0.46.1) with a fresh token — re-pushing v0.46.0 won't re-trigger (agent now
+#   reports 0.46.0).
+#   RESIDUAL (dual review): the EXIT trap can't run on abrupt power loss / SIGKILL / kernel panic. The mixed state
+#   (pstation credential beside a makeros cloud_url) is only exposed in the ~1ms window between the agent's own
+#   write_credential() and persist_cloud_url() (consecutive statements in `enroll`; config is writable, so it
+#   flips there — this shell sed is a backstop). A crash in that sub-ms window would strand the hub → physical
+#   recovery, the SAME class as any OTA on a no-SSH box. Truly closing it needs a combined atomic credential+URL
+#   state in the agent runtime; deliberately not doing that here (bigger risk to the print-driving code than the
+#   window it removes).
 set -euo pipefail
 
 PSTATION_URL="https://procrastinationstation.net"
@@ -76,6 +83,7 @@ grep -Eq "^[[:space:]]*cloud_url[[:space:]]*=[[:space:]]*\"${PSTATION_URL}\"[[:s
   || { echo "bootstrap: cloud_url is not pstation after write — aborting (will restore)" >&2; exit 1; }
 [ -s "$CRED" ] || { echo "bootstrap: no credential present after enroll — aborting (will restore)" >&2; exit 1; }
 
+sync  # flush credential + config to disk so the migrated state is durable before we commit + restart
 DONE=1  # commit: the migration is verified; the EXIT trap will NOT roll back
 echo "bootstrap: migrated to pstation (cloud_url + per-hub credential verified) — restarting service"
 # The OTA (update.sh) restarts the service after install.sh returns; this is belt-and-suspenders so the running
