@@ -61,6 +61,11 @@ class Config:
         return self.cloud_url.rstrip("/") + "/api/print/hub/submit"
 
     @property
+    def camera_url(self) -> str:
+        # Camera frames POST here as raw JPEG bytes, out-of-band from the heartbeat (whose body is size-capped).
+        return self.cloud_url.rstrip("/") + "/api/print/hub/camera"
+
+    @property
     def queue_status_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/queue-status"
 

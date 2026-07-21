@@ -69,6 +69,32 @@ def post_json(
         time.sleep(min(sleep_s, 30.0))
 
 
+def post_bytes(
+    url: str,
+    data: bytes,
+    *,
+    content_type: str = "application/octet-stream",
+    bearer: str | None = None,
+    timeout: float = 15.0,
+) -> int:
+    """POST raw bytes (a camera JPEG frame) and return the HTTP status. No JSON body/parse — the frame rides its OWN
+    request, out-of-band from the heartbeat (whose body is size-capped on the cloud). Raises TransportError only on a
+    network failure; callers are best-effort (a failed frame push must never sink the heartbeat)."""
+    headers = {"Content-Type": content_type}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _read_capped(resp)  # drain (bounded) so the socket can be reused
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        _safe_read(exc)
+        return exc.code
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        raise TransportError(f"network error posting bytes to {url}: {exc}") from exc
+
+
 def get_json(url: str, *, bearer: str | None = None, timeout: float = 15.0) -> Response:
     """GET JSON, parse a JSON object back. Used for config-down (the printer
     list + access codes). No retries — the heartbeat loop re-pulls on the next

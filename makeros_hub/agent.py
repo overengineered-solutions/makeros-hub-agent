@@ -34,7 +34,7 @@ from . import __version__
 from .config import SPOOL_DIR, Config, parse_virtual_printer_config, read_credential
 from .vprinter.live_pool import updated_config_if_pool_changed
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
-from .http import TransportError, get_json, post_json
+from .http import TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import PrinterManager
@@ -570,6 +570,39 @@ TAILSCALE_RETRY_MAX_SEC = 300
 def _record_diagnostic(diagnostics, subsystem: str, message) -> None:
     if diagnostics is not None:
         diagnostics.record(subsystem, message)
+
+
+def push_camera_frames(
+    camera_url: str,
+    credential: str,
+    camera_frames: list[dict] | None,
+    camera_failures: list[dict] | list[str] | None,
+    log,
+) -> None:
+    """POST each collected camera frame to the cloud's dedicated camera endpoint as raw JPEG bytes — out-of-band from
+    the heartbeat (whose body is size-capped on the cloud, so a base64 frame won't fit). Best-effort: a frame that
+    fails to push is logged and skipped, never raised into the heartbeat loop. A capture failure this beat is signaled
+    with ?failed=1 + an empty body so the board can show 'reconnecting'. Frames carry {printerId, jpegBase64}."""
+    import base64
+
+    for f in camera_frames or []:
+        pid = f.get("printerId")
+        b64 = f.get("jpegBase64")
+        if not pid or not b64:
+            continue
+        try:
+            raw = base64.b64decode(b64)
+            post_bytes(f"{camera_url}?printerId={pid}", raw, content_type="image/jpeg", bearer=credential, timeout=15.0)
+        except Exception as exc:  # noqa: BLE001 — best-effort; a bad frame must never sink the heartbeat
+            log.warning("camera push failed for %s: %s", pid, str(exc)[:200])
+    for fail in camera_failures or []:
+        pid = fail.get("printerId") if isinstance(fail, dict) else fail
+        if not pid:
+            continue
+        try:
+            post_bytes(f"{camera_url}?printerId={pid}&failed=1", b"", content_type="image/jpeg", bearer=credential, timeout=10.0)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def heartbeat_payload(
@@ -1419,6 +1452,11 @@ def run(
                             camera_scheduler,
                             time.monotonic(),
                         )
+                        # Ship frames OUT-OF-BAND to the dedicated camera endpoint (raw JPEG bytes) — never in the
+                        # heartbeat, whose body the cloud caps at 512KB (a base64 frame would 413 the whole beat).
+                        # Best-effort; never raises into the loop. camera_frames/_failures are then dropped from the
+                        # heartbeat payload below (send None).
+                        push_camera_frames(cfg.camera_url, credential, camera_frames, camera_failures, log)
                         # R4.5 agent-side loudness — when failures > 0, mirror
                         # the cloud's loud signal to the Pi-local diagnostics
                         # board so an offline operator can triage without a
@@ -1601,8 +1639,8 @@ def run(
                         probe_results=pending_probe_results,
                         command_results=pending_command_results,
                         diagnostics=diagnostics,
-                        camera_frames=camera_frames,
-                        camera_failures=camera_failures,
+                        camera_frames=None,  # pushed out-of-band to /api/print/hub/camera (see push_camera_frames)
+                        camera_failures=None,
                         failure_samples=failure_samples,
                         vp_ca=vp_ca,
                         discovery_hits=discovery_hits,
