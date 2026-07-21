@@ -34,7 +34,7 @@ from . import __version__
 from .config import SPOOL_DIR, Config, parse_virtual_printer_config, read_credential
 from .vprinter.live_pool import updated_config_if_pool_changed
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
-from .http import TransportError, get_json, post_json
+from .http import TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import PrinterManager
@@ -572,6 +572,39 @@ def _record_diagnostic(diagnostics, subsystem: str, message) -> None:
         diagnostics.record(subsystem, message)
 
 
+def push_camera_frames(
+    camera_url: str,
+    credential: str,
+    camera_frames: list[dict] | None,
+    camera_failures: list[dict] | list[str] | None,
+    log,
+) -> None:
+    """POST each collected camera frame to the cloud's dedicated camera endpoint as raw JPEG bytes — out-of-band from
+    the heartbeat (whose body is size-capped on the cloud, so a base64 frame won't fit). Best-effort: a frame that
+    fails to push is logged and skipped, never raised into the heartbeat loop. A capture failure this beat is signaled
+    with ?failed=1 + an empty body so the board can show 'reconnecting'. Frames carry {printerId, jpegBase64}."""
+    import base64
+
+    for f in camera_frames or []:
+        pid = f.get("printerId")
+        b64 = f.get("jpegBase64")
+        if not pid or not b64:
+            continue
+        try:
+            raw = base64.b64decode(b64)
+            post_bytes(f"{camera_url}?printerId={pid}", raw, content_type="image/jpeg", bearer=credential, timeout=15.0)
+        except Exception as exc:  # noqa: BLE001 — best-effort; a bad frame must never sink the heartbeat
+            log.warning("camera push failed for %s: %s", pid, str(exc)[:200])
+    for fail in camera_failures or []:
+        pid = fail.get("printerId") if isinstance(fail, dict) else fail
+        if not pid:
+            continue
+        try:
+            post_bytes(f"{camera_url}?printerId={pid}&failed=1", b"", content_type="image/jpeg", bearer=credential, timeout=10.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def heartbeat_payload(
     printers: list[dict] | None = None,
     jobs: list[dict] | None = None,
@@ -592,11 +625,13 @@ def heartbeat_payload(
         "os": f"{platform.system()} {platform.release()}",
         "hostname": socket.gethostname(),
         "uptimeSec": _uptime_sec(),
-        "printers": printers or [],
+        # Cap every list field so a misbehaving adapter can't bloat the heartbeat (dual-review 2026-07-20;
+        # cameraFailures[:64] + VP CA 8KB were already bounded — this brings the rest in line).
+        "printers": (printers or [])[:256],
         # Terminal jobs observed since the last confirmed send — the cloud
         # ingests them into print_jobs (observe-only until a printer is
         # billing-authoritative) and dedupes on jobKey, so re-sends are safe.
-        "jobs": jobs or [],
+        "jobs": (jobs or [])[:256],
     }
     if isinstance(tailscale_status, dict):
         for key in TAILSCALE_HEARTBEAT_FIELDS:
@@ -604,11 +639,11 @@ def heartbeat_payload(
             if value not in (None, ""):
                 payload[key] = value
     if probe_results:
-        payload["probeResults"] = list(probe_results)
+        payload["probeResults"] = list(probe_results)[:64]
     if command_results:
-        payload["commandResults"] = list(command_results)
+        payload["commandResults"] = list(command_results)[:64]
     if camera_frames:
-        payload["cameraFrames"] = list(camera_frames)
+        payload["cameraFrames"] = list(camera_frames)[:32]
     if camera_failures:
         # v0.41.0: the shape became list[dict{printerId,reason,stderrTail}] so
         # the cloud's nativeprint.camera.no_frame event can carry a categorized
@@ -625,7 +660,7 @@ def heartbeat_payload(
         # unreadable source is silently omitted.
         payload["piMetrics"] = pi_metrics
     if failure_samples:
-        payload["failureSamples"] = list(failure_samples)
+        payload["failureSamples"] = list(failure_samples)[:64]
     # V4 Slice 2 — managed CA delivery. When the agent has an enabled VP
     # running, ship the CA PEM + sha256 fingerprint so the cloud can bundle
     # it into the member's `.orca_printer` + installer. Cap the PEM at 8KB
@@ -640,12 +675,12 @@ def heartbeat_payload(
     # AddPrinterForm. Empty/missing list = no fresh sweep yet (the cached
     # hits expired or the periodic worker hasn't run yet).
     if discovery_hits:
-        payload["discoveryHits"] = list(discovery_hits)
+        payload["discoveryHits"] = list(discovery_hits)[:128]
     # VP-binding reports — the IP allocator picked an IP for one or more
     # per-model VPs (Option A). Cloud upserts these into
     # virtual_printers.bind_ip. Empty/missing = no fresh allocations this tick.
     if vp_bindings:
-        payload["vpBindings"] = list(vp_bindings)
+        payload["vpBindings"] = list(vp_bindings)[:64]
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
@@ -1171,6 +1206,26 @@ def _restore_shutdown_signal_handlers(previous: dict[int, object]) -> None:
             continue
 
 
+def _surface_last_bootstrap(diagnostics) -> None:
+    """The one-time makeros→pstation migration runs in a SEPARATE root OTA unit, so a failed enroll leaves no
+    trace the cloud can see (there's no SSH to this box). If that bootstrap left a result log, surface its tail
+    into diagnostics ("update" subsystem, redacted+truncated by the ring) so the failure is visible in the cloud
+    diag on the very next heartbeat. Best-effort: a normal install has no such file."""
+    path = os.environ.get("MAKEROS_HUB_BOOTSTRAP_LOG", "/var/lib/makeros-hub/last-bootstrap.log")
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            try:  # bounded read — only ever the tail, even if the file is unexpectedly large
+                fh.seek(0, 2)
+                fh.seek(max(0, fh.tell() - 4096))
+            except OSError:
+                pass
+            data = fh.read().strip()
+    except OSError:
+        return
+    if data:
+        _record_diagnostic(diagnostics, "update", f"bootstrap: {data[-600:]}")
+
+
 def run(
     cfg: Config,
     *,
@@ -1183,6 +1238,7 @@ def run(
     diagnostics = Diagnostics(cloud_url=cfg.cloud_url, agent_version=__version__)
     set_default(diagnostics)
     install_log_handler(diagnostics)
+    _surface_last_bootstrap(diagnostics)
 
     credential = read_credential()
     if not credential:
@@ -1396,6 +1452,11 @@ def run(
                             camera_scheduler,
                             time.monotonic(),
                         )
+                        # Ship frames OUT-OF-BAND to the dedicated camera endpoint (raw JPEG bytes) — never in the
+                        # heartbeat, whose body the cloud caps at 512KB (a base64 frame would 413 the whole beat).
+                        # Best-effort; never raises into the loop. camera_frames/_failures are then dropped from the
+                        # heartbeat payload below (send None).
+                        push_camera_frames(cfg.camera_url, credential, camera_frames, camera_failures, log)
                         # R4.5 agent-side loudness — when failures > 0, mirror
                         # the cloud's loud signal to the Pi-local diagnostics
                         # board so an offline operator can triage without a
@@ -1578,8 +1639,8 @@ def run(
                         probe_results=pending_probe_results,
                         command_results=pending_command_results,
                         diagnostics=diagnostics,
-                        camera_frames=camera_frames,
-                        camera_failures=camera_failures,
+                        camera_frames=None,  # pushed out-of-band to /api/print/hub/camera (see push_camera_frames)
+                        camera_failures=None,
                         failure_samples=failure_samples,
                         vp_ca=vp_ca,
                         discovery_hits=discovery_hits,
@@ -1662,11 +1723,13 @@ def run(
                             tailscale_status = pulled_tailscale_status
                         maybe_rehydrate_vprinter_outbox()
                     # Over-the-air self-update: the cloud names the release this
-                    # hub should run. No-op unless it's a strictly-newer release
-                    # tag and the cooldown has passed; on apply, the update
-                    # script restarts the service onto the new version.
+                    # hub should run + (content-trust) the commit SHA that tag MUST
+                    # resolve to. No-op unless it's a strictly-newer release tag and
+                    # the cooldown has passed; on apply, the root script verifies the
+                    # SHA before installing, then restarts the service (systemd mode).
                     target = resp.body.get("targetVersion")
-                    if isinstance(target, str) and target and maybe_update(__version__, target):
+                    target_sha = resp.body.get("targetVersionSha256")
+                    if isinstance(target, str) and target and maybe_update(__version__, target, target_sha):
                         log.info("OTA: update to %s launched; the service will restart", target)
                     probe_results = _run_pending_probes(
                         resp.body.get("pendingProbes"),

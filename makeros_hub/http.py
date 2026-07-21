@@ -7,10 +7,18 @@ touching the enroll/heartbeat logic. Responses are explicitly shape-checked
 from __future__ import annotations
 
 import json
+import random
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+
+# Cap every parsed response body (config-down included) so a bad/hostile cloud or proxy can't force the Pi to
+# buffer an unbounded body into memory. 8 MiB is far above any real config-down / heartbeat response.
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+# CSPRNG for backoff jitter — a shared PRNG seed across agents started together (e.g. after a cloud deploy) would
+# leave them synchronized and thundering-herd the endpoint. (dual-review 2026-07-20.)
+_RNG = random.SystemRandom()
 
 
 @dataclass
@@ -45,7 +53,7 @@ def post_json(
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return _parse(resp.status, resp.read())
+                return _parse(resp.status, _read_capped(resp))
         except urllib.error.HTTPError as exc:
             # 4xx are deterministic (bad token, revoked cred) — surface, don't retry.
             body = _safe_read(exc)
@@ -55,10 +63,36 @@ def post_json(
             if attempt >= retries:
                 raise TransportError(f"network error talking to {url}: {exc}") from exc
         attempt += 1
-        # Jitter without importing random's global state concerns — coarse is fine.
+        # Exponential backoff + FULL CSPRNG jitter so simultaneously-restarted agents de-synchronize.
         sleep_s = backoff_base * (2 ** (attempt - 1))
-        sleep_s += (time.monotonic() % 1.0) * backoff_base  # cheap jitter
+        sleep_s += _RNG.uniform(0.0, backoff_base)
         time.sleep(min(sleep_s, 30.0))
+
+
+def post_bytes(
+    url: str,
+    data: bytes,
+    *,
+    content_type: str = "application/octet-stream",
+    bearer: str | None = None,
+    timeout: float = 15.0,
+) -> int:
+    """POST raw bytes (a camera JPEG frame) and return the HTTP status. No JSON body/parse — the frame rides its OWN
+    request, out-of-band from the heartbeat (whose body is size-capped on the cloud). Raises TransportError only on a
+    network failure; callers are best-effort (a failed frame push must never sink the heartbeat)."""
+    headers = {"Content-Type": content_type}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            _read_capped(resp)  # drain (bounded) so the socket can be reused
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        _safe_read(exc)
+        return exc.code
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        raise TransportError(f"network error posting bytes to {url}: {exc}") from exc
 
 
 def get_json(url: str, *, bearer: str | None = None, timeout: float = 15.0) -> Response:
@@ -71,11 +105,19 @@ def get_json(url: str, *, bearer: str | None = None, timeout: float = 15.0) -> R
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return _parse(resp.status, resp.read())
+            return _parse(resp.status, _read_capped(resp))
     except urllib.error.HTTPError as exc:
         return Response(status=exc.code, body=_safe_read(exc))
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
         raise TransportError(f"network error talking to {url}: {exc}") from exc
+
+
+def _read_capped(resp) -> bytes:
+    """Read at most MAX_RESPONSE_BYTES; refuse a larger body rather than buffering it into memory."""
+    raw = resp.read(MAX_RESPONSE_BYTES + 1)
+    if len(raw) > MAX_RESPONSE_BYTES:
+        raise TransportError(f"response body exceeds {MAX_RESPONSE_BYTES} bytes")
+    return raw
 
 
 def _parse(status: int, raw: bytes) -> Response:
@@ -90,7 +132,7 @@ def _parse(status: int, raw: bytes) -> Response:
 
 def _safe_read(exc: urllib.error.HTTPError) -> dict:
     try:
-        raw = exc.read()
+        raw = exc.read(MAX_RESPONSE_BYTES + 1)
         parsed = json.loads(raw.decode("utf-8")) if raw else {}
         return parsed if isinstance(parsed, dict) else {}
     except Exception:  # noqa: BLE001 — best-effort error-body parse

@@ -76,7 +76,7 @@ class TestMaybeUpdate(unittest.TestCase):
             update, "apply_update", return_value=True
         ) as ap:
             self.assertTrue(update.maybe_update("0.3.0", "v0.4.0"))
-            ap.assert_called_once_with("v0.4.0")
+            ap.assert_called_once_with("v0.4.0", None)
 
     def test_skips_when_cooled_down(self):
         with mock.patch.object(update, "recently_attempted", return_value=True), mock.patch.object(
@@ -84,6 +84,85 @@ class TestMaybeUpdate(unittest.TestCase):
         ) as ap:
             self.assertFalse(update.maybe_update("0.3.0", "v0.4.0"))
             ap.assert_not_called()
+
+
+class TestIsCommitSha(unittest.TestCase):
+    def test_valid_and_invalid(self):
+        self.assertTrue(update.is_commit_sha("a" * 40))
+        self.assertTrue(update.is_commit_sha("0123456789abcdef0123456789abcdef01234567"))
+        for bad in ["A" * 40, "a" * 39, "a" * 41, "main", "", None, 40, "a" * 40 + " "]:
+            self.assertFalse(update.is_commit_sha(bad), bad)
+
+
+class TestApplyUpdateContentTrust(unittest.TestCase):
+    def test_systemd_passes_tag_and_sha_to_root_script(self):
+        sha = "b" * 40
+        with mock.patch.object(update, "UPDATE_MODE", "systemd"), mock.patch.object(
+            update, "_write_state"
+        ), mock.patch("makeros_hub.update.subprocess.run") as run:
+            self.assertTrue(update.apply_update("v0.46.0", sha))
+            self.assertEqual(run.call_args[0][0], ["sudo", update.UPDATE_SCRIPT, "v0.46.0", sha])
+
+    def test_systemd_without_sha_installs_unverified(self):
+        with mock.patch.object(update, "UPDATE_MODE", "systemd"), mock.patch.object(
+            update, "_write_state"
+        ), mock.patch("makeros_hub.update.subprocess.run") as run:
+            self.assertTrue(update.apply_update("v0.46.0"))
+            self.assertEqual(run.call_args[0][0], ["sudo", update.UPDATE_SCRIPT, "v0.46.0"])
+
+    def test_refuses_malformed_sha_before_running_anything(self):
+        with mock.patch.object(update, "UPDATE_MODE", "systemd"), mock.patch(
+            "makeros_hub.update.subprocess.run"
+        ) as run:
+            self.assertFalse(update.apply_update("v0.46.0", "NOThex"))
+            run.assert_not_called()
+
+    def test_refuses_nonrelease_tag(self):
+        with mock.patch("makeros_hub.update.subprocess.run") as run:
+            self.assertFalse(update.apply_update("main"))
+            run.assert_not_called()
+
+
+class TestUpdateModes(unittest.TestCase):
+    def test_disabled_ignores(self):
+        with mock.patch.object(update, "UPDATE_MODE", "disabled"), mock.patch(
+            "makeros_hub.update.subprocess.run"
+        ) as run:
+            self.assertFalse(update.apply_update("v0.46.0", "c" * 40))
+            run.assert_not_called()
+
+    def test_exit_mode_records_and_requests_repull(self):
+        captured = {}
+        with mock.patch.object(update, "UPDATE_MODE", "exit"), mock.patch.object(
+            update, "_write_state"
+        ) as ws, mock.patch.object(
+            update, "_request_exit", side_effect=lambda code: captured.setdefault("code", code)
+        ), mock.patch("makeros_hub.update.subprocess.run") as run:
+            update.apply_update("v0.46.0", "d" * 40)
+            self.assertEqual(captured["code"], update.EXIT_FOR_UPDATE_CODE)
+            ws.assert_called_once()  # recorded the target for the orchestrator
+            run.assert_not_called()  # no sudo/systemd in container mode
+
+    def test_request_exit_raises_systemexit(self):
+        with self.assertRaises(SystemExit) as cm:
+            update._request_exit(update.EXIT_FOR_UPDATE_CODE)
+        self.assertEqual(cm.exception.code, update.EXIT_FOR_UPDATE_CODE)
+
+
+class TestMaybeUpdateThreadsSha(unittest.TestCase):
+    def test_passes_valid_sha_through(self):
+        with mock.patch.object(update, "recently_attempted", return_value=False), mock.patch.object(
+            update, "apply_update", return_value=True
+        ) as ap:
+            self.assertTrue(update.maybe_update("0.45.0", "v0.46.0", "e" * 40))
+            ap.assert_called_once_with("v0.46.0", "e" * 40)
+
+    def test_drops_malformed_sha_to_none(self):
+        with mock.patch.object(update, "recently_attempted", return_value=False), mock.patch.object(
+            update, "apply_update", return_value=True
+        ) as ap:
+            update.maybe_update("0.45.0", "v0.46.0", "not-a-sha")
+            ap.assert_called_once_with("v0.46.0", None)
 
 
 if __name__ == "__main__":

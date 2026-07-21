@@ -39,9 +39,16 @@ auditable record of the trust model.
 ## Least privilege
 
 - Runs as a dedicated **non-login system user** (`makeros-hub`), not root.
-- **Outbound HTTPS only** — no inbound ports opened on the shop LAN.
-- systemd hardening: `NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome`, `PrivateTmp`,
-  a scoped `StateDirectory`.
+- **Outbound HTTPS to the cloud.** The only inbound listeners are on the **trusted shop LAN** — the OrcaSlicer
+  ingest (`:8787`) and, when a virtual printer is enabled, its Bambu-emulation ports (e.g. FTPS `990`). Never the
+  internet.
+- systemd hardening: `ProtectHome`, `PrivateTmp`, and a scoped `StateDirectory` (0700, service-user-owned).
+  `NoNewPrivileges` and `ProtectSystem=full` are **deliberately NOT set** — each would block a legitimate
+  privileged path this design needs: `NoNewPrivileges` stops `sudo` from escalating even with a valid NOPASSWD
+  rule (breaks the OTA self-update), and `ProtectSystem=full` mounts `/usr` + `/etc` read-only (breaks the
+  OTA/Tailscale installs that write there). The real controls are the unprivileged service user + the narrow,
+  arg-scoped sudoers rules below — not filesystem/privilege sandboxing. (Verified against
+  `systemd/makeros-hub.service`, which documents both omissions inline.)
 - **No secrets in this repository.**
 
 ## Supply-chain integrity
@@ -83,15 +90,24 @@ the one remote-code-execution path in the system, so it is deliberately narrow:
   on both the agent and the root script. The cloud cannot point it at a branch, a commit,
   `main`, or any non-release ref — only a real tagged release of the one hardcoded repo URL.
 - **Forward-only.** Never downgrades; a cooldown stops an update loop on a broken target.
-- **Narrow sudoers.** The non-root `makeros-hub` user may run **only** `/opt/makeros-hub/update.sh`
-  as root (an `/etc/sudoers.d/makeros-hub` drop-in, validated with `visudo` at install). The
-  script is root-owned and not writable by the service user, so it can't be swapped. The update
-  runs in an independent systemd transient unit so the service restart can't kill it mid-flight.
+- **Scoped sudoers (not update-only).** The non-root `makeros-hub` user has an `/etc/sudoers.d/makeros-hub`
+  drop-in (validated with `visudo` at install) granting root for exactly five things (`install.sh`):
+  `update.sh` (OTA), `tailscale-setup.sh` (Tailscale install/up), and — for the per-model virtual-printer IP
+  allocator — `ip addr add|del … dev …` and `arping -c … -w … -I …`. No shell, no arbitrary command. The
+  `ip`/`arping` wildcards are the widest remaining surface (any IP/interface); moving them behind arg-validating
+  wrapper scripts (as `update.sh` already is) is a tracked hardening item. The OTA + setup scripts are root-owned
+  and not writable by the service user, so they can't be swapped; the OTA runs in an independent systemd transient
+  unit so the service restart can't kill it mid-flight.
 - **Operator-controlled.** Auto-update is **off by default**, per hub; the admin opts in (or
   triggers a one-shot "Update now") from the dashboard.
-- **Roadmap:** signed release artifacts (minisign/Sigstore) + signature verification in the
-  update path, so even a compromised repo can't push code to tenant hardware. Until then the
-  control is pinned reviewed releases + the narrow sudoers surface above.
+- **Content-trust (implemented).** The cloud sends, alongside the target tag, the exact **commit SHA** that tag
+  must resolve to. The root update script runs `git rev-parse HEAD` after cloning and **refuses to install**
+  anything that doesn't match — so a compromised or re-pointed tag on the git host can't push other code (both the
+  cloud AND the git host would have to be compromised, consistently). Signed release artifacts (minisign/Sigstore)
+  remain a roadmap second factor.
+- **Portable update transport.** `MAKEROS_HUB_UPDATE_MODE` selects `systemd` (default — the sudo root script +
+  transient-unit restart above), `exit` (container: record the target + exit a defined code so the orchestrator
+  repulls the pinned image — no sudo/systemd), or `disabled` (never self-update).
 
 ## Reporting
 
