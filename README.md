@@ -55,8 +55,8 @@ per-vendor adapters, and reports rich telemetry every beat. Capabilities:
    reviewed release** (never mutable `main` — see [`SECURITY.md`](SECURITY.md)), installs the
    agent, enrolls this hub, and starts the service:
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/overengineered-solutions/makeros-hub-agent/v0.45.0/bootstrap.sh \
-     | sudo bash -s -- --token <TOKEN> --cloud-url https://<cloud-host> --ref v0.45.0
+   curl -fsSL https://git.overengineeredsolutions.org/bootstrap.sh \
+     | sudo bash -s -- --token <TOKEN> --cloud-url https://<cloud-host> --ref v0.47.0
    ```
 3. Watch it go **online** within ~30s: `journalctl -u makeros-hub -f` (`heartbeat ok 200`). Stop
    the service → it flips **offline** after ~90s; revoke in the UI → the next heartbeat 401s.
@@ -67,7 +67,8 @@ still works: `git clone --branch <tag> … && cd makeros-hub-agent && sudo ./ins
 
 ## Config
 
-`/etc/makeros-hub/config.toml` (non-secret): `cloud_url`, `heartbeat_sec`. Everything is
+`/etc/makeros-hub/config.toml` (non-secret): `cloud_url`, `heartbeat_sec`, and `repo` (the code
+host bootstrap recorded, reused by OTA — defaults to the sovereign mirror). Everything is
 overridable by env (`MAKEROS_HUB_CLOUD_URL`, `MAKEROS_HUB_HEARTBEAT_SEC`, …) and by
 `--cloud-url` on the CLI. The actual heartbeat cadence is dictated by the cloud in each
 response (no redeploy to change it). AI failure-watch activates only when

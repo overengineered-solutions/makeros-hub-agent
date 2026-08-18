@@ -26,7 +26,14 @@ if [ -n "$EXPECTED_SHA" ]; then
   }
 fi
 
-REPO="https://github.com/overengineered-solutions/makeros-hub-agent.git"
+# Code host: read `repo` from config.toml (bootstrap wrote it), so OTA pulls from the SAME mirror the install
+# used. Falls back to the sovereign default if the key is absent (e.g. a hub installed before this key existed).
+# The host does NOT need to be trusted: the content-trust SHA check below rejects any clone whose HEAD is not
+# the exact commit the cloud pinned, so a read-only public mirror is sufficient and GitHub is not required.
+CONFIG="${MAKEROS_HUB_CONFIG:-/etc/makeros-hub/config.toml}"
+REPO_DEFAULT="https://git.overengineeredsolutions.org/makeros-hub-agent.git"
+REPO="$(sed -n 's/^[[:space:]]*repo[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$CONFIG" 2>/dev/null | head -1)"
+[ -n "$REPO" ] || REPO="$REPO_DEFAULT"
 SELF="/opt/makeros-hub/update.sh"
 
 # Phase 1 — invoked by the agent, still inside the service's cgroup. Detach into
@@ -45,7 +52,8 @@ fi
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 echo "makeros-hub OTA: cloning $TAG"
-git clone --depth 1 --branch "$TAG" "$REPO" "$TMP/src"
+# No --depth: a dumb-HTTP-served mirror does not support shallow clones (this repo is small).
+git clone --branch "$TAG" "$REPO" "$TMP/src"
 cd "$TMP/src"
 # Content-trust: the tag must resolve to the EXACT commit the cloud pinned. A compromised/re-pointed tag on the
 # git host fails here BEFORE anything runs as root. (dual-review 2026-07-20; roadmap: signed-tag verification.)
