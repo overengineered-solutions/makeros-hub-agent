@@ -58,6 +58,12 @@ auditable record of the trust model.
   a repo compromise from reaching tenant devices.
 - The repository is **public** for transparency — tenants and auditors can review exactly what
   runs on their hardware and talks to the shared cloud.
+- **The code host is the OES sovereign mirror** (`git.overengineeredsolutions.org`), served read-only over
+  HTTPS, not GitHub. This is not a trust downgrade: the cloud pins the exact commit SHA in each heartbeat and
+  both `bootstrap.sh` and `update.sh` **refuse any clone whose HEAD is not that commit** (content-trust). The
+  host therefore only needs to be *available*, not *trusted* — a re-pointed tag or a tampered mirror fails the
+  SHA check before anything runs as root. `--repo` overrides the host; `config.toml`'s `repo` key persists it
+  for OTA. (Integrity roadmap: signed-tag verification, on top of the SHA pin.)
 - **Roadmap (before second-tenant onboarding):** signed release artifacts (minisign/Sigstore)
   + checksum verification in the installer, and a `--verify` step in the bootstrap one-liner.
   Until then, install only from a tag you (or your operator) have reviewed.

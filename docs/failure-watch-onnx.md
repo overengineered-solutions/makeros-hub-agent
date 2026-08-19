@@ -57,7 +57,6 @@ Options (any works):
 
 - Supabase Storage public bucket (recommended — same infra as `workspace-images`)
 - Cloudflare R2 + custom domain
-- GitHub release attached binary on this repo
 
 The URL must serve the raw bytes (no HTML wrapper). Test with `curl -I`.
 

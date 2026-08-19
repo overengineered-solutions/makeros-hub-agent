@@ -1,6 +1,6 @@
 [Unit]
 Description=makeros native-print hub agent
-Documentation=https://github.com/overengineered-solutions/makeros-hub-agent
+Documentation=https://git.overengineeredsolutions.org/
 After=network-online.target
 Wants=network-online.target
 
