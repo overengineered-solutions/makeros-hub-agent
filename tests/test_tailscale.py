@@ -124,6 +124,18 @@ class TestTailscaleReconcile(unittest.TestCase):
         self.assertNotIn(key, " ".join(setup_calls[0]["argv"]))
         self.assertEqual(status["tailscaleStatus"], "connected")
 
+    def test_absent_config_touches_nothing(self):
+        # Tri-state contract (2026-08-26 shop-box incident): NO tailscale block in config-down means the
+        # cloud does not manage tailscale here — no probe, no shell-out, and above all no `down` on a box
+        # whose network the operator manages. Only an explicit {"enabled": False} tears down.
+        runner = SequencedRunner()
+
+        status = tailscale.reconcile_tailscale(None, runner)
+
+        self.assertEqual(runner.calls, [])
+        self.assertEqual(status["tailscaleStatus"], "disabled")
+        self.assertEqual(status["tailscaleStatusReason"], "not managed by cloud config")
+
     def test_disabled_when_up_calls_down(self):
         runner = SequencedRunner(
             result(["tailscale", "ip", "-4"], stdout="100.64.0.10\n"),

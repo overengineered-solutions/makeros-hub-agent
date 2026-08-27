@@ -252,7 +252,15 @@ def current_tailscale_status(
 
 
 def reconcile_tailscale(cfg: dict | None, runner: Runner = subprocess_runner) -> dict:
-    """Reconcile local Tailscale state to the config-down `tailscale` block."""
+    """Reconcile local Tailscale state to the config-down `tailscale` block.
+
+    Tri-state contract (2026-08-26 shop-box incident): an ABSENT block (cfg is None) means the cloud does
+    not manage Tailscale on this box — touch NOTHING, don't even probe. Only an explicit
+    {"enabled": false} tears down. A box whose network the OPERATOR manages must never be disconnected
+    by a config that simply says nothing about Tailscale.
+    """
+    if cfg is None:
+        return _status("disabled", reason="not managed by cloud config")
     enabled = bool(cfg.get("enabled")) if isinstance(cfg, dict) else False
     auth_key = cfg.get("authKey") if isinstance(cfg, dict) else None
     auth_key = auth_key if isinstance(auth_key, str) else None
