@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from makeros_hub.vprinter.pool_ranking import PoolRankingState
-from makeros_hub.vprinter.live_pool import active_keys, scoped_statuses, vp_pool_from_statuses_ranked
+from makeros_hub.vprinter.live_pool import active_keys, scoped_statuses, tray_key, vp_pool_from_statuses_ranked
 
 DAY = 86400.0
 
@@ -48,6 +48,18 @@ class TestRankingPolicy(unittest.TestCase):
                 st.observe([], ["b"], 0.5, now - 29 * DAY + i * 30)
             got = st.select(["a", "b", "c"], capacity=1, now=now)
         self.assertEqual(got, ["b"])   # most-used wins the last slot
+
+    def test_recent_burst_cannot_evict_every_usage_winner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = self._state(tmp)
+            now = 100 * DAY
+            st.observe(["heavy"], [], 0.5, now - 30 * DAY)
+            for i in range(60):                                              # 30 active-minutes on heavy
+                st.observe([], ["heavy"], 0.5, now - 29 * DAY + i * 30)
+            fresh = [f"fresh{i}" for i in range(5)]                          # capacity+1 spools loaded today
+            st.observe(fresh, [], 0.5, now - 1)
+            got = st.select(fresh + ["heavy"], capacity=4, now=now)
+        self.assertIn("heavy", got)   # usage reserve holds against a fresh-spool burst
 
     def test_persistence_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -93,7 +105,7 @@ class TestScopedAndActive(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             st = PoolRankingState(Path(tmp) / "r.json", now=0.0)
             now = 100 * DAY
-            st.observe(["PLA|GFL99|FFFFFF", "ABS|GFB99|000000"], [], 0.5, now - 30 * DAY)
+            st.observe([tray_key(tray("PLA", "#ffffff", "GFL99")), tray_key(tray("ABS", "#000000", "GFB99"))], [], 0.5, now - 30 * DAY)
             sts = [status("m", [tray("PLA", "#ffffff", "GFL99", 0), tray("ABS", "#000000", "GFB99", 1),
                                tray("PETG", "#ff0000", "GFG99", 2)])]
             pool = vp_pool_from_statuses_ranked(sts, units=1, trays=2, ranking=st, now=now)

@@ -1462,12 +1462,16 @@ def run(
                     # (first-seen on every loaded key; active-minutes on printing printers' active trays),
                     # then per-VP: model-scope -> derive -> RANK -> hot-apply only on display change.
                     try:
+                        # TWO clocks, deliberately (codex): the loop's `now` is MONOTONIC — right for the
+                        # tick SPAN, catastrophically wrong for persisted timestamps (the epoch resets every
+                        # restart; recency/decay would compare across epochs for weeks). Signals use wall time.
                         last = ranking_clock.get("last")
                         tick_min = ((now - last) / 60.0) if isinstance(last, (int, float)) else 0.5
                         ranking_clock["last"] = now
-                        pool_ranking.observe(vp_loaded_keys(statuses), vp_active_keys(statuses), tick_min, now)
-                        pool_ranking.persist(now)
-                        updated_cfgs = updated_configs_if_pools_changed(multi_vp_live, statuses, pool_ranking, now)
+                        wall = time.time()
+                        pool_ranking.observe(vp_loaded_keys(statuses), vp_active_keys(statuses), tick_min, wall)
+                        pool_ranking.persist(wall)
+                        updated_cfgs = updated_configs_if_pools_changed(multi_vp_live, statuses, pool_ranking, wall)
                         if updated_cfgs is not None:
                             vp_manager.reconcile_sync(updated_cfgs)
                             log.info("VP AMS multi live-mirror applied (%d VPs)", len(updated_cfgs))

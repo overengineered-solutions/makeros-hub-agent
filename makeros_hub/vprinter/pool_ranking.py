@@ -33,6 +33,9 @@ log = logging.getLogger("makeros-hub.vprinter")
 DEFAULT_STATE_PATH = Path("/var/lib/makeros-hub/pool-ranking.json")
 RECENT_DAYS = 7.0
 HALF_LIFE_DAYS = 30.0
+USAGE_RESERVE_FRACTION = 0.25   # over-capacity, at least this share stays with usage-tier winners (codex #3:
+                                # 'most-used AND most-recently-added' is a conjunction — capacity+1 fresh spools
+                                # must never evict every heavy-use color for a week)
 PERSIST_MIN_INTERVAL_SEC = 60.0
 MAX_TRACKED_KEYS = 512   # a shop cannot plausibly rotate more distinct spools; bound the file
 
@@ -125,7 +128,11 @@ class PoolRankingState:
         recent_cutoff = now - RECENT_DAYS * 86400.0
         recent = [k for k in cands if self._keys.get(k, {}).get("first_seen", 0.0) >= recent_cutoff]
         recent.sort(key=lambda k: (-self._keys.get(k, {}).get("first_seen", 0.0), k))
-        chosen: list[str] = recent[:capacity]
+        non_recent = [k for k in cands if k not in set(recent)]
+        # The recent tier is capped so usage winners keep a reserved share whenever non-recent candidates
+        # exist — the requirement is a conjunction, not recency-first-take-all.
+        reserve = min(len(non_recent), max(1, int(capacity * USAGE_RESERVE_FRACTION))) if non_recent else 0
+        chosen: list[str] = recent[: max(0, capacity - reserve)]
         if len(chosen) < capacity:
             rest = [k for k in cands if k not in set(chosen)]
             rest.sort(key=lambda k: (-self._decayed(k, now), k))
