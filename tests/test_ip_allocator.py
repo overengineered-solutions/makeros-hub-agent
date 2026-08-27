@@ -372,5 +372,133 @@ class TestBinding(unittest.TestCase):
         self.assertEqual(b.claimed_at, 42.0)
 
 
+
+
+class TestIpAllocatorEnsureClaimed(unittest.TestCase):
+    """ensure_claimed (v0.49): the cloud-assigned + reboot re-claim path — routed ips land on lo with no
+    arping; LAN ips re-claim on the persisted/guessed iface; invariants (persist-first, File-exists=ok)
+    match allocation."""
+
+    def test_routed_ip_claims_on_lo_without_arping(self):
+        calls: list[tuple] = []
+        routes = {
+            ("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.1/32", "dev", "lo"): StubResult(returncode=0),
+        }
+        base = make_run(routes)
+
+        def spy(argv, timeout):
+            calls.append(tuple(argv))
+            return base(argv, timeout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            alloc = IpAllocator(
+                state_path=Path(tmp) / "b.json",
+                run=spy,
+                iface_override="eth0",
+                routed_prefix="198.18.10.0/29",
+            )
+            res = alloc.ensure_claimed("X1 Carbon", "198.18.10.1")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.iface, "lo")
+        self.assertEqual(res.bind_ip, "198.18.10.1")
+        self.assertFalse(any("arping" in c[0] or (len(c) > 2 and "arping" in c[2]) for c in calls))
+        self.assertEqual(calls, [("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.1/32", "dev", "lo")])
+
+    def test_lan_ip_reclaims_on_iface_and_file_exists_is_ok(self):
+        routes = {
+            ("sudo", "-n", "/sbin/ip", "addr", "add", "192.168.1.240/32", "dev", "eth0"): StubResult(returncode=2, stderr="RTNETLINK answers: File exists"),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            alloc = IpAllocator(
+                state_path=Path(tmp) / "b.json",
+                run=make_run(routes),
+                iface_override="eth0",
+                routed_prefix="198.18.10.0/29",
+            )
+            res = alloc.ensure_claimed("P1S", "192.168.1.240")   # outside the prefix -> LAN path
+        self.assertTrue(res.ok)
+        self.assertEqual(res.iface, "eth0")
+
+    def test_claim_persisted_before_privileged_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "b.json"
+            alloc = IpAllocator(
+                state_path=state,
+                run=make_run({}),                        # claim FAILS (unknown call -> rc=1)
+                iface_override="eth0",
+                routed_prefix="198.18.10.0/29",
+            )
+            res = alloc.ensure_claimed("H2D", "198.18.10.4")
+            self.assertFalse(res.ok)
+            persisted = json.loads(state.read_text())["bindings"]
+            self.assertTrue(any(b.get("bind_ip") == "198.18.10.4" for b in persisted.values()))
+
+    def test_invalid_prefix_ignored_and_invalid_ip_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            alloc = IpAllocator(
+                state_path=Path(tmp) / "b.json",
+                run=make_run({}),
+                iface_override="eth0",
+                routed_prefix="not-a-prefix",
+            )
+            self.assertIsNone(alloc._routed_prefix)
+            alloc.set_routed_prefix("198.18.10.0/29")
+            res = alloc.ensure_claimed("A1 mini", "not-an-ip")
+            self.assertFalse(res.ok)
+            self.assertIn("invalid bind ip", res.error or "")
+
+
+    def test_changed_binding_releases_old_claim_lan_to_routed(self):
+        # codex blocker #1: model moves LAN eth0 -> routed lo; the OLD /32 must be released, not leaked.
+        calls: list[tuple] = []
+        routes = {
+            ("sudo", "-n", "/sbin/ip", "addr", "add", "192.168.1.240/32", "dev", "eth0"): StubResult(returncode=0),
+            ("sudo", "-n", "/sbin/ip", "addr", "del", "192.168.1.240/32", "dev", "eth0"): StubResult(returncode=0),
+            ("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.2/32", "dev", "lo"): StubResult(returncode=0),
+        }
+        base = make_run(routes)
+
+        def spy(argv, timeout):
+            calls.append(tuple(argv))
+            return base(argv, timeout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            alloc = IpAllocator(
+                state_path=Path(tmp) / "b.json",
+                run=spy,
+                iface_override="eth0",
+                routed_prefix="198.18.10.0/29",
+            )
+            self.assertTrue(alloc.ensure_claimed("A1 mini", "192.168.1.240").ok)
+            res = alloc.ensure_claimed("A1 mini", "198.18.10.2")
+        self.assertTrue(res.ok)
+        self.assertEqual(res.iface, "lo")
+        self.assertIn(("sudo", "-n", "/sbin/ip", "addr", "del", "192.168.1.240/32", "dev", "eth0"), calls)
+
+    def test_routed_ip_churn_releases_old_lo_claim(self):
+        routes = {
+            ("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.1/32", "dev", "lo"): StubResult(returncode=0),
+            ("sudo", "-n", "/sbin/ip", "addr", "del", "198.18.10.1/32", "dev", "lo"): StubResult(returncode=0),
+            ("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.5/32", "dev", "lo"): StubResult(returncode=0),
+        }
+        calls: list[tuple] = []
+        base = make_run(routes)
+
+        def spy(argv, timeout):
+            calls.append(tuple(argv))
+            return base(argv, timeout)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            alloc = IpAllocator(
+                state_path=Path(tmp) / "b.json",
+                run=spy,
+                iface_override="eth0",
+                routed_prefix="198.18.10.0/29",
+            )
+            self.assertTrue(alloc.ensure_claimed("X1 Carbon", "198.18.10.1").ok)
+            self.assertTrue(alloc.ensure_claimed("X1 Carbon", "198.18.10.5").ok)
+        self.assertIn(("sudo", "-n", "/sbin/ip", "addr", "del", "198.18.10.1/32", "dev", "lo"), calls)
+
+
 if __name__ == "__main__":
     unittest.main()

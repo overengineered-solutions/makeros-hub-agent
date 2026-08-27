@@ -616,6 +616,7 @@ def heartbeat_payload(
     camera_failures: list[dict] | list[str] | None = None,
     failure_samples: list[dict] | None = None,
     vp_ca: tuple[str, str] | None = None,
+    vp_cas: list[dict] | None = None,
     discovery_hits: list[dict] | None = None,
     vp_bindings: list[dict] | None = None,
     pi_metrics: dict | None = None,
@@ -670,6 +671,9 @@ def heartbeat_payload(
         pem, fp = vp_ca
         if isinstance(pem, str) and isinstance(fp, str) and 0 < len(pem) <= 8192 and fp:
             payload["virtualPrinterCa"] = {"caCertPem": pem, "caFingerprintSha256": fp}
+    # Plural per-VP CAs (v0.49) — entries pre-validated + size-capped at collection; cap the count here too.
+    if vp_cas:
+        payload["vpCas"] = list(vp_cas)[:8]
     # LAN discovery — periodic sweep results (Moonraker + Bambu) the cloud
     # uses to populate the "Detected on your LAN" dropdown in the admin
     # AddPrinterForm. Empty/missing list = no fresh sweep yet (the cached
@@ -982,6 +986,17 @@ def _pull_config(
         # to claim one + queue the allocation for the next heartbeat
         # (cloud writes virtual_printers.bind_ip from `vpBindings`).
         raw_multi_vp = _virtual_printers_config_block(resp.body)
+        # Routed VP prefix (member-net VPs, v0.49): the cloud names the reserved prefix its bind ips live in;
+        # ensure_claimed puts those on `lo` instead of the LAN iface. Reset every apply (absent = LAN-only).
+        if ip_allocator is not None:
+            try:
+                ip_allocator.set_routed_prefix(resp.body.get("routedPrefix"))
+            except Exception as exc:  # noqa: BLE001 - config apply must never sink; but never silently either
+                _record_diagnostic(
+                    diagnostics,
+                    "vprinter",
+                    f"routedPrefix apply crashed: {redact(str(exc))}",
+                )
         if raw_multi_vp and ip_allocator is not None and pending_vp_bindings is not None:
             raw_multi_vp = _allocate_vp_bind_ips(
                 raw_multi_vp,
@@ -1106,10 +1121,36 @@ def _allocate_vp_bind_ips(
             filled.append(entry)
             continue
         if isinstance(bind_ip, str) and bind_ip.strip():
-            # Existing IP — opportunistically re-claim so a Pi reboot
-            # re-establishes it. The allocator treats existing binding +
-            # re-claim as idempotent (returns success without changing).
-            filled.append(entry)
+            # (Re-)claim so the address actually EXISTS on an interface before the per-VP servers bind it —
+            # covers a reboot (the addr is gone) and a CLOUD-ASSIGNED routed ip (never allocated locally).
+            # The old code only appended here while its comment claimed a re-claim happened (2026-08-27).
+            claim_ok = True
+            try:
+                claimed = allocator.ensure_claimed(model, bind_ip)
+                if not claimed.ok:
+                    claim_ok = False
+                    _record_diagnostic(
+                        diagnostics,
+                        "vprinter",
+                        f"bind ip claim failed for {model}: {claimed.error}",
+                    )
+            except Exception as exc:  # noqa: BLE001 - never sink the config pull
+                claim_ok = False   # a CRASHED claim is as unproven as a failed one — skip, never phantom (codex r3 #2)
+                _record_diagnostic(
+                    diagnostics,
+                    "vprinter",
+                    f"bind ip claim crashed for {model}: {redact(str(exc))}",
+                )
+            if claim_ok:
+                filled.append(entry)
+            else:
+                # A FAILED claim must not reconcile a VP onto an address that doesn't exist (codex: that
+                # would preserve the reboot failure mode in degraded form). Clear the ip so the manager
+                # skips this VP this cycle — same semantics as an allocation failure; retried next config.
+                skipped = dict(entry)
+                skipped["bind_ip"] = None
+                skipped["bindIp"] = None
+                filled.append(skipped)
             continue
         try:
             result = allocator.allocate_for(model)
@@ -1600,6 +1641,34 @@ def run(
                             "vprinter",
                             f"ca read failed: {redact(str(exc))}",
                         )
+                # PLURAL per-VP CA report (v0.49, member-net VPs): every live VP mints its OWN CA (SAN =
+                # bind ip), and the member installer must trust ALL of them — the singular field above only
+                # ever carried the legacy single-VP's. Same caps as the singular path (8KB/PEM), max 8 VPs.
+                # Best-effort per VP: one unreadable CA never drops the others or the heartbeat.
+                vp_cas: list[dict] = []
+                if vp_manager is not None:
+                    try:
+                        from .vprinter.cert import read_vp_ca as _read_vp_ca2
+                        from .vprinter.manager import VP_BASE_DIR as _VP_BASE_DIR2
+
+                        for _serial, _model in vp_manager.current_identities()[:8]:
+                            try:
+                                got = _read_vp_ca2(_VP_BASE_DIR2, _serial)
+                            except Exception:  # noqa: BLE001
+                                got = None
+                            if got is None:
+                                continue
+                            _pem, _fp = got
+                            if isinstance(_pem, str) and isinstance(_fp, str) and 0 < len(_pem) <= 8192 and _fp:
+                                vp_cas.append(
+                                    {"serial": _serial, "model": _model, "caCertPem": _pem, "caFingerprintSha256": _fp}
+                                )
+                    except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
+                        _record_diagnostic(
+                            diagnostics,
+                            "vprinter",
+                            f"plural ca read failed: {redact(str(exc))}",
+                        )
 
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 # LAN discovery — fire the periodic sweep (rate-limited inside,
@@ -1643,6 +1712,7 @@ def run(
                         camera_failures=None,
                         failure_samples=failure_samples,
                         vp_ca=vp_ca,
+                        vp_cas=vp_cas,
                         discovery_hits=discovery_hits,
                         vp_bindings=pending_vp_bindings,
                         pi_metrics=pi_metrics,
