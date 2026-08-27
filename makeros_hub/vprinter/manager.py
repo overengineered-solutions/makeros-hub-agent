@@ -58,6 +58,8 @@ class VirtualPrinterManager:
         # previously passed `config | None` keep working via `_to_list`.
         self._supervisor: _AsyncMultiVirtualPrinterSupervisor | None = None
         self._current_model: str | None = None
+        self._current_identities: list[tuple[str, str]] = []
+        self._current_configs: list[VirtualPrinterConfig] = []
 
     async def start(self) -> None:
         self._ensure_loop()
@@ -107,9 +109,32 @@ class VirtualPrinterManager:
         with self._lock:
             return self._current_model
 
+    def current_identities(self) -> list[tuple[str, str]]:
+        """(serial, model) of every LIVE VP — a CACHED snapshot updated post-reconcile under the facade
+        lock (the heartbeat thread must never index supervisor.runtimes directly: a concurrent reconcile
+        between sort and index raises KeyError — codex v0.49 round 3). Sorted by serial, stable."""
+        with self._lock:
+            return list(self._current_identities)
+
     def _set_current_model(self, model: str | None) -> None:
         with self._lock:
             self._current_model = model
+            if model is None:
+                self._current_identities = []
+
+    def current_configs(self) -> list[VirtualPrinterConfig]:
+        """The live VPs' configs — CACHED snapshot (same rules as current_identities: written post-reconcile
+        from the loop thread; safe for the heartbeat's multi live-mirror to read)."""
+        with self._lock:
+            return list(self._current_configs)
+
+    def _set_current_identities(self, identities: list[tuple[str, str]]) -> None:
+        with self._lock:
+            self._current_identities = list(identities)
+
+    def _set_current_configs(self, configs: list[VirtualPrinterConfig]) -> None:
+        with self._lock:
+            self._current_configs = list(configs)
 
     def _ensure_loop(self) -> None:
         with self._lock:
@@ -155,6 +180,8 @@ class VirtualPrinterManager:
             raise RuntimeError("virtual printer supervisor is not ready")
         await self._supervisor.reconcile(configs if configs else None)
         self._set_current_model(self._supervisor.current_model())
+        self._set_current_identities(self._supervisor.current_identities())
+        self._set_current_configs(self._supervisor.current_configs())
 
     async def _stop_in_loop(self) -> None:
         if self._supervisor is not None:
@@ -169,6 +196,8 @@ class VirtualPrinterManager:
             self._thread = None
             self._supervisor = None
             self._current_model = None
+            self._current_identities = []   # a stopped loop has NO live VPs — never serve a stale snapshot
+            self._current_configs = []
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
         if thread is not None and thread.is_alive():
@@ -203,6 +232,16 @@ class _AsyncMultiVirtualPrinterSupervisor:
 
     def current_models(self) -> list[str]:
         return [r.config.model for r in self.runtimes.values()]
+
+    def current_identities(self) -> list[tuple[str, str]]:
+        """(serial, model) for every live VP, codepoint-sorted. LOOP-INTERNAL ONLY: iterates the live
+        runtimes dict, so it must run on the supervisor's loop thread (the facade caches a snapshot for
+        cross-thread readers — codex v0.49 round 3)."""
+        return [(s, r.config.model) for s, r in sorted(self.runtimes.items())]
+
+    def current_configs(self) -> list[VirtualPrinterConfig]:
+        """LOOP-INTERNAL ONLY (same rule as current_identities): the live runtimes' configs, serial-sorted."""
+        return [r.config for _s, r in sorted(self.runtimes.items())]
 
     def current_model(self) -> str | None:
         """Back-compat scalar for callers that previously expected one VP.

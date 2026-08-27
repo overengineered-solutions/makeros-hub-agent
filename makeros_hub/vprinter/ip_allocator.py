@@ -34,6 +34,7 @@ Sudoers: bootstrap.sh installs narrow patterns for
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import re
@@ -117,14 +118,35 @@ class IpAllocator:
         netmask_override: Optional[str] = None,
         own_ip_override: Optional[str] = None,
         iface_override: Optional[str] = None,
+        routed_prefix: Optional[str] = None,
     ):
         self._state_path = state_path
         self._run = run
         self._netmask_override = netmask_override
         self._own_ip_override = own_ip_override
         self._iface_override = iface_override
+        self._routed_prefix: Optional[ipaddress.IPv4Network] = None
+        self.set_routed_prefix(routed_prefix)
         self._bindings: dict[str, Binding] = {}
         self._load()
+
+    def set_routed_prefix(self, prefix: Optional[str]) -> None:
+        """Config-down can (re)set the routed VP prefix each apply. A cloud-assigned bind ip inside this
+        prefix claims on `lo` (see ensure_claimed); invalid values are ignored loudly, never fatal."""
+        if not prefix or not isinstance(prefix, str):
+            self._routed_prefix = None
+            return
+        try:
+            net = ipaddress.ip_network(prefix.strip(), strict=True)
+        except ValueError:
+            log.warning("ip-allocator: ignoring invalid routedPrefix %r", prefix)
+            self._routed_prefix = None
+            return
+        if not isinstance(net, ipaddress.IPv4Network):
+            log.warning("ip-allocator: ignoring non-IPv4 routedPrefix %r", prefix)
+            self._routed_prefix = None
+            return
+        self._routed_prefix = net
 
     # ----- persistence -------------------------------------------------
 
@@ -265,6 +287,50 @@ class IpAllocator:
             error="no_free_ip",
             tried=tried,
         )
+
+    def ensure_claimed(self, model: str, bind_ip: str) -> AllocationResult:
+        """Idempotently (re-)claim a KNOWN bind ip — the cloud-assigned case and the reboot case (the old
+        existing-ip path only trusted the config value; after a reboot the address no longer existed on any
+        interface and every per-VP server bind failed — found 2026-08-27).
+
+        ROUTED mode (member-net VPs): an ip inside the configured routed prefix claims as /32 on `lo` —
+        traffic arrives via the tailnet subnet route, and Linux delivers routed-to-local addresses held on
+        loopback. The reserved-space prefix cannot collide with any LAN, so no arping. The existing sudoers
+        pattern (`ip addr add * dev *`) already covers lo — no bootstrap change.
+        LAN mode: re-claim on the persisted iface (or the guessed primary) exactly like allocation does.
+        Same invariants: persist BEFORE the privileged command; 'File exists' counts as success.
+        """
+        bind_ip = (bind_ip or "").strip()
+        iface: Optional[str] = None
+        if self._routed_prefix is not None:
+            try:
+                if ipaddress.ip_address(bind_ip) in self._routed_prefix:
+                    iface = "lo"
+            except ValueError:
+                return AllocationResult(ok=False, model=model, bind_ip=None, iface=None, error=f"invalid bind ip {bind_ip!r}")
+        if iface is None:
+            existing = self._bindings.get(model)
+            if existing is not None and existing.bind_ip == bind_ip and existing.iface:
+                iface = existing.iface
+            else:
+                iface = self._iface_override or self._guess_iface()
+        if not iface:
+            return AllocationResult(ok=False, model=model, bind_ip=bind_ip, iface=None, error="no interface to claim on")
+        # A CHANGED binding releases the old claim first (codex: LAN->routed or routed ip churn would other-
+        # wise leak /32s on the old iface forever — nothing above ever compensates). Best-effort: a failed
+        # release never blocks the new claim; the leak-with-warning beats a dead VP.
+        existing = self._bindings.get(model)
+        if existing is not None and (existing.bind_ip != bind_ip or existing.iface != iface):
+            released = self._release_ip(existing.bind_ip, existing.iface)
+            if not released.ok:
+                log.warning(
+                    "ip-allocator: could not release old claim %s on %s for %s: %s",
+                    existing.bind_ip, existing.iface, model, released.error,
+                )
+        self._bindings[model] = Binding(model=model, bind_ip=bind_ip, iface=iface)
+        self._save()
+        claimed = self._claim_ip(bind_ip, iface)
+        return AllocationResult(ok=claimed.ok, model=model, bind_ip=bind_ip, iface=iface, error=claimed.error)
 
     def release(self, model: str) -> AllocationResult:
         """Drop the binding for `model` — remove the IP from the iface +

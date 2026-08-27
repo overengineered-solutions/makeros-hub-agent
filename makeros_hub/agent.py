@@ -32,7 +32,13 @@ from pathlib import Path
 
 from . import __version__
 from .config import SPOOL_DIR, Config, parse_virtual_printer_config, read_credential
-from .vprinter.live_pool import updated_config_if_pool_changed
+from .vprinter.live_pool import (
+    active_keys as vp_active_keys,
+    loaded_keys as vp_loaded_keys,
+    updated_config_if_pool_changed,
+    updated_configs_if_pools_changed,
+)
+from .vprinter.pool_ranking import PoolRankingState
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
@@ -616,6 +622,7 @@ def heartbeat_payload(
     camera_failures: list[dict] | list[str] | None = None,
     failure_samples: list[dict] | None = None,
     vp_ca: tuple[str, str] | None = None,
+    vp_cas: list[dict] | None = None,
     discovery_hits: list[dict] | None = None,
     vp_bindings: list[dict] | None = None,
     pi_metrics: dict | None = None,
@@ -670,6 +677,9 @@ def heartbeat_payload(
         pem, fp = vp_ca
         if isinstance(pem, str) and isinstance(fp, str) and 0 < len(pem) <= 8192 and fp:
             payload["virtualPrinterCa"] = {"caCertPem": pem, "caFingerprintSha256": fp}
+    # Plural per-VP CAs (v0.49) — entries pre-validated + size-capped at collection; cap the count here too.
+    if vp_cas:
+        payload["vpCas"] = list(vp_cas)[:8]
     # LAN discovery — periodic sweep results (Moonraker + Bambu) the cloud
     # uses to populate the "Detected on your LAN" dropdown in the admin
     # AddPrinterForm. Empty/missing list = no fresh sweep yet (the cached
@@ -982,6 +992,17 @@ def _pull_config(
         # to claim one + queue the allocation for the next heartbeat
         # (cloud writes virtual_printers.bind_ip from `vpBindings`).
         raw_multi_vp = _virtual_printers_config_block(resp.body)
+        # Routed VP prefix (member-net VPs, v0.49): the cloud names the reserved prefix its bind ips live in;
+        # ensure_claimed puts those on `lo` instead of the LAN iface. Reset every apply (absent = LAN-only).
+        if ip_allocator is not None:
+            try:
+                ip_allocator.set_routed_prefix(resp.body.get("routedPrefix"))
+            except Exception as exc:  # noqa: BLE001 - config apply must never sink; but never silently either
+                _record_diagnostic(
+                    diagnostics,
+                    "vprinter",
+                    f"routedPrefix apply crashed: {redact(str(exc))}",
+                )
         if raw_multi_vp and ip_allocator is not None and pending_vp_bindings is not None:
             raw_multi_vp = _allocate_vp_bind_ips(
                 raw_multi_vp,
@@ -1106,10 +1127,36 @@ def _allocate_vp_bind_ips(
             filled.append(entry)
             continue
         if isinstance(bind_ip, str) and bind_ip.strip():
-            # Existing IP — opportunistically re-claim so a Pi reboot
-            # re-establishes it. The allocator treats existing binding +
-            # re-claim as idempotent (returns success without changing).
-            filled.append(entry)
+            # (Re-)claim so the address actually EXISTS on an interface before the per-VP servers bind it —
+            # covers a reboot (the addr is gone) and a CLOUD-ASSIGNED routed ip (never allocated locally).
+            # The old code only appended here while its comment claimed a re-claim happened (2026-08-27).
+            claim_ok = True
+            try:
+                claimed = allocator.ensure_claimed(model, bind_ip)
+                if not claimed.ok:
+                    claim_ok = False
+                    _record_diagnostic(
+                        diagnostics,
+                        "vprinter",
+                        f"bind ip claim failed for {model}: {claimed.error}",
+                    )
+            except Exception as exc:  # noqa: BLE001 - never sink the config pull
+                claim_ok = False   # a CRASHED claim is as unproven as a failed one — skip, never phantom (codex r3 #2)
+                _record_diagnostic(
+                    diagnostics,
+                    "vprinter",
+                    f"bind ip claim crashed for {model}: {redact(str(exc))}",
+                )
+            if claim_ok:
+                filled.append(entry)
+            else:
+                # A FAILED claim must not reconcile a VP onto an address that doesn't exist (codex: that
+                # would preserve the reboot failure mode in degraded form). Clear the ip so the manager
+                # skips this VP this cycle — same semantics as an allocation failure; retried next config.
+                skipped = dict(entry)
+                skipped["bind_ip"] = None
+                skipped["bindIp"] = None
+                filled.append(skipped)
             continue
         try:
             result = allocator.allocate_for(model)
@@ -1281,6 +1328,10 @@ def run(
     # same IPs.
     from .vprinter.ip_allocator import IpAllocator as _IpAllocator
     ip_allocator = _IpAllocator()
+    # §10.2 pool ranking — persisted first-seen + decayed active-minutes; drives which filaments the VPs
+    # advertise when more are loaded than a VP has slots. Best-effort everywhere; never sinks a heartbeat.
+    pool_ranking = PoolRankingState()
+    ranking_clock: dict = {"last": None}
     tailscale_state = _TailscaleRuntimeState()
     vprinter_state = _VirtualPrinterRuntimeState()
     # Per-printer camera capture is normally driven by the admin toggle
@@ -1402,7 +1453,35 @@ def run(
                 # truth) tracks reality every heartbeat: no cloud round-trip, no
                 # config re-pull, no VP restart. Only reconciles on a display change
                 # (updated_config_if_pool_changed returns None otherwise → no churn).
-                if vp_manager is not None and vprinter_state.config is not None:
+                # Duck-typed: an older/injected manager without the v0.49 snapshot accessor simply means no
+                # multi mirror this build — the singular branch below still runs.
+                _get_cfgs = getattr(vp_manager, "current_configs", None) if vp_manager is not None else None
+                multi_vp_live = _get_cfgs() if callable(_get_cfgs) else []
+                if multi_vp_live:
+                    # MULTI-VP ranked mirror (v0.49, §10.2): observe the ranking signals over ALL statuses
+                    # (first-seen on every loaded key; active-minutes on printing printers' active trays),
+                    # then per-VP: model-scope -> derive -> RANK -> hot-apply only on display change.
+                    try:
+                        # TWO clocks, deliberately (codex): the loop's `now` is MONOTONIC — right for the
+                        # tick SPAN, catastrophically wrong for persisted timestamps (the epoch resets every
+                        # restart; recency/decay would compare across epochs for weeks). Signals use wall time.
+                        last = ranking_clock.get("last")
+                        tick_min = ((now - last) / 60.0) if isinstance(last, (int, float)) else 0.5
+                        ranking_clock["last"] = now
+                        wall = time.time()
+                        pool_ranking.observe(vp_loaded_keys(statuses), vp_active_keys(statuses), tick_min, wall)
+                        pool_ranking.persist(wall)
+                        updated_cfgs = updated_configs_if_pools_changed(multi_vp_live, statuses, pool_ranking, wall)
+                        if updated_cfgs is not None:
+                            vp_manager.reconcile_sync(updated_cfgs)
+                            log.info("VP AMS multi live-mirror applied (%d VPs)", len(updated_cfgs))
+                    except Exception as exc:  # noqa: BLE001 - must not sink heartbeat
+                        _record_diagnostic(
+                            diagnostics,
+                            "vprinter",
+                            f"multi live AMS apply failed: {redact(str(exc))}",
+                        )
+                elif vp_manager is not None and vprinter_state.config is not None:
                     try:
                         live_vp = updated_config_if_pool_changed(vprinter_state.config, statuses)
                         if live_vp is not None:
@@ -1600,6 +1679,34 @@ def run(
                             "vprinter",
                             f"ca read failed: {redact(str(exc))}",
                         )
+                # PLURAL per-VP CA report (v0.49, member-net VPs): every live VP mints its OWN CA (SAN =
+                # bind ip), and the member installer must trust ALL of them — the singular field above only
+                # ever carried the legacy single-VP's. Same caps as the singular path (8KB/PEM), max 8 VPs.
+                # Best-effort per VP: one unreadable CA never drops the others or the heartbeat.
+                vp_cas: list[dict] = []
+                if vp_manager is not None:
+                    try:
+                        from .vprinter.cert import read_vp_ca as _read_vp_ca2
+                        from .vprinter.manager import VP_BASE_DIR as _VP_BASE_DIR2
+
+                        for _serial, _model in vp_manager.current_identities()[:8]:
+                            try:
+                                got = _read_vp_ca2(_VP_BASE_DIR2, _serial)
+                            except Exception:  # noqa: BLE001
+                                got = None
+                            if got is None:
+                                continue
+                            _pem, _fp = got
+                            if isinstance(_pem, str) and isinstance(_fp, str) and 0 < len(_pem) <= 8192 and _fp:
+                                vp_cas.append(
+                                    {"serial": _serial, "model": _model, "caCertPem": _pem, "caFingerprintSha256": _fp}
+                                )
+                    except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
+                        _record_diagnostic(
+                            diagnostics,
+                            "vprinter",
+                            f"plural ca read failed: {redact(str(exc))}",
+                        )
 
                 connected = sum(1 for s in statuses if s.get("connectionState") == "connected")
                 # LAN discovery — fire the periodic sweep (rate-limited inside,
@@ -1643,6 +1750,7 @@ def run(
                         camera_failures=None,
                         failure_samples=failure_samples,
                         vp_ca=vp_ca,
+                        vp_cas=vp_cas,
                         discovery_hits=discovery_hits,
                         vp_bindings=pending_vp_bindings,
                         pi_metrics=pi_metrics,
