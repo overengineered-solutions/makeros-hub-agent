@@ -38,6 +38,9 @@ USAGE_RESERVE_FRACTION = 0.25   # over-capacity, at least this share stays with 
                                 # must never evict every heavy-use color for a week)
 PERSIST_MIN_INTERVAL_SEC = 60.0
 MAX_TRACKED_KEYS = 512   # a shop cannot plausibly rotate more distinct spools; bound the file
+PLAUSIBLE_MIN_EPOCH = 1577836800.0   # 2020-01-01: anything below is a monotonic-era or garbage stamp —
+                                     # comparing it against wall time would read as ancient (codex confirm
+                                     # round). Reset to `now` = the documented harmless direction.
 
 
 class PoolRankingState:
@@ -64,9 +67,9 @@ class PoolRankingState:
                     um = v.get("use_minutes")
                     lu = v.get("last_use")
                     self._keys[k] = {
-                        "first_seen": float(fs) if isinstance(fs, (int, float)) and fs > 0 else now,
+                        "first_seen": float(fs) if isinstance(fs, (int, float)) and fs >= PLAUSIBLE_MIN_EPOCH else now,
                         "use_minutes": float(um) if isinstance(um, (int, float)) and um >= 0 else 0.0,
-                        "last_use": float(lu) if isinstance(lu, (int, float)) and lu > 0 else now,
+                        "last_use": float(lu) if isinstance(lu, (int, float)) and lu >= PLAUSIBLE_MIN_EPOCH else now,
                     }
         except FileNotFoundError:
             pass

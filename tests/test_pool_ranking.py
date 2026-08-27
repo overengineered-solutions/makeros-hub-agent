@@ -64,11 +64,23 @@ class TestRankingPolicy(unittest.TestCase):
     def test_persistence_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "r.json"
-            st = PoolRankingState(p, now=1000.0)
-            st.observe(["k"], ["k"], 0.5, 1000.0)
-            st.persist(1000.0, force=True)
-            st2 = PoolRankingState(p, now=2000.0)
-            self.assertGreater(st2._decayed("k", 2000.0), 0.0)
+            wall = 1_700_000_000.0
+            st = PoolRankingState(p, now=wall)
+            st.observe(["k"], ["k"], 0.5, wall)
+            st.persist(wall, force=True)
+            st2 = PoolRankingState(p, now=wall + 1000.0)
+            self.assertGreater(st2._decayed("k", wall + 1000.0), 0.0)
+
+    def test_monotonic_era_timestamps_quarantined_on_load(self):
+        # A state file stamped by a monotonic clock (seconds-since-boot ≪ 2020 epoch) must not read as
+        # ancient against wall time: implausible stamps reset to load-time `now`, keeping use_minutes.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "r.json"
+            p.write_text('{"version": 1, "keys": {"k": {"first_seen": 12345.0, "use_minutes": 30.0, "last_use": 12345.0}}}')
+            wall = 1_700_000_000.0
+            st = PoolRankingState(p, now=wall)
+            self.assertGreater(st._decayed("k", wall), 25.0)          # usage survives, not decayed to ~0
+            self.assertIn("k", st.select(["k", "other"], 1, wall))    # reads as newly seen → recent tier
 
 
 class TestScopedAndActive(unittest.TestCase):
