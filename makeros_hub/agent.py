@@ -32,7 +32,13 @@ from pathlib import Path
 
 from . import __version__
 from .config import SPOOL_DIR, Config, parse_virtual_printer_config, read_credential
-from .vprinter.live_pool import updated_config_if_pool_changed
+from .vprinter.live_pool import (
+    active_keys as vp_active_keys,
+    loaded_keys as vp_loaded_keys,
+    updated_config_if_pool_changed,
+    updated_configs_if_pools_changed,
+)
+from .vprinter.pool_ranking import PoolRankingState
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
@@ -1322,6 +1328,10 @@ def run(
     # same IPs.
     from .vprinter.ip_allocator import IpAllocator as _IpAllocator
     ip_allocator = _IpAllocator()
+    # §10.2 pool ranking — persisted first-seen + decayed active-minutes; drives which filaments the VPs
+    # advertise when more are loaded than a VP has slots. Best-effort everywhere; never sinks a heartbeat.
+    pool_ranking = PoolRankingState()
+    ranking_clock: dict = {"last": None}
     tailscale_state = _TailscaleRuntimeState()
     vprinter_state = _VirtualPrinterRuntimeState()
     # Per-printer camera capture is normally driven by the admin toggle
@@ -1443,7 +1453,31 @@ def run(
                 # truth) tracks reality every heartbeat: no cloud round-trip, no
                 # config re-pull, no VP restart. Only reconciles on a display change
                 # (updated_config_if_pool_changed returns None otherwise → no churn).
-                if vp_manager is not None and vprinter_state.config is not None:
+                # Duck-typed: an older/injected manager without the v0.49 snapshot accessor simply means no
+                # multi mirror this build — the singular branch below still runs.
+                _get_cfgs = getattr(vp_manager, "current_configs", None) if vp_manager is not None else None
+                multi_vp_live = _get_cfgs() if callable(_get_cfgs) else []
+                if multi_vp_live:
+                    # MULTI-VP ranked mirror (v0.49, §10.2): observe the ranking signals over ALL statuses
+                    # (first-seen on every loaded key; active-minutes on printing printers' active trays),
+                    # then per-VP: model-scope -> derive -> RANK -> hot-apply only on display change.
+                    try:
+                        last = ranking_clock.get("last")
+                        tick_min = ((now - last) / 60.0) if isinstance(last, (int, float)) else 0.5
+                        ranking_clock["last"] = now
+                        pool_ranking.observe(vp_loaded_keys(statuses), vp_active_keys(statuses), tick_min, now)
+                        pool_ranking.persist(now)
+                        updated_cfgs = updated_configs_if_pools_changed(multi_vp_live, statuses, pool_ranking, now)
+                        if updated_cfgs is not None:
+                            vp_manager.reconcile_sync(updated_cfgs)
+                            log.info("VP AMS multi live-mirror applied (%d VPs)", len(updated_cfgs))
+                    except Exception as exc:  # noqa: BLE001 - must not sink heartbeat
+                        _record_diagnostic(
+                            diagnostics,
+                            "vprinter",
+                            f"multi live AMS apply failed: {redact(str(exc))}",
+                        )
+                elif vp_manager is not None and vprinter_state.config is not None:
                     try:
                         live_vp = updated_config_if_pool_changed(vprinter_state.config, statuses)
                         if live_vp is not None:

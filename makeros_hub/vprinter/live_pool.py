@@ -186,3 +186,136 @@ def updated_config_if_pool_changed(current_config: Any, statuses: list[dict[str,
     if _pool_identity(live) == _pool_identity(list(current_config.pool)[:cap]):
         return None
     return dataclasses.replace(current_config, pool=tuple(live))
+
+
+# ── Multi-VP, model-scoped, RANKED live mirror (v0.49; §10.2) ─────────────────────────────────────────────
+# The singular path above stays untouched for legacy single-VP clouds. The multi path scopes each VP's pool
+# to printers of ITS model and — when more filaments are loaded than the VP has slots — selects by the
+# ranking policy (pool_ranking.PoolRankingState) instead of blind truncation. Selection carries the ranking;
+# DISPLAY order stays stable key-sort so slot layout only changes when set membership does.
+
+def tray_key(tray: dict[str, Any]) -> str | None:
+    """The live_pool dedupe key for one tray, or None for an empty slot — the SAME string the derivation
+    uses, exposed for the ranking signals."""
+    if not isinstance(tray, dict) or not _clean_optional(tray.get("material")):
+        return None
+    return "|".join(
+        (
+            _norm_material(tray.get("material")),
+            _clean_optional(tray.get("filamentId")) or "",
+            _norm_color(tray.get("colorHex")),
+        )
+    )
+
+
+def scoped_statuses(statuses: list[dict[str, Any]], model: Any) -> list[dict[str, Any]]:
+    """Printers of the VP's model (exact string match — our cloud creates VPs FROM machines.model, one
+    string domain). No matches → the WHOLE hub (makeros's never-strand rule: an empty VP helps nobody)."""
+    want = (str(model) if model else "").strip().lower()
+    if not want:
+        return list(statuses or [])
+    matching = [s for s in statuses or [] if isinstance(s, dict) and str(s.get("model") or "").strip().lower() == want]
+    return matching if matching else list(statuses or [])
+
+
+def loaded_keys(statuses: list[dict[str, Any]]) -> list[str]:
+    out: list[str] = []
+    for s in statuses or []:
+        if not isinstance(s, dict):
+            continue
+        for unit in s.get("ams") or []:
+            if not isinstance(unit, dict):
+                continue
+            for tray in unit.get("trays") or []:
+                k = tray_key(tray) if isinstance(tray, dict) else None
+                if k:
+                    out.append(k)
+    return out
+
+
+def active_keys(statuses: list[dict[str, Any]]) -> list[str]:
+    """The key loaded in the ACTIVE tray (amsActiveTray, global unit*4+slot) of every PRINTING printer —
+    the passive usage signal (§10.2). Positional unit addressing with guards: any miss = no signal, never
+    a wrong one."""
+    out: list[str] = []
+    for s in statuses or []:
+        if not isinstance(s, dict) or s.get("state") != "printing":
+            continue
+        at = s.get("amsActiveTray")
+        if not isinstance(at, int) or at < 0 or at > 63:
+            continue
+        units = [u for u in (s.get("ams") or []) if isinstance(u, dict)]
+        ui, slot = divmod(at, 4)
+        if ui >= len(units):
+            continue
+        for tray in units[ui].get("trays") or []:
+            if isinstance(tray, dict) and tray.get("slot") == slot:
+                k = tray_key(tray)
+                if k:
+                    out.append(k)
+                break
+    return out
+
+
+def vp_pool_from_statuses_ranked(
+    statuses: list[dict[str, Any]],
+    units: int,
+    trays: int,
+    ranking: Any,
+    now: float,
+) -> list[dict[str, Any]]:
+    """The ranked variant: dedupe EVERY loaded filament (no blind cap), let the ranking pick which fit the
+    VP's capacity, then build rows in stable key order. With capacity to spare this is byte-identical to
+    vp_pool_from_statuses (the selection is the full sorted set)."""
+    capacity = max(1, int(units) * int(trays))
+    ordered = sorted(
+        statuses or [],
+        key=lambda s: str(s.get("printerId") or "") if isinstance(s, dict) else "",
+    )
+    deduped: dict[str, dict[str, Any]] = {}
+    for status in ordered:
+        if not isinstance(status, dict):
+            continue
+        for unit in status.get("ams") or []:
+            if not isinstance(unit, dict):
+                continue
+            for tray in unit.get("trays") or []:
+                k = tray_key(tray) if isinstance(tray, dict) else None
+                if k:
+                    deduped.setdefault(k, tray)
+    if ranking is not None and len(deduped) > capacity:
+        chosen = ranking.select(list(deduped.keys()), capacity, now)
+    else:
+        chosen = sorted(deduped)[:capacity]
+    # Row-building parity with vp_pool_from_statuses: feed it ONLY the chosen trays' statuses? Simpler and
+    # exact: build a synthetic single status carrying the chosen trays and reuse the proven builder.
+    synthetic = [{"printerId": "", "ams": [{"trays": [dict(deduped[k], slot=i % 4) for i, k in enumerate(chosen)]}]}]
+    return vp_pool_from_statuses(synthetic, units, trays)
+
+
+def updated_configs_if_pools_changed(
+    configs: list[Any],
+    statuses: list[dict[str, Any]],
+    ranking: Any,
+    now: float,
+) -> list[Any] | None:
+    """Multi-VP mirror step: for EVERY live VP config, derive its model-scoped ranked pool; return the full
+    replacement list when at least one pool's display identity changed, else None (no churn). The caller
+    reconciles the WHOLE list (reconcile replaces the set; unchanged VPs hot-no-op on identity)."""
+    if not configs:
+        return None
+    changed = False
+    out: list[Any] = []
+    for cfg in configs:
+        try:
+            scoped = scoped_statuses(statuses, getattr(cfg, "model", None))
+            live = vp_pool_from_statuses_ranked(scoped, cfg.units, cfg.trays, ranking, now)
+            cap = max(1, int(cfg.units) * int(cfg.trays))
+            if _pool_identity(live) != _pool_identity(list(cfg.pool)[:cap]):
+                out.append(dataclasses.replace(cfg, pool=tuple(live)))
+                changed = True
+            else:
+                out.append(cfg)
+        except Exception:  # noqa: BLE001 - one bad config must not sink the mirror; keep it as-is
+            out.append(cfg)
+    return out if changed else None
