@@ -65,6 +65,21 @@ class TestScopedAndActive(unittest.TestCase):
         self.assertEqual(len(scoped_statuses(sts, "Bambu X1 Carbon")), 1)
         self.assertEqual(len(scoped_statuses(sts, "Nonexistent Model")), 2)   # fallback: whole hub
 
+    def test_active_key_resolves_by_raw_unit_id_across_gaps(self):
+        # build_ams re-enumerates units contiguously while tray_now uses RAW ids: with unit 0 absent and
+        # raw units 1+2 present, active tray in raw unit 1 (global 4..7) must hit raw unit 1 — a positional
+        # lookup would land on raw unit 2 (WRONG key). Raw ids ride unit["raw"]["id"].
+        s = {
+            "printerId": "p1", "model": "m", "state": "printing", "amsActiveTray": 5,
+            "ams": [
+                {"unit": 0, "raw": {"id": 1}, "trays": [tray("PETG", "#00ff00", "GFG99", slot=1)]},
+                {"unit": 1, "raw": {"id": 2}, "trays": [tray("ABS", "#000000", "GFB99", slot=1)]},
+            ],
+        }
+        keys = active_keys([s])
+        self.assertEqual(len(keys), 1)
+        self.assertIn("PETG", keys[0])   # raw unit 1, slot 1 — never the ABS in raw unit 2
+
     def test_active_keys_only_from_printing_printers(self):
         sts = [
             status("m", [tray("PLA", "#fff", slot=1)], state="printing", active=1),

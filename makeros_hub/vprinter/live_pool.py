@@ -233,10 +233,25 @@ def loaded_keys(statuses: list[dict[str, Any]]) -> list[str]:
     return out
 
 
+def _unit_raw_id(unit: dict[str, Any]) -> int | None:
+    raw = unit.get("raw")
+    if isinstance(raw, dict):
+        try:
+            return int(raw.get("id"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def active_keys(statuses: list[dict[str, Any]]) -> list[str]:
-    """The key loaded in the ACTIVE tray (amsActiveTray, global unit*4+slot) of every PRINTING printer —
-    the passive usage signal (§10.2). Positional unit addressing with guards: any miss = no signal, never
-    a wrong one."""
+    """The key loaded in the ACTIVE tray (amsActiveTray = RAW-unit-id*4+slot from the printer) of every
+    PRINTING printer — the passive usage signal (§10.2).
+
+    Unit resolution is by the unit's RAW Bambu id (surviving in unit.raw.id) — build_ams RE-ENUMERATES
+    emitted units contiguously (its own comment: H2D second unit reports id 128+), so with a leading unit
+    gap a positional lookup lands on the WRONG unit, not a miss. Positional fallback only when NO unit
+    carries a raw id (legacy payloads) — there gaps are undetectable and the no-gap case is the norm.
+    Any unresolved case = no signal, never a wrong one."""
     out: list[str] = []
     for s in statuses or []:
         if not isinstance(s, dict) or s.get("state") != "printing":
@@ -246,9 +261,14 @@ def active_keys(statuses: list[dict[str, Any]]) -> list[str]:
             continue
         units = [u for u in (s.get("ams") or []) if isinstance(u, dict)]
         ui, slot = divmod(at, 4)
-        if ui >= len(units):
+        raw_ids = [_unit_raw_id(u) for u in units]
+        if any(r is not None for r in raw_ids):
+            target = next((u for u, r in zip(units, raw_ids) if r == ui), None)
+        else:
+            target = units[ui] if ui < len(units) else None
+        if target is None:
             continue
-        for tray in units[ui].get("trays") or []:
+        for tray in target.get("trays") or []:
             if isinstance(tray, dict) and tray.get("slot") == slot:
                 k = tray_key(tray)
                 if k:
