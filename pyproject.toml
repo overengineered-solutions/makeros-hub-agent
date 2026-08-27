@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "makeros-hub-agent"
-version = "0.48.0"
+version = "0.48.1"
 description = "On-LAN bridge between makerspace 3D printers and the makeros cloud control plane (the SimplyPrint replacement)"
 requires-python = ">=3.11"
 # The source-of-truth version is makeros_hub/__init__.py:__version__ (reported in
