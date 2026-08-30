@@ -468,6 +468,7 @@ def _vp_submit_filament(item: dict[str, Any]) -> dict[str, Any]:
     tray_info_idx = item.get("trayInfoIdx") or item.get("tray_info_idx")
     if tray_info_idx is not None:
         filament["trayInfoIdx"] = tray_info_idx
+        filament["idx"] = tray_info_idx   # the cloud's stored name for it — sent as both during the v0.56 transition
     used_g = item.get("usedG")
     if isinstance(used_g, (int, float)) and not isinstance(used_g, bool) and used_g >= 0:
         filament["usedG"] = used_g
@@ -592,7 +593,7 @@ def parse_slice_info_config(raw: bytes | str, plate: int | None = None) -> list[
     # The project-wide metadata arrays (0-based) are a FALLBACK for files without per-filament elements (1-based
     # Bambu ids) — mixing the two bases produced phantom slot 0 entries (codex v0.56 r1), so they only seed an empty result.
     if not by_slot:
-        _merge_array_metadata(root, by_slot)
+        _merge_array_metadata(scope, by_slot)   # plate-scoped when a plate was found (codex r3), else the whole file
 
     return [by_slot[slot] for slot in sorted(by_slot)]
 

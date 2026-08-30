@@ -1017,7 +1017,7 @@ class TestCaptureAssembly(unittest.TestCase):
                 "useAms": True,
                 "amsMapping": [0, 1],
                 "requiredFilaments": [
-                    {"slot": 0, "type": "PLA", "color": "FFFFFFFF", "trayInfoIdx": "GFL99"}
+                    {"slot": 0, "type": "PLA", "color": "FFFFFFFF", "trayInfoIdx": "GFL99", "idx": "GFL99"}
                 ],
                 "plate": 1,
                 "amsMappingRaw": [0, 1],

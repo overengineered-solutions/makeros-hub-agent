@@ -100,7 +100,11 @@ def _pick(req: dict[str, Any], trays: list[dict[str, Any]]) -> dict[str, Any] | 
     material = _norm_material(req.get("type") or req.get("material"))
     color = _norm_color(req.get("color"))
     fid = _norm_fid(req.get("idx") or req.get("trayInfoIdx"))
-    cands = [t for t in trays if (not material or t["material"] == material) and (color is None or t["color"] == color)]
+    if not material or color is None:
+        # codex v0.56 r3: a half identity is not a wildcard — "PLA, any colour" would map to black when the member chose
+        # white. The cloud may PARK on partial identity; the hub never PRINTS on it.
+        raise TrayTranslationError("spool_mismatch", f"filament identity incomplete ({describe(req)}) — re-send it from OrcaSlicer")
+    cands = [t for t in trays if t["material"] == material and t["color"] == color]
     if not cands:
         return None
     if fid:
@@ -149,18 +153,39 @@ def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[
     return out
 
 
+def mapping_from_requirements(required: list[dict[str, Any]], trays: list[dict[str, Any]]) -> list[int]:
+    """A web upload has no member mapping (no captured print command): build one from the plate's requirements alone —
+    position k = the physical tray for project filament k, -1 for positions the plate does not use."""
+    by_index = _by_filament_index(required or [])
+    if not by_index:
+        raise TrayTranslationError("spool_mismatch", "no filament requirements recorded for this job (re-send it from OrcaSlicer)")
+    out = [-1] * (max(by_index) + 1)
+    for k, req in by_index.items():
+        tray = _pick(req, trays)
+        if tray is None:
+            raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} (not loaded on this printer)")
+        out[k] = tray["tray_id"]
+    return out
+
+
 def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, Any]] | None, ams_units: Any, vt_tray: Any = None,
                           ) -> dict[str, Any]:
     """Return a copy of a built `print` command with ams_mapping (and ams_mapping2 when present — the H2D's second
     nozzle uses the same tray-id space) translated to this printer's physical trays. use_ams=false (external spool)
-    is left untouched. Raises TrayTranslationError."""
+    is left untouched. An AMS print WITHOUT a mapping (a web upload, or a malformed replay coerced to []) gets one built
+    from the requirements — never sent bare (codex v0.56 r3). Raises TrayTranslationError."""
     out = dict(print_cmd)
     if out.get("use_ams") is not True:
         return out
     trays = live_trays(ams_units, vt_tray)
     if not trays and unaddressable_units(ams_units):
         raise TrayTranslationError("spool_mismatch", f"{unaddressable_units(ams_units)} AMS unit(s) report no id — cannot address trays")
-    for key in ("ams_mapping", "ams_mapping2"):
-        if key in out and isinstance(out[key], list) and out[key]:
-            out[key] = translate_mapping(out[key], required or [], trays)
+    mapping = out.get("ams_mapping")
+    if isinstance(mapping, list) and mapping:
+        out["ams_mapping"] = translate_mapping(mapping, required or [], trays)
+    else:
+        out["ams_mapping"] = mapping_from_requirements(required or [], trays)
+    mapping2 = out.get("ams_mapping2")
+    if isinstance(mapping2, list) and mapping2:
+        out["ams_mapping2"] = translate_mapping(mapping2, required or [], trays)
     return out

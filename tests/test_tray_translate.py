@@ -62,7 +62,7 @@ class TestTranslateMapping(unittest.TestCase):
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFZ99"}], no_ids), [0])
 
     def test_external_spool_is_a_target_when_it_is_the_only_match(self):
-        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "TPU"}], self.trays), [254])
+        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "TPU", "color": "00FF00"}], self.trays), [254])
         # an AMS tray always wins over the external holder for the same requirement
         both = self.trays + [{"tray_id": 254, "material": "PETG", "color": "000000", "filament_id": None}]
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PETG", "color": "000000"}], both), [0])
@@ -78,9 +78,22 @@ class TestTranslateMapping(unittest.TestCase):
     def test_ht_unit_and_colour_alpha_and_case(self):
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "pla-cf", "color": "#333333ff"}], self.trays), [512])
 
-    def test_colour_only_and_material_only_requirements(self):
-        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "color": "000000"}], self.trays), [0])
-        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PETG"}], self.trays), [0])
+    def test_half_identity_is_never_a_wildcard(self):
+        # codex r3: "PETG, any colour" / "black, any material" would print the wrong spool — refuse instead
+        for req in ({"slot": 1, "color": "000000"}, {"slot": 1, "type": "PETG"}):
+            with self.assertRaises(tt.TrayTranslationError) as ctx:
+                tt.translate_mapping([0], [req], self.trays)
+            self.assertIn("identity incomplete", ctx.exception.detail)
+
+    def test_web_upload_mapping_is_built_from_requirements(self):
+        required = [{"slot": 1, "type": "PLA", "color": "FFFFFF"}, {"slot": 3, "type": "PETG", "color": "000000"}]
+        self.assertEqual(tt.mapping_from_requirements(required, self.trays), [1, -1, 0])
+        out = tt.translate_print_trays({"use_ams": True, "ams_mapping": []}, required, UNITS, VT)      # malformed/empty replay
+        self.assertEqual(out["ams_mapping"], [1, -1, 0])
+        out = tt.translate_print_trays({"use_ams": True}, required, UNITS, VT)                           # no mapping at all
+        self.assertEqual(out["ams_mapping"], [1, -1, 0])
+        with self.assertRaises(tt.TrayTranslationError):
+            tt.translate_print_trays({"use_ams": True}, [], UNITS, VT)
 
     def test_missing_spool_refuses_never_guesses(self):
         with self.assertRaises(tt.TrayTranslationError) as ctx:
@@ -114,6 +127,11 @@ SLICE_INFO = """<?xml version="1.0" encoding="UTF-8"?>
   <metadata key="filament_type" value="PLA;PETG;ABS"/>
   <metadata key="filament_colour" value="#FFFFFF;#000000;#FF0000"/>
   <plate>
+    <metadata key="index" value="3"/>
+    <metadata key="filament_type" value="TPU"/>
+    <metadata key="filament_colour" value="#00FF00"/>
+  </plate>
+  <plate>
     <metadata key="index" value="1"/>
     <filament id="1" tray_info_idx="GFL99" type="PLA" color="#FFFFFF" used_m="1.0" used_g="3.5"/>
     <filament id="2" tray_info_idx="GFG00" type="PETG" color="#000000" used_m="2.0" used_g="7.25"/>
@@ -132,6 +150,10 @@ class TestPlateScopedRequirements(unittest.TestCase):
         self.assertEqual([f["slot"] for f in parse_slice_info_config(SLICE_INFO, 1)], [1, 2])
         self.assertEqual(parse_slice_info_config(SLICE_INFO, 1)[1]["usedG"], 7.25)
         self.assertEqual(parse_slice_info_config(SLICE_INFO, 1)[0]["trayInfoIdx"], "GFL99")
+
+    def test_array_only_plate_is_scoped_to_that_plate(self):
+        # plate 3 has no <filament> elements, only its own arrays — read THOSE, not the project-wide ones (codex r3)
+        self.assertEqual(parse_slice_info_config(SLICE_INFO, 3), [{"slot": 0, "material": "TPU", "color": "00FF00FF"}])
 
     def test_unknown_or_absent_plate_keeps_every_filament(self):
         self.assertEqual([f["slot"] for f in parse_slice_info_config(SLICE_INFO)], [1, 2, 3])
