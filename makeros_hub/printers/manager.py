@@ -776,15 +776,23 @@ class PrinterManager:
                 emit(held(result.get("reason", "start_failed")))
         return reports
 
-    def collect_queue_progress(self) -> list[dict]:
-        """Drain queue-status updates observed by printer adapters."""
+    def collect_queue_progress(self, on_report=None) -> list[dict]:
+        """Drain queue-status updates observed by printer adapters. `on_report` is handed down to adapters that support it
+        (v0.58 r3: the durable outbox write happens before the adapter persists the popped dispatch)."""
         reports: list[dict] = []
         for pid, adapter in self._adapters.items():
             collect_progress = getattr(adapter, "collect_queue_progress", None)
             if not callable(collect_progress):
                 continue
             try:
-                for report in collect_progress():
+                try:
+                    produced = collect_progress(on_report=on_report) if on_report is not None else collect_progress()
+                except TypeError:
+                    produced = collect_progress()   # an adapter without the hook (tests / other printer kinds)
+                    if callable(on_report):
+                        for report in produced:
+                            on_report(report)
+                for report in produced:
                     reports.append(report)
                     if report.get("state") in ("completed", "held") and isinstance(
                         report.get("queueJobId"), str

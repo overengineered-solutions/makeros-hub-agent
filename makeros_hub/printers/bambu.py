@@ -448,8 +448,10 @@ class BambuAdapter:
             return {"ok": False, "reason": "command_failed"}
         return {"ok": True}
 
-    def collect_queue_progress(self) -> list[dict]:
-        """Drain queue-status reports inferred from observed printer telemetry."""
+    def collect_queue_progress(self, on_report=None) -> list[dict]:
+        """Drain queue-status reports inferred from observed printer telemetry. `on_report` (v0.58 r3) receives each report
+        BEFORE the popped dispatch state is persisted: the agent writes it to the durable outbox there, so a crash between
+        the two can only replay a report (the cloud is idempotent), never lose 'completed' while the dispatch is gone."""
         with self._lock:
             print_obj = self._data.get("print") if isinstance(self._data.get("print"), dict) else {}
             # None until the first report after (re)start: silence is not idle (codex v0.54 #1)
@@ -458,6 +460,12 @@ class BambuAdapter:
                 self._jobs.pending(),
                 print_obj.get("gcode_state") if observed else None,
             )
+            if callable(on_report):
+                for report in reports:
+                    try:
+                        on_report(report)
+                    except Exception as exc:  # noqa: BLE001 — the hook logs its own persistence trouble
+                        log.warning("progress report hook failed: %s", exc)
             self._save_queue_progress()
             return reports
 

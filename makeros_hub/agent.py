@@ -1820,10 +1820,7 @@ def run(
                                 fetch_lock.release()
 
                         threading.Thread(target=_fetch_worker, name="web-upload-fetch", daemon=True).start()
-                    progress_reports = manager.collect_queue_progress()
-                    if progress_reports:
-                        pending_queue_reports.extend(progress_reports)
-                        report_outbox.save(pending_queue_reports)
+                    progress_reports = manager.collect_queue_progress(on_report=_durable)   # v0.58 r3: durable before the state pop persists
                     if pending_queue_reports:
                         before = len(pending_queue_reports)
                         pending_queue_reports = _flush_queue_status_reports(

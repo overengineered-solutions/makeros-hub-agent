@@ -112,6 +112,15 @@ class TestReportOutbox(unittest.TestCase):
             self.assertEqual(report_outbox.load(p), [])
             self.assertTrue(report_outbox.save([{"queueJobId": str(i), "state": "printing"} for i in range(report_outbox.MAX_REPORTS + 5)], p))
             self.assertEqual(len(report_outbox.load(p)), report_outbox.MAX_REPORTS)
+            # over the bound, each job keeps its LAST report (its current state), never just "the newest entries"
+            many = []
+            for i in range(report_outbox.MAX_REPORTS + 10):
+                many += [{"queueJobId": "old", "state": "uploading"}, {"queueJobId": f"j{i}", "state": "printing"}]
+            many.append({"queueJobId": "old", "state": "completed"})
+            self.assertTrue(report_outbox.save(many, p))
+            loaded = report_outbox.load(p)
+            self.assertLessEqual(len(loaded), report_outbox.MAX_REPORTS)
+            self.assertEqual([r for r in loaded if r["queueJobId"] == "old"], [{"queueJobId": "old", "state": "completed"}])
 
 
 class TestExternalSpoolIdentity(unittest.TestCase):
@@ -175,3 +184,31 @@ class TestRecoveryAndSeqOnProgress(unittest.TestCase):
         with self.assertRaises(tt.TrayTranslationError):
             tt.translate_print_trays({"use_ams": False, "ams_mapping": [255]}, [{"slot": 1, "type": "PETG", "color": "000000"}], units, vt)
         self.assertEqual(tt.translate_print_trays({"use_ams": False, "ams_mapping": [254]}, [{"slot": 1, "type": "PETG", "color": "000000"}], units, vt)["ams_mapping"], [254])
+
+
+class TestProgressReportsDurableBeforeStatePop(unittest.TestCase):
+    def test_the_hook_runs_while_the_dispatch_is_still_on_disk(self):
+        import json as _json
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf"):
+            a = adapter()
+            kw = dict(plate=1, use_ams=True, ams_mapping=[5], raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]}, required_filaments=REQ_PLA)
+            self.assertTrue(a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", assignment_seq=3, **kw)["ok"])
+            a._data = {"print": {**RAW_STATE["print"], "gcode_state": "RUNNING"}}
+            seen = []
+
+            def hook(report):
+                on_disk = _json.loads((Path(d) / "p1.json").read_text())
+                seen.append((report, [x["queueJobId"] for x in on_disk["dispatches"]]))
+
+            reports = a.collect_queue_progress(on_report=hook)
+            self.assertEqual(reports, [{"queueJobId": "q1", "state": "printing", "assignmentSeq": 3}])
+            self.assertEqual(seen, [({"queueJobId": "q1", "state": "printing", "assignmentSeq": 3}, ["q1"])])   # still on disk at hook time
+            # the manager passes the hook down and still forgets a completed/held job
+            m = PrinterManager(); m._adapters["p1"] = a; m._remember_dispatched_queue_job("q1")
+            a._data = {"print": {**RAW_STATE["print"], "gcode_state": "IDLE"}}
+            got = []
+            with mock.patch.object(a._queue_progress, "collect", return_value=[{"queueJobId": "q1", "state": "completed", "assignmentSeq": 3}]):
+                out = m.collect_queue_progress(on_report=got.append)
+            self.assertEqual((out, got), ([{"queueJobId": "q1", "state": "completed", "assignmentSeq": 3}], [{"queueJobId": "q1", "state": "completed", "assignmentSeq": 3}]))
+            self.assertNotIn("q1", m._dispatched_queue_jobs)

@@ -36,9 +36,24 @@ def load(path: Path | None = None) -> list[dict]:
     return out
 
 
+def compact(reports: list[dict]) -> list[dict]:
+    """Over the bound, keep each queue job's LAST report (its current state — the cloud accepts it without the earlier
+    transitions) rather than blindly dropping the oldest entries (codex v0.58 r3); then, still over, drop the oldest."""
+    rows = [r for r in reports if isinstance(r, dict)]
+    if len(rows) <= MAX_REPORTS:
+        return rows
+    last_index: dict[str, int] = {}
+    for i, r in enumerate(rows):
+        jid = r.get("queueJobId")
+        if isinstance(jid, str):
+            last_index[jid] = i
+    kept = [r for i, r in enumerate(rows) if not isinstance(r.get("queueJobId"), str) or last_index[r["queueJobId"]] == i]
+    return kept[-MAX_REPORTS:]
+
+
 def save(reports: list[dict], path: Path | None = None) -> bool:
     p = path or PATH
-    keep = [r for r in reports if isinstance(r, dict)][-MAX_REPORTS:]
+    keep = compact(reports)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(p.name + ".tmp")
