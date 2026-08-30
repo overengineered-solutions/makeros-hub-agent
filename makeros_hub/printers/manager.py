@@ -14,6 +14,7 @@ loop — stay importable on a box where paho isn't installed yet.
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import time
@@ -27,6 +28,14 @@ from .threemf_objects import parse_plate_objects
 log = logging.getLogger("makeros-hub.printers")
 
 MAX_DISPATCHED_QUEUE_JOBS = 1000
+# A printer in any of these is mid-job: never send it another project_file (v0.53 — a hub restart mid-window used to
+# re-dispatch a still-'assigned' job onto a printer that was already heating for it).
+BUSY_GCODE_STATES = frozenset({"RUNNING", "PAUSE", "PREPARE"})
+BUSY_ACTIVITY_STATES = frozenset({"printing", "paused"})
+# The dispatched-job guard persists across restarts (v0.53): the cloud re-sends an 'assigned' job every beat until the
+# printer reports RUNNING, and bed heating (PREPARE, which maps to idle) can outlast an OTA restart.
+DISPATCHED_STATE_PATH = Path(os.environ.get("MAKEROS_HUB_DISPATCHED_STATE", "/var/lib/makeros-hub/dispatched.json"))
+DISPATCHED_TTL_SEC = 24 * 3600
 MAX_DISPATCHED_COMMANDS = 1000
 # A paho client that got a CONNACK auth-rejection (or never completed its first
 # connect) does NOT reliably auto-retry — so an adapter built while a printer was
@@ -64,6 +73,8 @@ class PrinterManager:
         # resend must not re-upload or re-start the printer. Terminal progress
         # reports prune this bounded guard.
         self._dispatched_queue_jobs: OrderedDict[str, float] = OrderedDict()
+        self._dispatched_wall: dict[str, float] = {}   # queueJobId -> wall-clock stamp, the persisted twin of the above
+        self._load_dispatched()
         # Same at-least-once guard for control commands. Cloud delivery is
         # one-shot (queued->delivered is atomic; delivered rows are never
         # re-selected), but a lost result report could in theory get the row
@@ -346,11 +357,67 @@ class PrinterManager:
     def _remember_dispatched_queue_job(self, queue_job_id: str) -> None:
         self._dispatched_queue_jobs[queue_job_id] = time.monotonic()
         self._dispatched_queue_jobs.move_to_end(queue_job_id)
+        self._dispatched_wall[queue_job_id] = time.time()
         while len(self._dispatched_queue_jobs) > MAX_DISPATCHED_QUEUE_JOBS:
-            self._dispatched_queue_jobs.popitem(last=False)
+            evicted, _ = self._dispatched_queue_jobs.popitem(last=False)
+            self._dispatched_wall.pop(evicted, None)
+        self._save_dispatched()
 
     def _forget_dispatched_queue_job(self, queue_job_id: str) -> None:
         self._dispatched_queue_jobs.pop(queue_job_id, None)
+        if self._dispatched_wall.pop(queue_job_id, None) is not None:
+            self._save_dispatched()
+
+    def _load_dispatched(self) -> None:
+        """Rehydrate the guard after a restart; entries older than DISPATCHED_TTL_SEC are dropped (the cloud will have
+        moved such a job on long ago)."""
+        try:
+            raw = json.loads(DISPATCHED_STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        now_wall, now_mono = time.time(), time.monotonic()
+        if not isinstance(raw, dict):
+            return
+        for job_id, stamp in raw.items():
+            if not (isinstance(job_id, str) and isinstance(stamp, (int, float))):
+                continue
+            # A stamp from the "future" = the wall clock stepped BACKWARDS across the restart (a Pi before time sync,
+            # codex v0.53): keep the entry — dropping it reopens the duplicate-dispatch window this guard exists for.
+            age = max(0.0, now_wall - float(stamp))
+            if age < DISPATCHED_TTL_SEC:
+                self._dispatched_queue_jobs[job_id] = now_mono
+                self._dispatched_wall[job_id] = float(stamp)
+
+    def _save_dispatched(self) -> None:
+        try:
+            DISPATCHED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = DISPATCHED_STATE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._dispatched_wall), encoding="utf-8")
+            os.replace(tmp, DISPATCHED_STATE_PATH)
+        except OSError as e:
+            log.warning("could not persist the dispatched-job guard: %s", e)
+
+    def busy_printers(self) -> list[str]:
+        """Printers currently preparing/printing/paused per their own live status (the hub is the truth for physical
+        state). Used to refuse a second dispatch and to defer an OTA restart."""
+        out: list[str] = []
+        for pid, adapter in self._adapters.items():
+            if self._adapter_busy(adapter):
+                out.append(pid)
+        return out
+
+    @staticmethod
+    def _adapter_busy(adapter) -> bool:
+        status = getattr(adapter, "status", None)
+        if not callable(status):
+            return False
+        try:
+            st = status()
+        except Exception:  # noqa: BLE001 — a status read failure must not block dispatch or updates
+            return False
+        if not isinstance(st, dict):
+            return False
+        return str(st.get("gcodeState", "")).upper() in BUSY_GCODE_STATES or str(st.get("state", "")).lower() in BUSY_ACTIVITY_STATES
 
     def _assignment_path_ok(self, submission_uid: str, file_name: str) -> bool:
         return (
@@ -493,6 +560,12 @@ class PrinterManager:
                         "reason": "printer_unavailable",
                     }
                 )
+                continue
+
+            if self._adapter_busy(adapter):
+                # v0.53: the printer is mid-job by its OWN report — never upload/start another file onto it, whatever the
+                # cloud's view (an 'assigned' re-send after a restart, or a stale idle in the cloud mirror).
+                reports.append({"queueJobId": queue_job_id, "state": "held", "reason": "printer_busy"})
                 continue
 
             local_path = base / submission_uid / file_name

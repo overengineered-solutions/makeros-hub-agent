@@ -140,6 +140,19 @@ def apply_update(tag: str, expected_sha: str | None = None) -> bool:
         return False
 
 
+def should_defer_update(statuses) -> bool:
+    """v0.53: never restart the agent while a printer is preparing/printing/paused. Pure over the heartbeat statuses
+    (PrinterStatusDTO dicts): gcodeState RUNNING/PAUSE/PREPARE or activity state printing/paused ⇒ defer."""
+    for st in statuses if isinstance(statuses, list) else []:
+        if not isinstance(st, dict):
+            continue
+        if str(st.get("gcodeState", "")).upper() in {"RUNNING", "PAUSE", "PREPARE"}:
+            return True
+        if str(st.get("state", "")).lower() in {"printing", "paused"}:
+            return True
+    return False
+
+
 def maybe_update(current_version: str, target_version, target_sha=None) -> bool:
     """Decide + (if appropriate) trigger an update. `target_sha` (optional) is the cloud's content-trust pin.
     Returns True if a systemd update launched; honors the cooldown so a broken target can't loop."""
