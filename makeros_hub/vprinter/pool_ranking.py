@@ -61,7 +61,9 @@ class PoolRankingState:
             keys = raw.get("keys") if isinstance(raw, dict) else None
             if isinstance(keys, dict):
                 for k, v in list(keys.items())[:MAX_TRACKED_KEYS]:
-                    if not isinstance(k, str) or not isinstance(v, dict):
+                    # Tray keys are material|filamentId|color; anything else (e.g. the withdrawn
+                    # 0.50-dev "~unknown" marker) is pruned so a stale file can never reintroduce it.
+                    if not isinstance(k, str) or "|" not in k or not isinstance(v, dict):
                         continue
                     fs = v.get("first_seen")
                     um = v.get("use_minutes")

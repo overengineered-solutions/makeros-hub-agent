@@ -3,6 +3,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from makeros_hub.printers.bambu_parse import normalize_status
+from makeros_hub.vprinter import live_pool
 from makeros_hub.vprinter.pool_ranking import PoolRankingState
 from makeros_hub.vprinter.live_pool import active_keys, scoped_statuses, tray_key, vp_pool_from_statuses_ranked
 
@@ -13,11 +15,25 @@ def tray(material, color, fid="GFL99", slot=0):
     return {"slot": slot, "material": material, "colorHex": color, "filamentId": fid}
 
 
-def status(model, trays_list, state="idle", active=None, pid="p1"):
-    s = {"printerId": pid, "model": model, "state": state, "ams": [{"trays": trays_list}]}
-    if active is not None:
-        s["amsActiveTray"] = active
-    return s
+def raw_unit(unit_id, trays_list):
+    """One raw Bambu AMS unit: 4 slots, `trays_list` placed at their slot index (build_ams slots by position)."""
+    slots = [{"id": str(i)} for i in range(4)]
+    for t in trays_list:
+        slots[t["slot"]] = {
+            "id": str(t["slot"]), "state": 9, "tray_type": t["material"],
+            "tray_color": live_pool._norm_color(t["colorHex"]), "tray_info_idx": t["filamentId"],
+        }
+    return {"id": str(unit_id), "tray": slots}
+
+
+def status(model, trays_list, state="idle", active=None, pid="p1", units=None):
+    """A status built by the REAL DTO builder (RC1 guard): `model` comes from normalize_status, never a
+    hand-injected key. `units` = raw AMS units (default: one unit id 0 holding `trays_list`)."""
+    print_obj = {
+        "gcode_state": {"idle": "IDLE", "printing": "RUNNING"}[state],
+        "ams": {"tray_now": "255" if active is None else str(active), "ams": units or [raw_unit(0, trays_list)]},
+    }
+    return normalize_status(pid, {"print": print_obj}, connection_state="connected", model=model)
 
 
 class TestRankingPolicy(unittest.TestCase):
@@ -66,40 +82,52 @@ class TestRankingPolicy(unittest.TestCase):
             p = Path(tmp) / "r.json"
             wall = 1_700_000_000.0
             st = PoolRankingState(p, now=wall)
-            st.observe(["k"], ["k"], 0.5, wall)
+            st.observe(["PLA|GFL99|FFFFFFFF"], ["PLA|GFL99|FFFFFFFF"], 0.5, wall)
             st.persist(wall, force=True)
             st2 = PoolRankingState(p, now=wall + 1000.0)
-            self.assertGreater(st2._decayed("k", wall + 1000.0), 0.0)
+            self.assertGreater(st2._decayed("PLA|GFL99|FFFFFFFF", wall + 1000.0), 0.0)
+
+    def test_load_prunes_keys_that_are_not_tray_keys(self):
+        # A stale state file must never reintroduce a non-spool key (the withdrawn 0.50-dev "~unknown" marker).
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "r.json"
+            wall = 1_700_000_000.0
+            p.write_text('{"version": 1, "keys": {"~unknown": {"first_seen": %r, "use_minutes": 99.0, "last_use": %r},'
+                         ' "PLA|GFL99|FFFFFFFF": {"first_seen": %r, "use_minutes": 1.0, "last_use": %r}}}' % (wall, wall, wall, wall))
+            st = PoolRankingState(p, now=wall)
+        self.assertEqual(sorted(st._keys), ["PLA|GFL99|FFFFFFFF"])
 
     def test_monotonic_era_timestamps_quarantined_on_load(self):
         # A state file stamped by a monotonic clock (seconds-since-boot ≪ 2020 epoch) must not read as
         # ancient against wall time: implausible stamps reset to load-time `now`, keeping use_minutes.
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "r.json"
-            p.write_text('{"version": 1, "keys": {"k": {"first_seen": 12345.0, "use_minutes": 30.0, "last_use": 12345.0}}}')
+            p.write_text('{"version": 1, "keys": {"PLA|GFL99|FFFFFFFF": {"first_seen": 12345.0, "use_minutes": 30.0, "last_use": 12345.0}}}')
             wall = 1_700_000_000.0
             st = PoolRankingState(p, now=wall)
-            self.assertGreater(st._decayed("k", wall), 25.0)          # usage survives, not decayed to ~0
-            self.assertIn("k", st.select(["k", "other"], 1, wall))    # reads as newly seen → recent tier
+            self.assertGreater(st._decayed("PLA|GFL99|FFFFFFFF", wall), 25.0)          # usage survives, not decayed to ~0
+            self.assertIn("PLA|GFL99|FFFFFFFF", st.select(["PLA|GFL99|FFFFFFFF", "other"], 1, wall))    # reads as newly seen → recent tier
 
 
 class TestScopedAndActive(unittest.TestCase):
-    def test_scoped_exact_match_with_never_strand_fallback(self):
+    def setUp(self):
+        live_pool._scope_state.clear()
+
+    def test_scoped_exact_match_and_empty_when_the_model_is_offline(self):
         sts = [status("Bambu X1 Carbon", [tray("PLA", "#fff")]), status("Bambu A1 Mini", [tray("ABS", "#000")], pid="p2")]
         self.assertEqual(len(scoped_statuses(sts, "Bambu X1 Carbon")), 1)
-        self.assertEqual(len(scoped_statuses(sts, "Nonexistent Model")), 2)   # fallback: whole hub
+        with self.assertLogs("makeros-hub.vprinter", level="WARNING"):        # never silent
+            self.assertEqual(scoped_statuses(sts, "Nonexistent Model"), [])   # other models' spools are NOT offered
 
     def test_active_key_resolves_by_raw_unit_id_across_gaps(self):
         # build_ams re-enumerates units contiguously while tray_now uses RAW ids: with unit 0 absent and
         # raw units 1+2 present, active tray in raw unit 1 (global 4..7) must hit raw unit 1 — a positional
-        # lookup would land on raw unit 2 (WRONG key). Raw ids ride unit["raw"]["id"].
-        s = {
-            "printerId": "p1", "model": "m", "state": "printing", "amsActiveTray": 5,
-            "ams": [
-                {"unit": 0, "raw": {"id": 1}, "trays": [tray("PETG", "#00ff00", "GFG99", slot=1)]},
-                {"unit": 1, "raw": {"id": 2}, "trays": [tray("ABS", "#000000", "GFB99", slot=1)]},
-            ],
-        }
+        # lookup would land on raw unit 2 (WRONG key). Raw ids ride unit["raw"]["id"] — built by the DTO.
+        s = status(
+            "m", [], state="printing", active=5,
+            units=[raw_unit(1, [tray("PETG", "#00ff00", "GFG99", slot=1)]), raw_unit(2, [tray("ABS", "#000000", "GFB99", slot=1)])],
+        )
+        self.assertEqual([u["unit"] for u in s["ams"]], [0, 1])   # contiguous DTO index, raw ids kept in raw
         keys = active_keys([s])
         self.assertEqual(len(keys), 1)
         self.assertIn("PETG", keys[0])   # raw unit 1, slot 1 — never the ABS in raw unit 2
@@ -126,6 +154,14 @@ class TestScopedAndActive(unittest.TestCase):
         # PETG unseen -> first_seen defaults absent -> not recent -> falls to usage tier at 0. All three at
         # usage 0 -> stable key-sort decides. The assertion pins determinism, not a specific winner.
         self.assertEqual(pool, sorted(pool, key=lambda t: str(t)))  # deterministic ordering shape
+
+    def test_ranked_pool_ignores_unidentified_spools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            st = PoolRankingState(Path(tmp) / "r.json", now=0.0)
+            sts = [status("m", [tray("PLA", "#ffffff", "GFL99", 0)])]
+            sts[0]["unidentifiedSpools"] = [{"unit": 0, "slot": 2}]   # as the DTO reports it
+            pool = vp_pool_from_statuses_ranked(sts, units=1, trays=4, ranking=st, now=100 * DAY)
+        self.assertEqual([t["tray_type"] for t in pool], ["PLA"])
 
 
 if __name__ == "__main__":

@@ -482,7 +482,9 @@ class _VirtualPrinterRuntime:
         self.base_dir = base_dir / _safe_serial(config.serial)
         self.on_capture = on_capture
         self.auth = MemberAuthSet(config.members)
-        self.capture = CaptureCoordinator(on_capture, log.warning)
+        self.capture = CaptureCoordinator(
+            on_capture, log.warning, vp_serial=config.serial, vp_model=config.model
+        )
         self.servers: list[asyncio.AbstractServer] = []
         # v0.40.0 — when a shared SSDP listener exists (multi-VP), this runtime
         # REGISTERS its config with that shared listener instead of starting its
@@ -699,7 +701,9 @@ class _VirtualPrinterRuntime:
 
     def _on_stored(self, upload: UploadRecord) -> None:
         if self.broker is not None:
-            self.broker.set_print_state("FINISH", gcode_file=upload.filename, prepare_percent="100")
+            self.broker.set_print_state(
+                "FINISH", gcode_file=upload.filename, prepare_percent="100", member_id=upload.member_id
+            )
         self.capture.record_upload(upload)
 
 

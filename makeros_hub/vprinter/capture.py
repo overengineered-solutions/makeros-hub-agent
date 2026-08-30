@@ -55,6 +55,10 @@ class CapturedJob:
     submission_uid: str = field(default_factory=lambda: uuid.uuid4().hex)
     plate: int | None = None
     attempts: int = 0
+    # The Virtual Printer that captured the job — its model is the job's target model (each VP is one
+    # model group) and its serial lets the cloud dedupe a double Send per VP.
+    vp_serial: str = ""
+    vp_model: str = ""
 
     @property
     def file_sha256(self) -> str:
@@ -104,10 +108,17 @@ class CaptureCoordinator:
         max_pending: int = 256,
         max_pending_per_key: int = 2,
         clock: Callable[[], float] | None = None,
+        vp_serial: str = "",
+        vp_model: str = "",
+        intent_dedupe_sec: float = 30.0,
     ) -> None:
         self.on_capture = on_capture
         self.log = log
         self.upload_wait_sec = upload_wait_sec
+        self.vp_serial = vp_serial
+        self.vp_model = vp_model
+        self.intent_dedupe_sec = intent_dedupe_sec
+        self._recent_intents: OrderedDict[tuple, float] = OrderedDict()
         self.max_pending = max(1, int(max_pending))
         self.max_pending_per_key = max(1, int(max_pending_per_key))
         self.clock = clock or time.monotonic
@@ -130,6 +141,12 @@ class CaptureCoordinator:
     def record_project_file(self, intent: ProjectFileIntent) -> None:
         now = self.clock()
         self._prune_expired(now)
+        if self._is_redelivery(intent, now):
+            self.log(
+                f"virtual printer capture ignored re-delivered project_file for {intent.filename!r} "
+                f"member_id={intent.member_id!r} sequence_id={intent.raw.get('sequence_id')!r}"
+            )
+            return
         key = _capture_key(intent.member_id, intent.filename)
         queue = self._intents.setdefault(key, deque())
         queue.append(_PendingIntent(intent, now + self.upload_wait_sec))
@@ -145,42 +162,54 @@ class CaptureCoordinator:
             self._expiry_handle = None
         self._uploads.clear()
         self._intents.clear()
+        self._recent_intents.clear()
+
+    def _is_redelivery(self, intent: ProjectFileIntent, now: float) -> bool:
+        """A QoS1 re-delivered project_file (same member, filename, sequence_id inside the window) must
+        not pair with the member's NEXT upload. OrcaSlicer numbers every command, so a genuine second
+        Send carries a new sequence_id. ponytail: with no sequence_id the identity is the whole raw
+        command — two byte-identical genuine Sends of one file inside the window would then collapse;
+        add a per-upload nonce if a slicer ever sends unnumbered commands."""
+        for ident, expires_at in list(self._recent_intents.items()):
+            if expires_at <= now:
+                del self._recent_intents[ident]
+        seq = intent.raw.get("sequence_id")
+        tag = str(seq) if seq not in (None, "") else json.dumps(intent.raw, sort_keys=True, default=str)
+        ident = (intent.member_id, intent.filename, tag)
+        if ident in self._recent_intents:
+            return True
+        self._recent_intents[ident] = now + self.intent_dedupe_sec
+        while len(self._recent_intents) > self.max_pending:
+            self._recent_intents.popitem(last=False)
+        return False
 
     def _try_capture(self, key: "_CaptureKey") -> bool:
+        """Pair pending uploads and project_file intents for one (member, filename) FIFO: OrcaSlicer's
+        Send is upload-then-command, so the oldest of each belong together. A member sending the same
+        filename twice inside the window therefore yields TWO jobs (RC8) instead of an "ambiguous" drop.
+        The cloud dedupes a double Send per VP; a re-delivered command is filtered before it is queued
+        (_is_redelivery)."""
         upload_queue = self._uploads.get(key)
         intent_queue = self._intents.get(key)
-        if not upload_queue or not intent_queue:
-            return False
-        if len(upload_queue) != 1 or len(intent_queue) != 1:
-            member_id, filename = key
-            self.log(
-                "virtual printer capture skipped for "
-                f"{filename!r} member_id={member_id!r}: ambiguous pending match "
-                f"uploads={len(upload_queue)} project_files={len(intent_queue)}"
-            )
-            self._uploads.pop(key, None)
-            self._intents.pop(key, None)
-            return False
-        upload = upload_queue[0].record
-        intent = intent_queue[0].intent
-        try:
-            job = assemble_captured_job(upload, intent)
-        except Exception as exc:  # noqa: BLE001 - observe-only hook must not sink protocol ACKs
-            self.log(f"virtual printer capture skipped for {upload.filename!r}: {exc}")
-            self._uploads.pop(key, None)
-            self._intents.pop(key, None)
-            return False
-        upload_queue.popleft()
-        intent_queue.popleft()
+        captured = False
+        while upload_queue and intent_queue:
+            upload = upload_queue.popleft().record
+            intent = intent_queue.popleft().intent
+            try:
+                job = assemble_captured_job(upload, intent, vp_serial=self.vp_serial, vp_model=self.vp_model)
+            except Exception as exc:  # noqa: BLE001 - observe-only hook must not sink protocol ACKs
+                self.log(f"virtual printer capture skipped for {upload.filename!r}: {exc}")
+                continue
+            try:
+                self.on_capture(job)
+            except Exception as exc:  # noqa: BLE001 - capture is observe-only in V1
+                self.log(f"virtual printer capture callback failed for {upload.filename!r}: {exc}")
+            captured = True
         if not upload_queue:
             self._uploads.pop(key, None)
         if not intent_queue:
             self._intents.pop(key, None)
-        try:
-            self.on_capture(job)
-        except Exception as exc:  # noqa: BLE001 - capture is observe-only in V1
-            self.log(f"virtual printer capture callback failed for {upload.filename!r}: {exc}")
-        return True
+        return captured
 
     def _schedule_expiry(self) -> None:
         if self._expiry_handle is not None:
@@ -288,6 +317,8 @@ def assemble_captured_job(
     intent: ProjectFileIntent,
     *,
     submitted_at: datetime | None = None,
+    vp_serial: str = "",
+    vp_model: str = "",
 ) -> CapturedJob:
     if upload.filename != intent.filename:
         raise ValueError("upload and project_file filenames do not match")
@@ -305,6 +336,7 @@ def assemble_captured_job(
         upload.sha256,
         intent.plate,
         ams_mapping,
+        upload.file_path.name,
     )
     return CapturedJob(
         member_id=upload.member_id,
@@ -318,6 +350,8 @@ def assemble_captured_job(
         submitted_at=submitted_at or datetime.now(timezone.utc),
         submission_uid=submission_uid,
         plate=intent.plate,
+        vp_serial=vp_serial,
+        vp_model=vp_model,
     )
 
 
@@ -328,7 +362,9 @@ def build_vp_submit_body(job: CapturedJob, *, model: str) -> dict[str, Any]:
         "fileName": job.filename,
         "fileSha256": job.file_sha256,
         "fileSizeBytes": job.size,
-        "printerModel": model,
+        # The capturing VP's model is the job's target model; `model` (the hub's first live VP) is only
+        # the fallback for outbox records written before vp_model existed.
+        "printerModel": job.vp_model or model,
         "useAms": job.use_ams,
         # The cloud contract is amsMapping: number[]. When a print carries both
         # ams_mapping + ams_mapping2 the capture stores a dict; flatten to the
@@ -339,6 +375,12 @@ def build_vp_submit_body(job: CapturedJob, *, model: str) -> dict[str, Any]:
     }
     if job.plate is not None:
         body["plate"] = job.plate
+    # Additive (cloud-side double-Send dedupe on member + VP + sha + plate + mapping): the mapping exactly
+    # as OrcaSlicer sent it (list, or {ams_mapping, ams_mapping2} for dual-nozzle prints) + the VP serial.
+    if job.ams_mapping is not None:
+        body["amsMappingRaw"] = job.ams_mapping
+    if job.vp_serial:
+        body["vpSerial"] = job.vp_serial
     return body
 
 
@@ -357,14 +399,17 @@ def _deterministic_submission_uid(
     file_sha256: str,
     plate: int | None,
     ams_mapping: Any,
+    upload_name: str,
 ) -> str:
+    """Stable for one capture (an agent retry re-sends the same uid), distinct per UPLOAD: the spooled
+    file name is unique per STOR, so a member's second Send of the same bytes is its own job (RC8)."""
     ams_mapping_json = json.dumps(
         _ams_mapping_list(ams_mapping),
         sort_keys=True,
         separators=(",", ":"),
     )
     plate_value = "" if plate is None else str(plate)
-    payload = f"{member_id}\n{file_sha256}\n{plate_value}\n{ams_mapping_json}"
+    payload = f"{member_id}\n{file_sha256}\n{plate_value}\n{ams_mapping_json}\n{upload_name}"
     return hashlib.sha256(payload.encode()).hexdigest()
 
 

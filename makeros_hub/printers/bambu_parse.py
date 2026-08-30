@@ -216,9 +216,11 @@ def build_vt_tray(print_obj: dict) -> dict | None:
 
     tray_out: dict[str, Any] = {}
     _add_tray_identity_fields(tray_out, vt_tray)
+    # filamentId included (v0.50): the VP pool dedupes spools by material|filamentId|color, so the
+    # same Generic PLA on an AMS and on an external holder must key identically.
     return {
         k: tray_out[k]
-        for k in ("material", "productName", "colorHex", "remainPct", "tagUid")
+        for k in ("material", "productName", "filamentId", "colorHex", "remainPct", "tagUid")
         if k in tray_out
     } or None
 
@@ -295,6 +297,55 @@ def build_ams(print_obj: dict) -> list[dict] | None:
     return units or None
 
 
+def _has_material(tray: dict) -> bool:
+    material = tray.get("tray_type")
+    return isinstance(material, str) and bool(material.strip())
+
+
+def _tray_present(tray: dict, *, empty_when_unflagged: bool = False) -> bool:
+    """Is a spool physically in this tray? Current firmware reports a `state` bitfield; the rule is
+    pybambu utils.ams_tray_spool_loaded verbatim (SPOOL=0x01 must be set; legacy values <=3 count as
+    loaded only at 3; otherwise STEADY=0x08 must be set). Without `state`: an EMPTY AMS slot is a bare
+    {"id"} (OpenBambuAPI pushall sample), so any richer object holds a spool — but an empty EXTERNAL
+    holder reports a full field set (tray_type "", color 00000000, ...), so vt_tray without `state`
+    is never called present (`empty_when_unflagged`)."""
+    state = _to_int(tray.get("state"))
+    if state is None:
+        return False if empty_when_unflagged else any(k != "id" for k in tray)
+    if not state & 0x01:
+        return False
+    if state <= 3:
+        return state == 3
+    return bool(state & 0x08)
+
+
+def build_unidentified_spools(print_obj: dict) -> list[dict] | None:
+    """Trays holding a spool the printer could not identify (no tray_type: a non-RFID spool nobody has
+    typed on the screen/Handy yet) — invisible to the VP pool, so surface them for The Floor. Same
+    unit/slot enumeration as build_ams (CONTIGUOUS unit index, slots 0-3); the external spool is
+    slot 254 (Bambu's own id for vt_tray). None when there are none."""
+    if not isinstance(print_obj, dict):
+        return None
+    out: list[dict] = []
+    ams_obj = print_obj.get("ams")
+    units_raw = ams_obj.get("ams") if isinstance(ams_obj, dict) else None
+    unit_idx = 0
+    for unit in units_raw if isinstance(units_raw, list) else []:
+        if not isinstance(unit, dict):
+            continue
+        trays_raw = unit.get("tray")
+        for slot_idx, tray in enumerate(trays_raw if isinstance(trays_raw, list) else []):
+            if slot_idx > 3:
+                break
+            if isinstance(tray, dict) and tray and _tray_present(tray) and not _has_material(tray):
+                out.append({"unit": unit_idx, "slot": slot_idx})
+        unit_idx += 1
+    vt_tray = print_obj.get("vt_tray")
+    if isinstance(vt_tray, dict) and _tray_present(vt_tray, empty_when_unflagged=True) and not _has_material(vt_tray):
+        out.append({"slot": 254})
+    return out or None
+
+
 def build_active_tray(print_obj: dict) -> int | None:
     """The currently-selected AMS global tray index, or None for external(254)/
     none(255)/absent."""
@@ -335,9 +386,16 @@ def normalize_status(
     merged: dict,
     *,
     connection_state: str,
+    model: str | None,
     error_reason: str | None = None,
 ) -> dict:
     """Build the wire DTO the cloud heartbeat expects (PrinterStatusDTO).
+
+    `model` is the config-down machine model (e.g. "A1 Mini") — the VP live-mirror scopes each
+    Virtual Printer's filament pool by it (live_pool.scoped_statuses), so it must ride EVERY status:
+    a REQUIRED keyword (None only when config-down carried no model; the key is then omitted).
+    Additive keys (model, gcodeState, unidentifiedSpools) are safe for pstation, whose heartbeat
+    ingest hand-picks fields.
 
     `merged` is the deep-merged report state (telemetry under merged['print']).
     Only set keys are included — the cloud DTO is strict() and rejects unknown
@@ -345,6 +403,8 @@ def normalize_status(
     is required. NEVER include the serial / IP / access code (telemetry only).
     """
     out: dict[str, Any] = {"printerId": printer_id, "connectionState": connection_state}
+    if isinstance(model, str) and model.strip():
+        out["model"] = model.strip()[:80]
     if connection_state == "error" and error_reason:
         out["errorReason"] = error_reason
 
@@ -353,6 +413,11 @@ def normalize_status(
     # Activity state only meaningful once we're actually connected.
     if connection_state == "connected":
         out["state"] = map_activity_state(print_obj.get("gcode_state"))
+        # The RAW state too: `state` collapses FINISH/FAILED into idle, but a plate-clear gate needs
+        # to tell IDLE (dismissed at the printer) from FINISH (part still on the bed).
+        gcode_state = print_obj.get("gcode_state")
+        if isinstance(gcode_state, str) and gcode_state.strip():
+            out["gcodeState"] = gcode_state.strip()[:32]
 
     pct = _num(print_obj.get("mc_percent"))
     if pct is not None:
@@ -383,6 +448,9 @@ def normalize_status(
         active = build_active_tray(print_obj)
         if active is not None:
             out["amsActiveTray"] = active
+        unidentified = build_unidentified_spools(print_obj)
+        if unidentified:
+            out["unidentifiedSpools"] = unidentified
         hms = build_hms(print_obj)
         if hms:
             out["hms"] = hms

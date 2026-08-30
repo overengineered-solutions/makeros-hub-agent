@@ -21,6 +21,9 @@ MQTT_DRAIN_TIMEOUT_SEC = 5.0
 MQTT_CLOSE_TIMEOUT_SEC = 2.0
 MQTT_KEEPALIVE_MIN_TIMEOUT_SEC = 30.0
 MQTT_KEEPALIVE_FALLBACK_TIMEOUT_SEC = 300.0
+# After a project_file ack the session's fake print flips PREPARE -> FINISH so OrcaSlicer's Send dialog
+# completes; the real print is dispatched by the cloud later (design RC7 mirrors real state in phase C).
+FINISH_DELAY_SEC = 1.5
 
 
 @dataclass(frozen=True)
@@ -51,7 +54,7 @@ class PublishPacket:
     dup: bool
 
 
-@dataclass
+@dataclass(eq=False)  # identity semantics: sessions live in a set
 class MqttSession:
     writer: asyncio.StreamWriter
     peer: object
@@ -59,6 +62,12 @@ class MqttSession:
     report_topic: str
     request_topic: str
     subscribed: bool = False
+    # Per-session fake print state (RC8): the PREPARE->FINISH progression one member's Send produces must
+    # not change what another member's Device tab shows.
+    gcode_state: str = "IDLE"
+    gcode_file: str = ""
+    prepare_percent: str = "0"
+    finish_task: asyncio.Task | None = None
 
 
 def encode_remaining_length(length: int) -> bytes:
@@ -211,14 +220,11 @@ class MqttBroker:
         self.default_report_topic = f"device/{serial}/report"
         self.default_request_topic = f"device/{serial}/request"
         self._sequence = 1
-        self._active_writer: asyncio.StreamWriter | None = None
-        self._active_session: MqttSession | None = None
+        # Every live OrcaSlicer session on this VP (RC8): several members, or one member's two slicers,
+        # at once — a new connection never displaces an existing one.
+        self._sessions: set[MqttSession] = set()
         self._client_tasks: set[asyncio.Task] = set()
         self._write_lock = asyncio.Lock()
-        self._gcode_state = "IDLE"
-        self._gcode_file = ""
-        self._prepare_percent = "0"
-        self._finish_task: asyncio.Task | None = None
 
     async def start(self, host: str, port: int, ssl_context) -> asyncio.AbstractServer:
         return await asyncio.start_server(
@@ -230,18 +236,16 @@ class MqttBroker:
         )
 
     async def close(self) -> None:
-        if self._finish_task is not None and not self._finish_task.done():
-            self._finish_task.cancel()
-            await asyncio.gather(self._finish_task, return_exceptions=True)
-        if self._active_writer is not None:
-            self._active_writer.close()
+        finishes = [self._cancel_finish(session) for session in list(self._sessions)]
+        for session in list(self._sessions):
+            session.writer.close()
         tasks = [task for task in self._client_tasks if not task.done()]
         for task in tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._active_writer = None
-        self._active_session = None
+        pending = tasks + [t for t in finishes if t is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._sessions.clear()
 
     async def _handle_client(
         self,
@@ -254,11 +258,6 @@ class MqttBroker:
         peer = writer.get_extra_info("peername")
         peer_ip = _peer_ip(peer)
         _enable_socket_keepalive(writer)
-        if self._active_writer is not None and not self._active_writer.is_closing():
-            self.log(f"MQTT replacing existing client with new client from {peer}")
-            self._active_writer.close()
-            self._active_session = None
-        self._active_writer = writer
         periodic_task: asyncio.Task | None = None
         session: MqttSession | None = None
         self.log(f"MQTT TLS connection from {peer}")
@@ -292,10 +291,8 @@ class MqttBroker:
                 report_topic=self.default_report_topic,
                 request_topic=self.default_request_topic,
             )
-            self._active_session = session
-            # Fresh session => present a clean idle printer (clears any phantom
-            # job left over from a prior connect) with the current AMS pool.
-            self._reset_print_state()
+            # A fresh session starts IDLE by construction (its own state) and sees the current AMS pool.
+            self._sessions.add(session)
             await self._send_report(session, "connack")
             periodic_task = asyncio.create_task(self._periodic_reports(session))
             read_timeout = _mqtt_read_timeout(connect.keep_alive)
@@ -347,10 +344,11 @@ class MqttBroker:
             if periodic_task is not None:
                 periodic_task.cancel()
                 await asyncio.gather(periodic_task, return_exceptions=True)
-            if self._active_writer is writer:
-                self._active_writer = None
-            if self._active_session is session:
-                self._active_session = None
+            if session is not None:
+                finish = self._cancel_finish(session)
+                if finish is not None:
+                    await asyncio.gather(finish, return_exceptions=True)
+                self._sessions.discard(session)
             writer.close()
             await _wait_closed(writer)
             if task is not None:
@@ -385,7 +383,7 @@ class MqttBroker:
 
     async def _handle_publish(self, session: MqttSession, publish: PublishPacket) -> None:
         if not self._session_is_active(session):
-            self.log(f"MQTT ignoring PUBLISH from displaced session peer={session.peer}")
+            self.log(f"MQTT ignoring PUBLISH from closed session peer={session.peer}")
             return
         text = publish.payload.decode("utf-8", errors="replace").rstrip("\x00 \r\n\t")
         parsed = _json_or_none(text)
@@ -399,7 +397,8 @@ class MqttBroker:
             session.writer.write(build_puback(publish.packet_id))
             await _drain(session.writer)
             self.log(f"MQTT PUBACK peer={session.peer} packet_id={publish.packet_id}")
-        if not _is_request_topic(publish.topic):
+        if publish.topic != session.request_topic:
+            self.log(f"MQTT ignoring PUBLISH on foreign topic {publish.topic!r} from peer={session.peer}")
             return
         if _is_pushall(parsed):
             await self._send_report(session, "pushall")
@@ -410,13 +409,14 @@ class MqttBroker:
             await self._send_version(session, seq)
         elif _is_project_file(parsed):
             intent = parse_project_file_command(parsed, session.member_id)
-            gfile = intent.filename if intent is not None else self._gcode_file or "job.3mf"
+            gfile = intent.filename if intent is not None else session.gcode_file or "job.3mf"
             seq = ""
             if isinstance(parsed, dict):
                 seq = str(parsed.get("print", {}).get("sequence_id", ""))
             await self._send_print_ack(session, seq, gfile)
             if not self._session_is_active(session):
                 return
+            # Attribution is the SESSION's authenticated member — two members on one VP each get their own job.
             if intent is not None and self.on_project_file is not None:
                 try:
                     self.on_project_file(intent)
@@ -434,20 +434,31 @@ class MqttBroker:
             pass
 
     async def push_report_now(self) -> None:
-        session = self._active_session
-        if session is None or session.writer.is_closing():
-            return
-        await self._send_report(session, "hot_apply")
+        """Broadcast the current report (e.g. a changed AMS pool) to EVERY live session."""
+        for session in list(self._sessions):
+            if session.writer.is_closing():
+                continue
+            try:
+                await self._send_report(session, "hot_apply")
+            except Exception as exc:  # noqa: BLE001 - one dead client must not block the broadcast
+                # Evict the dead client now so repeated hot-applies never hit the same broken writer; its
+                # handler's finally finds the writer closed and finishes the cleanup.
+                self.log(f"MQTT hot_apply push failed for peer={session.peer}: {exc} — dropping session")
+                finish = self._cancel_finish(session)
+                if finish is not None:
+                    await asyncio.gather(finish, return_exceptions=True)
+                session.writer.close()
+                self._sessions.discard(session)
 
     async def _send_report(self, session: MqttSession, reason: str) -> None:
         if not self._session_is_active(session):
-            self.log(f"MQTT skipping report for displaced session peer={session.peer}")
+            self.log(f"MQTT skipping report for closed session peer={session.peer}")
             return
         report = self.report_builder(
             self._sequence,
-            self._gcode_state,
-            self._gcode_file,
-            self._prepare_percent,
+            session.gcode_state,
+            session.gcode_file,
+            session.prepare_percent,
         )
         self._sequence += 1
         payload = json.dumps(report, indent=4).encode("utf-8")
@@ -462,7 +473,7 @@ class MqttBroker:
 
     async def _send_version(self, session: MqttSession, sequence_id: str) -> None:
         if not self._session_is_active(session):
-            self.log(f"MQTT skipping version response for displaced session peer={session.peer}")
+            self.log(f"MQTT skipping version response for closed session peer={session.peer}")
             return
         version = self.version_builder(sequence_id)
         payload = json.dumps(version, indent=4).encode("utf-8")
@@ -477,9 +488,9 @@ class MqttBroker:
 
     async def _send_print_ack(self, session: MqttSession, sequence_id: str, gcode_file: str) -> None:
         if not self._session_is_active(session):
-            self.log(f"MQTT skipping print ack for displaced session peer={session.peer}")
+            self.log(f"MQTT skipping print ack for closed session peer={session.peer}")
             return
-        self.set_print_state("PREPARE", gcode_file=gcode_file, prepare_percent="0")
+        self._set_session_state(session, "PREPARE", gcode_file=gcode_file, prepare_percent="0")
         ack = self.ack_builder(sequence_id, gcode_file)
         payload = json.dumps(ack, indent=4).encode("utf-8")
         packet = build_publish(session.report_topic, payload, qos=0)
@@ -488,9 +499,9 @@ class MqttBroker:
             await _drain(session.writer)
         self.log(f"MQTT PUBLISH broker->client reason=project_file_ack file={gcode_file!r}")
         if not self._session_is_active(session):
-            self.log(f"MQTT skipping finish schedule for displaced session peer={session.peer}")
+            self.log(f"MQTT skipping finish schedule for closed session peer={session.peer}")
             return
-        self._schedule_finish(gcode_file)
+        self._schedule_finish(session, gcode_file)
 
     def set_print_state(
         self,
@@ -498,43 +509,53 @@ class MqttBroker:
         *,
         gcode_file: str | None = None,
         prepare_percent: str | None = None,
+        member_id: str | None = None,
     ) -> None:
-        self._gcode_state = gcode_state
+        """Set the fake print state on every live session — or only the given member's sessions
+        (the FTPS upload path knows the member, not the MQTT session)."""
+        for session in list(self._sessions):
+            if member_id is None or session.member_id == member_id:
+                self._set_session_state(session, gcode_state, gcode_file=gcode_file, prepare_percent=prepare_percent)
+
+    def _set_session_state(
+        self,
+        session: MqttSession,
+        gcode_state: str,
+        *,
+        gcode_file: str | None = None,
+        prepare_percent: str | None = None,
+    ) -> None:
+        session.gcode_state = gcode_state
         if gcode_file is not None:
-            self._gcode_file = gcode_file
+            session.gcode_file = gcode_file
         if prepare_percent is not None:
-            self._prepare_percent = prepare_percent
+            session.prepare_percent = prepare_percent
         self.log(
-            f"virtual printer state -> {gcode_state} "
-            f"(file={self._gcode_file!r} prep={self._prepare_percent})"
+            f"virtual printer state -> {gcode_state} for peer={session.peer} "
+            f"(file={session.gcode_file!r} prep={session.prepare_percent})"
         )
 
-    def _schedule_finish(self, gcode_file: str, delay: float = 1.5) -> None:
-        if self._finish_task is not None and not self._finish_task.done():
-            self._finish_task.cancel()
+    def _schedule_finish(self, session: MqttSession, gcode_file: str) -> None:
+        self._cancel_finish(session)
 
         async def _finish() -> None:
-            try:
-                await asyncio.sleep(delay)
-                self.set_print_state("FINISH", gcode_file=gcode_file, prepare_percent="100")
-            except asyncio.CancelledError:
-                pass
+            # Cancellation propagates (no swallowed CancelledError): whoever cancels awaits the task, and
+            # a cancelled finish must READ as cancelled, not as a normal completion.
+            await asyncio.sleep(FINISH_DELAY_SEC)
+            self._set_session_state(session, "FINISH", gcode_file=gcode_file, prepare_percent="100")
 
-        self._finish_task = asyncio.create_task(_finish())
+        session.finish_task = asyncio.create_task(_finish())
 
-    def _reset_print_state(self) -> None:
-        # A capture printer is always READY on a fresh connect: clear any
-        # lingering job state (and a pending FINISH) from a prior session so the
-        # Device tab shows an idle printer, not a phantom completed job.
-        if self._finish_task is not None and not self._finish_task.done():
-            self._finish_task.cancel()
-        self._finish_task = None
-        self._gcode_state = "IDLE"
-        self._gcode_file = ""
-        self._prepare_percent = "0"
+    def _cancel_finish(self, session: MqttSession) -> asyncio.Task | None:
+        task = session.finish_task
+        session.finish_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            return task
+        return None
 
     def _session_is_active(self, session: MqttSession) -> bool:
-        return self._active_session is session and not session.writer.is_closing()
+        return session in self._sessions and not session.writer.is_closing()
 
 
 async def _read_packet(
@@ -609,11 +630,6 @@ def _command_name(parsed: Any) -> str | None:
         if isinstance(value, dict) and isinstance(value.get("command"), str):
             return value["command"]
     return None
-
-
-def _is_request_topic(topic: str) -> bool:
-    parts = topic.split("/")
-    return len(parts) == 3 and parts[0] == "device" and parts[2] == "request"
 
 
 def _serial_from_report_topic(topic: str) -> str | None:

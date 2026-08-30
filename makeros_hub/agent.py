@@ -1022,6 +1022,15 @@ def _pull_config(
 
         if virtual_printer_manager is not None:
             if multi_vp_configs:
+                # Keep each RUNNING VP's live pool across a re-pull: the cloud's `pool` column is a
+                # placeholder (pstation never writes it), so applying it would blank every Device tab
+                # until the next heartbeat's mirror re-derived it — the 0-30 s empty-AMS flicker.
+                _get_cfgs = getattr(virtual_printer_manager, "current_configs", None)
+                live_pools = {c.serial: c.pool for c in (_get_cfgs() if callable(_get_cfgs) else [])}
+                multi_vp_configs = [
+                    replace(c, pool=live_pools[c.serial]) if c.serial in live_pools else c
+                    for c in multi_vp_configs
+                ]
                 # v0.40.0 multi-broker path — pass the full list to the manager
                 # which spins up ONE runtime per VP and shares a single SSDP
                 # listener across them. State-tracking (retry-on-failure)
