@@ -224,11 +224,19 @@ class CameraScheduler:
         self._last_state: dict[str, str] = {}
 
     def should_capture(
-        self, printer_id: str, state: Optional[str], progress_pct: Any, now: float
+        self, printer_id: str, state: Optional[str], progress_pct: Any, now: float, dense: bool = False
     ) -> bool:
         """Decide whether to attempt a capture this beat. Side-effects ONLY the
         last-state tracking — does NOT stamp last_capture. Callers must call
-        `mark_captured` AFTER a successful frame is in hand."""
+        `mark_captured` AFTER a successful frame is in hand.
+
+        `dense` (cameraDense, config-down): the cloud is asking a HUMAN to judge
+        this printer from its picture — today, "is the build plate clear?" for a
+        plate-gated printer. Such a printer is by definition idle, which is this
+        scheduler's slowest tier (IDLE_S = 600s), so the honest answer would be
+        based on a ten-minute-old frame. While the flag is set the printer gets
+        the dense cadence instead. It clears itself the moment the plate is
+        confirmed, so this costs nothing on a shop where nothing is waiting."""
         state = state or ""
         prev_state = self._last_state.get(printer_id)
         last = self._last_capture.get(printer_id)
@@ -237,7 +245,7 @@ class CameraScheduler:
             return True
         if state != prev_state:  # state change is high-signal — grab one now
             return True
-        return now - last >= self._interval(state, progress_pct)
+        return now - last >= (self.FIRST_OR_LAST_LAYER_S if dense else self._interval(state, progress_pct))
 
     def mark_captured(self, printer_id: str, now: float) -> None:
         """Stamp last_capture so the next beat respects the cadence interval.
@@ -314,6 +322,7 @@ def collect_camera_frames(
             (status_by_id.get(t["printerId"]) or {}).get("state"),
             (status_by_id.get(t["printerId"]) or {}).get("progressPct"),
             now,
+            dense=bool(t.get("cameraDense")),
         )
     ]
     if not due:

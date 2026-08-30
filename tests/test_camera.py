@@ -167,6 +167,22 @@ class TestCameraScheduler(unittest.TestCase):
         # idle -> printing a moment later: state change beats the idle interval
         self.assertTrue(s.should_capture("p", "printing", 1, now=1.0))
 
+
+    def test_dense_overrides_the_idle_tier_for_a_printer_a_human_must_judge(self):
+        # cameraDense (0069): a plate-gated printer is IDLE, this scheduler's slowest tier (600s), and yet its picture
+        # is exactly what a member is being asked to answer "is the plate clear?" from. While the flag is set it gets
+        # the dense cadence, so the answer is not given on a ten-minute-old frame.
+        s = camera.CameraScheduler()
+        self.assertTrue(s.should_capture("p", "idle", None, now=0.0, dense=True))
+        s.mark_captured("p", 0.0)
+        # not yet due on either cadence
+        self.assertFalse(s.should_capture("p", "idle", None, now=10.0, dense=True))
+        # due on the dense cadence, still far from the idle one
+        self.assertTrue(s.should_capture("p", "idle", None, now=camera.CameraScheduler.FIRST_OR_LAST_LAYER_S, dense=True))
+        self.assertFalse(s.should_capture("p", "idle", None, now=camera.CameraScheduler.FIRST_OR_LAST_LAYER_S, dense=False))
+        # and the idle tier still governs once nothing is waiting on it
+        self.assertTrue(s.should_capture("p", "idle", None, now=camera.CameraScheduler.IDLE_S, dense=False))
+
     def test_failed_capture_stays_due_next_beat(self):
         # The 2026-06-17 bug this fixes: pre-v0.41.0 every attempt stamped
         # last_capture, so a Liveview-off printer went dark for IDLE_S=600s

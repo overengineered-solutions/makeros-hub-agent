@@ -132,6 +132,9 @@ class PrinterManager:
                 # Strict True only — a malformed/older payload sending a string
                 # like "false" must NOT enable capture (preserve default-off).
                 "cameraEnabled": p.get("cameraEnabled") is True,
+                # cameraDense (0069): the cloud is asking a human to judge this printer from its picture right now —
+                # capture on the dense cadence instead of the 600s idle tier. Same strict-True, default-off semantics.
+                "cameraDense": p.get("cameraDense") is True,
                 # V5 — AI failure-watch per-printer opt-in (cloud also gates on
                 # the workspace feature). Same strict-True default-off semantics.
                 "aiFailureWatchEnabled": p.get("aiFailureWatchEnabled") is True,
