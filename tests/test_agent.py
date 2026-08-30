@@ -43,7 +43,7 @@ from makeros_hub.agent import (
     make_queue_status_reporter,
     run,
 )
-from makeros_hub.config import Config
+from makeros_hub.config import Config, VirtualPrinterConfig, VirtualPrinterMember
 from makeros_hub.vprinter.capture import CapturedJob
 
 
@@ -447,6 +447,55 @@ class TestConfigDownVirtualPrinter(unittest.TestCase):
         self.assertEqual(vp_manager.reconciled.serial, "SER123")
         self.assertEqual(vp_manager.reconciled.members[0].member_id, "m1")
         self.assertEqual(vp_manager.reconciled.members[0].access_code_sha256, _code_hash("12345678"))
+
+    def test_pull_config_keeps_live_vp_pools_across_repull(self):
+        # The cloud's `pool` is a placeholder (pstation never writes it). A re-pull — e.g. a member minting
+        # a code bumps config_version — must not blank a running VP's Device tab until the next mirror.
+        class Manager:
+            config_version = None
+
+            def reconcile(self, printers, version):
+                self.config_version = version
+
+            def statuses(self):
+                return []
+
+        live_pool = ({"tray_type": "PLA", "tray_info_idx": "GFL99", "tray_sub_brands": "", "tray_color": "FFFFFFFF", "cols": ["FFFFFFFF"]},)
+
+        class VirtualPrinterManager:
+            def __init__(self):
+                self.reconciled = None
+
+            def current_configs(self):
+                return [VirtualPrinterConfig(
+                    enabled=True, serial="SER123", model="A1 Mini", name="VP", fw="01.00.00.00", bind_ip="198.18.10.2",
+                    units=4, trays=4, ams_type="n3f",
+                    members=(VirtualPrinterMember(_code_hash("12345678"), "m1"),), pool=live_pool,
+                )]
+
+            def reconcile_sync(self, configs):
+                self.reconciled = configs
+
+        def vp(serial, bind_ip):
+            return {
+                "enabled": True, "serial": serial, "model": "A1 Mini", "name": "VP", "fw": "01.00.00.00", "bindIp": bind_ip,
+                "members": [{"accessCodeSha256": _code_hash("12345678"), "memberId": "m1"}], "pool": [],
+            }
+
+        vp_manager = VirtualPrinterManager()
+        with mock.patch(
+            "makeros_hub.agent.get_json",
+            return_value=http.Response(200, {"printers": [], "version": "v2", "virtualPrinters": [vp("SER123", "198.18.10.2"), vp("SER999", "198.18.10.3")]}),
+        ):
+            _pull_config(
+                Config(cloud_url="https://host.example"), "cred", Manager(),
+                tailscale_reconciler=mock.Mock(return_value={"tailscaleStatus": "disabled"}),
+                virtual_printer_manager=vp_manager,
+            )
+
+        by_serial = {c.serial: c for c in vp_manager.reconciled}
+        self.assertEqual(by_serial["SER123"].pool, live_pool)   # running VP keeps what it is showing
+        self.assertEqual(by_serial["SER999"].pool, ())          # a VP not yet running takes the cloud's (empty) pool
 
     def test_pull_config_disables_virtual_printer_when_block_absent(self):
         class Manager:

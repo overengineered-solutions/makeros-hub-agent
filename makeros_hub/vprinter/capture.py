@@ -147,40 +147,32 @@ class CaptureCoordinator:
         self._intents.clear()
 
     def _try_capture(self, key: "_CaptureKey") -> bool:
+        """Pair pending uploads and project_file intents for one (member, filename) FIFO: OrcaSlicer's
+        Send is upload-then-command, so the oldest of each belong together. A member sending the same
+        filename twice inside the window therefore yields TWO jobs (RC8) instead of an "ambiguous" drop.
+        ponytail: a QoS1 re-delivered project_file would pair with the NEXT upload; the broker PUBACKs
+        immediately so OrcaSlicer never re-sends — add sequence_id dedupe if a capture ever shows it."""
         upload_queue = self._uploads.get(key)
         intent_queue = self._intents.get(key)
-        if not upload_queue or not intent_queue:
-            return False
-        if len(upload_queue) != 1 or len(intent_queue) != 1:
-            member_id, filename = key
-            self.log(
-                "virtual printer capture skipped for "
-                f"{filename!r} member_id={member_id!r}: ambiguous pending match "
-                f"uploads={len(upload_queue)} project_files={len(intent_queue)}"
-            )
-            self._uploads.pop(key, None)
-            self._intents.pop(key, None)
-            return False
-        upload = upload_queue[0].record
-        intent = intent_queue[0].intent
-        try:
-            job = assemble_captured_job(upload, intent)
-        except Exception as exc:  # noqa: BLE001 - observe-only hook must not sink protocol ACKs
-            self.log(f"virtual printer capture skipped for {upload.filename!r}: {exc}")
-            self._uploads.pop(key, None)
-            self._intents.pop(key, None)
-            return False
-        upload_queue.popleft()
-        intent_queue.popleft()
+        captured = False
+        while upload_queue and intent_queue:
+            upload = upload_queue.popleft().record
+            intent = intent_queue.popleft().intent
+            try:
+                job = assemble_captured_job(upload, intent)
+            except Exception as exc:  # noqa: BLE001 - observe-only hook must not sink protocol ACKs
+                self.log(f"virtual printer capture skipped for {upload.filename!r}: {exc}")
+                continue
+            try:
+                self.on_capture(job)
+            except Exception as exc:  # noqa: BLE001 - capture is observe-only in V1
+                self.log(f"virtual printer capture callback failed for {upload.filename!r}: {exc}")
+            captured = True
         if not upload_queue:
             self._uploads.pop(key, None)
         if not intent_queue:
             self._intents.pop(key, None)
-        try:
-            self.on_capture(job)
-        except Exception as exc:  # noqa: BLE001 - capture is observe-only in V1
-            self.log(f"virtual printer capture callback failed for {upload.filename!r}: {exc}")
-        return True
+        return captured
 
     def _schedule_expiry(self) -> None:
         if self._expiry_handle is not None:
@@ -305,6 +297,7 @@ def assemble_captured_job(
         upload.sha256,
         intent.plate,
         ams_mapping,
+        upload.file_path.name,
     )
     return CapturedJob(
         member_id=upload.member_id,
@@ -357,14 +350,17 @@ def _deterministic_submission_uid(
     file_sha256: str,
     plate: int | None,
     ams_mapping: Any,
+    upload_name: str,
 ) -> str:
+    """Stable for one capture (an agent retry re-sends the same uid), distinct per UPLOAD: the spooled
+    file name is unique per STOR, so a member's second Send of the same bytes is its own job (RC8)."""
     ams_mapping_json = json.dumps(
         _ams_mapping_list(ams_mapping),
         sort_keys=True,
         separators=(",", ":"),
     )
     plate_value = "" if plate is None else str(plate)
-    payload = f"{member_id}\n{file_sha256}\n{plate_value}\n{ams_mapping_json}"
+    payload = f"{member_id}\n{file_sha256}\n{plate_value}\n{ams_mapping_json}\n{upload_name}"
     return hashlib.sha256(payload.encode()).hexdigest()
 
 

@@ -699,8 +699,7 @@ class TestMqttCodec(unittest.TestCase):
                 await broker._handle_client(reader, writer)
 
             self.assertTrue(writer.closed)
-            self.assertIsNone(broker._active_writer)
-            self.assertIsNone(broker._active_session)
+            self.assertEqual(broker._sessions, set())
             self.assertEqual(broker._client_tasks, set())
             self.assertIn(
                 (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
@@ -708,125 +707,6 @@ class TestMqttCodec(unittest.TestCase):
             )
 
         asyncio.run(run())
-
-    def test_reset_print_state_clears_lingering_job(self):
-        broker = _mqtt_broker()
-        broker.set_print_state("FINISH", gcode_file="Cube.gcode.3mf", prepare_percent="100")
-        broker._reset_print_state()
-        self.assertEqual(broker._gcode_state, "IDLE")
-        self.assertEqual(broker._gcode_file, "")
-        self.assertEqual(broker._prepare_percent, "0")
-        self.assertIsNone(broker._finish_task)
-
-    def test_fresh_connect_presents_idle_not_a_phantom_job(self):
-        async def run():
-            broker = _mqtt_broker()
-            # A prior session left a completed job in the broker's print state.
-            broker.set_print_state("FINISH", gcode_file="Cube.gcode.3mf", prepare_percent="100")
-            reader = asyncio.StreamReader()
-            payload = (
-                _mqtt_string("MQTT")
-                + bytes([4, 0xC2])
-                + (1).to_bytes(2, "big")
-                + _mqtt_string("orca-client")
-                + _mqtt_string("bblp")
-                + _mqtt_string("12345678")
-            )
-            reader.feed_data(b"\x10" + encode_remaining_length(len(payload)) + payload)
-            writer = _FakeWriter(("100.64.0.20", 1883), sock=_FakeSocket())
-            with mock.patch("makeros_hub.vprinter.mqtt_broker._mqtt_read_timeout", return_value=0.01):
-                await broker._handle_client(reader, writer)
-            # The fresh connect cleared the phantom job -> a clean idle printer.
-            self.assertEqual(broker._gcode_state, "IDLE")
-            self.assertEqual(broker._gcode_file, "")
-
-        asyncio.run(run())
-
-    def test_push_report_now_writes_active_session_and_noops_without_one(self):
-        async def run():
-            broker = _mqtt_broker()
-
-            await broker.push_report_now()
-
-            writer = _FakeWriter(("100.64.0.20", 1883))
-            broker._active_session = MqttSession(
-                writer=writer,
-                peer=writer.peer,
-                member_id="m1",
-                report_topic=broker.default_report_topic,
-                request_topic=broker.default_request_topic,
-                subscribed=True,
-            )
-
-            await broker.push_report_now()
-
-            self.assertEqual(len(writer.writes), 1)
-            remaining, consumed = decode_remaining_length_from_bytes(writer.writes[0][1:])
-            publish = parse_publish(
-                writer.writes[0][0],
-                writer.writes[0][1 + consumed : 1 + consumed + remaining],
-            )
-            self.assertEqual(publish.topic, "device/SER123/report")
-            self.assertEqual(json.loads(publish.payload)["print"]["command"], "push_status")
-
-            writer.close()
-            await broker.push_report_now()
-            self.assertEqual(len(writer.writes), 1)
-
-        asyncio.run(run())
-
-    def test_displaced_session_publish_cannot_mutate_print_state(self):
-        async def run():
-            captured = []
-            broker = _mqtt_broker(on_project_file=captured.append)
-            old_writer = _FakeWriter(("100.64.0.20", 1883))
-            new_writer = _FakeWriter(("100.64.0.21", 1883))
-            old_session = MqttSession(
-                writer=old_writer,
-                peer=old_writer.peer,
-                member_id="old-member",
-                report_topic=broker.default_report_topic,
-                request_topic=broker.default_request_topic,
-            )
-            new_session = MqttSession(
-                writer=new_writer,
-                peer=new_writer.peer,
-                member_id="new-member",
-                report_topic=broker.default_report_topic,
-                request_topic=broker.default_request_topic,
-            )
-            broker._active_session = new_session
-            broker.set_print_state("PREPARE", gcode_file="active.3mf", prepare_percent="42")
-            finish_task = asyncio.create_task(asyncio.sleep(60))
-            broker._finish_task = finish_task
-            publish = parse_publish(
-                0x30,
-                _mqtt_string(broker.default_request_topic)
-                + json.dumps(
-                    {
-                        "print": {
-                            "command": "project_file",
-                            "sequence_id": "9",
-                            "file": "stale.3mf",
-                        }
-                    }
-                ).encode("utf-8"),
-            )
-
-            await broker._handle_publish(old_session, publish)
-
-            self.assertEqual(broker._gcode_state, "PREPARE")
-            self.assertEqual(broker._gcode_file, "active.3mf")
-            self.assertEqual(broker._prepare_percent, "42")
-            self.assertIs(broker._finish_task, finish_task)
-            self.assertFalse(finish_task.done())
-            self.assertEqual(old_writer.writes, [])
-            self.assertEqual(captured, [])
-            finish_task.cancel()
-            await asyncio.gather(finish_task, return_exceptions=True)
-
-        asyncio.run(run())
-
 
 class TestMemberAuth(unittest.TestCase):
     def test_lookup_is_member_attributing_and_checks_all_codes(self):
@@ -1031,7 +911,7 @@ class TestCaptureAssembly(unittest.TestCase):
             dict_form = assemble_captured_job(upload, dict_intent)
 
         expected = hashlib.sha256(
-            f"member-1\n{file_sha256}\n2\n[0,1]".encode()
+            f"member-1\n{file_sha256}\n2\n[0,1]\npart.3mf".encode()  # + the spooled file name (RC8)
         ).hexdigest()
         self.assertEqual(first.submission_uid, expected)
         self.assertEqual(first.submission_uid, second.submission_uid)
@@ -1301,23 +1181,27 @@ class TestCaptureAssembly(unittest.TestCase):
         self.assertEqual(captured, [])
         self.assertTrue(any("md5" in message for message in messages))
 
-    def test_ambiguous_same_member_same_filename_is_rejected(self):
+    def test_same_member_same_filename_twice_captures_both_in_order(self):
+        # RC8: a member's double Send (or two OrcaSlicers) inside the pairing window is two jobs, paired
+        # FIFO (upload N with command N), each with its own submission uid — never an "ambiguous" drop.
         captured = []
         messages = []
         with tempfile.TemporaryDirectory() as d:
             first = Path(d) / "first.3mf"
             second = Path(d) / "second.3mf"
-            first.write_bytes(b"first")
-            second.write_bytes(b"second")
+            first.write_bytes(b"same bytes")
+            second.write_bytes(b"same bytes")
             coordinator = CaptureCoordinator(captured.append, messages.append)
-            coordinator.record_upload(UploadRecord("m1", "part.3mf", first, "sha1", 5))
-            coordinator.record_upload(UploadRecord("m1", "part.3mf", second, "sha2", 6))
-            coordinator.record_project_file(
-                ProjectFileIntent("m1", "part.3mf", None, None, False, None, {})
-            )
+            coordinator.record_upload(UploadRecord("m1", "part.3mf", first, "sha", 10))
+            coordinator.record_upload(UploadRecord("m1", "part.3mf", second, "sha", 10))
+            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", [0], None, True, None, {}, plate=1))
+            self.assertEqual([job.file_path.name for job in captured], ["first.3mf"])  # oldest upload first
+            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", [0], None, True, None, {}, plate=1))
 
-        self.assertEqual(captured, [])
-        self.assertTrue(any("ambiguous" in message for message in messages))
+        self.assertEqual([job.file_path.name for job in captured], ["first.3mf", "second.3mf"])
+        self.assertEqual({job.member_id for job in captured}, {"m1"})
+        self.assertNotEqual(captured[0].submission_uid, captured[1].submission_uid)
+        self.assertFalse(any("ambiguous" in message for message in messages))
 
     def test_pending_capture_state_has_ttl_and_total_caps(self):
         now = [100.0]

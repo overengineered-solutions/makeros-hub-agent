@@ -699,7 +699,9 @@ class _VirtualPrinterRuntime:
 
     def _on_stored(self, upload: UploadRecord) -> None:
         if self.broker is not None:
-            self.broker.set_print_state("FINISH", gcode_file=upload.filename, prepare_percent="100")
+            self.broker.set_print_state(
+                "FINISH", gcode_file=upload.filename, prepare_percent="100", member_id=upload.member_id
+            )
         self.capture.record_upload(upload)
 
 
