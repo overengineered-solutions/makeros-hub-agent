@@ -13,6 +13,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+from cryptography.hazmat.primitives import hashes
 
 from makeros_hub.config import VirtualPrinterMember, parse_virtual_printer_config
 from makeros_hub.vprinter.ftp_server import FtpConfig, FtpServer, FtpSession, sweep_uploads_dir
@@ -1930,3 +1931,71 @@ class _FakePassive:
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestVpCaSubjectIsUnique(unittest.TestCase):
+    """Every VP minted its OWN CA, all with the identical subject "Virtual Printer CA". A TLS client looks a CA up BY
+    SUBJECT, so with four of them in OrcaSlicer's printer.cer it took the first match and every other VP's leaf failed
+    "certificate signature failure" — which OrcaSlicer reports only as "Connect ... failed! [code=-1]". Whichever CA
+    sat first in the bundle was the single model that could connect; on the live fleet that was an A1 mini's, so only
+    the A1 minis worked. Reproduced end to end 2026-08-30.
+
+    One CA now signs every VP on the hub, so there is nothing left to collide."""
+
+    def _bundle(self, base, serial, ip):
+        from makeros_hub.vprinter.cert import ensure_certificates
+        return ensure_certificates(base, serial, ip=ip)
+
+    def test_all_printers_on_a_hub_share_one_ca(self):
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "vp"
+            self._bundle(base / "a", "00M09VP111111111", "198.18.10.2")
+            self._bundle(base / "b", "00M09VP222222222", "198.18.10.4")
+            load = lambda w: x509.load_pem_x509_certificate((base / w / "certs" / "ca.crt").read_bytes())
+            cn = lambda c: c.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
+            ca_a, ca_b = load("a"), load("b")
+            self.assertEqual(cn(ca_a), cn(ca_b))             # one CA: a member trusts a single certificate
+            self.assertEqual(ca_a.fingerprint(hashes.SHA256()), ca_b.fingerprint(hashes.SHA256()))
+            # and it is not the bare shared name that collided across hubs — it carries this hub's id
+            from makeros_hub.vprinter import cert as certmod
+            self.assertTrue(cn(ca_a).startswith(certmod.CA_COMMON_NAME + " "))
+            self.assertNotEqual(cn(ca_a), certmod.CA_COMMON_NAME)
+
+    def test_every_leaf_verifies_against_the_one_ca(self):
+        from cryptography import x509
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "vp"
+            a = self._bundle(base / "a", "00M09VP111111111", "198.18.10.2")
+            b = self._bundle(base / "b", "00M09VP222222222", "198.18.10.4")
+            ca = x509.load_pem_x509_certificate((base / "a" / "certs" / "ca.crt").read_bytes())
+            for who, bundle in (("a", a), ("b", b)):
+                leaf = x509.load_pem_x509_certificate(Path(bundle.leaf_chain).read_bytes())
+                self.assertEqual(leaf.issuer, ca.subject, who)
+                # the check members' clients actually perform, and the one that used to fail for 3 of 4 printers
+                ca.public_key().verify(
+                    leaf.signature, leaf.tbs_certificate_bytes, padding.PKCS1v15(), leaf.signature_hash_algorithm
+                )
+
+    def test_a_ca_left_from_before_the_fix_is_re_minted(self):
+        from makeros_hub.vprinter import cert as certmod
+        from cryptography import x509
+        from cryptography.x509.oid import NameOID
+
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "vp"
+            self._bundle(base / "a", "00M09VP333333333", "198.18.10.3")
+            ca_id = (base / "ca" / "ca.id").read_text().strip()
+            good = x509.load_pem_x509_certificate((base / "a" / "certs" / "ca.crt").read_bytes())
+            self.assertTrue(certmod._is_expected_ca(good, ca_id))    # kept: no re-mint on every restart
+
+            class _OldStyle:                                          # a CA from before this change
+                subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, certmod.CA_COMMON_NAME)])
+                extensions = good.extensions
+
+            self.assertFalse(certmod._is_expected_ca(_OldStyle(), ca_id))
+

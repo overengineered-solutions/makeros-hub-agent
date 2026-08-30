@@ -14,6 +14,25 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 
 CA_COMMON_NAME = "Virtual Printer CA"
+
+
+def ca_common_name(ca_id: str) -> str:
+    """The subject of this hub's ONE virtual-printer CA.
+
+    Every VP used to mint its own CA with the identical subject "Virtual Printer CA". A TLS client looks a CA up BY
+    SUBJECT, so with four indistinguishable ones in OrcaSlicer's printer.cer the client took the first match and every
+    other VP's leaf failed "certificate signature failure" — the whole reason only one model could ever connect
+    (reproduced 2026-08-30; whichever CA sat first in the bundle won, and it happened to be an A1 mini's. OrcaSlicer
+    reports it only as "Connect PS H2D (Operator) failed! [SN:..., code=-1]").
+
+    One CA now signs every virtual printer on the hub, so there is nothing to collide: the member trusts a single
+    certificate instead of one per printer. The VPs themselves are unchanged — still one per MODEL, each with its own
+    serial, IP and Device-tab entry, so a member still picks the machine they mean.
+
+    The subject carries a per-hub id minted once, so a member who belongs to TWO makerspaces does not reintroduce the
+    same collision between the two shops' CAs.
+    """
+    return f"{CA_COMMON_NAME} {ca_id}"
 CIPHER_STRING = "DEFAULT:AES256-GCM-SHA384:AES128-GCM-SHA256"
 
 
@@ -41,9 +60,14 @@ def ensure_certificates(
     cert_dir = base_dir / "certs"
     cert_dir.mkdir(parents=True, exist_ok=True)
 
+    # ONE CA per hub, shared by every virtual printer, kept beside the per-serial directories. The public cert is also
+    # copied into this VP's own certs/ dir so read_vp_ca and the heartbeat upload keep working unchanged; the KEY never
+    # leaves the shared directory.
+    ca_dir = base_dir.parent / "ca"
+    ca_dir.mkdir(parents=True, exist_ok=True)
+    ca_key, ca_cert = _load_or_create_ca(ca_dir / "ca.crt", ca_dir / "ca.key", ca_dir / "ca.id")
     ca_cert_path = cert_dir / "ca.crt"
-    ca_key_path = cert_dir / "ca.key"
-    ca_key, ca_cert = _load_or_create_ca(ca_cert_path, ca_key_path)
+    ca_cert_path.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
 
     ips = [bind_ips] if isinstance(bind_ips, str) else list(bind_ips)
     leaf_key, leaf_cert = _create_leaf(ca_key, ca_cert, serial, ips)
@@ -59,7 +83,7 @@ def ensure_certificates(
     return CertBundle(
         cert_dir=cert_dir,
         ca_cert=ca_cert_path,
-        ca_key=ca_key_path,
+        ca_key=ca_dir / "ca.key",   # the shared CA key never leaves its own directory
         leaf_chain=leaf_chain_path,
         leaf_key=leaf_key_path,
         ca_fingerprint_sha256=_fingerprint(ca_cert),
@@ -82,12 +106,29 @@ def create_server_ssl_context(
     return context
 
 
-def _load_or_create_ca(ca_cert_path: Path, ca_key_path: Path) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+def _ca_id(path: Path) -> str:
+    """A stable random id for THIS hub's CA, minted once. Keeps two shops' CAs distinguishable in one member's trust
+    store — the same failure the per-VP collision caused, one level up."""
+    try:
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    minted = os.urandom(4).hex()
+    path.write_text(minted)
+    return minted
+
+
+def _load_or_create_ca(ca_cert_path: Path, ca_key_path: Path, ca_id_path: Path) -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
+    ca_id = _ca_id(ca_id_path)
     if ca_cert_path.exists() and ca_key_path.exists():
         try:
             key = serialization.load_pem_private_key(ca_key_path.read_bytes(), password=None)
             cert = x509.load_pem_x509_certificate(ca_cert_path.read_bytes())
-            if isinstance(key, rsa.RSAPrivateKey) and _is_expected_ca(cert):
+            # A CA carrying the OLD shared subject fails this check and is re-minted — that is the migration.
+            # A CA from before this change carries the old shared subject, fails here, and is re-minted.
+            if isinstance(key, rsa.RSAPrivateKey) and _is_expected_ca(cert, ca_id):
                 os.chmod(ca_key_path, 0o600)
                 return key, cert
         except Exception:
@@ -95,7 +136,7 @@ def _load_or_create_ca(ca_cert_path: Path, ca_key_path: Path) -> tuple[rsa.RSAPr
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = datetime.now(timezone.utc)
-    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, CA_COMMON_NAME)])
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, ca_common_name(ca_id))])
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -175,9 +216,9 @@ def _create_leaf(
     return key, cert
 
 
-def _is_expected_ca(cert: x509.Certificate) -> bool:
+def _is_expected_ca(cert: x509.Certificate, ca_id: str) -> bool:
     cn = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-    if not cn or cn[0].value != CA_COMMON_NAME:
+    if not cn or cn[0].value != ca_common_name(ca_id):
         return False
     try:
         basic = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
