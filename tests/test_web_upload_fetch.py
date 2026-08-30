@@ -10,7 +10,7 @@ from pathlib import Path
 
 from makeros_hub.printers.manager import PrinterManager
 
-SLICE_INFO = b"""<?xml version="1.0"?><config><plate><metadata key="index" value="1"/>
+SLICE_INFO = b"""<?xml version="1.0"?><config><header><metadata key="printer_model_id" value="N1"/></header><plate><metadata key="index" value="1"/>
 <filament id="1" tray_info_idx="GFL99" type="PLA" color="#FFFFFF" used_m="1.0" used_g="3.4"/>
 <filament id="2" tray_info_idx="GFG00" type="PETG" color="#000000" used_m="2.0" used_g="7.25"/></plate>
 <plate><metadata key="index" value="2"/><filament id="3" type="ABS" color="#FF0000" used_g="1.5"/></plate></config>"""
@@ -57,6 +57,7 @@ class TestFetchUploads(unittest.TestCase):
             self.assertEqual([f["slot"] for f in r["requiredFilaments"]], [1, 2])          # plate 1 only — not plate 2's ABS
             self.assertEqual(r["requiredFilaments"][0]["trayInfoIdx"], "GFL99")
             self.assertEqual(r["estGrams"], 11)                                             # ceil(3.4 + 7.25)
+            self.assertEqual(r["printerModelId"], "N1")                                        # what the file was sliced for
             # already in the spool: no second download, still reported (idempotent)
             n = m.fetch_uploads([self._fetch(data)], d, getter=getter, reporter=lambda b: (reports.append(b), _Resp())[1])
             self.assertEqual((n, len(calls), len(reports)), (1, 1, 2))

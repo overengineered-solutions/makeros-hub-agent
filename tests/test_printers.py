@@ -508,7 +508,8 @@ class TestAmsHmsBuilders(unittest.TestCase):
     def test_build_active_tray(self):
         self.assertEqual(bambu_parse.build_active_tray({"ams": {"tray_now": "5"}}), 5)
         self.assertEqual(bambu_parse.build_active_tray({"ams": {"tray_now": "63"}}), 63)  # max
-        self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": 999}}))  # out of range
+        self.assertEqual(bambu_parse.build_active_tray({"ams": {"tray_now": 999}}), 999)  # AMS-HT range (512+) is real
+        self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": 4096}}))  # out of range
         self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": "-1"}}))  # negative
         self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": "254"}}))
         self.assertIsNone(bambu_parse.build_active_tray({"ams": {"tray_now": "255"}}))

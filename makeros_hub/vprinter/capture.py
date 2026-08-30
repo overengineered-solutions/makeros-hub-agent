@@ -520,6 +520,29 @@ def filename_from_project_file(print_obj: dict[str, Any]) -> str:
     return "job.3mf"
 
 
+def parse_printer_model_id(path: Path) -> str | None:
+    """The Bambu printer model id the plate was sliced for (slice_info.config <metadata key="printer_model_id">, e.g. N1 =
+    A1 mini, BL-P001 = X1C, O1D = H2D). The cloud compares it with the model the member uploaded for — gcode for another
+    machine must never reach a printer (audit 2026-08-30). None when the file does not say."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            info = archive.getinfo(SLICE_INFO_PATH)
+            if info.file_size > MAX_SLICE_INFO_BYTES:
+                return None
+            raw = archive.read(info)
+        root = ElementTree.fromstring(raw.decode("utf-8", errors="replace"))
+    except (KeyError, OSError, zipfile.BadZipFile, ElementTree.ParseError):
+        return None
+    for element in root.iter():
+        if _strip_ns(element.tag).lower() != "metadata":
+            continue
+        attrs = {_strip_ns(key).lower(): value for key, value in element.attrib.items()}
+        if (attrs.get("key") or attrs.get("name") or "").lower() == "printer_model_id":
+            value = str(attrs.get("value") or element.text or "").strip()
+            return value[:16] if re.fullmatch(r"[A-Za-z0-9-]{1,16}", value) else None
+    return None
+
+
 def parse_required_filaments(path: Path, plate: int | None = None) -> list[dict[str, Any]]:
     try:
         with zipfile.ZipFile(path) as archive:

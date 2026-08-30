@@ -121,6 +121,10 @@ class QueueProgressTracker:
             }
         )
 
+    def pending_queue_job_ids(self) -> list[str]:
+        """Queue jobs dispatched to this printer whose outcome is not yet known (v0.58: the adapter's in-flight guard)."""
+        return [str(d.get("queueJobId")) for d in self._dispatches if d.get("queueJobId")]
+
     def discard_dispatch(self, queue_job_id: str) -> None:
         """The start command never left the box (publish failed): forget the dispatch we recorded ahead of it."""
         self._dispatches = [d for d in self._dispatches if d["queueJobId"] != queue_job_id]

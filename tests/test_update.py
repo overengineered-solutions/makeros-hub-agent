@@ -105,8 +105,12 @@ class TestMaybeUpdate(unittest.TestCase):
         with mock.patch.object(update, "recently_attempted", return_value=False), mock.patch.object(
             update, "apply_update", return_value=True
         ) as ap:
-            self.assertTrue(update.maybe_update("0.3.0", "v0.4.0"))
-            ap.assert_called_once_with("v0.4.0", None)
+            self.assertTrue(update.maybe_update("0.3.0", "v0.4.0", "a" * 40))
+            ap.assert_called_once_with("v0.4.0", "a" * 40)
+            # audit 2026-08-30: a target WITHOUT a commit sha never reaches apply_update — content trust is mandatory
+            ap.reset_mock()
+            self.assertFalse(update.maybe_update("0.3.0", "v0.4.0"))
+            ap.assert_not_called()
 
     def test_skips_when_cooled_down(self):
         with mock.patch.object(update, "recently_attempted", return_value=True), mock.patch.object(
@@ -133,12 +137,14 @@ class TestApplyUpdateContentTrust(unittest.TestCase):
             self.assertTrue(update.apply_update("v0.46.0", sha))
             self.assertEqual(run.call_args[0][0], ["sudo", update.UPDATE_SCRIPT, "v0.46.0", sha])
 
-    def test_systemd_without_sha_installs_unverified(self):
+    def test_systemd_without_sha_refuses_before_running_anything(self):
+        # audit 2026-08-30: no sha → no root install, no attempt recorded
         with mock.patch.object(update, "UPDATE_MODE", "systemd"), mock.patch.object(
             update, "_write_state"
-        ), mock.patch("makeros_hub.update.subprocess.run") as run:
-            self.assertTrue(update.apply_update("v0.46.0"))
-            self.assertEqual(run.call_args[0][0], ["sudo", update.UPDATE_SCRIPT, "v0.46.0"])
+        ) as ws, mock.patch("makeros_hub.update.subprocess.run") as run:
+            self.assertFalse(update.apply_update("v0.46.0"))
+            run.assert_not_called()
+            ws.assert_not_called()
 
     def test_refuses_malformed_sha_before_running_anything(self):
         with mock.patch.object(update, "UPDATE_MODE", "systemd"), mock.patch(
@@ -187,12 +193,12 @@ class TestMaybeUpdateThreadsSha(unittest.TestCase):
             self.assertTrue(update.maybe_update("0.45.0", "v0.46.0", "e" * 40))
             ap.assert_called_once_with("v0.46.0", "e" * 40)
 
-    def test_drops_malformed_sha_to_none(self):
+    def test_refuses_a_malformed_sha_outright(self):
         with mock.patch.object(update, "recently_attempted", return_value=False), mock.patch.object(
             update, "apply_update", return_value=True
         ) as ap:
-            update.maybe_update("0.45.0", "v0.46.0", "not-a-sha")
-            ap.assert_called_once_with("v0.46.0", None)
+            self.assertFalse(update.maybe_update("0.45.0", "v0.46.0", "not-a-sha"))
+            ap.assert_not_called()
 
 
 if __name__ == "__main__":

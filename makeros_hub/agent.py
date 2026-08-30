@@ -31,6 +31,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import __version__
+from . import report_outbox
 from .config import SPOOL_DIR, Config, parse_virtual_printer_config, read_credential
 from .vprinter.live_pool import (
     active_keys as vp_active_keys,
@@ -131,6 +132,9 @@ def make_queue_status_reporter(cfg: Config, credential: str, diagnostics=None):
             body["printerJobKey"] = status_report["printerJobKey"]
         if status_report.get("reason"):
             body["reason"] = status_report["reason"]
+        seq = status_report.get("assignmentSeq")
+        if isinstance(seq, int) and not isinstance(seq, bool):
+            body["assignmentSeq"] = seq   # v0.58: the cloud binds the report to THAT assignment (a stale one is ignored)
         if status_report.get("objects"):
             body["objects"] = status_report["objects"]
         try:
@@ -1325,7 +1329,7 @@ def run(
     )
     queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
     fetch_lock = threading.Lock()   # v0.57: one web-upload fetch worker at a time
-    pending_queue_reports: list[dict] = []
+    pending_queue_reports: list[dict] = report_outbox.load()   # v0.58: durable across restarts
     pending_probe_results: list[dict] = []
     pending_command_results: list[dict] = []
     # Per-model VP-binding queue (Option A) — the IP allocator pushes onto this
@@ -1790,6 +1794,7 @@ def run(
                     )
                     if dispatch_reports:
                         pending_queue_reports.extend(dispatch_reports)
+                        report_outbox.save(pending_queue_reports)
                         log.info(
                             "dispatched %d assignment report(s) from %d assignment(s)",
                             len(dispatch_reports),
@@ -1814,12 +1819,14 @@ def run(
                     progress_reports = manager.collect_queue_progress()
                     if progress_reports:
                         pending_queue_reports.extend(progress_reports)
+                        report_outbox.save(pending_queue_reports)
                     if pending_queue_reports:
                         before = len(pending_queue_reports)
                         pending_queue_reports = _flush_queue_status_reports(
                             queue_status_reporter,
                             pending_queue_reports,
                         )
+                        report_outbox.save(pending_queue_reports)
                         sent = before - len(pending_queue_reports)
                         if sent:
                             log.info("flushed %d queue status update(s) from the local outbox", sent)

@@ -126,8 +126,8 @@ def apply_update(tag: str, expected_sha: str | None = None) -> bool:
     if not is_release_tag(tag):
         log.error("refusing to update to non-release tag %r", tag)
         return False
-    if expected_sha is not None and not is_commit_sha(expected_sha):
-        log.error("refusing update to %s: malformed target SHA %r", tag, expected_sha)
+    if not is_commit_sha(expected_sha):
+        log.error("refusing update to %s: missing/malformed target SHA %r (content trust is mandatory)", tag, expected_sha)
         return False
     if UPDATE_MODE == "disabled":
         log.info("OTA: update to %s requested but MAKEROS_HUB_UPDATE_MODE=disabled — ignoring", tag)
@@ -140,9 +140,9 @@ def apply_update(tag: str, expected_sha: str | None = None) -> bool:
                     "repull the pinned image", tag, EXIT_FOR_UPDATE_CODE)
         _request_exit(EXIT_FOR_UPDATE_CODE)
         return False  # unreachable in prod (_request_exit raises); returns only under a test seam
-    trust = f" @ {expected_sha[:12]}…" if expected_sha else " (UNVERIFIED — cloud sent no target SHA)"
+    trust = f" @ {expected_sha[:12]}…"
     log.warning("OTA: triggering update to %s%s via %s (service will restart)", tag, trust, UPDATE_SCRIPT)
-    cmd = ["sudo", UPDATE_SCRIPT, tag] + ([expected_sha] if expected_sha else [])
+    cmd = ["sudo", UPDATE_SCRIPT, tag, expected_sha]
     try:
         subprocess.run(cmd, check=True, timeout=120)
         return True
@@ -182,4 +182,9 @@ def maybe_update(current_version: str, target_version, target_sha=None) -> bool:
     if recently_attempted(target_version):
         log.info("OTA: target %s attempted recently — waiting out the cooldown", target_version)
         return False
-    return apply_update(target_version, target_sha if is_commit_sha(target_sha) else None)
+    if not is_commit_sha(target_sha):
+        # content trust is not optional (audit 2026-08-30): the cloud pins every target to a commit; a target without a
+        # valid 40-hex sha is a cloud bug or a tampered heartbeat, and unpinned code must never run as root.
+        log.error("OTA: target %s carries no valid commit sha — refusing (content trust is mandatory)", target_version)
+        return False
+    return apply_update(target_version, target_sha)

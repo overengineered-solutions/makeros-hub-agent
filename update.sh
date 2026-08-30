@@ -17,14 +17,12 @@ echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || {
   echo "makeros-hub update: refusing non-release tag '$TAG'" >&2
   exit 2
 }
-# Optional content-trust pin: the commit the tag MUST resolve to (the cloud sends it in the heartbeat). Validate
-# the shape here so a malformed value can't slip past to the compare below.
-if [ -n "$EXPECTED_SHA" ]; then
-  echo "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$' || {
-    echo "makeros-hub update: malformed target SHA '$EXPECTED_SHA'" >&2
-    exit 2
-  }
-fi
+# Content-trust pin: the commit the tag MUST resolve to (the cloud sends it in the heartbeat). MANDATORY (audit
+# 2026-08-30): without it a repointed tag on the code host would run unverified code as root — refuse.
+echo "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$' || {
+  echo "makeros-hub update: missing/malformed target SHA '$EXPECTED_SHA' — content trust is mandatory" >&2
+  exit 2
+}
 
 # Code host: read `repo` from config.toml (bootstrap wrote it), so OTA pulls from the SAME mirror the install
 # used. Falls back to the sovereign default if the key is absent (e.g. a hub installed before this key existed).

@@ -149,6 +149,12 @@ def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[
         v = v if isinstance(v, int) and not isinstance(v, bool) else -1
         req = by_index.get(k)
         if v in EXTERNAL_TRAY_IDS:
+            # a REQUIRED filament routed to the external holder must be what the holder reports (audit 2026-08-30): the
+            # same material + colour (+ id) rule as an AMS tray — never "whatever is on the spool holder"
+            if req is not None:
+                ext = [x for x in trays if x["tray_id"] in EXTERNAL_TRAY_IDS]
+                if _pick(req, ext) is None:
+                    raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} on the external spool (not loaded there)")
             out.append(v)
             continue
         if req is None or (v < 0 and (not fill_required or k in skip_fill)):
@@ -183,9 +189,15 @@ def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, An
     is left untouched. An AMS print WITHOUT a mapping (a web upload, or a malformed replay coerced to []) gets one built
     from the requirements — never sent bare (codex v0.56 r3). Raises TrayTranslationError."""
     out = dict(print_cmd)
-    if out.get("use_ams") is not True:
-        return out
     trays = live_trays(ams_units, vt_tray)
+    if out.get("use_ams") is not True:
+        # a direct-spool print (use_ams false): the external holder must carry EVERY required filament — nothing to
+        # translate, but the identity gate still applies (audit 2026-08-30). No requirements known = nothing to check.
+        ext = [x for x in trays if x["tray_id"] in EXTERNAL_TRAY_IDS]
+        for req in _by_filament_index(required or []).values():
+            if _pick(req, ext) is None:
+                raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} on the external spool (not loaded there)")
+        return out
     if not trays and unaddressable_units(ams_units):
         raise TrayTranslationError("spool_mismatch", f"{unaddressable_units(ams_units)} AMS unit(s) report no id — cannot address trays")
     mapping2 = out.get("ams_mapping2")

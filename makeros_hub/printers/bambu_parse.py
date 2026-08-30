@@ -357,7 +357,8 @@ def build_active_tray(print_obj: dict) -> int | None:
     tray_now = _to_int(ams_obj.get("tray_now"))
     # Sentinels: 254 = external spool, 255 = none. Bound to a sane global index
     # (16 AMS units * 4 slots) so a garbage value like -1 or 999 never escapes.
-    if tray_now is None or tray_now < 0 or tray_now > 63 or tray_now in (254, 255):
+    # ams_id*4+slot: standard units 0..15, the AMS-HT / H2D second port (raw id 128+) → 512+ (audit 2026-08-30); 254/255 = external
+    if tray_now is None or tray_now < 0 or tray_now > 1023 or tray_now in (254, 255):
         return None
     return tray_now
 

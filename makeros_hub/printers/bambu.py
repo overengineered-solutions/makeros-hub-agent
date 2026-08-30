@@ -248,6 +248,17 @@ class BambuAdapter:
                 connected = self._connack == "ok"
         if client is None or not connected:
             return {"ok": False, "reason": "not_connected"}
+        if queue_job_id:
+            with self._lock:
+                pending = self._queue_progress.pending_queue_job_ids()
+            if queue_job_id in pending:
+                # the durable dispatch state already holds THIS job (a re-sent assignment after a restart / a lost report):
+                # idempotent success — nothing is uploaded or published twice (audit 2026-08-30)
+                log.info("bambu %s: %s already dispatched here — not starting it again", self.printer_id, queue_job_id)
+                return {"ok": True, "already_dispatched": True}
+            if pending:
+                # another job's outcome on this printer is still unknown: never stack a second start on it
+                return {"ok": False, "reason": "printer_busy"}
 
         sequence_id = os.urandom(4).hex()
         payload = bambu_send.build_print_start_payload(
@@ -261,7 +272,7 @@ class BambuAdapter:
         # B3 (v0.56): the member's ams_mapping names VIRTUAL pool positions; rewrite it to THIS printer's physical
         # trays from its live AMS state, or refuse before anything is uploaded (a wrong tray = the wrong material).
         # Only when the cloud sent the job's requirements (older clouds / web uploads without them keep the replay).
-        if payload["print"].get("use_ams") is True:
+        if payload["print"].get("use_ams") is True or isinstance(required_filaments, list):
             st = self.status()
             if st.get("connectionState") != "connected":
                 # the AMS mirror rides only on a FRESH report (bambu_parse.normalize_status); stale trays are no basis.

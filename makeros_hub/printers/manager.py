@@ -460,7 +460,7 @@ class PrinterManager:
         beat. A failed fetch is logged and retried next beat (the file stays listed) and never leaves a temp file; a sha
         mismatch is reported so the member is told to re-upload. Returns the number of successful reports.
         `getter(path, dest) -> (sha256, size)`, `reporter(body) -> Response`."""
-        from ..vprinter.capture import _vp_submit_filament, parse_required_filaments
+        from ..vprinter.capture import _vp_submit_filament, parse_printer_model_id, parse_required_filaments
         import hashlib
         import math
         import os as _os
@@ -532,6 +532,9 @@ class PrinterManager:
                         log.warning("web upload %s: directory fsync failed (%s) — continuing", job_id, exc)
                 items = parse_required_filaments(dest, plate)
                 body: dict = {"queueJobId": job_id, "sha256": got, "requiredFilaments": [_vp_submit_filament(i) for i in items]}
+                model_id = parse_printer_model_id(dest)
+                if model_id:
+                    body["printerModelId"] = model_id   # the cloud refuses a file sliced for another printer (audit)
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
                 if grams:
                     body["estGrams"] = int(math.ceil(sum(grams)))
@@ -647,6 +650,7 @@ class PrinterManager:
         """
         reports: list[dict] = []
         base = Path(spool_dir)
+        reserved: set[str] = set()   # printers that took a start THIS pass (audit 2026-08-30): telemetry lags the start
         for assignment in assignments if isinstance(assignments, list) else []:
             if not isinstance(assignment, dict):
                 continue
@@ -677,6 +681,9 @@ class PrinterManager:
             if not callable(start_print):
                 reports.append(held("printer_unavailable"))
                 continue
+            if printer_id in reserved:
+                reports.append(held("printer_busy"))
+                continue
 
             if self._adapter_busy(adapter):
                 # v0.53: the printer is mid-job by its OWN report — never upload/start another file onto it, whatever the
@@ -694,6 +701,9 @@ class PrinterManager:
             # cloud can offer per-object cancel. Best-effort: a parse miss just
             # omits the list (skip simply isn't offered for that job).
             uploading: dict = {"queueJobId": queue_job_id, "state": "uploading"}
+            seq0 = assignment.get("assignmentSeq")
+            if isinstance(seq0, int) and not isinstance(seq0, bool):
+                uploading["assignmentSeq"] = seq0   # v0.58: every assignment-derived report names its assignment
             objects = parse_plate_objects(local_path, plate_int)
             if objects:
                 uploading["objects"] = objects
@@ -728,9 +738,11 @@ class PrinterManager:
 
             if result.get("ok"):
                 self._remember_dispatched_queue_job(queue_job_id)
+                reserved.add(printer_id)
                 # v0.56 (codex r2): 'uploading' is reported only AFTER start_print succeeded — a pre-upload refusal
                 # (spool_mismatch / printer_stale) must never leave the cloud believing the file went up.
-                reports.append(uploading)
+                if not result.get("already_dispatched"):
+                    reports.append(uploading)
             else:
                 reports.append(held(result.get("reason", "start_failed")))
         return reports

@@ -124,8 +124,11 @@ class TestTranslatePrint(unittest.TestCase):
         out = tt.translate_print_trays(cmd, required, UNITS, VT)
         self.assertEqual((out["ams_mapping"], out["ams_mapping2"], out["bed_type"]), ([1, 0], [-1, 0], "cool_plate"))
         self.assertEqual(cmd["ams_mapping"], [5, 9])   # input untouched
+        # a direct-spool print (use_ams false) is not translated, but the holder must carry what the plate needs (audit)
         ext = {"use_ams": False, "ams_mapping": [254]}
-        self.assertEqual(tt.translate_print_trays(ext, required, UNITS, VT), ext)
+        self.assertEqual(tt.translate_print_trays(ext, [{"slot": 1, "type": "TPU", "color": "00FF00"}], UNITS, VT), ext)
+        with self.assertRaises(tt.TrayTranslationError):
+            tt.translate_print_trays(ext, required, UNITS, VT)   # white PLA / black PETG are in the AMS, not on the holder
 
     def test_absent_requirements_refuse_ams_prints_but_not_external_ones(self):
         with self.assertRaises(tt.TrayTranslationError):
