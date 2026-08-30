@@ -57,6 +57,30 @@ class TestCooldown(unittest.TestCase):
                 # a different target is not cooled down
                 self.assertFalse(update.recently_attempted("v0.3.2", now=1000.0 + 10))
 
+    def test_a_corrected_sha_is_a_new_target(self):
+        # 2026-08-30: a release tag was re-cut, the corrected sha was set on /admin/hub, and the agent ignored it for
+        # the whole 15-minute cooldown because only the TAG was compared — the hub sat on the old version with nothing
+        # in the log but "attempted recently". The sha is half the target: different sha, different code.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "last_update.json"
+            with mock.patch.object(update, "STATE_PATH", p):
+                update._write_state({"target": "v0.3.1", "sha": "a" * 40, "at": 1000.0, "attempts": 2})
+                self.assertTrue(update.recently_attempted("v0.3.1", now=1010.0, sha="a" * 40))
+                self.assertFalse(update.recently_attempted("v0.3.1", now=1010.0, sha="b" * 40))
+                # the attempt cap follows the same rule, so a re-cut release is not born exhausted
+                self.assertFalse(update.attempts_exhausted("v0.3.1", "b" * 40))
+                update._write_state({"target": "v0.3.1", "sha": "a" * 40, "at": 1000.0, "attempts": 3})
+                self.assertTrue(update.attempts_exhausted("v0.3.1", "a" * 40))
+                self.assertFalse(update.attempts_exhausted("v0.3.1", "b" * 40))
+
+    def test_state_written_before_shas_were_recorded_still_cools_down(self):
+        # Upgrading INTO this change: the state file on disk has no "sha" key, and an in-flight cooldown must survive.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "last_update.json"
+            with mock.patch.object(update, "STATE_PATH", p):
+                update._write_state({"target": "v0.3.1", "at": 1000.0, "attempts": 1})
+                self.assertTrue(update.recently_attempted("v0.3.1", now=1010.0, sha="a" * 40))
+
     def test_attempt_cap_stops_a_non_converging_target(self):
         # v0.55: installed 3x and still running the old version ⇒ never launch again for that target.
         with tempfile.TemporaryDirectory() as d:

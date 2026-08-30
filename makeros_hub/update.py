@@ -104,15 +104,27 @@ def _request_exit(code: int) -> None:
     raise SystemExit(code)
 
 
-def recently_attempted(target: str, now: float | None = None) -> bool:
+# The cooldown and the attempt cap are keyed on the tag AND the sha, because the sha is half the target: a release
+# whose tag was re-cut points at different code, and refusing to retry it as "attempted recently" strands the hub on
+# the old version with nothing in the log but a cooldown message. Exactly that happened 2026-08-30 — a corrected sha
+# was set on /admin/hub and the agent ignored it for 15 minutes because the tag string had not changed. State written
+# before this carries no sha; treat it as matching so an in-flight cooldown is still honoured.
+def _same_target(st: dict, target: str, sha: str | None) -> bool:
+    if st.get("target") != target:
+        return False
+    recorded = st.get("sha")
+    return recorded is None or sha is None or recorded == sha
+
+
+def recently_attempted(target: str, now: float | None = None, sha: str | None = None) -> bool:
     now = time.time() if now is None else now
     st = _read_state()
-    return st.get("target") == target and (now - float(st.get("at", 0))) < ATTEMPT_COOLDOWN_SEC
+    return _same_target(st, target, sha) and (now - float(st.get("at", 0))) < ATTEMPT_COOLDOWN_SEC
 
 
-def attempts_exhausted(target: str) -> bool:
+def attempts_exhausted(target: str, sha: str | None = None) -> bool:
     st = _read_state()
-    return st.get("target") == target and int(st.get("attempts", 0)) >= MAX_ATTEMPTS_PER_TARGET
+    return _same_target(st, target, sha) and int(st.get("attempts", 0)) >= MAX_ATTEMPTS_PER_TARGET
 
 
 def apply_update(tag: str, expected_sha: str | None = None) -> bool:
@@ -133,8 +145,8 @@ def apply_update(tag: str, expected_sha: str | None = None) -> bool:
         log.info("OTA: update to %s requested but MAKEROS_HUB_UPDATE_MODE=disabled — ignoring", tag)
         return False
     prev = _read_state()
-    attempts = int(prev.get("attempts", 0)) + 1 if prev.get("target") == tag else 1
-    _write_state({"target": tag, "at": time.time(), "attempts": attempts})
+    attempts = int(prev.get("attempts", 0)) + 1 if _same_target(prev, tag, expected_sha) else 1
+    _write_state({"target": tag, "sha": expected_sha, "at": time.time(), "attempts": attempts})
     if UPDATE_MODE == "exit":
         log.warning("OTA: MAKEROS_HUB_UPDATE_MODE=exit — recorded target %s; exiting %d for the orchestrator to "
                     "repull the pinned image", tag, EXIT_FOR_UPDATE_CODE)
@@ -174,13 +186,13 @@ def maybe_update(current_version: str, target_version, target_sha=None) -> bool:
     Returns True if a systemd update launched; honors the cooldown so a broken target can't loop."""
     if not isinstance(target_version, str) or not should_update(current_version, target_version):
         return False
-    if attempts_exhausted(target_version):
+    if attempts_exhausted(target_version, target_sha):
         log.error("OTA: target %s was installed %d times but this agent still reports %s — the release is not "
                   "reporting its own version (bump makeros_hub/__init__.py:__version__); refusing to loop until a "
-                  "NEW target is set", target_version, MAX_ATTEMPTS_PER_TARGET, current_version)
+                  "NEW target (version or sha) is set", target_version, MAX_ATTEMPTS_PER_TARGET, current_version)
         return False
-    if recently_attempted(target_version):
-        log.info("OTA: target %s attempted recently — waiting out the cooldown", target_version)
+    if recently_attempted(target_version, sha=target_sha):
+        log.info("OTA: target %s @ %s attempted recently — waiting out the cooldown", target_version, str(target_sha)[:12])
         return False
     if not is_commit_sha(target_sha):
         # content trust is not optional (audit 2026-08-30): the cloud pins every target to a commit; a target without a
