@@ -198,7 +198,11 @@ def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, An
         # a direct-spool print (use_ams false): the external holder must carry EVERY required filament — nothing to
         # translate, but the identity gate still applies (audit 2026-08-30). No requirements known = nothing to check.
         ext = [x for x in trays if x["tray_id"] in EXTERNAL_TRAY_IDS]
-        for req in _by_filament_index(required or []).values():
+        by_index = _by_filament_index(required or [])
+        mapping = out.get("ams_mapping") if isinstance(out.get("ams_mapping"), list) else []
+        for k, req in by_index.items():
+            if k < len(mapping) and mapping[k] == 255:
+                raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} on the second external holder (not verifiable yet)")
             if _pick(req, ext) is None:
                 raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} on the external spool (not loaded there)")
         return out

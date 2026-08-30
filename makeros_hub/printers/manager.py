@@ -671,7 +671,17 @@ class PrinterManager:
             if not all(isinstance(v, str) and v for v in (queue_job_id, printer_id, submission_uid, file_name)):
                 log.warning("skipping malformed assignment: %s", assignment)
                 continue
+            def recovery_uploading(_a=assignment, _q=queue_job_id) -> dict:
+                # v0.58 r2: a re-sent assignment for a job this hub ALREADY started answers 'uploading' again (the cloud's
+                # sent_at stamp is idempotent) — a crash between the start and the outbox write must not leave the cloud blind
+                out = {"queueJobId": _q, "state": "uploading"}
+                seq = _a.get("assignmentSeq")
+                if isinstance(seq, int) and not isinstance(seq, bool):
+                    out["assignmentSeq"] = seq
+                return out
+
             if queue_job_id in self._dispatched_queue_jobs:
+                emit(recovery_uploading())
                 continue
 
             def held(reason: str, _a=assignment, _q=queue_job_id) -> dict:
@@ -695,6 +705,13 @@ class PrinterManager:
                 emit(held("printer_busy"))
                 continue
 
+            pending_ids = getattr(adapter, "pending_queue_job_ids", None)
+            if callable(pending_ids) and queue_job_id in (pending_ids() or []):
+                # the adapter's durable dispatch state already holds THIS job (started, then the agent died before the
+                # manager guard / outbox were written): report it, never 'printer_busy' (codex v0.58 r2)
+                self._remember_dispatched_queue_job(queue_job_id)
+                emit(recovery_uploading())
+                continue
             if self._adapter_busy(adapter):
                 # v0.53: the printer is mid-job by its OWN report — never upload/start another file onto it, whatever the
                 # cloud's view (an 'assigned' re-send after a restart, or a stale idle in the cloud mirror).
@@ -733,6 +750,7 @@ class PrinterManager:
                     raw_print=raw_print,
                     # B3 (v0.56): the job's required filaments (cloud-normalised) drive virtual→physical tray translation
                     required_filaments=assignment.get("requiredFilaments") if isinstance(assignment.get("requiredFilaments"), list) else None,
+                    assignment_seq=seq0 if isinstance(seq0, int) and not isinstance(seq0, bool) else None,   # v0.58: rides on every progress report
                 )
             except Exception as e:  # noqa: BLE001
                 code = self._access_code_for(printer_id)
@@ -747,13 +765,13 @@ class PrinterManager:
                 result = {"ok": False, "reason": "start_failed"}
 
             if result.get("ok"):
-                self._remember_dispatched_queue_job(queue_job_id)
-                reserved.add(printer_id)
                 # v0.56 (codex r2): 'uploading' is reported only AFTER start_print succeeded — a pre-upload refusal
                 # (spool_mismatch / printer_stale) must never leave the cloud believing the file went up.
-                # v0.58 r2: ALWAYS report uploading — for an idempotent re-send too (the cloud's 'uploading' only stamps
-                # sent_at, so a repeat is harmless and a lost earlier report is recovered)
+                # v0.58 r2: the report goes to the durable outbox BEFORE the manager guard is persisted (a crash in between
+                # then re-dispatches idempotently rather than going silent), and ALWAYS — an idempotent re-send too.
                 emit(uploading)
+                self._remember_dispatched_queue_job(queue_job_id)
+                reserved.add(printer_id)
             else:
                 emit(held(result.get("reason", "start_failed")))
         return reports

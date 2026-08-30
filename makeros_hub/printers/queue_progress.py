@@ -42,6 +42,12 @@ def _gcode_state(value: Any) -> str | None:
     return value.upper() if isinstance(value, str) else ""
 
 
+def _seq_of(dispatch: dict) -> dict:
+    """The assignment sequence this dispatch answers (v0.58) — the cloud binds every report to that assignment."""
+    seq = dispatch.get("assignmentSeq")
+    return {"assignmentSeq": seq} if isinstance(seq, int) and not isinstance(seq, bool) else {}
+
+
 class QueueProgressTracker:
     """Tracks cloud queue assignments until observed printer telemetry resolves
     them. Not thread-safe; callers should serialize access with their adapter
@@ -61,6 +67,7 @@ class QueueProgressTracker:
             "dispatches": [
                 {
                     "queueJobId": d["queueJobId"],
+                    **({"assignmentSeq": d["assignmentSeq"]} if isinstance(d.get("assignmentSeq"), int) and not isinstance(d.get("assignmentSeq"), bool) else {}),
                     "dispatched_wall": d.get("dispatched_wall", time.time()),
                     "reported_printing": bool(d["reported_printing"]),
                     "baselineKeys": sorted(d["baselineKeys"]),
@@ -85,12 +92,14 @@ class QueueProgressTracker:
             age = max(0.0, now_wall - float(wall)) if isinstance(wall, (int, float)) else 0.0
             self._dispatches.append(
                 {
+                    **({"assignmentSeq": d["assignmentSeq"]} if isinstance(d.get("assignmentSeq"), int) and not isinstance(d.get("assignmentSeq"), bool) else {}),
                     "queueJobId": d["queueJobId"],
                     "started_monotonic": now - age,
                     "dispatched_wall": float(wall) if isinstance(wall, (int, float)) else now_wall,
                     "reported_printing": bool(d.get("reported_printing")),
                     "baselineKeys": {k for k in (d.get("baselineKeys") or []) if isinstance(k, str)},
                     "taskName": d.get("taskName") if isinstance(d.get("taskName"), str) else None,
+                    **({"assignmentSeq": d["assignmentSeq"]} if isinstance(d.get("assignmentSeq"), int) and not isinstance(d.get("assignmentSeq"), bool) else {}),
                     "rehydrated_monotonic": now,
                 }
             )
@@ -104,6 +113,7 @@ class QueueProgressTracker:
         now: float | None = None,
         task_name: str | None = None,
         active_key: str | None = None,
+        assignment_seq: int | None = None,
     ) -> None:
         """`active_key` = the job the printer was ALREADY running when we dispatched (JobTracker.active_key()); it can
         never be ours. `task_name` = the subtask name we sent; a recovered terminal with a different filename is not ours."""
@@ -112,6 +122,7 @@ class QueueProgressTracker:
             baseline.add(active_key)
         self._dispatches.append(
             {
+                **({"assignmentSeq": assignment_seq} if isinstance(assignment_seq, int) and not isinstance(assignment_seq, bool) else {}),
                 "queueJobId": queue_job_id,
                 "started_monotonic": time.monotonic() if now is None else now,
                 "dispatched_wall": time.time(),
@@ -162,12 +173,15 @@ class QueueProgressTracker:
         ]
         if candidates:
             if len(candidates) > 1:
+                # v0.58 (codex): never latch the printer on an ambiguity — the queue job is HELD for a human (billing never
+                # guesses "completed"); the terminal records still reach the cloud as plain printer jobs
                 log.warning(
-                    "ambiguous queue dispatch correlation for %s: %s",
+                    "ambiguous queue dispatch correlation for %s: %s — holding it",
                     dispatch["queueJobId"],
                     [_job_key(job) for job in candidates],
                 )
-                return []
+                self._dispatches.pop(0)
+                return [{"queueJobId": dispatch["queueJobId"], "state": "held", "reason": "ambiguous_queue_correlation", **_seq_of(dispatch)}]
             job = candidates[0]
             job_key = _job_key(job)
             self._linked_job_keys.add(job_key)
@@ -177,6 +191,7 @@ class QueueProgressTracker:
                 "queueJobId": dispatch["queueJobId"],
                 "state": "completed" if status == "done" else "held",
                 "printerJobKey": job_key,
+                **_seq_of(dispatch),
             }
             if status != "done":
                 report["reason"] = f"print_{status}"
@@ -188,7 +203,7 @@ class QueueProgressTracker:
             # strand the job in 'uploading'. A 'held' terminal is fine as-is.
             if report["state"] == "completed" and not dispatch["reported_printing"]:
                 return [
-                    {"queueJobId": dispatch["queueJobId"], "state": "printing"},
+                    {"queueJobId": dispatch["queueJobId"], "state": "printing", **_seq_of(dispatch)},
                     report,
                 ]
             return [report]
@@ -202,7 +217,7 @@ class QueueProgressTracker:
             dispatch["observed_monotonic"] = now
         if state in _ACTIVE_GCODE_STATES and not dispatch["reported_printing"]:
             dispatch["reported_printing"] = True
-            return [{"queueJobId": dispatch["queueJobId"], "state": "printing"}]
+            return [{"queueJobId": dispatch["queueJobId"], "state": "printing", **_seq_of(dispatch)}]
 
         elapsed = now - dispatch.get("observed_monotonic", dispatch["started_monotonic"])
         if (
@@ -216,8 +231,21 @@ class QueueProgressTracker:
                     "queueJobId": dispatch["queueJobId"],
                     "state": "held",
                     "reason": "start_not_observed",
+                    **_seq_of(dispatch),
                 }
             ]
+
+        # v0.58 (codex): the same for a dispatch that was NOT rehydrated — printing was observed, the printer is idle again,
+        # and no terminal record could be linked (missing task id, or an ambiguity already consumed the records): hold it
+        # after the start timeout rather than leaving the in-flight guard latched forever.
+        if (
+            "rehydrated_monotonic" not in dispatch
+            and dispatch["reported_printing"]
+            and state in _IDLE_GCODE_STATES
+            and now - dispatch.get("observed_monotonic", dispatch["started_monotonic"]) >= self._start_timeout_sec
+        ):
+            self._dispatches.pop(0)
+            return [{"queueJobId": dispatch["queueJobId"], "state": "held", "reason": "outcome_unknown", **_seq_of(dispatch)}]
 
         # v0.54: a rehydrated dispatch that HAD reached printing, now sees an idle printer and no terminal record (the
         # printer supplied no task id, or the end happened while the box was down and left no trace) — never leave the
@@ -236,6 +264,7 @@ class QueueProgressTracker:
                     "queueJobId": dispatch["queueJobId"],
                     "state": "held",
                     "reason": "outcome_unknown_after_restart",
+                    **_seq_of(dispatch),
                 }
             ]
 

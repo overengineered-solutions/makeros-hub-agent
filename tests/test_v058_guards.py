@@ -127,3 +127,51 @@ class TestExternalSpoolIdentity(unittest.TestCase):
         self.assertEqual(tt.translate_mapping([254], [{"slot": 1, "type": "PETG", "color": "000000"}], tt.live_trays(units, vt)), [254])
         with self.assertRaises(tt.TrayTranslationError):   # the second external holder (255) cannot be verified → refuse
             tt.translate_mapping([255], [{"slot": 1, "type": "PETG", "color": "000000"}], tt.live_trays(units, vt))
+
+
+class TestRecoveryAndSeqOnProgress(unittest.TestCase):
+    def test_guarded_resend_and_adapter_pending_resend_report_uploading_not_silence_or_busy(self):
+        class Started:
+            def __init__(self):
+                self.calls = 0
+
+            def pending_queue_job_ids(self):
+                return ["q1"]
+
+            def start_print(self, *a, **k):
+                self.calls += 1; return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "aaaaaaaa").mkdir(); (Path(d) / "aaaaaaaa" / "p.3mf").write_bytes(b"3mf")
+            m = PrinterManager(); ad = Started(); m._adapters["p1"] = ad
+            asg = {"queueJobId": "q1", "printerId": "p1", "submissionUid": "aaaaaaaa", "fileName": "p.3mf", "plate": 1, "useAms": True, "amsMapping": [0], "assignmentSeq": 5}
+            rep = m.dispatch_assignments([asg], d)
+            self.assertEqual((ad.calls, [(r["state"], r["assignmentSeq"]) for r in rep]), (0, [("uploading", 5)]))
+            rep = m.dispatch_assignments([asg], d)
+            self.assertEqual([(r["state"], r["assignmentSeq"]) for r in rep], [("uploading", 5)])
+
+    def test_progress_reports_carry_the_assignment_seq_and_ambiguity_or_idle_never_latch_the_printer(self):
+        from makeros_hub.printers.queue_progress import QueueProgressTracker
+        t = QueueProgressTracker()
+        t.record_dispatch("q1", [], now=0.0, task_name="part", assignment_seq=4)
+        self.assertEqual(t.pending_queue_job_ids(), ["q1"])
+        self.assertEqual(t.collect([], "RUNNING", now=1.0), [{"queueJobId": "q1", "state": "printing", "assignmentSeq": 4}])
+        two = [{"jobKey": "a", "status": "done", "filename": "part"}, {"jobKey": "b", "status": "done", "filename": "part"}]
+        self.assertEqual(t.collect(two, "IDLE", now=2.0), [{"queueJobId": "q1", "state": "held", "reason": "ambiguous_queue_correlation", "assignmentSeq": 4}])
+        self.assertEqual(t.pending_queue_job_ids(), [])
+        t.record_dispatch("q2", [], now=10.0, assignment_seq=6)
+        t.collect([], "RUNNING", now=11.0)
+        self.assertEqual(t.collect([], "IDLE", now=12.0), [])
+        late = t.collect([], "IDLE", now=12.0 + t._start_timeout_sec + 1)
+        self.assertEqual(late, [{"queueJobId": "q2", "state": "held", "reason": "outcome_unknown", "assignmentSeq": 6}])
+        self.assertEqual(t.pending_queue_job_ids(), [])
+        t.record_dispatch("q3", [], now=20.0, assignment_seq=9)
+        u = QueueProgressTracker(); u.load_state(t.to_state(), now=21.0, now_wall=t.to_state()["dispatches"][0]["dispatched_wall"] + 1)
+        self.assertEqual(u.collect([], "RUNNING", now=22.0), [{"queueJobId": "q3", "state": "printing", "assignmentSeq": 9}])
+
+    def test_direct_spool_print_never_routes_a_required_filament_to_255(self):
+        units = [{"unit": 0, "raw": {"id": "0"}, "trays": []}]
+        vt = {"material": "PETG", "colorHex": "000000FF"}
+        with self.assertRaises(tt.TrayTranslationError):
+            tt.translate_print_trays({"use_ams": False, "ams_mapping": [255]}, [{"slot": 1, "type": "PETG", "color": "000000"}], units, vt)
+        self.assertEqual(tt.translate_print_trays({"use_ams": False, "ams_mapping": [254]}, [{"slot": 1, "type": "PETG", "color": "000000"}], units, vt)["ams_mapping"], [254])

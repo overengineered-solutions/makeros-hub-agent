@@ -216,6 +216,11 @@ class BambuAdapter:
             self.printer_id, data, connection_state=conn_state, error_reason=reason, model=self.model
         )
 
+    def pending_queue_job_ids(self) -> list[str]:
+        """Queue jobs dispatched here whose outcome is not yet known (v0.58: the manager asks before its busy check)."""
+        with self._lock:
+            return self._queue_progress.pending_queue_job_ids()
+
     def pending_jobs(self) -> list[dict]:
         """Unacked terminal jobs (re-send-safe — the cloud dedupes on jobKey)."""
         with self._lock:
@@ -237,6 +242,7 @@ class BambuAdapter:
         queue_job_id: str | None = None,
         raw_print: dict | None = None,
         required_filaments: list | None = None,
+        assignment_seq: int | None = None,
     ) -> dict:
         client = self._client
         connected = False
@@ -302,7 +308,8 @@ class BambuAdapter:
         if queue_job_id:
             with self._lock:
                 self._queue_progress.record_dispatch(
-                    queue_job_id, self._jobs.pending(), task_name=task_name, active_key=self._jobs.active_key()
+                    queue_job_id, self._jobs.pending(), task_name=task_name, active_key=self._jobs.active_key(),
+                    assignment_seq=assignment_seq,
                 )
                 if not self._save_queue_progress():
                     # Durable state is the invariant (codex v0.54 r2): a print we cannot track across a restart is a

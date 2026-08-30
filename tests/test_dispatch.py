@@ -151,7 +151,8 @@ class TestDispatchAssignments(unittest.TestCase):
             second = manager.dispatch_assignments([assignment()], d)
 
         self.assertEqual([r["state"] for r in first], ["uploading"])
-        self.assertEqual(second, [])
+        # v0.58 (codex): a guarded re-send is never silent — it answers 'uploading' again (idempotent for the cloud)
+        self.assertEqual(second, [{"queueJobId": "q1", "state": "uploading"}])
         self.assertEqual(len(fake.calls), 1)
 
     def test_start_failure_reports_held_only(self):
