@@ -456,16 +456,21 @@ class BambuAdapter:
             print_obj = self._data.get("print") if isinstance(self._data.get("print"), dict) else {}
             # None until the first report after (re)start: silence is not idle (codex v0.54 #1)
             observed = self._last_report_at is not None
+            before = self._queue_progress.to_state()
             reports = self._queue_progress.collect(
                 self._jobs.pending(),
                 print_obj.get("gcode_state") if observed else None,
             )
             if callable(on_report):
-                for report in reports:
+                for i, report in enumerate(reports):
                     try:
                         on_report(report)
-                    except Exception as exc:  # noqa: BLE001 — the hook logs its own persistence trouble
-                        log.warning("progress report hook failed: %s", exc)
+                    except Exception as exc:  # noqa: BLE001
+                        # the report could NOT be made durable (codex v0.58 r4): put the tracker back the way it was, keep the
+                        # on-disk state untouched, and hand out nothing — the same reports are regenerated next beat
+                        log.error("progress report not durable (%s) — keeping the dispatch state, retrying next beat", exc)
+                        self._queue_progress.load_state(before, now=time.monotonic(), now_wall=time.time())
+                        return []
             self._save_queue_progress()
             return reports
 

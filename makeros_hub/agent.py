@@ -1789,9 +1789,12 @@ def run(
                         log.info("reported %d VP binding(s) to the cloud", reported_binding_count)
                     assignments = resp.body.get("assignments")
                     def _durable(report: dict) -> None:
-                        # v0.58 r2: each dispatch report is appended + fsynced the moment the manager creates it
+                        # v0.58 r2: each report is appended + fsynced the moment it exists; a write failure RAISES so the
+                        # caller keeps its recoverable state (the dispatch stays on disk / the manager guard is not set)
                         pending_queue_reports.append(report)
-                        report_outbox.save(pending_queue_reports)
+                        if not report_outbox.save(pending_queue_reports):
+                            pending_queue_reports.remove(report)
+                            raise OSError("report outbox not durable")
 
                     dispatch_reports = manager.dispatch_assignments(
                         assignments if isinstance(assignments, list) else [],

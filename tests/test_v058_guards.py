@@ -212,3 +212,50 @@ class TestProgressReportsDurableBeforeStatePop(unittest.TestCase):
                 out = m.collect_queue_progress(on_report=got.append)
             self.assertEqual((out, got), ([{"queueJobId": "q1", "state": "completed", "assignmentSeq": 3}], [{"queueJobId": "q1", "state": "completed", "assignmentSeq": 3}]))
             self.assertNotIn("q1", m._dispatched_queue_jobs)
+
+
+class TestDurabilityFailures(unittest.TestCase):
+    def test_a_failed_outbox_write_keeps_the_dispatch_and_regenerates_the_report_next_beat(self):
+        import json as _json
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf"):
+            a = adapter()
+            kw = dict(plate=1, use_ams=True, ams_mapping=[5], raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]}, required_filaments=REQ_PLA)
+            self.assertTrue(a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", assignment_seq=2, **kw)["ok"])
+            a._data = {"print": {**RAW_STATE["print"], "gcode_state": "RUNNING"}}
+
+            def failing(report):
+                raise OSError("disk full")
+
+            self.assertEqual(a.collect_queue_progress(on_report=failing), [])
+            self.assertEqual(a.pending_queue_job_ids(), ["q1"])                                  # still tracked in memory…
+            self.assertEqual([x["queueJobId"] for x in _json.loads((Path(d) / "p1.json").read_text())["dispatches"]], ["q1"])   # …and on disk
+            got = []
+            self.assertEqual(a.collect_queue_progress(on_report=got.append), [{"queueJobId": "q1", "state": "printing", "assignmentSeq": 2}])   # regenerated
+
+    def test_uploading_not_durable_leaves_the_manager_guard_unset(self):
+        class Adapter:
+            def start_print(self, *a, **k):
+                return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "aaaaaaaa").mkdir(); (Path(d) / "aaaaaaaa" / "p.3mf").write_bytes(b"3mf")
+            m = PrinterManager(); m._adapters["p1"] = Adapter()
+            asg = {"queueJobId": "q1", "printerId": "p1", "submissionUid": "aaaaaaaa", "fileName": "p.3mf", "plate": 1, "useAms": True, "amsMapping": [0], "assignmentSeq": 1}
+
+            def failing(report):
+                raise OSError("disk full")
+
+            m.dispatch_assignments([asg], d, on_report=failing)
+            self.assertNotIn("q1", m._dispatched_queue_jobs)
+            ok = []
+            m.dispatch_assignments([asg], d, on_report=ok.append)
+            self.assertIn("q1", m._dispatched_queue_jobs)
+            self.assertEqual([r["state"] for r in ok], ["uploading"])
+
+    def test_save_bounds_the_live_list_and_fails_on_an_unwritable_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            live = [{"queueJobId": str(i), "state": "printing"} for i in range(report_outbox.MAX_REPORTS + 50)]
+            self.assertTrue(report_outbox.save(live, Path(d) / "q.json"))
+            self.assertEqual(len(live), report_outbox.MAX_REPORTS)
+            self.assertFalse(report_outbox.save(live, Path(d) / "nope" / "deeper" / "q.json") if False else report_outbox.save(live, Path("/proc/q.json")))

@@ -652,15 +652,18 @@ class PrinterManager:
         base = Path(spool_dir)
         reserved: set[str] = set()   # printers that took a start THIS pass (audit 2026-08-30): telemetry lags the start
 
-        def emit(report: dict) -> None:
+        def emit(report: dict) -> bool:
             """Every report is handed to `on_report` the moment it exists (the agent writes it to the durable outbox
-            there — v0.58 r2: a crash between a start and the end of this pass must not lose 'uploading') and returned."""
+            there — v0.58 r2: a crash between a start and the end of this pass must not lose 'uploading') and returned.
+            Returns False when the hook could not make it durable (the caller then keeps its recoverable state)."""
             reports.append(report)
             if callable(on_report):
                 try:
                     on_report(report)
-                except Exception as exc:  # noqa: BLE001 — persistence trouble is logged by the hook itself
-                    log.warning("report hook failed: %s", exc)
+                except Exception as exc:  # noqa: BLE001
+                    log.error("report not durable (%s): %s", report.get("state"), exc)
+                    return False
+            return True
         for assignment in assignments if isinstance(assignments, list) else []:
             if not isinstance(assignment, dict):
                 continue
@@ -769,8 +772,12 @@ class PrinterManager:
                 # (spool_mismatch / printer_stale) must never leave the cloud believing the file went up.
                 # v0.58 r2: the report goes to the durable outbox BEFORE the manager guard is persisted (a crash in between
                 # then re-dispatches idempotently rather than going silent), and ALWAYS — an idempotent re-send too.
-                emit(uploading)
-                self._remember_dispatched_queue_job(queue_job_id)
+                if emit(uploading):
+                    self._remember_dispatched_queue_job(queue_job_id)
+                else:
+                    # not durable: leave the manager guard UNSET — the adapter's pending_queue_job_ids() recovers the
+                    # re-sent assignment with a fresh 'uploading' instead of a silent skip (codex v0.58 r4)
+                    log.warning("uploading report for %s not durable — guard left unset for recovery", queue_job_id)
                 reserved.add(printer_id)
             else:
                 emit(held(result.get("reason", "start_failed")))

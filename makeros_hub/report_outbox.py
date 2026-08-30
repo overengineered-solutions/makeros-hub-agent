@@ -62,15 +62,13 @@ def save(reports: list[dict], path: Path | None = None) -> bool:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, p)
+        dfd = os.open(str(p.parent), os.O_RDONLY)   # the rename itself must be durable: a dir-fsync failure is a failure (codex r4)
         try:
-            dfd = os.open(str(p.parent), os.O_RDONLY)
-            try:
-                os.fsync(dfd)
-            finally:
-                os.close(dfd)
-        except OSError:
-            pass
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+        reports[:] = keep   # the LIVE list is bounded the same way as the file (codex r4): what was compacted away is gone
         return True
     except OSError as exc:
-        log.error("report outbox could not be written (%s) — reports stay in memory only until the next save", exc)
+        log.error("report outbox could not be written (%s) — the report is NOT durable", exc)
         return False
