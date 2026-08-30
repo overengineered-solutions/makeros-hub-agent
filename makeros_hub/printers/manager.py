@@ -47,6 +47,18 @@ STUCK_ADAPTER_RETRY_S = 120.0
 _SUBMISSION_UID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
 
+def plate_of(value) -> int:
+    """The plate a cloud message names: a positive int (a digit string is coerced), 1..64; anything else = plate 1 — the
+    SAME rule for a fetch (what we parse) and an assignment (what we print), so the two can never disagree (codex v0.57)."""
+    if isinstance(value, bool):
+        return 1
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
+    if isinstance(value, int) and 1 <= value <= 64:
+        return value
+    return 1
+
+
 def _fingerprint(p: dict) -> tuple:
     """What, if changed, means we must rebuild the adapter (new connection)."""
     return (p.get("vendor"), p.get("host"), p.get("serial"), p.get("accessCode"))
@@ -470,24 +482,24 @@ class PrinterManager:
 
         done = 0
         base = Path(spool_dir)
-        for f in (fetches if isinstance(fetches, list) else [])[:max_per_beat]:
+        taken = 0
+        for f in (fetches if isinstance(fetches, list) else []):
+            if taken >= max_per_beat:
+                break
             if not isinstance(f, dict):
                 continue
             job_id, uid, name, sha, path = (f.get("queueJobId"), f.get("submissionUid"), f.get("fileName"), f.get("sha256"), f.get("path"))
             if not all(isinstance(v, str) and v for v in (job_id, uid, name, sha, path)) or not self._assignment_path_ok(uid, name):
                 log.warning("skipping malformed fetch: %s", {k: f.get(k) for k in ("queueJobId", "submissionUid", "fileName")})
-                continue
+                continue   # malformed rows never consume the per-beat slot (codex r2: a bad first row must not starve the rest)
             if not str(path).startswith("/api/print/hub/file/"):
                 log.warning("skipping fetch with an unexpected path for %s", job_id)
                 continue
+            taken += 1
             sha = sha.lower()
             # the plate the cloud will print: a positive int (a digit string is coerced); anything else = 1, the same
             # default dispatch applies — so the parsed requirements always describe the plate that prints (codex r1)
-            raw_plate = f.get("plate")
-            plate = raw_plate if isinstance(raw_plate, int) and not isinstance(raw_plate, bool) else (
-                int(raw_plate) if isinstance(raw_plate, str) and raw_plate.isdigit() else 1)
-            if plate < 1 or plate > 64:
-                plate = 1
+            plate = plate_of(f.get("plate"))
             dest_dir = base / uid
             dest = dest_dir / name
             tmp = dest_dir / f".{name}.fetch.tmp"
@@ -510,6 +522,14 @@ class PrinterManager:
                         reporter({"queueJobId": job_id, "sha256": got})   # the cloud fails the job + tells the member
                         continue
                     _os.replace(tmp, dest)
+                    try:   # the rename itself must be on disk before we tell the cloud the file is ours to print (codex r2)
+                        dfd = _os.open(str(dest_dir), _os.O_RDONLY)
+                        try:
+                            _os.fsync(dfd)
+                        finally:
+                            _os.close(dfd)
+                    except OSError as exc:
+                        log.warning("web upload %s: directory fsync failed (%s) — continuing", job_id, exc)
                 items = parse_required_filaments(dest, plate)
                 body: dict = {"queueJobId": job_id, "sha256": got, "requiredFilaments": [_vp_submit_filament(i) for i in items]}
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
@@ -669,8 +689,7 @@ class PrinterManager:
                 reports.append(held("file_not_found"))
                 continue
 
-            plate = assignment.get("plate") or 1
-            plate_int = plate if isinstance(plate, int) and not isinstance(plate, bool) else 1
+            plate_int = plate_of(assignment.get("plate"))   # v0.57: the same coercion the fetch used
             # Enumerate the plate's skippable objects from the staged 3MF so the
             # cloud can offer per-object cancel. Best-effort: a parse miss just
             # omits the list (skip simply isn't offered for that job).

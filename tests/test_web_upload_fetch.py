@@ -91,6 +91,9 @@ class TestFetchUploads(unittest.TestCase):
             self.assertEqual(got, [])
             self.assertEqual(m.fetch_uploads(two, d, getter=getter, reporter=lambda b: _Resp()), 1)   # one per beat
             self.assertEqual(len(got), 1)
+            # a malformed FIRST row never consumes the beat's slot: the valid one behind it is fetched (codex r2)
+            self.assertEqual(m.fetch_uploads([bad_path, dict(self._fetch(data), submissionUid="cccccccc")], d, getter=getter, reporter=lambda b: _Resp()), 1)
+            self.assertEqual(len(got), 2)
 
     def test_a_failing_download_never_raises_and_leaves_no_temp_file(self):
         def getter(path, dest):
@@ -138,6 +141,13 @@ class TestFetchUploads(unittest.TestCase):
             for raw in (0, "x", None, True):
                 m.fetch_uploads([dict(self._fetch(data), plate=raw)], d, getter=getter, reporter=lambda b: (reports.append(b), _Resp())[1])
                 self.assertEqual([f["slot"] for f in reports[-1]["requiredFilaments"]], [1, 2])     # → plate 1, like dispatch
+
+
+class TestPlateCoercion(unittest.TestCase):
+    def test_fetch_and_dispatch_share_one_rule(self):
+        from makeros_hub.printers.manager import plate_of
+        for raw, want in ((2, 2), ("2", 2), (" 7 ", 7), (64, 64), (0, 1), (65, 1), ("x", 1), (None, 1), (True, 1), (2.0, 1)):
+            self.assertEqual(plate_of(raw), want, raw)
 
 
 class TestGetToFileDeadline(unittest.TestCase):

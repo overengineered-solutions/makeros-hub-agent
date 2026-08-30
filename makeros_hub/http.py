@@ -171,9 +171,10 @@ def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 6
                 digest.update(chunk)
                 out.write(chunk)
             out.flush()
+            import os as _os
+            _os.fsync(out.fileno())   # crash-durable before the caller renames + reports (codex v0.57 r2)
     except urllib.error.HTTPError as exc:
         raise TransportError(f"GET {url}: HTTP {exc.code}") from exc
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
         raise TransportError(f"network error fetching {url}: {exc}") from exc
     return digest.hexdigest(), size
-
