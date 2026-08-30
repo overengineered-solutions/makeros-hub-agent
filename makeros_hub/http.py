@@ -139,9 +139,12 @@ def _safe_read(exc: urllib.error.HTTPError) -> dict:
         return {}
 
 
-def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 60.0, max_bytes: int = 64 * 1024 * 1024) -> tuple[str, int]:
-    """GET a (web-upload) file into `dest`, streaming with a hard size cap; returns (sha256, size). Raises TransportError on
-    a network failure or a non-200; the caller verifies the sha against the cloud's before trusting the bytes."""
+def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 60.0, max_bytes: int = 64 * 1024 * 1024,
+                max_seconds: float = 300.0) -> tuple[str, int]:
+    """GET a (web-upload) file into `dest`, streaming with a hard size cap AND a wall-clock budget for the whole transfer
+    (`timeout` is only per-read inactivity — a dripping 200 would otherwise never end; codex v0.57 r1); returns
+    (sha256, size). Raises TransportError on a network failure, a non-200, the cap or the deadline; the caller verifies the
+    sha against the cloud's before trusting the bytes and removes `dest` on any failure."""
     import hashlib
     from pathlib import Path
 
@@ -151,6 +154,7 @@ def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 6
     req = urllib.request.Request(url, headers=headers, method="GET")
     digest = hashlib.sha256()
     size = 0
+    started = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp, Path(dest).open("wb") as out:
             if resp.status != 200:
@@ -162,6 +166,8 @@ def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 6
                 size += len(chunk)
                 if size > max_bytes:
                     raise TransportError(f"GET {url}: body exceeds {max_bytes} bytes")
+                if time.monotonic() - started > max_seconds:
+                    raise TransportError(f"GET {url}: transfer exceeded {max_seconds:.0f}s")
                 digest.update(chunk)
                 out.write(chunk)
             out.flush()

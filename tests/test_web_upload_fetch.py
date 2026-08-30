@@ -92,8 +92,78 @@ class TestFetchUploads(unittest.TestCase):
             self.assertEqual(m.fetch_uploads(two, d, getter=getter, reporter=lambda b: _Resp()), 1)   # one per beat
             self.assertEqual(len(got), 1)
 
-    def test_a_failing_download_never_raises(self):
+    def test_a_failing_download_never_raises_and_leaves_no_temp_file(self):
         def getter(path, dest):
+            Path(dest).write_bytes(b"partial")
             raise OSError("boom")
         with tempfile.TemporaryDirectory() as d:
             self.assertEqual(PrinterManager().fetch_uploads([self._fetch(b"x")], d, getter=getter, reporter=lambda b: _Resp()), 0)
+            self.assertEqual(list((Path(d) / "abcdef1234567890").iterdir()), [])
+
+    def test_stale_or_oversized_spool_file_is_replaced_not_reused(self):
+        data = three_mf()
+        calls = []
+
+        def getter(path, dest):
+            calls.append(path); Path(dest).write_bytes(data); return hashlib.sha256(data).hexdigest(), len(data)
+
+        with tempfile.TemporaryDirectory() as d:
+            spool = Path(d) / "abcdef1234567890"; spool.mkdir()
+            (spool / "part.3mf").write_bytes(b"an older upload with the same name")
+            m = PrinterManager()
+            self.assertEqual(m.fetch_uploads([self._fetch(data)], d, getter=getter, reporter=lambda b: _Resp()), 1)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual((spool / "part.3mf").read_bytes(), data)
+            # an existing file over the cap is never read into memory: streamed under the cap, then replaced
+            (spool / "part.3mf").write_bytes(b"x" * 300)
+            self.assertEqual(m.fetch_uploads([self._fetch(data)], d, getter=getter, reporter=lambda b: _Resp(), max_bytes=200), 1)
+            self.assertEqual(len(calls), 2)
+
+    def test_plate_is_coerced_to_the_plate_that_prints(self):
+        data = three_mf()
+        reports = []
+
+        def getter(path, dest):
+            Path(dest).write_bytes(data); return hashlib.sha256(data).hexdigest(), len(data)
+
+        with tempfile.TemporaryDirectory() as d:
+            m = PrinterManager()
+            for raw in ("2", 2):
+                shutil_dir = Path(d) / "abcdef1234567890"
+                if shutil_dir.exists():
+                    for p in shutil_dir.iterdir():
+                        p.unlink()
+                m.fetch_uploads([dict(self._fetch(data), plate=raw)], d, getter=getter, reporter=lambda b: (reports.append(b), _Resp())[1])
+                self.assertEqual([f["slot"] for f in reports[-1]["requiredFilaments"]], [3])        # plate 2 = ABS only
+            for raw in (0, "x", None, True):
+                m.fetch_uploads([dict(self._fetch(data), plate=raw)], d, getter=getter, reporter=lambda b: (reports.append(b), _Resp())[1])
+                self.assertEqual([f["slot"] for f in reports[-1]["requiredFilaments"]], [1, 2])     # → plate 1, like dispatch
+
+
+class TestGetToFileDeadline(unittest.TestCase):
+    def test_a_dripping_200_is_cut_by_the_wall_clock_budget(self):
+        from unittest import mock
+        from makeros_hub import http as http_module
+
+        class Drip:
+            status = 200
+
+            def __init__(self):
+                self.n = 0
+
+            def read(self, _n):
+                self.n += 1
+                return b"x" if self.n < 1000 else b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        clock = iter([0.0] + [i * 100.0 for i in range(1, 2000)])
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(http_module.urllib.request, "urlopen", return_value=Drip()), \
+                mock.patch.object(http_module.time, "monotonic", side_effect=lambda: next(clock)):
+            with self.assertRaises(http_module.TransportError) as ctx:
+                http_module.get_to_file("https://cloud/x", Path(d) / "f", max_seconds=300.0)
+            self.assertIn("exceeded 300s", str(ctx.exception))

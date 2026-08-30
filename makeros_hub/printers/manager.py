@@ -439,17 +439,34 @@ class PrinterManager:
             and "\\" not in file_name
         )
 
-    def fetch_uploads(self, fetches, spool_dir, *, getter, reporter, max_per_beat: int = 1) -> int:
+    def fetch_uploads(self, fetches, spool_dir, *, getter, reporter, max_per_beat: int = 1,
+                      max_bytes: int = 64 * 1024 * 1024) -> int:
         """Web uploads (v0.57, design B4): the cloud lists this hub's member uploads it has not fetched; download each
-        into <spool>/<uid>/<file> (streaming, size-capped), verify the cloud's sha256, parse the sent plate's filaments the
-        same way a VP capture is parsed, and report `fetched` so the job enters the scheduler. One per beat keeps the
-        heartbeat loop responsive; the cloud lists the rest again next beat. A failed fetch is logged and retried next
-        beat (the file stays listed); a sha mismatch is reported so the member is told to re-upload. Returns the number
-        of successful reports. `getter(path, dest) -> (sha256, size)`, `reporter(body) -> Response`."""
+        into <spool>/<uid>/<file> (streaming, size-capped, wall-clock-bounded), verify the cloud's sha256, parse the sent
+        plate's filaments the same way a VP capture is parsed, and report `fetched` so the job enters the scheduler. One
+        per call keeps the loop responsive (the agent runs this on its own worker thread); the cloud lists the rest next
+        beat. A failed fetch is logged and retried next beat (the file stays listed) and never leaves a temp file; a sha
+        mismatch is reported so the member is told to re-upload. Returns the number of successful reports.
+        `getter(path, dest) -> (sha256, size)`, `reporter(body) -> Response`."""
         from ..vprinter.capture import _vp_submit_filament, parse_required_filaments
         import hashlib
         import math
         import os as _os
+
+        def stream_sha(path: Path) -> str | None:
+            """sha256 of an existing spool file under the same cap — None when it is over the cap (never read into RAM)."""
+            digest = hashlib.sha256()
+            total = 0
+            with path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(1024 * 256)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > max_bytes:
+                        return None
+                    digest.update(chunk)
+            return digest.hexdigest()
 
         done = 0
         base = Path(spool_dir)
@@ -464,26 +481,35 @@ class PrinterManager:
                 log.warning("skipping fetch with an unexpected path for %s", job_id)
                 continue
             sha = sha.lower()
-            plate = f.get("plate") if isinstance(f.get("plate"), int) and not isinstance(f.get("plate"), bool) else None
+            # the plate the cloud will print: a positive int (a digit string is coerced); anything else = 1, the same
+            # default dispatch applies — so the parsed requirements always describe the plate that prints (codex r1)
+            raw_plate = f.get("plate")
+            plate = raw_plate if isinstance(raw_plate, int) and not isinstance(raw_plate, bool) else (
+                int(raw_plate) if isinstance(raw_plate, str) and raw_plate.isdigit() else 1)
+            if plate < 1 or plate > 64:
+                plate = 1
             dest_dir = base / uid
             dest = dest_dir / name
+            tmp = dest_dir / f".{name}.fetch.tmp"
             try:
                 dest_dir.mkdir(parents=True, exist_ok=True)
-                if dest.exists():
-                    got = hashlib.sha256(dest.read_bytes()).hexdigest()
-                else:
-                    tmp = dest_dir / f".{name}.fetch.tmp"
-                    got, size = getter(path, tmp)
+                got = stream_sha(dest) if dest.exists() else None
+                if dest.exists() and got != sha:
+                    # a stale same-name file (earlier upload, over the cap, or corrupt): never reused — replaced below
+                    log.warning("web upload %s: spool file present but does not match the cloud's sha — re-fetching", job_id)
+                    dest.unlink(missing_ok=True)
+                    got = None
+                if got is None:
+                    try:
+                        got, _size = getter(path, tmp)
+                    finally:
+                        if got is None or got != sha:
+                            tmp.unlink(missing_ok=True)   # any failure or mismatch: no temp file survives
                     if got != sha:
-                        tmp.unlink(missing_ok=True)
                         log.error("web upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], got[:12])
                         reporter({"queueJobId": job_id, "sha256": got})   # the cloud fails the job + tells the member
                         continue
                     _os.replace(tmp, dest)
-                if got != sha:
-                    log.error("web upload %s: spool file does not match the cloud's sha — leaving it for the next beat", job_id)
-                    dest.unlink(missing_ok=True)
-                    continue
                 items = parse_required_filaments(dest, plate)
                 body: dict = {"queueJobId": job_id, "sha256": got, "requiredFilaments": [_vp_submit_filament(i) for i in items]}
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
@@ -493,11 +519,12 @@ class PrinterManager:
                 ok = getattr(resp, "status", None) == 200 and isinstance(getattr(resp, "body", None), dict) and resp.body.get("ok") is True
                 if ok:
                     done += 1
-                    log.info("web upload %s fetched into the spool (%d filament(s), estGrams=%s)", job_id, len(items), body.get("estGrams"))
+                    log.info("web upload %s fetched into the spool (plate %d, %d filament(s), estGrams=%s)", job_id, plate, len(items), body.get("estGrams"))
                 else:
                     log.warning("web upload %s: cloud did not accept the fetched report: %s", job_id, getattr(resp, "body", resp))
-            except Exception as exc:  # noqa: BLE001 — a failed fetch must never sink the heartbeat; retried next beat
-                log.warning("web upload %s: fetch failed: %s", job_id, self._redact_printer_exception(exc, None) if hasattr(self, "_redact_printer_exception") else exc)
+            except Exception as exc:  # noqa: BLE001 — a failed fetch must never sink the loop; retried next beat
+                tmp.unlink(missing_ok=True)
+                log.warning("web upload %s: fetch failed: %s", job_id, exc)
         return done
 
     def dispatch_commands(self, pending_commands) -> list[dict]:

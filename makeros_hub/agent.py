@@ -1324,6 +1324,7 @@ def run(
         diagnostics=diagnostics,
     )
     queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
+    fetch_lock = threading.Lock()   # v0.57: one web-upload fetch worker at a time
     pending_queue_reports: list[dict] = []
     pending_probe_results: list[dict] = []
     pending_command_results: list[dict] = []
@@ -1795,13 +1796,21 @@ def run(
                             len(assignments) if isinstance(assignments, list) else 0,
                         )
                     fetches = resp.body.get("fetches")
-                    if isinstance(fetches, list) and fetches:
-                        manager.fetch_uploads(
-                            fetches,
-                            SPOOL_DIR,
-                            getter=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential),
-                            reporter=lambda body: post_json(cfg.fetched_url, body, bearer=credential, timeout=15.0),
-                        )
+                    if isinstance(fetches, list) and fetches and fetch_lock.acquire(blocking=False):
+                        # off the heartbeat thread (codex v0.57 r1): a slow download must never stall telemetry; one
+                        # fetch at a time, the lock is released by the worker; a busy worker just skips this beat.
+                        def _fetch_worker(items=fetches):
+                            try:
+                                manager.fetch_uploads(
+                                    items,
+                                    SPOOL_DIR,
+                                    getter=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential),
+                                    reporter=lambda body: post_json(cfg.fetched_url, body, bearer=credential, timeout=15.0),
+                                )
+                            finally:
+                                fetch_lock.release()
+
+                        threading.Thread(target=_fetch_worker, name="web-upload-fetch", daemon=True).start()
                     progress_reports = manager.collect_queue_progress()
                     if progress_reports:
                         pending_queue_reports.extend(progress_reports)
