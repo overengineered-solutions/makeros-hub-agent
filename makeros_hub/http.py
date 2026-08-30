@@ -137,3 +137,37 @@ def _safe_read(exc: urllib.error.HTTPError) -> dict:
         return parsed if isinstance(parsed, dict) else {}
     except Exception:  # noqa: BLE001 — best-effort error-body parse
         return {}
+
+
+def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 60.0, max_bytes: int = 64 * 1024 * 1024) -> tuple[str, int]:
+    """GET a (web-upload) file into `dest`, streaming with a hard size cap; returns (sha256, size). Raises TransportError on
+    a network failure or a non-200; the caller verifies the sha against the cloud's before trusting the bytes."""
+    import hashlib
+    from pathlib import Path
+
+    headers = {"Accept": "application/octet-stream"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp, Path(dest).open("wb") as out:
+            if resp.status != 200:
+                raise TransportError(f"GET {url}: HTTP {resp.status}")
+            while True:
+                chunk = resp.read(1024 * 256)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_bytes:
+                    raise TransportError(f"GET {url}: body exceeds {max_bytes} bytes")
+                digest.update(chunk)
+                out.write(chunk)
+            out.flush()
+    except urllib.error.HTTPError as exc:
+        raise TransportError(f"GET {url}: HTTP {exc.code}") from exc
+    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        raise TransportError(f"network error fetching {url}: {exc}") from exc
+    return digest.hexdigest(), size
+

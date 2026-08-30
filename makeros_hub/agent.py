@@ -40,7 +40,7 @@ from .vprinter.live_pool import (
 )
 from .vprinter.pool_ranking import PoolRankingState
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
-from .http import TransportError, get_json, post_bytes, post_json
+from .http import get_to_file, TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import PrinterManager
@@ -1793,6 +1793,14 @@ def run(
                             "dispatched %d assignment report(s) from %d assignment(s)",
                             len(dispatch_reports),
                             len(assignments) if isinstance(assignments, list) else 0,
+                        )
+                    fetches = resp.body.get("fetches")
+                    if isinstance(fetches, list) and fetches:
+                        manager.fetch_uploads(
+                            fetches,
+                            SPOOL_DIR,
+                            getter=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential),
+                            reporter=lambda body: post_json(cfg.fetched_url, body, bearer=credential, timeout=15.0),
                         )
                     progress_reports = manager.collect_queue_progress()
                     if progress_reports:

@@ -439,6 +439,67 @@ class PrinterManager:
             and "\\" not in file_name
         )
 
+    def fetch_uploads(self, fetches, spool_dir, *, getter, reporter, max_per_beat: int = 1) -> int:
+        """Web uploads (v0.57, design B4): the cloud lists this hub's member uploads it has not fetched; download each
+        into <spool>/<uid>/<file> (streaming, size-capped), verify the cloud's sha256, parse the sent plate's filaments the
+        same way a VP capture is parsed, and report `fetched` so the job enters the scheduler. One per beat keeps the
+        heartbeat loop responsive; the cloud lists the rest again next beat. A failed fetch is logged and retried next
+        beat (the file stays listed); a sha mismatch is reported so the member is told to re-upload. Returns the number
+        of successful reports. `getter(path, dest) -> (sha256, size)`, `reporter(body) -> Response`."""
+        from ..vprinter.capture import _vp_submit_filament, parse_required_filaments
+        import hashlib
+        import math
+        import os as _os
+
+        done = 0
+        base = Path(spool_dir)
+        for f in (fetches if isinstance(fetches, list) else [])[:max_per_beat]:
+            if not isinstance(f, dict):
+                continue
+            job_id, uid, name, sha, path = (f.get("queueJobId"), f.get("submissionUid"), f.get("fileName"), f.get("sha256"), f.get("path"))
+            if not all(isinstance(v, str) and v for v in (job_id, uid, name, sha, path)) or not self._assignment_path_ok(uid, name):
+                log.warning("skipping malformed fetch: %s", {k: f.get(k) for k in ("queueJobId", "submissionUid", "fileName")})
+                continue
+            if not str(path).startswith("/api/print/hub/file/"):
+                log.warning("skipping fetch with an unexpected path for %s", job_id)
+                continue
+            sha = sha.lower()
+            plate = f.get("plate") if isinstance(f.get("plate"), int) and not isinstance(f.get("plate"), bool) else None
+            dest_dir = base / uid
+            dest = dest_dir / name
+            try:
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                if dest.exists():
+                    got = hashlib.sha256(dest.read_bytes()).hexdigest()
+                else:
+                    tmp = dest_dir / f".{name}.fetch.tmp"
+                    got, size = getter(path, tmp)
+                    if got != sha:
+                        tmp.unlink(missing_ok=True)
+                        log.error("web upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], got[:12])
+                        reporter({"queueJobId": job_id, "sha256": got})   # the cloud fails the job + tells the member
+                        continue
+                    _os.replace(tmp, dest)
+                if got != sha:
+                    log.error("web upload %s: spool file does not match the cloud's sha — leaving it for the next beat", job_id)
+                    dest.unlink(missing_ok=True)
+                    continue
+                items = parse_required_filaments(dest, plate)
+                body: dict = {"queueJobId": job_id, "sha256": got, "requiredFilaments": [_vp_submit_filament(i) for i in items]}
+                grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
+                if grams:
+                    body["estGrams"] = int(math.ceil(sum(grams)))
+                resp = reporter(body)
+                ok = getattr(resp, "status", None) == 200 and isinstance(getattr(resp, "body", None), dict) and resp.body.get("ok") is True
+                if ok:
+                    done += 1
+                    log.info("web upload %s fetched into the spool (%d filament(s), estGrams=%s)", job_id, len(items), body.get("estGrams"))
+                else:
+                    log.warning("web upload %s: cloud did not accept the fetched report: %s", job_id, getattr(resp, "body", resp))
+            except Exception as exc:  # noqa: BLE001 — a failed fetch must never sink the heartbeat; retried next beat
+                log.warning("web upload %s: fetch failed: %s", job_id, self._redact_printer_exception(exc, None) if hasattr(self, "_redact_printer_exception") else exc)
+        return done
+
     def dispatch_commands(self, pending_commands) -> list[dict]:
         """Execute cloud-delivered control commands (pause/resume/stop) against
         the target adapters and return result reports for the next heartbeat.

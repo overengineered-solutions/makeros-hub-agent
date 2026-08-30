@@ -61,6 +61,15 @@ class Config:
         return self.cloud_url.rstrip("/") + "/api/print/hub/submit"
 
     @property
+    def fetched_url(self) -> str:
+        return self.cloud_url.rstrip("/") + "/api/print/hub/fetched"
+
+    def file_url(self, path: str) -> str:
+        """A cloud-relative download path from the heartbeat's `fetches` (never an absolute URL — the hub only ever
+        talks to its own cloud)."""
+        return self.cloud_url.rstrip("/") + "/" + str(path).lstrip("/")
+
+    @property
     def camera_url(self) -> str:
         # Camera frames POST here as raw JPEG bytes, out-of-band from the heartbeat (whose body is size-capped).
         return self.cloud_url.rstrip("/") + "/api/print/hub/camera"
