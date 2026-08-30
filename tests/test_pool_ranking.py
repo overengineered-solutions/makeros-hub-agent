@@ -6,7 +6,7 @@ from pathlib import Path
 from makeros_hub.printers.bambu_parse import normalize_status
 from makeros_hub.vprinter import live_pool
 from makeros_hub.vprinter.pool_ranking import PoolRankingState
-from makeros_hub.vprinter.live_pool import UNKNOWN_KEY, active_keys, scoped_statuses, tray_key, vp_pool_from_statuses_ranked
+from makeros_hub.vprinter.live_pool import active_keys, scoped_statuses, tray_key, vp_pool_from_statuses_ranked
 
 DAY = 86400.0
 
@@ -82,32 +82,42 @@ class TestRankingPolicy(unittest.TestCase):
             p = Path(tmp) / "r.json"
             wall = 1_700_000_000.0
             st = PoolRankingState(p, now=wall)
-            st.observe(["k"], ["k"], 0.5, wall)
+            st.observe(["PLA|GFL99|FFFFFFFF"], ["PLA|GFL99|FFFFFFFF"], 0.5, wall)
             st.persist(wall, force=True)
             st2 = PoolRankingState(p, now=wall + 1000.0)
-            self.assertGreater(st2._decayed("k", wall + 1000.0), 0.0)
+            self.assertGreater(st2._decayed("PLA|GFL99|FFFFFFFF", wall + 1000.0), 0.0)
+
+    def test_load_prunes_keys_that_are_not_tray_keys(self):
+        # A stale state file must never reintroduce a non-spool key (the withdrawn 0.50-dev "~unknown" marker).
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "r.json"
+            wall = 1_700_000_000.0
+            p.write_text('{"version": 1, "keys": {"~unknown": {"first_seen": %r, "use_minutes": 99.0, "last_use": %r},'
+                         ' "PLA|GFL99|FFFFFFFF": {"first_seen": %r, "use_minutes": 1.0, "last_use": %r}}}' % (wall, wall, wall, wall))
+            st = PoolRankingState(p, now=wall)
+        self.assertEqual(sorted(st._keys), ["PLA|GFL99|FFFFFFFF"])
 
     def test_monotonic_era_timestamps_quarantined_on_load(self):
         # A state file stamped by a monotonic clock (seconds-since-boot ≪ 2020 epoch) must not read as
         # ancient against wall time: implausible stamps reset to load-time `now`, keeping use_minutes.
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "r.json"
-            p.write_text('{"version": 1, "keys": {"k": {"first_seen": 12345.0, "use_minutes": 30.0, "last_use": 12345.0}}}')
+            p.write_text('{"version": 1, "keys": {"PLA|GFL99|FFFFFFFF": {"first_seen": 12345.0, "use_minutes": 30.0, "last_use": 12345.0}}}')
             wall = 1_700_000_000.0
             st = PoolRankingState(p, now=wall)
-            self.assertGreater(st._decayed("k", wall), 25.0)          # usage survives, not decayed to ~0
-            self.assertIn("k", st.select(["k", "other"], 1, wall))    # reads as newly seen → recent tier
+            self.assertGreater(st._decayed("PLA|GFL99|FFFFFFFF", wall), 25.0)          # usage survives, not decayed to ~0
+            self.assertIn("PLA|GFL99|FFFFFFFF", st.select(["PLA|GFL99|FFFFFFFF", "other"], 1, wall))    # reads as newly seen → recent tier
 
 
 class TestScopedAndActive(unittest.TestCase):
     def setUp(self):
-        live_pool._fallback_engaged.clear()
+        live_pool._scope_state.clear()
 
-    def test_scoped_exact_match_with_never_strand_fallback(self):
+    def test_scoped_exact_match_and_empty_when_the_model_is_offline(self):
         sts = [status("Bambu X1 Carbon", [tray("PLA", "#fff")]), status("Bambu A1 Mini", [tray("ABS", "#000")], pid="p2")]
         self.assertEqual(len(scoped_statuses(sts, "Bambu X1 Carbon")), 1)
-        with self.assertLogs("makeros-hub.vprinter", level="WARNING"):        # the fallback is never silent
-            self.assertEqual(len(scoped_statuses(sts, "Nonexistent Model")), 2)   # fallback: whole hub
+        with self.assertLogs("makeros-hub.vprinter", level="WARNING"):        # never silent
+            self.assertEqual(scoped_statuses(sts, "Nonexistent Model"), [])   # other models' spools are NOT offered
 
     def test_active_key_resolves_by_raw_unit_id_across_gaps(self):
         # build_ams re-enumerates units contiguously while tray_now uses RAW ids: with unit 0 absent and
@@ -145,14 +155,13 @@ class TestScopedAndActive(unittest.TestCase):
         # usage 0 -> stable key-sort decides. The assertion pins determinism, not a specific winner.
         self.assertEqual(pool, sorted(pool, key=lambda t: str(t)))  # deterministic ordering shape
 
-    def test_ranked_pool_carries_the_unknown_marker(self):
+    def test_ranked_pool_ignores_unidentified_spools(self):
         with tempfile.TemporaryDirectory() as tmp:
             st = PoolRankingState(Path(tmp) / "r.json", now=0.0)
-            sts = [status("m", [tray("PLA", "#ffffff", "GFL99", 0)], units=[raw_unit(0, [tray("PLA", "#ffffff", "GFL99", 0)])])]
+            sts = [status("m", [tray("PLA", "#ffffff", "GFL99", 0)])]
             sts[0]["unidentifiedSpools"] = [{"unit": 0, "slot": 2}]   # as the DTO reports it
             pool = vp_pool_from_statuses_ranked(sts, units=1, trays=4, ranking=st, now=100 * DAY)
-        self.assertEqual([t["tray_type"] for t in pool], ["PLA", "Unknown"])
-        self.assertEqual(tray_key({"unidentified": True}), UNKNOWN_KEY)
+        self.assertEqual([t["tray_type"] for t in pool], ["PLA"])
 
 
 if __name__ == "__main__":

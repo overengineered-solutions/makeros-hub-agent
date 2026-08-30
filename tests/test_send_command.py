@@ -50,6 +50,15 @@ def make_adapter():
     )
 
 
+class TestStatusModel(unittest.TestCase):
+    def test_status_carries_the_adapters_model(self):
+        # RC1 end-to-end pin: the VP pool scopes by status["model"], which only exists because
+        # BambuAdapter.status() hands its config-down model to normalize_status.
+        adapter = make_adapter()
+        self.assertEqual(adapter.status()["model"], adapter.model)
+        self.assertEqual(adapter.status()["model"], "A1 Mini")
+
+
 class TestSendCommand(unittest.TestCase):
     def test_publishes_correct_payload_for_each_command(self):
         for command in ("pause", "resume", "stop"):

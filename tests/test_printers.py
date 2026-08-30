@@ -35,7 +35,7 @@ class TestNormalizeStatus(unittest.TestCase):
             gcode_state="RUNNING", mc_percent=42, nozzle_temper=210.4, bed_temper=60.0,
             subtask_name="bracket.3mf", mc_remaining_time=90,
         )
-        s = bambu_parse.normalize_status("p1", merged, connection_state="connected")
+        s = bambu_parse.normalize_status("p1", merged, connection_state="connected", model="N1")
         self.assertEqual(s["printerId"], "p1")
         self.assertEqual(s["connectionState"], "connected")
         self.assertEqual(s["state"], "printing")
@@ -48,7 +48,7 @@ class TestNormalizeStatus(unittest.TestCase):
     def test_s_obj_surfaces_as_skipped_objects(self):
         s = bambu_parse.normalize_status(
             "p", self._merged(gcode_state="RUNNING", s_obj=[286, 9, True, "x"]),
-            connection_state="connected",
+            connection_state="connected", model="N1",
         )
         # ints only (bool/str dropped); the cloud scopes display to active prints.
         self.assertEqual(s["skippedObjects"], [286, 9])
@@ -58,7 +58,7 @@ class TestNormalizeStatus(unittest.TestCase):
             fields = {"gcode_state": "RUNNING"}
             if s_obj is not None:
                 fields["s_obj"] = s_obj
-            s = bambu_parse.normalize_status("p", self._merged(**fields), connection_state="connected")
+            s = bambu_parse.normalize_status("p", self._merged(**fields), connection_state="connected", model="N1")
             self.assertNotIn("skippedObjects", s)
 
     def test_model_and_raw_gcode_state_ride_the_dto(self):
@@ -73,7 +73,11 @@ class TestNormalizeStatus(unittest.TestCase):
         off = bambu_parse.normalize_status("p", merged, connection_state="offline", model=" A1 Mini ")
         self.assertEqual(off["model"], "A1 Mini")  # identity, not telemetry: present while offline too
         self.assertNotIn("gcodeState", off)
-        bare = bambu_parse.normalize_status("p", self._merged(gcode_state=""), connection_state="connected")
+        # model is REQUIRED at the call site (a forgotten kwarg fails loudly, never a silently unscoped
+        # pool); None — a machine config-down left without a model — omits the key.
+        with self.assertRaises(TypeError):
+            bambu_parse.normalize_status("p", merged, connection_state="connected")  # type: ignore[call-arg]
+        bare = bambu_parse.normalize_status("p", self._merged(gcode_state=""), connection_state="connected", model=None)
         self.assertNotIn("model", bare)
         self.assertNotIn("gcodeState", bare)
 
@@ -101,11 +105,11 @@ class TestNormalizeStatus(unittest.TestCase):
         )
         print_obj["vt_tray"]["state"] = 9
         self.assertEqual(bambu_parse.build_unidentified_spools(print_obj)[-1], {"slot": 254})
-        s = bambu_parse.normalize_status("p", {"print": print_obj}, connection_state="connected")
+        s = bambu_parse.normalize_status("p", {"print": print_obj}, connection_state="connected", model="N1")
         self.assertEqual(len(s["unidentifiedSpools"]), 4)
         self.assertNotIn(
             "unidentifiedSpools",
-            bambu_parse.normalize_status("p", {"print": print_obj}, connection_state="offline"),
+            bambu_parse.normalize_status("p", {"print": print_obj}, connection_state="offline", model="N1"),
         )
         self.assertIsNone(bambu_parse.build_unidentified_spools({"ams": {"ams": [{"id": "0", "tray": [{"id": "0"}]}]}}))
         self.assertIsNone(bambu_parse.build_unidentified_spools({"vt_tray": {"id": "254", "state": 9, "tray_type": "PLA"}}))
@@ -118,32 +122,32 @@ class TestNormalizeStatus(unittest.TestCase):
         for gcode_state in ("FINISH", "FAILED"):
             self.assertEqual(
                 bambu_parse.normalize_status(
-                    "p", self._merged(gcode_state=gcode_state), connection_state="connected"
+                    "p", self._merged(gcode_state=gcode_state), connection_state="connected", model="N1"
                 )["state"],
                 "idle",
             )
 
     def test_omits_absent_fields_and_state_when_not_connected(self):
-        s = bambu_parse.normalize_status("p", {"print": {}}, connection_state="connecting")
-        self.assertEqual(set(s.keys()), {"printerId", "connectionState"})  # no null keys (strict DTO)
+        s = bambu_parse.normalize_status("p", {"print": {}}, connection_state="connecting", model="N1")
+        self.assertEqual(set(s.keys()), {"printerId", "connectionState", "model"})  # no null keys (strict DTO); model is identity
         self.assertNotIn("state", s)
 
     def test_error_reason_only_on_error(self):
-        ok = bambu_parse.normalize_status("p", {"print": {}}, connection_state="connected")
+        ok = bambu_parse.normalize_status("p", {"print": {}}, connection_state="connected", model="N1")
         self.assertNotIn("errorReason", ok)
-        err = bambu_parse.normalize_status("p", {"print": {}}, connection_state="error", error_reason="mqtt_auth_failed")
+        err = bambu_parse.normalize_status("p", {"print": {}}, connection_state="error", model="N1", error_reason="mqtt_auth_failed")
         self.assertEqual(err["errorReason"], "mqtt_auth_failed")
 
     def test_coerces_string_numbers_and_clamps_progress(self):
         s = bambu_parse.normalize_status(
-            "p", {"print": {"nozzle_temper": "215.0", "mc_percent": 130}}, connection_state="connected"
+            "p", {"print": {"nozzle_temper": "215.0", "mc_percent": 130}}, connection_state="connected", model="N1"
         )
         self.assertEqual(s["nozzleTempC"], 215.0)
         self.assertEqual(s["progressPct"], 100)  # clamped
 
     def test_gcode_file_fallback_for_job_name(self):
         s = bambu_parse.normalize_status(
-            "p", {"print": {"gcode_file": "Metadata/plate_1.gcode"}}, connection_state="connected"
+            "p", {"print": {"gcode_file": "Metadata/plate_1.gcode"}}, connection_state="connected", model="N1"
         )
         self.assertEqual(s["jobName"], "Metadata/plate_1.gcode")
 
@@ -172,7 +176,7 @@ class TestNormalizeStatus(unittest.TestCase):
             hms=[{"attr": "1", "code": 1234}],
             print_error="7",
         )
-        s = bambu_parse.normalize_status("p", merged, connection_state="connected")
+        s = bambu_parse.normalize_status("p", merged, connection_state="connected", model="N1")
         self.assertEqual(
             s["ams"],
             [
@@ -210,7 +214,7 @@ class TestNormalizeStatus(unittest.TestCase):
 
     def test_connected_status_omits_absent_ams_hms_and_zero_print_error(self):
         s = bambu_parse.normalize_status(
-            "p", self._merged(gcode_state="IDLE", print_error=0), connection_state="connected"
+            "p", self._merged(gcode_state="IDLE", print_error=0), connection_state="connected", model="N1"
         )
         self.assertNotIn("ams", s)
         self.assertNotIn("amsActiveTray", s)
@@ -225,8 +229,8 @@ class TestNormalizeStatus(unittest.TestCase):
             vt_tray={"tray_type": "PLA"},
         )
         for state in ("offline", "error"):
-            with self.subTest(connection_state=state):
-                s = bambu_parse.normalize_status("p", merged, connection_state=state)
+            with self.subTest(connection_state=state, model="N1"):
+                s = bambu_parse.normalize_status("p", merged, connection_state=state, model="N1")
                 self.assertNotIn("ams", s)
                 self.assertNotIn("amsActiveTray", s)
                 self.assertNotIn("hms", s)
@@ -489,7 +493,7 @@ class TestAmsHmsBuilders(unittest.TestCase):
                 "tagUid": "vt-uid",
             },
         )
-        s = bambu_parse.normalize_status("p", {"print": print_obj}, connection_state="connected")
+        s = bambu_parse.normalize_status("p", {"print": print_obj}, connection_state="connected", model="N1")
         self.assertEqual(s["vtTray"], bambu_parse.build_vt_tray(print_obj))
         self.assertIsNone(bambu_parse.build_vt_tray({"vt_tray": {}}))
         self.assertIsNone(bambu_parse.build_vt_tray({"vt_tray": {"id": "0"}}))

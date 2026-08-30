@@ -19,25 +19,10 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
 from typing import Any
 
 log = logging.getLogger("makeros-hub.vprinter")
-
-# One marker row per model group when any printer holds a spool it could not identify (a non-RFID
-# spool nobody typed on the screen yet). Sorts LAST ("~" > every letter), never matches a job, and
-# tells the member "there is a spool here nobody has named" — the per-printer detail rides the
-# status DTO (unidentifiedSpools) for The Floor.
-UNKNOWN_KEY = "~unknown"
-_UNKNOWN_ROW: dict[str, Any] = {
-    "tray_type": "Unknown",
-    "tray_info_idx": "",
-    "tray_sub_brands": "Unidentified spool",
-    "tray_color": "00000000",
-    "cols": ["00000000"],
-    "nozzle_temp_min": "0",
-    "nozzle_temp_max": "0",
-    "remain": -1,
-}
 
 # Mirror of the cloud FILAMENT_CATALOG (virtual-printers.ts). A material with no
 # Bambu filament id on the tray falls back to the catalog's info idx + temps,
@@ -99,8 +84,10 @@ def _norm_color(value: Any) -> str:
 
 
 def _spools(status: Any):
-    """Every spool a status reports: the AMS trays, the external spool (vtTray — an A1 mini often
-    runs on it alone), and one pseudo-tray when the printer holds unidentified spools (RC2)."""
+    """Every spool a status reports: the AMS trays and the external spool (vtTray — an A1 mini often
+    runs on it alone). Unidentified spools (status["unidentifiedSpools"]) are deliberately NOT here:
+    a tray without a type can never be matched to a job, so it must never be selectable; The Floor
+    shows them from the DTO field instead."""
     if not isinstance(status, dict):
         return
     for unit in status.get("ams") or []:
@@ -111,8 +98,6 @@ def _spools(status: Any):
     vt_tray = status.get("vtTray")
     if isinstance(vt_tray, dict):
         yield vt_tray
-    if status.get("unidentifiedSpools"):
-        yield {"unidentified": True}
 
 
 def vp_pool_from_statuses(
@@ -120,8 +105,8 @@ def vp_pool_from_statuses(
     units: int,
     trays: int,
 ) -> list[dict[str, Any]]:
-    """Pool = the filaments ACTUALLY loaded across the hub's printers (AMS trays + external spools,
-    plus one "Unknown" marker when an unidentified spool is present), deduped by
+    """Pool = the filaments ACTUALLY loaded across the hub's printers (AMS trays + external spools),
+    deduped by
     (material, Bambu filament id, color) so the same spool in two printers shows
     once. Mirrors the cloud deriveVpPool: statuses are visited in a stable
     printerId order (deterministic first-wins tie-break), the dedupe key is the
@@ -143,11 +128,6 @@ def vp_pool_from_statuses(
 
     pool: list[dict[str, Any]] = []
     for key in sorted(deduped):
-        if key == UNKNOWN_KEY:
-            pool.append(dict(_UNKNOWN_ROW))
-            if len(pool) >= capacity:
-                break
-            continue
         t = deduped[key]
         material = _norm_material(t.get("material"))
         color = _norm_color(t.get("colorHex"))
@@ -224,12 +204,8 @@ def updated_config_if_pool_changed(current_config: Any, statuses: list[dict[str,
 
 def tray_key(tray: dict[str, Any]) -> str | None:
     """The live_pool dedupe key for one tray, or None for an empty slot — the SAME string the derivation
-    uses, exposed for the ranking signals. The unidentified-spool pseudo-tray keys to UNKNOWN_KEY."""
-    if not isinstance(tray, dict):
-        return None
-    if tray.get("unidentified"):
-        return UNKNOWN_KEY
-    if not _clean_optional(tray.get("material")):
+    uses, exposed for the ranking signals."""
+    if not isinstance(tray, dict) or not _clean_optional(tray.get("material")):
         return None
     return "|".join(
         (
@@ -240,34 +216,60 @@ def tray_key(tray: dict[str, Any]) -> str | None:
     )
 
 
-# Models whose VP is currently advertising the whole hub — logged on the EDGES (engage / recover), not
-# every heartbeat, so the journal shows the event without a 30s drumbeat.
-_fallback_engaged: set[str] = set()
+# Per-VP scope outcome ("matched" | "empty" | "compat"), logged on TRANSITIONS only so the journal shows
+# the event without a 30s drumbeat. Lock-guarded (the heartbeat thread is the only writer today; the
+# lock keeps that an implementation detail). Pruned against the configured VP set each mirror pass so a
+# VP that is removed and later re-added logs afresh.
+_scope_lock = threading.Lock()
+_scope_state: dict[str, str] = {}
+
+
+def _model_key(model: Any) -> str:
+    return (str(model) if model else "").strip().lower()
+
+
+def prune_scope_state(models) -> None:
+    keep = {_model_key(m) for m in models}
+    with _scope_lock:
+        for key in [k for k in _scope_state if k not in keep]:
+            del _scope_state[key]
 
 
 def scoped_statuses(statuses: list[dict[str, Any]], model: Any) -> list[dict[str, Any]]:
     """Printers of the VP's model (exact string match — our cloud creates VPs FROM machines.model, one
-    string domain). No matches → the WHOLE hub (makeros's never-strand rule: an empty VP helps nobody),
-    logged LOUDLY: silently falling back is what hid RC1 (statuses carried no `model` at all, so every
-    VP advertised the entire fleet's spools)."""
-    want = (str(model) if model else "").strip().lower()
+    string domain). None online → an EMPTY pool: a VP must never advertise spools that sit on printers
+    which cannot run its jobs (the pre-0.50 whole-hub fallback did exactly that, and hid RC1). The
+    whole-hub path survives ONLY as a compatibility fallback for statuses that carry no `model` at all
+    (a pre-0.50 DTO), and says so in the log."""
+    want = _model_key(model)
+    present = [s for s in statuses or [] if isinstance(s, dict)]
     if not want:
-        return list(statuses or [])
-    matching = [s for s in statuses or [] if isinstance(s, dict) and str(s.get("model") or "").strip().lower() == want]
+        return present
+    matching = [s for s in present if _model_key(s.get("model")) == want]
+    reported = sorted({_model_key(s.get("model")) for s in present} - {""})
     if matching:
-        if want in _fallback_engaged:
-            _fallback_engaged.discard(want)
-            log.info("VP %r: a printer of its model is reporting again — pool scoped to the model group", model)
-        return matching
-    if want not in _fallback_engaged:
-        _fallback_engaged.add(want)
-        seen = sorted({str(s.get("model") or "<none>") for s in statuses or [] if isinstance(s, dict)})
-        log.warning(
-            "VP %r: NO connected printer reports model %r — advertising the WHOLE hub's spools "
-            "(never-strand fallback). Models reported this beat: %s",
-            model, model, seen or "<no printers>",
-        )
-    return list(statuses or [])
+        mode, out = "matched", matching
+    elif reported or not present:
+        mode, out = "empty", []
+    else:
+        mode, out = "compat", present
+    with _scope_lock:
+        changed = _scope_state.get(want) != mode
+        _scope_state[want] = mode
+    if changed:
+        if mode == "matched":
+            log.info("VP %r: %d printer(s) of its model reporting — pool scoped to the model group", model, len(matching))
+        elif mode == "empty":
+            log.warning(
+                "VP %r: no connected printer reports model %r — advertising NO spools (models reported: %s)",
+                model, model, reported or "<none>",
+            )
+        else:
+            log.warning(
+                "VP %r: COMPATIBILITY fallback — no status carries a model at all (pre-0.50 DTO?); "
+                "advertising the WHOLE hub's spools", model,
+            )
+    return out
 
 
 def loaded_keys(statuses: list[dict[str, Any]]) -> list[str]:
@@ -364,6 +366,7 @@ def updated_configs_if_pools_changed(
     """Multi-VP mirror step: for EVERY live VP config, derive its model-scoped ranked pool; return the full
     replacement list when at least one pool's display identity changed, else None (no churn). The caller
     reconciles the WHOLE list (reconcile replaces the set; unchanged VPs hot-no-op on identity)."""
+    prune_scope_state(getattr(cfg, "model", None) for cfg in configs or [])
     if not configs:
         return None
     changed = False

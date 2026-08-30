@@ -386,13 +386,14 @@ def normalize_status(
     merged: dict,
     *,
     connection_state: str,
+    model: str | None,
     error_reason: str | None = None,
-    model: str | None = None,
 ) -> dict:
     """Build the wire DTO the cloud heartbeat expects (PrinterStatusDTO).
 
     `model` is the config-down machine model (e.g. "A1 Mini") — the VP live-mirror scopes each
-    Virtual Printer's filament pool by it (live_pool.scoped_statuses), so it must ride EVERY status.
+    Virtual Printer's filament pool by it (live_pool.scoped_statuses), so it must ride EVERY status:
+    a REQUIRED keyword (None only when config-down carried no model; the key is then omitted).
     Additive keys (model, gcodeState, unidentifiedSpools) are safe for pstation, whose heartbeat
     ingest hand-picks fields.
 
