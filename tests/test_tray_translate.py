@@ -50,6 +50,21 @@ class TestTranslateMapping(unittest.TestCase):
         # k=0 unused (-1), k=1 → PETG, k=2 mapped by the member but not a required filament → unmapped, k=3 external kept
         self.assertEqual(tt.translate_mapping([-1, 7, 3, 254], required, self.trays), [-1, 0, -1, 254])
 
+    def test_every_required_filament_ends_up_mapped(self):
+        # codex r4: a TRUNCATED member mapping ([0] for a two-filament plate) or a -1 where the plate needs a spool is
+        # extended/filled from the requirements — never sent short
+        required = [{"slot": 1, "type": "PLA", "color": "FFFFFF"}, {"slot": 2, "type": "PETG", "color": "000000"}]
+        self.assertEqual(tt.translate_mapping([0], required, self.trays), [1, 0])
+        self.assertEqual(tt.translate_mapping([-1, -1], required, self.trays), [1, 0])
+        self.assertEqual(tt.translate_mapping([], required, self.trays), [1, 0])
+        # …and a required spool that is not loaded still refuses, even when the short list never mentioned it
+        with self.assertRaises(tt.TrayTranslationError):
+            tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF"}, {"slot": 2, "type": "ABS", "color": "FF0000"}], self.trays)
+        # the H2D's second-nozzle map keeps -1 = "not on this nozzle", and the primary map is not filled for a filament the
+        # second map covers (a two-colour dual-nozzle plate: PLA on the left, PETG on the right)
+        out = tt.translate_print_trays({"use_ams": True, "ams_mapping": [5, -1], "ams_mapping2": [-1, 9]}, required, UNITS, VT)
+        self.assertEqual((out["ams_mapping"], out["ams_mapping2"]), ([1, -1], [-1, 0]))
+
     def test_filament_id_is_exact_when_the_loaded_spools_carry_ids(self):
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFA00"}], self.trays), [2])
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF"}], self.trays), [1])

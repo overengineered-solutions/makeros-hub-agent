@@ -114,4 +114,3 @@ class TestRefusalCarriesAssignmentSeq(unittest.TestCase):
             self.assertEqual(r, {"queueJobId": "q1", "state": "held", "reason": "spool_mismatch: needs PLA #FFFFFF (not loaded on this printer)", "assignmentSeq": 7})
             [r] = [x for x in m.dispatch_assignments([dict(base, queueJobId="q2")], d) if x["state"] == "held"]   # pre-0062 cloud: no seq
             self.assertNotIn("assignmentSeq", r)
-

@@ -127,23 +127,31 @@ def _by_filament_index(required: list[dict[str, Any]]) -> dict[int, dict[str, An
     return {r["slot"] - base: r for r in required if isinstance(r, dict) and isinstance(r.get("slot"), int) and not isinstance(r.get("slot"), bool)}
 
 
-def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[dict[str, Any]]) -> list[int]:
+def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[dict[str, Any]], *,
+                      fill_required: bool = True, skip_fill: frozenset[int] = frozenset()) -> list[int]:
     """Rewrite one ams_mapping list: position k (the k-th project filament) → the physical tray holding required
-    filament k. -1 and 254/255 pass through; a mapped position with no requirement record (a filament this plate
-    does not use) becomes -1 rather than a guessed tray. Raises TrayTranslationError('spool_mismatch') when a
+    filament k. -1 and 254/255 pass through for positions the plate does not use; a mapped position with no requirement
+    record becomes -1 rather than a guessed tray. With `fill_required` (the PRIMARY map) every required filament ends
+    up mapped: a list that is truncated, or carries -1 where the plate needs a spool, is extended/filled from the
+    requirements (codex v0.56 r4 — a short list must never start a print with a required spool unmapped) — except the
+    positions in `skip_fill` (filaments the H2D's second-nozzle map already covers). Without it (`ams_mapping2`) -1
+    keeps its meaning: "this filament is not on this nozzle". Raises TrayTranslationError('spool_mismatch') when a
     required spool is not loaded on this printer."""
     by_index = _by_filament_index(required or [])
     mapping = mapping if isinstance(mapping, list) else []
     if not by_index and any(isinstance(v, int) and not isinstance(v, bool) and v >= 0 and v not in EXTERNAL_TRAY_IDS for v in mapping):
         # codex v0.56 r1: no requirements + AMS trays mapped = nothing to translate FROM; blanking them would print
         raise TrayTranslationError("spool_mismatch", "no filament requirements recorded for this job (re-send it from OrcaSlicer)")
+    length = max([len(mapping)] + ([k + 1 for k in by_index if k not in skip_fill] if fill_required else []))
     out: list[int] = []
-    for k, v in enumerate(mapping):
-        if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v in EXTERNAL_TRAY_IDS:
-            out.append(v if isinstance(v, int) and not isinstance(v, bool) else -1)
-            continue
+    for k in range(length):
+        v = mapping[k] if k < len(mapping) else -1
+        v = v if isinstance(v, int) and not isinstance(v, bool) else -1
         req = by_index.get(k)
-        if req is None:
+        if v in EXTERNAL_TRAY_IDS:
+            out.append(v)
+            continue
+        if req is None or (v < 0 and (not fill_required or k in skip_fill)):
             out.append(-1)
             continue
         tray = _pick(req, trays)
@@ -180,12 +188,17 @@ def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, An
     trays = live_trays(ams_units, vt_tray)
     if not trays and unaddressable_units(ams_units):
         raise TrayTranslationError("spool_mismatch", f"{unaddressable_units(ams_units)} AMS unit(s) report no id — cannot address trays")
+    mapping2 = out.get("ams_mapping2")
+    # H2D: a filament the second-nozzle map covers is deliberately -1 in the primary map — never "fill" it there
+    on_second = frozenset(k for k, v in enumerate(mapping2 if isinstance(mapping2, list) else [])
+                          if isinstance(v, int) and not isinstance(v, bool) and v >= 0)
     mapping = out.get("ams_mapping")
     if isinstance(mapping, list) and mapping:
-        out["ams_mapping"] = translate_mapping(mapping, required or [], trays)
+        out["ams_mapping"] = translate_mapping(mapping, required or [], trays, skip_fill=on_second)
+    elif on_second:
+        out["ams_mapping"] = translate_mapping([], required or [], trays, skip_fill=on_second)
     else:
         out["ams_mapping"] = mapping_from_requirements(required or [], trays)
-    mapping2 = out.get("ams_mapping2")
     if isinstance(mapping2, list) and mapping2:
-        out["ams_mapping2"] = translate_mapping(mapping2, required or [], trays)
+        out["ams_mapping2"] = translate_mapping(mapping2, required or [], trays, fill_required=False)
     return out
