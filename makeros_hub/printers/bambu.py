@@ -185,7 +185,7 @@ class BambuAdapter:
             conn_state, reason = "connecting", None
 
         return bambu_parse.normalize_status(
-            self.printer_id, data, connection_state=conn_state, error_reason=reason
+            self.printer_id, data, connection_state=conn_state, error_reason=reason, model=self.model
         )
 
     def pending_jobs(self) -> list[dict]:

@@ -18,7 +18,26 @@ faster than the cloud round-trip. Keep these two in lockstep when either changes
 from __future__ import annotations
 
 import dataclasses
+import logging
 from typing import Any
+
+log = logging.getLogger("makeros-hub.vprinter")
+
+# One marker row per model group when any printer holds a spool it could not identify (a non-RFID
+# spool nobody typed on the screen yet). Sorts LAST ("~" > every letter), never matches a job, and
+# tells the member "there is a spool here nobody has named" — the per-printer detail rides the
+# status DTO (unidentifiedSpools) for The Floor.
+UNKNOWN_KEY = "~unknown"
+_UNKNOWN_ROW: dict[str, Any] = {
+    "tray_type": "Unknown",
+    "tray_info_idx": "",
+    "tray_sub_brands": "Unidentified spool",
+    "tray_color": "00000000",
+    "cols": ["00000000"],
+    "nozzle_temp_min": "0",
+    "nozzle_temp_max": "0",
+    "remain": -1,
+}
 
 # Mirror of the cloud FILAMENT_CATALOG (virtual-printers.ts). A material with no
 # Bambu filament id on the tray falls back to the catalog's info idx + temps,
@@ -79,12 +98,30 @@ def _norm_color(value: Any) -> str:
     return "FFFFFFFF"
 
 
+def _spools(status: Any):
+    """Every spool a status reports: the AMS trays, the external spool (vtTray — an A1 mini often
+    runs on it alone), and one pseudo-tray when the printer holds unidentified spools (RC2)."""
+    if not isinstance(status, dict):
+        return
+    for unit in status.get("ams") or []:
+        if isinstance(unit, dict):
+            for tray in unit.get("trays") or []:
+                if isinstance(tray, dict):
+                    yield tray
+    vt_tray = status.get("vtTray")
+    if isinstance(vt_tray, dict):
+        yield vt_tray
+    if status.get("unidentifiedSpools"):
+        yield {"unidentified": True}
+
+
 def vp_pool_from_statuses(
     statuses: list[dict[str, Any]],
     units: int,
     trays: int,
 ) -> list[dict[str, Any]]:
-    """Pool = the filaments ACTUALLY loaded across the hub's printers, deduped by
+    """Pool = the filaments ACTUALLY loaded across the hub's printers (AMS trays + external spools,
+    plus one "Unknown" marker when an unidentified spool is present), deduped by
     (material, Bambu filament id, color) so the same spool in two printers shows
     once. Mirrors the cloud deriveVpPool: statuses are visited in a stable
     printerId order (deterministic first-wins tie-break), the dedupe key is the
@@ -99,27 +136,18 @@ def vp_pool_from_statuses(
     )
     deduped: dict[str, dict[str, Any]] = {}
     for status in ordered:
-        if not isinstance(status, dict):
-            continue
-        for unit in status.get("ams") or []:
-            if not isinstance(unit, dict):
-                continue
-            for tray in unit.get("trays") or []:
-                if not isinstance(tray, dict):
-                    continue
-                if not _clean_optional(tray.get("material")):
-                    continue  # empty slot
-                key = "|".join(
-                    (
-                        _norm_material(tray.get("material")),
-                        _clean_optional(tray.get("filamentId")) or "",
-                        _norm_color(tray.get("colorHex")),
-                    )
-                )
+        for tray in _spools(status):
+            key = tray_key(tray)
+            if key:
                 deduped.setdefault(key, tray)
 
     pool: list[dict[str, Any]] = []
     for key in sorted(deduped):
+        if key == UNKNOWN_KEY:
+            pool.append(dict(_UNKNOWN_ROW))
+            if len(pool) >= capacity:
+                break
+            continue
         t = deduped[key]
         material = _norm_material(t.get("material"))
         color = _norm_color(t.get("colorHex"))
@@ -196,8 +224,12 @@ def updated_config_if_pool_changed(current_config: Any, statuses: list[dict[str,
 
 def tray_key(tray: dict[str, Any]) -> str | None:
     """The live_pool dedupe key for one tray, or None for an empty slot — the SAME string the derivation
-    uses, exposed for the ranking signals."""
-    if not isinstance(tray, dict) or not _clean_optional(tray.get("material")):
+    uses, exposed for the ranking signals. The unidentified-spool pseudo-tray keys to UNKNOWN_KEY."""
+    if not isinstance(tray, dict):
+        return None
+    if tray.get("unidentified"):
+        return UNKNOWN_KEY
+    if not _clean_optional(tray.get("material")):
         return None
     return "|".join(
         (
@@ -208,28 +240,43 @@ def tray_key(tray: dict[str, Any]) -> str | None:
     )
 
 
+# Models whose VP is currently advertising the whole hub — logged on the EDGES (engage / recover), not
+# every heartbeat, so the journal shows the event without a 30s drumbeat.
+_fallback_engaged: set[str] = set()
+
+
 def scoped_statuses(statuses: list[dict[str, Any]], model: Any) -> list[dict[str, Any]]:
     """Printers of the VP's model (exact string match — our cloud creates VPs FROM machines.model, one
-    string domain). No matches → the WHOLE hub (makeros's never-strand rule: an empty VP helps nobody)."""
+    string domain). No matches → the WHOLE hub (makeros's never-strand rule: an empty VP helps nobody),
+    logged LOUDLY: silently falling back is what hid RC1 (statuses carried no `model` at all, so every
+    VP advertised the entire fleet's spools)."""
     want = (str(model) if model else "").strip().lower()
     if not want:
         return list(statuses or [])
     matching = [s for s in statuses or [] if isinstance(s, dict) and str(s.get("model") or "").strip().lower() == want]
-    return matching if matching else list(statuses or [])
+    if matching:
+        if want in _fallback_engaged:
+            _fallback_engaged.discard(want)
+            log.info("VP %r: a printer of its model is reporting again — pool scoped to the model group", model)
+        return matching
+    if want not in _fallback_engaged:
+        _fallback_engaged.add(want)
+        seen = sorted({str(s.get("model") or "<none>") for s in statuses or [] if isinstance(s, dict)})
+        log.warning(
+            "VP %r: NO connected printer reports model %r — advertising the WHOLE hub's spools "
+            "(never-strand fallback). Models reported this beat: %s",
+            model, model, seen or "<no printers>",
+        )
+    return list(statuses or [])
 
 
 def loaded_keys(statuses: list[dict[str, Any]]) -> list[str]:
     out: list[str] = []
     for s in statuses or []:
-        if not isinstance(s, dict):
-            continue
-        for unit in s.get("ams") or []:
-            if not isinstance(unit, dict):
-                continue
-            for tray in unit.get("trays") or []:
-                k = tray_key(tray) if isinstance(tray, dict) else None
-                if k:
-                    out.append(k)
+        for tray in _spools(s):
+            k = tray_key(tray)
+            if k:
+                out.append(k)
     return out
 
 
@@ -294,15 +341,10 @@ def vp_pool_from_statuses_ranked(
     )
     deduped: dict[str, dict[str, Any]] = {}
     for status in ordered:
-        if not isinstance(status, dict):
-            continue
-        for unit in status.get("ams") or []:
-            if not isinstance(unit, dict):
-                continue
-            for tray in unit.get("trays") or []:
-                k = tray_key(tray) if isinstance(tray, dict) else None
-                if k:
-                    deduped.setdefault(k, tray)
+        for tray in _spools(status):
+            k = tray_key(tray)
+            if k:
+                deduped.setdefault(k, tray)
     if ranking is not None and len(deduped) > capacity:
         chosen = ranking.select(list(deduped.keys()), capacity, now)
     else:

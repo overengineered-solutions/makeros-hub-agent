@@ -1,7 +1,12 @@
 import unittest
 
 from makeros_hub.config import VirtualPrinterConfig, VirtualPrinterMember
+from makeros_hub.printers.bambu_parse import normalize_status
+from makeros_hub.vprinter import live_pool
 from makeros_hub.vprinter.live_pool import (
+    UNKNOWN_KEY,
+    loaded_keys,
+    scoped_statuses,
     updated_config_if_pool_changed,
     vp_pool_from_statuses,
 )
@@ -146,6 +151,69 @@ class TestLivePool(unittest.TestCase):
         b = {"printerId": "p-b", **_status([{"slot": 0, "material": "PLA", "filamentId": "GFA07", "colorHex": "FFFFFFFF", "productName": "BBB"}])}
         self.assertEqual(vp_pool_from_statuses([b, a], 1, 4)[0]["tray_sub_brands"], "AAA")
         self.assertEqual(vp_pool_from_statuses([a, b], 1, 4)[0]["tray_sub_brands"], "AAA")
+
+
+def _raw_status(pid, model, trays, vt_tray=None):
+    """A status built by the REAL DTO builder (bambu_parse.normalize_status) from a raw Bambu report —
+    the RC1 regression guard: `model` reaches the pool only if the DTO carries it. `trays` are raw
+    Bambu tray dicts at their array position (build_ams slots by position)."""
+    print_obj = {"gcode_state": "IDLE", "ams": {"tray_now": "255", "ams": [{"id": "0", "tray": trays}]}}
+    if vt_tray is not None:
+        print_obj["vt_tray"] = vt_tray
+    return normalize_status(pid, {"print": print_obj}, connection_state="connected", model=model)
+
+
+_WHITE_PLA = {"id": "0", "state": 9, "tray_type": "PLA", "tray_info_idx": "GFL99", "tray_color": "FFFFFFFF"}
+_BLACK_PETG = {"id": "0", "state": 9, "tray_type": "PETG", "tray_info_idx": "GFG99", "tray_color": "000000FF"}
+
+
+class TestRc1Rc2(unittest.TestCase):
+    def setUp(self):
+        live_pool._fallback_engaged.clear()
+
+    def test_pool_scopes_by_the_model_the_dto_carries(self):
+        a1 = _raw_status("p1", "A1 Mini", [_WHITE_PLA])
+        p2s = _raw_status("p2", "P2S", [_BLACK_PETG])
+        scoped = scoped_statuses([a1, p2s], "A1 Mini")
+        self.assertEqual([s["printerId"] for s in scoped], ["p1"])
+        self.assertEqual([t["tray_type"] for t in vp_pool_from_statuses(scoped, 4, 4)], ["PLA"])
+
+    def test_whole_hub_fallback_logs_loudly_on_the_edges_only(self):
+        a1 = _raw_status("p1", "A1 Mini", [_WHITE_PLA])
+        with self.assertLogs("makeros-hub.vprinter", level="WARNING") as engaged:
+            self.assertEqual(len(scoped_statuses([a1], "H2D")), 1)  # never-strand: whole hub
+        self.assertIn("WHOLE hub", engaged.output[0])
+        self.assertIn("A1 Mini", engaged.output[0])
+        with self.assertNoLogs("makeros-hub.vprinter", level="INFO"):
+            scoped_statuses([a1], "H2D")  # next beat: same condition, no drumbeat
+        h2d = _raw_status("p3", "H2D", [_BLACK_PETG])
+        with self.assertLogs("makeros-hub.vprinter", level="INFO") as recovered:
+            self.assertEqual([s["printerId"] for s in scoped_statuses([a1, h2d], "H2D")], ["p3"])
+        self.assertIn("scoped to the model group", recovered.output[0])
+
+    def test_external_spool_joins_the_pool(self):
+        vt = {"id": "254", "state": 9, "tray_type": "PLA", "tray_info_idx": "GFL99", "tray_color": "FFFFFFFF"}
+        s = _raw_status("p1", "A1 Mini", [{"id": "0"}], vt_tray=vt)
+        self.assertEqual([(t["tray_type"], t["tray_color"]) for t in vp_pool_from_statuses([s], 1, 4)], [("PLA", "FFFFFFFF")])
+        self.assertEqual(loaded_keys([s]), ["PLA|GFL99|FFFFFFFF"])
+        # an EMPTY external holder (full field set, no type, no state) contributes nothing
+        empty = _raw_status("p1", "A1 Mini", [{"id": "0"}], vt_tray={"id": "254", "tray_type": "", "tray_color": "00000000", "remain": 0})
+        self.assertEqual(vp_pool_from_statuses([empty], 1, 4), [])
+
+    def test_unidentified_spools_surface_once_as_unknown_sorted_last(self):
+        s1 = _raw_status("p1", "A1 Mini", [_WHITE_PLA, {"id": "1", "state": 9, "tray_type": ""}])
+        s2 = _raw_status("p2", "A1 Mini", [{"id": "0", "state": 9, "tray_type": ""}])
+        self.assertEqual(s1["unidentifiedSpools"], [{"unit": 0, "slot": 1}])  # per-printer detail for The Floor
+        pool = vp_pool_from_statuses([s1, s2], 1, 4)
+        self.assertEqual([t["tray_type"] for t in pool], ["PLA", "Unknown"])  # one marker for both printers, last
+        self.assertEqual((pool[1]["tray_info_idx"], pool[1]["tray_color"]), ("", "00000000"))
+        self.assertEqual(loaded_keys([s1, s2]), ["PLA|GFL99|FFFFFFFF", UNKNOWN_KEY, UNKNOWN_KEY])
+        # the marker appearing is a DISPLAY change (ams.version bumps); a stable marker does not churn
+        cfg = _cfg(vp_pool_from_statuses([s1], 1, 4))
+        self.assertIsNone(updated_config_if_pool_changed(cfg, [s1]))
+        self.assertIsNotNone(updated_config_if_pool_changed(_cfg(pool[:1]), [s1]))
+        # capacity still caps: a 1-slot VP shows the real spool, not the marker
+        self.assertEqual([t["tray_type"] for t in vp_pool_from_statuses([s1, s2], 1, 1)], ["PLA"])
 
 
 class TestUpdatedConfig(unittest.TestCase):

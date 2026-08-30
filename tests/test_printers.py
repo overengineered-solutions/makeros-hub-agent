@@ -61,6 +61,55 @@ class TestNormalizeStatus(unittest.TestCase):
             s = bambu_parse.normalize_status("p", self._merged(**fields), connection_state="connected")
             self.assertNotIn("skippedObjects", s)
 
+    def test_model_and_raw_gcode_state_ride_the_dto(self):
+        # RC1: the VP live-mirror scopes each pool by status["model"] — it must come from the DTO, not a
+        # test fixture. RC6: the cloud needs the RAW state (FINISH = part still on the bed) next to the
+        # collapsed one. Both are additive keys pstation's hand-picking ingest ignores until it uses them.
+        merged = self._merged(gcode_state="FINISH")
+        s = bambu_parse.normalize_status("p", merged, connection_state="connected", model="A1 Mini")
+        self.assertEqual(s["model"], "A1 Mini")
+        self.assertEqual(s["state"], "idle")
+        self.assertEqual(s["gcodeState"], "FINISH")
+        off = bambu_parse.normalize_status("p", merged, connection_state="offline", model=" A1 Mini ")
+        self.assertEqual(off["model"], "A1 Mini")  # identity, not telemetry: present while offline too
+        self.assertNotIn("gcodeState", off)
+        bare = bambu_parse.normalize_status("p", self._merged(gcode_state=""), connection_state="connected")
+        self.assertNotIn("model", bare)
+        self.assertNotIn("gcodeState", bare)
+
+    def test_unidentified_spools_use_the_tray_state_rule_and_contiguous_units(self):
+        ams = {
+            "ams": [
+                {
+                    "id": "0",
+                    "tray": [
+                        {"id": "0"},                                                        # empty: bare id
+                        {"id": "1", "state": "9", "tray_type": "", "tray_color": "00000000"},  # SPOOL|STEADY, untyped
+                        {"id": "2", "state": 1, "tray_type": ""},                           # inserted, still reading
+                        {"id": "3", "tray_type": "", "tray_color": "00000000", "remain": -1},  # legacy report, no state
+                    ],
+                },
+                "garbage",
+                {"id": "128", "tray": [{"id": "0", "state": 3, "tray_type": "PLA"}, {"id": "1", "state": 3}]},
+            ]
+        }
+        # An EMPTY external holder reports a full field set — never flagged without a state bit.
+        print_obj = {"ams": ams, "vt_tray": {"id": "254", "tray_type": "", "tray_color": "00000000", "remain": 0}}
+        self.assertEqual(
+            bambu_parse.build_unidentified_spools(print_obj),
+            [{"unit": 0, "slot": 1}, {"unit": 0, "slot": 3}, {"unit": 1, "slot": 1}],  # raw id 128 -> unit 1
+        )
+        print_obj["vt_tray"]["state"] = 9
+        self.assertEqual(bambu_parse.build_unidentified_spools(print_obj)[-1], {"slot": 254})
+        s = bambu_parse.normalize_status("p", {"print": print_obj}, connection_state="connected")
+        self.assertEqual(len(s["unidentifiedSpools"]), 4)
+        self.assertNotIn(
+            "unidentifiedSpools",
+            bambu_parse.normalize_status("p", {"print": print_obj}, connection_state="offline"),
+        )
+        self.assertIsNone(bambu_parse.build_unidentified_spools({"ams": {"ams": [{"id": "0", "tray": [{"id": "0"}]}]}}))
+        self.assertIsNone(bambu_parse.build_unidentified_spools({"vt_tray": {"id": "254", "state": 9, "tray_type": "PLA"}}))
+
     def test_finish_and_failed_are_both_idle(self):
         # A finished OR failed job leaves the printer free again — a failed *job*
         # is not a printer *fault* (real faults surface via HMS). Bed-occupancy
@@ -422,7 +471,7 @@ class TestAmsHmsBuilders(unittest.TestCase):
             "vt_tray": {
                 "tray_type": "PLA",
                 "tray_sub_brands": "PLA Marble",
-                "tray_info_idx": "ignored-for-vt",
+                "tray_info_idx": "GFL99",
                 "tray_color": "10203040",
                 "remain": "55.5",
                 "tag_uid": "vt-uid",
@@ -434,6 +483,7 @@ class TestAmsHmsBuilders(unittest.TestCase):
             {
                 "material": "PLA",
                 "productName": "PLA Marble",
+                "filamentId": "GFL99",
                 "colorHex": "10203040",
                 "remainPct": 55.5,
                 "tagUid": "vt-uid",
