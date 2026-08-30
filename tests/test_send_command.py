@@ -248,3 +248,37 @@ class TestSendCommand(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestVersionReask(unittest.TestCase):
+    """Only the A1 minis answered the connect-time get_version on the live fleet; the X1C, P2S and H2D stayed silent,
+    so their real module lists never arrived — and those lists are exactly what a VP of that model must present to
+    OrcaSlicer. Re-ask until one arrives, then stop."""
+
+    def test_reasks_until_answered_then_stops_and_gives_up_eventually(self):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True)
+        adapter._connack = "ok"
+        published = adapter._client.published
+
+        adapter.request_version_if_missing()
+        self.assertEqual(len(published), 1)
+        self.assertIn("get_version", published[0][1])
+        # rate-limited: not again in the same minute
+        adapter.request_version_if_missing()
+        self.assertEqual(len(published), 1)
+        # a minute later it asks again
+        adapter._version_asked_at -= 61
+        adapter.request_version_if_missing()
+        self.assertEqual(len(published), 2)
+        # once the printer answers, it never asks again
+        adapter._version_logged = True
+        adapter._version_asked_at -= 61
+        adapter.request_version_if_missing()
+        self.assertEqual(len(published), 2)
+        # and a printer that never answers is not pinged forever
+        adapter._version_logged = False
+        for _ in range(20):
+            adapter._version_asked_at -= 61
+            adapter.request_version_if_missing()
+        self.assertEqual(len(published), 5)

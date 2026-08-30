@@ -97,6 +97,8 @@ class BambuAdapter:
         self._started = 0.0
         self._shape_logged = False
         self._version_logged = False
+        self._version_asked_at = 0.0
+        self._version_asks = 0
         self._client: mqtt.Client | None = None
         # Terminal-job detection over the merged state (pure; fed under _lock).
         self._jobs = JobTracker(printer_id, serial, state_path=TERMINAL_JOBS_DIR / f"{_safe_file_component(printer_id)}.json")
@@ -210,6 +212,30 @@ class BambuAdapter:
         # was added) — stay signature-agnostic since we only log here. paho
         # auto-reconnects; status() degrades to offline if reports go stale.
         log.info("bambu %s disconnected — will reconnect", self.printer_id)
+
+    def request_version_if_missing(self) -> None:
+        """Ask again for get_version until the printer actually answers with modules.
+
+        The request goes out once at connect, and on this fleet only the A1 minis replied — the X1C, P2S and H2D
+        stayed silent, so their real module lists (the thing a VP of that model must present to OrcaSlicer) never
+        arrived. A get_version request is read-only and the printer answers on the same report topic, so re-asking
+        costs nothing; it stops the moment a module list is captured, and gives up after a few tries rather than
+        pinging a printer that never answers.
+        """
+        if self._version_logged or self._version_asks >= 5:
+            return
+        now = time.monotonic()
+        if now - self._version_asked_at < 60:
+            return
+        client = self._client
+        if client is None:
+            return
+        self._version_asked_at = now
+        self._version_asks += 1
+        try:
+            client.publish(self._request_topic, GET_VERSION)
+        except Exception as exc:  # noqa: BLE001 — a version probe must never disturb the poll
+            log.debug("bambu %s: get_version re-ask failed: %s", self.printer_id, exc)
 
     # --- status read (any thread) -----------------------------------------
     def status(self) -> dict:
