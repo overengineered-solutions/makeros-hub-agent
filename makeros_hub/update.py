@@ -42,6 +42,10 @@ STATE_PATH = Path(
 # Don't re-attempt the SAME target more often than this — avoids hammering a
 # broken release (failed update -> systemd restarts old agent -> sees target).
 ATTEMPT_COOLDOWN_SEC = 900
+# v0.55: a target that has been INSTALLED this many times and still isn't what the running agent reports means the
+# release itself is wrong (v0.51–v0.54 bumped pyproject but not __version__ → the hub reinstalled + restarted itself
+# every 15 min for an hour, mid-print). Stop, say so, and wait for a NEW target instead of looping forever.
+MAX_ATTEMPTS_PER_TARGET = 3
 COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # Update transport (dual-review 2026-07-20 — Docker portability): 'systemd' (default; sudo root script → transient
 # unit → systemctl restart), 'exit' (container: record the target + exit EXIT_FOR_UPDATE_CODE so an orchestrator
@@ -106,6 +110,11 @@ def recently_attempted(target: str, now: float | None = None) -> bool:
     return st.get("target") == target and (now - float(st.get("at", 0))) < ATTEMPT_COOLDOWN_SEC
 
 
+def attempts_exhausted(target: str) -> bool:
+    st = _read_state()
+    return st.get("target") == target and int(st.get("attempts", 0)) >= MAX_ATTEMPTS_PER_TARGET
+
+
 def apply_update(tag: str, expected_sha: str | None = None) -> bool:
     """Trigger an update to a validated release tag. Behavior follows MAKEROS_HUB_UPDATE_MODE:
       - 'systemd' (default): run the sudo root script, which (with expected_sha) verifies the tag resolves to
@@ -123,7 +132,9 @@ def apply_update(tag: str, expected_sha: str | None = None) -> bool:
     if UPDATE_MODE == "disabled":
         log.info("OTA: update to %s requested but MAKEROS_HUB_UPDATE_MODE=disabled — ignoring", tag)
         return False
-    _write_state({"target": tag, "at": time.time()})
+    prev = _read_state()
+    attempts = int(prev.get("attempts", 0)) + 1 if prev.get("target") == tag else 1
+    _write_state({"target": tag, "at": time.time(), "attempts": attempts})
     if UPDATE_MODE == "exit":
         log.warning("OTA: MAKEROS_HUB_UPDATE_MODE=exit — recorded target %s; exiting %d for the orchestrator to "
                     "repull the pinned image", tag, EXIT_FOR_UPDATE_CODE)
@@ -162,6 +173,11 @@ def maybe_update(current_version: str, target_version, target_sha=None) -> bool:
     """Decide + (if appropriate) trigger an update. `target_sha` (optional) is the cloud's content-trust pin.
     Returns True if a systemd update launched; honors the cooldown so a broken target can't loop."""
     if not isinstance(target_version, str) or not should_update(current_version, target_version):
+        return False
+    if attempts_exhausted(target_version):
+        log.error("OTA: target %s was installed %d times but this agent still reports %s — the release is not "
+                  "reporting its own version (bump makeros_hub/__init__.py:__version__); refusing to loop until a "
+                  "NEW target is set", target_version, MAX_ATTEMPTS_PER_TARGET, current_version)
         return False
     if recently_attempted(target_version):
         log.info("OTA: target %s attempted recently — waiting out the cooldown", target_version)

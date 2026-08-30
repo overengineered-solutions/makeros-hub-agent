@@ -57,6 +57,36 @@ class TestCooldown(unittest.TestCase):
                 # a different target is not cooled down
                 self.assertFalse(update.recently_attempted("v0.3.2", now=1000.0 + 10))
 
+    def test_attempt_cap_stops_a_non_converging_target(self):
+        # v0.55: installed 3x and still running the old version ⇒ never launch again for that target.
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "last_update.json"
+            with mock.patch.object(update, "STATE_PATH", p), mock.patch.object(
+                update, "apply_update", return_value=True
+            ) as launch:
+                update._write_state({"target": "v0.54.0", "at": 0.0, "attempts": update.MAX_ATTEMPTS_PER_TARGET})
+                self.assertFalse(update.maybe_update("0.50.0", "v0.54.0", "a" * 40))
+                launch.assert_not_called()
+                # one attempt short of the cap (and past the cooldown) still launches
+                update._write_state({"target": "v0.54.0", "at": 0.0, "attempts": update.MAX_ATTEMPTS_PER_TARGET - 1})
+                self.assertTrue(update.maybe_update("0.50.0", "v0.54.0", "a" * 40))
+                launch.assert_called_once()
+                # a NEW target starts its own count
+                update._write_state({"target": "v0.54.0", "at": 0.0, "attempts": 99})
+                self.assertFalse(update.attempts_exhausted("v0.56.0"))
+
+    def test_apply_update_counts_attempts_per_target(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "last_update.json"
+            with mock.patch.object(update, "STATE_PATH", p), mock.patch.object(
+                update.subprocess, "run", return_value=None
+            ):
+                for n in (1, 2):
+                    self.assertTrue(update.apply_update("v0.54.0", "a" * 40))
+                    self.assertEqual(update._read_state()["attempts"], n)
+                self.assertTrue(update.apply_update("v0.55.0", "b" * 40))
+                self.assertEqual(update._read_state()["attempts"], 1)
+
     def test_no_state_means_not_recent(self):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.object(update, "STATE_PATH", Path(d) / "missing.json"):
