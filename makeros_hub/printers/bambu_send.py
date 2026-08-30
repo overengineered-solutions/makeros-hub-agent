@@ -109,32 +109,96 @@ def build_print_start_payload(
     sequence_id,
     subtask_name: str | None = None,
     bed_type: str = "textured_plate",
+    raw_print: dict | None = None,
 ) -> dict:
-    """Build the exact MQTT project_file command for a root-uploaded 3MF."""
+    """Build the exact MQTT project_file command for a root-uploaded 3MF.
+
+    With `raw_print` (the member's own `print` command captured by the Virtual Printer, agent v0.51 / design
+    B1 + owner decision 6) the command is REPLAYED: every option OrcaSlicer set — bed type, calibration flags,
+    timelapse, and the H2D's dual-nozzle `ams_mapping2`/nozzle fields we cannot enumerate — reaches the
+    physical printer verbatim. Only the job identity is forced (command, ids, file, url, param, md5, sequence).
+    ponytail: virtual→physical tray translation is the identity today (a single-machine model group's VP pool
+    is 1:1 with that machine's trays); B3's `match` rewrites ams_mapping/ams_mapping2 here.
+    """
     task_name = subtask_name or os.path.splitext(os.path.basename(file_name))[0]
+    replay = raw_print if isinstance(raw_print, dict) and raw_print else None
+    if replay is not None and isinstance(replay.get("subtask_name"), str) and replay["subtask_name"].strip():
+        task_name = replay["subtask_name"].strip()[:120]
+    built = _rebuilt_print(
+        file_name, task_name, plate=plate, use_ams=use_ams, ams_mapping=ams_mapping, sequence_id=sequence_id, bed_type=bed_type
+    )
+    if replay is None:
+        return {"print": built}
+    merged = {k: v for k, v in replay.items() if k not in _FORCED_KEYS and k not in _DROPPED_KEYS}
+    merged["use_ams"] = merged["use_ams"] if isinstance(merged.get("use_ams"), bool) else bool(use_ams)
+    merged["ams_mapping"] = _coerce_ams_mapping(merged["ams_mapping"] if "ams_mapping" in merged else ams_mapping)
+    if "ams_mapping2" in merged:
+        # codex round 1: presence of ams_mapping2 is itself a dual-nozzle signal — a malformed one is DROPPED, never
+        # replaced by an empty list the printer might read as "second nozzle, no trays".
+        mapping2 = _coerce_ams_mapping(merged["ams_mapping2"])
+        if mapping2:
+            merged["ams_mapping2"] = mapping2
+        else:
+            merged.pop("ams_mapping2")
+    if not isinstance(merged.get("bed_type"), str) or not merged["bed_type"].strip():
+        merged["bed_type"] = bed_type
+    for key in _FORCED_KEYS:
+        merged[key] = built[key]
+    return {"print": merged}
+
+
+# Identity ALIASES BambuLAN also honours: `gcode_file` names a file (the gcode_file command's source) and `plate`
+# selects a plate beside `param`. Neither is rebuilt, so they are DROPPED from the replay (codex round 1) — the
+# forced `file`/`url`/`param` are the only file and plate selectors the printer sees.
+_DROPPED_KEYS = frozenset({"gcode_file", "plate"})
+
+# Job identity + transport fields the hub ALWAYS owns, whatever the member's command said.
+_FORCED_KEYS = (
+    "command",
+    "project_id",
+    "profile_id",
+    "task_id",
+    "subtask_id",
+    "param",
+    "file",
+    "url",
+    "md5",
+    "sequence_id",
+    "subtask_name",
+)
+
+
+def _rebuilt_print(
+    file_name: str,
+    task_name: str,
+    *,
+    plate: int,
+    use_ams: bool,
+    ams_mapping,
+    sequence_id,
+    bed_type: str,
+) -> dict:
     return {
-        "print": {
-            "command": "project_file",
-            "project_id": "0",
-            "profile_id": "0",
-            "task_id": "0",
-            "subtask_id": "0",
-            "param": f"Metadata/plate_{plate}.gcode",
-            "file": file_name,
-            "url": f"ftp:///{file_name}",
-            "subtask_name": task_name,
-            "bed_type": bed_type,
-            "bed_leveling": True,
-            "bed_levelling": True,
-            "flow_cali": False,
-            "vibration_cali": True,
-            "layer_inspect": False,
-            "timelapse": False,
-            "md5": "",
-            "use_ams": use_ams,
-            "ams_mapping": _coerce_ams_mapping(ams_mapping),
-            "sequence_id": str(sequence_id),
-        }
+        "command": "project_file",
+        "project_id": "0",
+        "profile_id": "0",
+        "task_id": "0",
+        "subtask_id": "0",
+        "param": f"Metadata/plate_{plate}.gcode",
+        "file": file_name,
+        "url": f"ftp:///{file_name}",
+        "subtask_name": task_name,
+        "bed_type": bed_type,
+        "bed_leveling": True,
+        "bed_levelling": True,
+        "flow_cali": False,
+        "vibration_cali": True,
+        "layer_inspect": False,
+        "timelapse": False,
+        "md5": "",
+        "use_ams": use_ams,
+        "ams_mapping": _coerce_ams_mapping(ams_mapping),
+        "sequence_id": str(sequence_id),
     }
 
 

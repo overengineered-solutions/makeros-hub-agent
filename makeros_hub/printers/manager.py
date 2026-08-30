@@ -516,6 +516,11 @@ class PrinterManager:
             if objects:
                 uploading["objects"] = objects
             reports.append(uploading)
+            # The member's own print command (cloud-stored from the capture, agent v0.51+): replayed verbatim by
+            # the adapter so dual-nozzle/H2D fields survive. Absent for web uploads → the adapter rebuilds.
+            raw_print = assignment.get("rawPrint")
+            if not isinstance(raw_print, dict) or not raw_print:
+                raw_print = None
             try:
                 result = start_print(
                     local_path,
@@ -524,6 +529,7 @@ class PrinterManager:
                     use_ams=bool(assignment.get("useAms", False)),
                     ams_mapping=assignment.get("amsMapping"),
                     queue_job_id=queue_job_id,
+                    raw_print=raw_print,
                 )
             except Exception as e:  # noqa: BLE001
                 code = self._access_code_for(printer_id)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import time
 import uuid
@@ -14,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
+
+log = logging.getLogger("makeros-hub.vprinter.capture")
 
 
 SLICE_INFO_PATH = "Metadata/slice_info.config"
@@ -59,6 +62,12 @@ class CapturedJob:
     # model group) and its serial lets the cloud dedupe a double Send per VP.
     vp_serial: str = ""
     vp_model: str = ""
+    # OrcaSlicer's own `print` command as sent to the VP (bounded copy, v0.51). The hub REPLAYS it to the assigned
+    # printer (bambu_send.build_print_start_payload raw_print=...) so every option the member chose — plate, bed
+    # type, calibration flags, timelapse, and the H2D's dual-nozzle `ams_mapping2`/nozzle fields we cannot
+    # enumerate — reaches the machine verbatim; only file/url/ids/sequence are forced. None = no captured
+    # command (web upload) → the dispatcher rebuilds the command exactly as before.
+    raw_print: dict[str, Any] | None = None
 
     @property
     def file_sha256(self) -> str:
@@ -312,6 +321,28 @@ def _oldest_key(bucket: OrderedDict[_CaptureKey, deque[_PendingItem]]) -> _Captu
     return min(candidates, key=lambda item: item[0])[1]
 
 
+RAW_PRINT_MAX_BYTES = 16 * 1024
+
+
+def replayable_print(raw: Any) -> dict[str, Any] | None:
+    """A bounded, JSON-clean copy of the member's `print` command for replay; None when absent, unencodable or
+    oversized (the dispatcher then falls back to the rebuilt command, exactly as before v0.51)."""
+    if not isinstance(raw, dict) or not raw:
+        return None
+    try:
+        encoded = json.dumps(raw, sort_keys=True, default=str)
+    except (TypeError, ValueError, RecursionError):   # RecursionError: a pathologically nested command (codex)
+        return None
+    if len(encoded) > RAW_PRINT_MAX_BYTES:
+        log.warning(
+            "vprinter.capture raw print command is %d bytes (> %d) — not replaying it",
+            len(encoded),
+            RAW_PRINT_MAX_BYTES,
+        )
+        return None
+    return json.loads(encoded)
+
+
 def assemble_captured_job(
     upload: UploadRecord,
     intent: ProjectFileIntent,
@@ -352,6 +383,7 @@ def assemble_captured_job(
         plate=intent.plate,
         vp_serial=vp_serial,
         vp_model=vp_model,
+        raw_print=replayable_print(intent.raw),
     )
 
 
@@ -381,6 +413,10 @@ def build_vp_submit_body(job: CapturedJob, *, model: str) -> dict[str, Any]:
         body["amsMappingRaw"] = job.ams_mapping
     if job.vp_serial:
         body["vpSerial"] = job.vp_serial
+    # Additive (agent v0.51): the member's own print command; the cloud stores it and hands it back in the
+    # assignment so dispatch replays it (see CapturedJob.raw_print).
+    if isinstance(job.raw_print, dict) and job.raw_print:
+        body["rawPrint"] = job.raw_print
     return body
 
 

@@ -207,6 +207,7 @@ class BambuAdapter:
         use_ams: bool = False,
         ams_mapping=None,
         queue_job_id: str | None = None,
+        raw_print: dict | None = None,
     ) -> dict:
         client = self._client
         connected = False
@@ -232,6 +233,7 @@ class BambuAdapter:
             use_ams=use_ams,
             ams_mapping=ams_mapping,
             sequence_id=sequence_id,
+            raw_print=raw_print,
         )
         try:
             info = client.publish(self._request_topic, json.dumps(payload))

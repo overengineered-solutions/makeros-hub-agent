@@ -41,6 +41,7 @@ def to_record(job: CapturedJob) -> dict[str, Any]:
         "attempts": job.attempts,
         "vp_serial": job.vp_serial,
         "vp_model": job.vp_model,
+        "raw_print": job.raw_print,
     }
 
 
@@ -77,6 +78,7 @@ def from_record(record: dict[str, Any]) -> CapturedJob:
         "attempts": max(0, _int_field(record, "attempts", default=0)),
         "vp_serial": _str_field(record, "vp_serial", "vpSerial", default="") or "",
         "vp_model": _str_field(record, "vp_model", "vpModel", default="") or "",
+        "raw_print": _dict_field(record, "raw_print", "rawPrint", default=None),
     }
     if submission_uid is not None:
         kwargs["submission_uid"] = validate_submission_uid(submission_uid)
@@ -150,6 +152,11 @@ def _field(record: dict[str, Any], *names: str, default: Any) -> Any:
         if name in record:
             return record[name]
     return default
+
+
+def _dict_field(record: dict[str, Any], *names: str, default: dict[str, Any] | None) -> dict[str, Any] | None:
+    value = _field(record, *names, default=default)
+    return value if isinstance(value, dict) and value else default
 
 
 def _str_field(record: dict[str, Any], *names: str, default: str | None) -> str | None:
