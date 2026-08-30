@@ -345,7 +345,9 @@ class MqttBroker:
                 periodic_task.cancel()
                 await asyncio.gather(periodic_task, return_exceptions=True)
             if session is not None:
-                self._cancel_finish(session)
+                finish = self._cancel_finish(session)
+                if finish is not None:
+                    await asyncio.gather(finish, return_exceptions=True)
                 self._sessions.discard(session)
             writer.close()
             await _wait_closed(writer)
@@ -395,7 +397,8 @@ class MqttBroker:
             session.writer.write(build_puback(publish.packet_id))
             await _drain(session.writer)
             self.log(f"MQTT PUBACK peer={session.peer} packet_id={publish.packet_id}")
-        if not _is_request_topic(publish.topic):
+        if publish.topic != session.request_topic:
+            self.log(f"MQTT ignoring PUBLISH on foreign topic {publish.topic!r} from peer={session.peer}")
             return
         if _is_pushall(parsed):
             await self._send_report(session, "pushall")
@@ -438,7 +441,14 @@ class MqttBroker:
             try:
                 await self._send_report(session, "hot_apply")
             except Exception as exc:  # noqa: BLE001 - one dead client must not block the broadcast
-                self.log(f"MQTT hot_apply push failed for peer={session.peer}: {exc}")
+                # Evict the dead client now so repeated hot-applies never hit the same broken writer; its
+                # handler's finally finds the writer closed and finishes the cleanup.
+                self.log(f"MQTT hot_apply push failed for peer={session.peer}: {exc} — dropping session")
+                finish = self._cancel_finish(session)
+                if finish is not None:
+                    await asyncio.gather(finish, return_exceptions=True)
+                session.writer.close()
+                self._sessions.discard(session)
 
     async def _send_report(self, session: MqttSession, reason: str) -> None:
         if not self._session_is_active(session):
@@ -529,11 +539,10 @@ class MqttBroker:
         self._cancel_finish(session)
 
         async def _finish() -> None:
-            try:
-                await asyncio.sleep(FINISH_DELAY_SEC)
-                self._set_session_state(session, "FINISH", gcode_file=gcode_file, prepare_percent="100")
-            except asyncio.CancelledError:
-                pass
+            # Cancellation propagates (no swallowed CancelledError): whoever cancels awaits the task, and
+            # a cancelled finish must READ as cancelled, not as a normal completion.
+            await asyncio.sleep(FINISH_DELAY_SEC)
+            self._set_session_state(session, "FINISH", gcode_file=gcode_file, prepare_percent="100")
 
         session.finish_task = asyncio.create_task(_finish())
 
@@ -621,11 +630,6 @@ def _command_name(parsed: Any) -> str | None:
         if isinstance(value, dict) and isinstance(value.get("command"), str):
             return value["command"]
     return None
-
-
-def _is_request_topic(topic: str) -> bool:
-    parts = topic.split("/")
-    return len(parts) == 3 and parts[0] == "device" and parts[2] == "request"
 
 
 def _serial_from_report_topic(topic: str) -> str | None:

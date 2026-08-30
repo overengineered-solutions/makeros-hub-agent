@@ -203,6 +203,62 @@ class TestMultiSession(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_dead_writer_is_evicted_on_push_and_others_still_get_it(self):
+        async def run():
+            broker = _broker()
+            a = _Client(broker, "m1", 5001)
+            b = _Client(broker, "m2", 5002)
+            await a.settle(broker)
+            await b.settle(broker)
+            await a.send(_project_file("alice.3mf"))
+            dead = a.session(broker)
+            pending = dead.finish_task
+
+            def boom(_data):
+                raise BrokenPipeError("peer went away")
+
+            a.writer.write = boom
+            before = len(_published(b.writer))
+            await broker.push_report_now()  # no exception
+            self.assertNotIn(dead, broker._sessions)
+            self.assertTrue(a.writer.closed)
+            self.assertTrue(pending.cancelled() or pending.done())
+            self.assertEqual(len(_published(b.writer)), before + 1)
+            await broker.push_report_now()  # a second hot-apply never touches the dead writer again
+            await a.disconnect()  # the handler's own cleanup still completes
+            await b.disconnect()
+
+        asyncio.run(run())
+
+    def test_disconnect_awaits_the_pending_finish_task(self):
+        async def run():
+            broker = _broker()
+            a = _Client(broker, "m1", 5001)
+            await a.settle(broker)
+            await a.send(_project_file("alice.3mf"))
+            pending = a.session(broker).finish_task
+            await a.disconnect()
+            self.assertTrue(pending.cancelled())  # cancelled AND awaited before the handler returned
+
+        asyncio.run(run())
+
+    def test_publish_on_a_foreign_request_topic_is_ignored(self):
+        async def run():
+            captured = []
+            broker = _broker(on_project_file=captured.append)
+            a = _Client(broker, "m1", 5001)
+            await a.settle(broker)
+            acks_before = len(_published(a.writer))
+            a.reader.feed_data(_publish_frame("device/OTHERSERIAL/request", _project_file("x.3mf")))
+            for _ in range(20):
+                await asyncio.sleep(0)
+            self.assertEqual(captured, [])
+            self.assertEqual(len(_published(a.writer)), acks_before)  # no ack for a topic that is not ours
+            self.assertEqual(a.session(broker).gcode_state, "IDLE")
+            await a.disconnect()
+
+        asyncio.run(run())
+
     def test_close_tears_down_every_session_and_pending_finish(self):
         async def run():
             broker = _broker()

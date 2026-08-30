@@ -1020,10 +1020,33 @@ class TestCaptureAssembly(unittest.TestCase):
                     {"slot": 0, "type": "PLA", "color": "FFFFFFFF", "trayInfoIdx": "GFL99"}
                 ],
                 "plate": 1,
+                "amsMappingRaw": [0, 1],
             },
         )
         self.assertNotIn("accessCode", body)
         self.assertNotIn("access_code", body)
+
+    def test_build_vp_submit_body_carries_the_capturing_vps_identity(self):
+        # Multi-VP: the job's target model is the VP that captured it, never the hub's first live VP;
+        # the serial + the raw mapping shape ride along for the cloud's double-Send dedupe.
+        job = CapturedJob(
+            member_id="member-1", filename="part.3mf", file_path=Path("part.3mf"), sha256="d" * 64, size=1,
+            ams_mapping={"ams_mapping": [3], "ams_mapping2": {"0": 1}}, use_ams=True, required_filaments=[],
+            submitted_at=datetime(2026, 6, 13, tzinfo=timezone.utc), plate=2,
+            vp_serial="00M09VP797134935", vp_model="A1 Mini",
+        )
+        body = build_vp_submit_body(job, model="X1C")
+        self.assertEqual(body["printerModel"], "A1 Mini")
+        self.assertEqual(body["vpSerial"], "00M09VP797134935")
+        self.assertEqual(body["amsMappingRaw"], {"ams_mapping": [3], "ams_mapping2": {"0": 1}})
+        self.assertEqual(body["amsMapping"], [3])
+        self.assertEqual((body["fileSha256"], body["plate"]), ("d" * 64, 2))
+        # outbox records round-trip the VP identity (older records without it fall back to the hub model)
+        from makeros_hub.vprinter.outbox import to_record
+        loaded = from_record(to_record(job))
+        self.assertEqual((loaded.vp_serial, loaded.vp_model), ("00M09VP797134935", "A1 Mini"))
+        legacy = from_record({"memberId": "m", "fileName": "f", "fileSha256": "e" * 64})
+        self.assertEqual(build_vp_submit_body(legacy, model="X1C")["printerModel"], "X1C")
 
     def test_build_vp_submit_body_omits_absent_plate_and_uid_is_stable(self):
         job = CapturedJob(
@@ -1181,6 +1204,35 @@ class TestCaptureAssembly(unittest.TestCase):
         self.assertEqual(captured, [])
         self.assertTrue(any("md5" in message for message in messages))
 
+    def test_redelivered_project_file_never_pairs_with_the_next_upload(self):
+        captured = []
+        messages = []
+        now = [100.0]
+        with tempfile.TemporaryDirectory() as d:
+            first = Path(d) / "first.3mf"
+            second = Path(d) / "second.3mf"
+            first.write_bytes(b"one")
+            second.write_bytes(b"two")
+            coordinator = CaptureCoordinator(captured.append, messages.append, upload_wait_sec=60.0, clock=lambda: now[0])
+            cmd = {"command": "project_file", "sequence_id": "41", "file": "part.3mf"}
+            coordinator.record_upload(UploadRecord("m1", "part.3mf", first, "sha1", 3))
+            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", None, None, False, None, dict(cmd)))
+            coordinator.record_upload(UploadRecord("m1", "part.3mf", second, "sha2", 3))
+            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", None, None, False, None, dict(cmd)))  # QoS1 re-delivery
+            self.assertEqual([job.file_path.name for job in captured], ["first.3mf"])  # second upload still waits
+            self.assertTrue(any("re-delivered" in message for message in messages))
+            fresh = dict(cmd, sequence_id="42")  # the member's genuine next Send
+            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", None, None, False, None, fresh))
+            self.assertEqual([job.file_path.name for job in captured], ["first.3mf", "second.3mf"])
+            # no sequence_id: the whole raw command is the identity
+            unnumbered = ProjectFileIntent("m1", "part.3mf", None, None, False, None, {"command": "project_file", "file": "part.3mf"})
+            coordinator.record_project_file(unnumbered)
+            coordinator.record_project_file(unnumbered)
+            self.assertEqual(sum(len(q) for q in coordinator._intents.values()), 1)
+            now[0] += 31.0  # past the dedupe window the same command is accepted again
+            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", None, None, False, None, dict(cmd)))
+            self.assertEqual(sum(len(q) for q in coordinator._intents.values()), 2)
+
     def test_same_member_same_filename_twice_captures_both_in_order(self):
         # RC8: a member's double Send (or two OrcaSlicers) inside the pairing window is two jobs, paired
         # FIFO (upload N with command N), each with its own submission uid — never an "ambiguous" drop.
@@ -1194,9 +1246,10 @@ class TestCaptureAssembly(unittest.TestCase):
             coordinator = CaptureCoordinator(captured.append, messages.append)
             coordinator.record_upload(UploadRecord("m1", "part.3mf", first, "sha", 10))
             coordinator.record_upload(UploadRecord("m1", "part.3mf", second, "sha", 10))
-            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", [0], None, True, None, {}, plate=1))
+            # OrcaSlicer numbers every command: a genuine second Send carries the next sequence_id
+            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", [0], None, True, None, {"sequence_id": "1"}, plate=1))
             self.assertEqual([job.file_path.name for job in captured], ["first.3mf"])  # oldest upload first
-            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", [0], None, True, None, {}, plate=1))
+            coordinator.record_project_file(ProjectFileIntent("m1", "part.3mf", [0], None, True, None, {"sequence_id": "2"}, plate=1))
 
         self.assertEqual([job.file_path.name for job in captured], ["first.3mf", "second.3mf"])
         self.assertEqual({job.member_id for job in captured}, {"m1"})

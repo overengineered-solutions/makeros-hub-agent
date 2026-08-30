@@ -39,6 +39,8 @@ def to_record(job: CapturedJob) -> dict[str, Any]:
         "submission_uid": validate_submission_uid(job.submission_uid),
         "plate": job.plate,
         "attempts": job.attempts,
+        "vp_serial": job.vp_serial,
+        "vp_model": job.vp_model,
     }
 
 
@@ -73,6 +75,8 @@ def from_record(record: dict[str, Any]) -> CapturedJob:
         "submitted_at": _datetime_field(record, "submitted_at", "submittedAt"),
         "plate": _optional_int_field(record, "plate", default=None),
         "attempts": max(0, _int_field(record, "attempts", default=0)),
+        "vp_serial": _str_field(record, "vp_serial", "vpSerial", default="") or "",
+        "vp_model": _str_field(record, "vp_model", "vpModel", default="") or "",
     }
     if submission_uid is not None:
         kwargs["submission_uid"] = validate_submission_uid(submission_uid)
