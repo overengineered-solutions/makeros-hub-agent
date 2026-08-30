@@ -79,15 +79,39 @@ class TestDispatchOrder(unittest.TestCase):
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5], queue_job_id="q1",
                               raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]},
                               required_filaments=[{"slot": 1, "type": "PLA", "color": "FFFFFF"}])
-            self.assertEqual(r, {"ok": False, "reason": "spool_mismatch: printer has not reported its trays recently"})
+            self.assertEqual(r, {"ok": False, "reason": "printer_stale: printer has not reported its trays recently"})
             up.assert_not_called()
 
-    def test_without_requirements_the_replay_is_untouched(self):
+    def test_without_requirements_an_ams_print_is_refused_and_an_external_print_passes(self):
         import json
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf"):
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5], queue_job_id="q1",
                               raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]})
+            self.assertFalse(r["ok"]); self.assertIn("no filament requirements", r["reason"]); up.assert_not_called()
+            r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=False, ams_mapping=[254], queue_job_id="q2",
+                              raw_print={"command": "project_file", "use_ams": False, "ams_mapping": [254]})
             self.assertTrue(r["ok"], r)
-            self.assertEqual(json.loads(a._client.published[0])["print"]["ams_mapping"], [5])
+            self.assertEqual(json.loads(a._client.published[0])["print"]["ams_mapping"], [254])
+
+
+class TestRefusalCarriesAssignmentSeq(unittest.TestCase):
+    def test_held_report_echoes_the_assignment_sequence(self):
+        from makeros_hub.printers.manager import PrinterManager
+
+        class Refusing:
+            def start_print(self, local_path, file_name, **kwargs):
+                return {"ok": False, "reason": "spool_mismatch: needs PLA #FFFFFF (not loaded on this printer)"}
+
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "abcdef12" / "part.3mf"
+            f.parent.mkdir(); f.write_bytes(b"3mf")
+            m = PrinterManager()
+            m._adapters["p1"] = Refusing()
+            base = {"queueJobId": "q1", "printerId": "p1", "submissionUid": "abcdef12", "fileName": "part.3mf", "plate": 1, "useAms": True, "amsMapping": [0]}
+            [r] = [x for x in m.dispatch_assignments([dict(base, assignmentSeq=7)], d) if x["state"] == "held"]
+            self.assertEqual(r, {"queueJobId": "q1", "state": "held", "reason": "spool_mismatch: needs PLA #FFFFFF (not loaded on this printer)", "assignmentSeq": 7})
+            [r] = [x for x in m.dispatch_assignments([dict(base, queueJobId="q2")], d) if x["state"] == "held"]   # pre-0062 cloud: no seq
+            self.assertNotIn("assignmentSeq", r)
+

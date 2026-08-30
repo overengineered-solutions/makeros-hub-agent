@@ -50,10 +50,30 @@ class TestTranslateMapping(unittest.TestCase):
         # k=0 unused (-1), k=1 → PETG, k=2 mapped by the member but not a required filament → unmapped, k=3 external kept
         self.assertEqual(tt.translate_mapping([-1, 7, 3, 254], required, self.trays), [-1, 0, -1, 254])
 
-    def test_prefers_exact_filament_id_then_lowest_tray(self):
+    def test_filament_id_is_exact_when_the_loaded_spools_carry_ids(self):
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFA00"}], self.trays), [2])
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF"}], self.trays), [1])
-        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFZ99"}], self.trays), [1])  # unknown id: any
+        # the member chose GFZ99 white PLA; only OTHER white PLAs are loaded → a refusal, never "close enough" (codex r1)
+        with self.assertRaises(tt.TrayTranslationError) as ctx:
+            tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFZ99"}], self.trays)
+        self.assertIn("a different PLA #FFFFFF is loaded", ctx.exception.detail)
+        # …but when the loaded candidates carry NO id at all, material + colour is the only signal and it is honoured
+        no_ids = [{"tray_id": 0, "material": "PLA", "color": "FFFFFF", "filament_id": None}]
+        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFZ99"}], no_ids), [0])
+
+    def test_external_spool_is_a_target_when_it_is_the_only_match(self):
+        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "TPU"}], self.trays), [254])
+        # an AMS tray always wins over the external holder for the same requirement
+        both = self.trays + [{"tray_id": 254, "material": "PETG", "color": "000000", "filament_id": None}]
+        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PETG", "color": "000000"}], both), [0])
+
+    def test_no_requirements_with_ams_trays_mapped_is_a_refusal(self):
+        for required in ([], None):
+            with self.assertRaises(tt.TrayTranslationError) as ctx:
+                tt.translate_mapping([5], required or [], self.trays)
+            self.assertIn("no filament requirements", ctx.exception.detail)
+        # external-only / unmapped prints have nothing to translate and pass through
+        self.assertEqual(tt.translate_mapping([254, -1], [], self.trays), [254, -1])
 
     def test_ht_unit_and_colour_alpha_and_case(self):
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "pla-cf", "color": "#333333ff"}], self.trays), [512])
@@ -67,9 +87,6 @@ class TestTranslateMapping(unittest.TestCase):
             tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FF00FF"}], self.trays)
         self.assertEqual(ctx.exception.reason, "spool_mismatch")
         self.assertIn("PLA #FF00FF", ctx.exception.detail)
-        # the external spool is never a candidate for an AMS-mapped filament
-        with self.assertRaises(tt.TrayTranslationError):
-            tt.translate_mapping([0], [{"slot": 1, "type": "TPU"}], self.trays)
 
 
 class TestTranslatePrint(unittest.TestCase):
@@ -82,6 +99,11 @@ class TestTranslatePrint(unittest.TestCase):
         ext = {"use_ams": False, "ams_mapping": [254]}
         self.assertEqual(tt.translate_print_trays(ext, required, UNITS, VT), ext)
 
+    def test_absent_requirements_refuse_ams_prints_but_not_external_ones(self):
+        with self.assertRaises(tt.TrayTranslationError):
+            tt.translate_print_trays({"use_ams": True, "ams_mapping": [5]}, None, UNITS, VT)
+        self.assertEqual(tt.translate_print_trays({"use_ams": True, "ams_mapping": [254]}, None, UNITS, VT)["ams_mapping"], [254])
+
     def test_no_addressable_units_is_a_refusal(self):
         with self.assertRaises(tt.TrayTranslationError):
             tt.translate_print_trays({"use_ams": True, "ams_mapping": [0]}, [{"slot": 1, "type": "PLA"}], [{"unit": 0, "trays": [{"slot": 0, "material": "PLA"}]}])
@@ -89,6 +111,8 @@ class TestTranslatePrint(unittest.TestCase):
 
 SLICE_INFO = """<?xml version="1.0" encoding="UTF-8"?>
 <config>
+  <metadata key="filament_type" value="PLA;PETG;ABS"/>
+  <metadata key="filament_colour" value="#FFFFFF;#000000;#FF0000"/>
   <plate>
     <metadata key="index" value="1"/>
     <filament id="1" tray_info_idx="GFL99" type="PLA" color="#FFFFFF" used_m="1.0" used_g="3.5"/>
@@ -103,9 +127,11 @@ SLICE_INFO = """<?xml version="1.0" encoding="UTF-8"?>
 
 class TestPlateScopedRequirements(unittest.TestCase):
     def test_only_the_sent_plate(self):
+        # project-wide metadata arrays must NOT seed a scoped plate (codex r1): plate 2 is ABS only
         self.assertEqual([f["slot"] for f in parse_slice_info_config(SLICE_INFO, 2)], [3])
         self.assertEqual([f["slot"] for f in parse_slice_info_config(SLICE_INFO, 1)], [1, 2])
         self.assertEqual(parse_slice_info_config(SLICE_INFO, 1)[1]["usedG"], 7.25)
+        self.assertEqual(parse_slice_info_config(SLICE_INFO, 1)[0]["trayInfoIdx"], "GFL99")
 
     def test_unknown_or_absent_plate_keeps_every_filament(self):
         self.assertEqual([f["slot"] for f in parse_slice_info_config(SLICE_INFO)], [1, 2, 3])

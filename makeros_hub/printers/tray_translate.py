@@ -93,18 +93,23 @@ def describe(req: dict[str, Any]) -> str:
 
 
 def _pick(req: dict[str, Any], trays: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The physical tray for one requirement: same material + colour; when the member chose a specific Bambu filament
+    (idx) and the loaded candidates carry ids, ONLY an exact id match will do (codex v0.56 r1: a different white PLA is
+    the wrong spool, not a near miss) — the brand-less fallback applies only when no candidate reports an id. AMS trays
+    win over the external spool (254/255), which is a valid mapping target when it is the only match."""
     material = _norm_material(req.get("type") or req.get("material"))
     color = _norm_color(req.get("color"))
     fid = _norm_fid(req.get("idx") or req.get("trayInfoIdx"))
-    cands = [t for t in trays if t["tray_id"] not in EXTERNAL_TRAY_IDS
-             and (not material or t["material"] == material) and (color is None or t["color"] == color)]
+    cands = [t for t in trays if (not material or t["material"] == material) and (color is None or t["color"] == color)]
     if not cands:
         return None
     if fid:
         exact = [t for t in cands if t["filament_id"] == fid]
         if exact:
             cands = exact
-    return min(cands, key=lambda t: t["tray_id"])
+        elif any(t["filament_id"] for t in cands):
+            raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} ({fid}) — a different {describe(req)} is loaded")
+    return min(cands, key=lambda t: (t["tray_id"] in EXTERNAL_TRAY_IDS, t["tray_id"]))
 
 
 def _by_filament_index(required: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
@@ -123,9 +128,13 @@ def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[
     filament k. -1 and 254/255 pass through; a mapped position with no requirement record (a filament this plate
     does not use) becomes -1 rather than a guessed tray. Raises TrayTranslationError('spool_mismatch') when a
     required spool is not loaded on this printer."""
-    by_index = _by_filament_index(required)
+    by_index = _by_filament_index(required or [])
+    mapping = mapping if isinstance(mapping, list) else []
+    if not by_index and any(isinstance(v, int) and not isinstance(v, bool) and v >= 0 and v not in EXTERNAL_TRAY_IDS for v in mapping):
+        # codex v0.56 r1: no requirements + AMS trays mapped = nothing to translate FROM; blanking them would print
+        raise TrayTranslationError("spool_mismatch", "no filament requirements recorded for this job (re-send it from OrcaSlicer)")
     out: list[int] = []
-    for k, v in enumerate(mapping if isinstance(mapping, list) else []):
+    for k, v in enumerate(mapping):
         if isinstance(v, bool) or not isinstance(v, int) or v < 0 or v in EXTERNAL_TRAY_IDS:
             out.append(v if isinstance(v, int) and not isinstance(v, bool) else -1)
             continue
@@ -140,7 +149,7 @@ def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[
     return out
 
 
-def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, Any]], ams_units: Any, vt_tray: Any = None,
+def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, Any]] | None, ams_units: Any, vt_tray: Any = None,
                           ) -> dict[str, Any]:
     """Return a copy of a built `print` command with ams_mapping (and ams_mapping2 when present — the H2D's second
     nozzle uses the same tray-id space) translated to this printer's physical trays. use_ams=false (external spool)
@@ -153,5 +162,5 @@ def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, An
         raise TrayTranslationError("spool_mismatch", f"{unaddressable_units(ams_units)} AMS unit(s) report no id — cannot address trays")
     for key in ("ams_mapping", "ams_mapping2"):
         if key in out and isinstance(out[key], list) and out[key]:
-            out[key] = translate_mapping(out[key], required, trays)
+            out[key] = translate_mapping(out[key], required or [], trays)
     return out

@@ -632,13 +632,12 @@ class PrinterManager:
             if result.get("ok"):
                 self._remember_dispatched_queue_job(queue_job_id)
             else:
-                reports.append(
-                    {
-                        "queueJobId": queue_job_id,
-                        "state": "held",
-                        "reason": result.get("reason", "start_failed"),
-                    }
-                )
+                held = {"queueJobId": queue_job_id, "state": "held", "reason": result.get("reason", "start_failed")}
+                # v0.56: echo the assignment's sequence so the cloud applies the refusal to THAT assignment only
+                seq = assignment.get("assignmentSeq")
+                if isinstance(seq, int) and not isinstance(seq, bool):
+                    held["assignmentSeq"] = seq
+                reports.append(held)
         return reports
 
     def collect_queue_progress(self) -> list[dict]:

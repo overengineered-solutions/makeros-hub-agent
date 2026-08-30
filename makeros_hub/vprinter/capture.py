@@ -555,11 +555,10 @@ def parse_slice_info_config(raw: bytes | str, plate: int | None = None) -> list[
         return _parse_slice_info_fallback(text)
 
     by_slot: dict[int, dict[str, Any]] = {}
-    _merge_array_metadata(root, by_slot)
-
     # v0.56: a multi-plate project lists EVERY plate's filaments; only the sent plate's are required (a spool used
     # solely on another plate must neither block dispatch nor inflate the grams estimate).
-    scope = _plate_element(root, plate) or root
+    plate_scope = _plate_element(root, plate)
+    scope = plate_scope if plate_scope is not None else root
     for element in scope.iter():
         attrs = {_strip_ns(key).lower(): value for key, value in element.attrib.items()}
         tag = _strip_ns(element.tag).lower()
@@ -579,11 +578,21 @@ def parse_slice_info_config(raw: bytes | str, plate: int | None = None) -> list[
         normalized = normalize_color(color)
         if normalized:
             item["color"] = normalized
+        # v0.56: Bambu's filament id (tray_info_idx, e.g. GFL99) — the hub's tray translation needs it to tell two
+        # same-colour spools apart; rides to the cloud as trayInfoIdx (its stored shape calls it idx).
+        tray_info_idx = _first_str(attrs, ("tray_info_idx", "trayinfoidx"))
+        if tray_info_idx:
+            item["trayInfoIdx"] = tray_info_idx.upper()[:12]
         # v0.52 (design B1 / owner decision 5): the slicer's per-filament weight for the sent plate. The cloud bills
         # COMPLETED jobs from it (staff-confirmed), so no one types grams by hand. Bambu writes used_g on <filament>.
         used_g = _first_float(attrs, ("used_g", "weight", "used_grams"))
         if used_g is not None and used_g >= 0:
             item["usedG"] = round(used_g, 2)
+
+    # The project-wide metadata arrays (0-based) are a FALLBACK for files without per-filament elements (1-based
+    # Bambu ids) — mixing the two bases produced phantom slot 0 entries (codex v0.56 r1), so they only seed an empty result.
+    if not by_slot:
+        _merge_array_metadata(root, by_slot)
 
     return [by_slot[slot] for slot in sorted(by_slot)]
 

@@ -261,25 +261,23 @@ class BambuAdapter:
         # B3 (v0.56): the member's ams_mapping names VIRTUAL pool positions; rewrite it to THIS printer's physical
         # trays from its live AMS state, or refuse before anything is uploaded (a wrong tray = the wrong material).
         # Only when the cloud sent the job's requirements (older clouds / web uploads without them keep the replay).
-        if isinstance(required_filaments, list):
+        if payload["print"].get("use_ams") is True:
             st = self.status()
             if st.get("connectionState") != "connected":
-                # the AMS mirror rides only on a FRESH report (bambu_parse.normalize_status); stale trays are no basis
+                # the AMS mirror rides only on a FRESH report (bambu_parse.normalize_status); stale trays are no basis.
+                # Its own reason: the cloud re-queues WITHOUT counting it as a spool refusal (codex v0.56 r1).
                 log.warning("bambu %s: refusing %s — no fresh printer report to translate trays from", self.printer_id, queue_job_id)
-                return {"ok": False, "reason": "spool_mismatch: printer has not reported its trays recently"}
+                return {"ok": False, "reason": "printer_stale: printer has not reported its trays recently"}
             try:
                 before = (payload["print"].get("ams_mapping"), payload["print"].get("ams_mapping2"))
                 payload["print"] = tray_translate.translate_print_trays(
-                    payload["print"], required_filaments, st.get("ams"), st.get("vtTray")
+                    payload["print"], required_filaments if isinstance(required_filaments, list) else None, st.get("ams"), st.get("vtTray")
                 )
             except tray_translate.TrayTranslationError as exc:
                 log.warning("bambu %s: refusing %s — %s", self.printer_id, queue_job_id, exc)
                 return {"ok": False, "reason": f"{exc.reason}: {exc.detail}"[:200]}
             log.info("bambu %s: trays for %s — virtual %s → physical %s / %s", self.printer_id, queue_job_id,
                      before, payload["print"].get("ams_mapping"), payload["print"].get("ams_mapping2"))
-        elif payload["print"].get("use_ams") is True:
-            log.warning("bambu %s: %s dispatched WITHOUT tray translation (no requirements from the cloud)",
-                        self.printer_id, queue_job_id)
 
         try:
             bambu_send.upload_3mf(self.host, self._access_code, local_path, file_name)
