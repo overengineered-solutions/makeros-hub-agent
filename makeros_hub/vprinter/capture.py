@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import logging
 import re
 import time
@@ -405,6 +406,11 @@ def build_vp_submit_body(job: CapturedJob, *, model: str) -> dict[str, Any]:
         "amsMapping": _ams_mapping_list(job.ams_mapping),
         "requiredFilaments": [_vp_submit_filament(item) for item in job.required_filaments],
     }
+    # estGrams (v0.52): the plate's total slicer weight, CEILed so the shop never undercharges (makeros rule); absent
+    # when no filament carried used_g (old 3MFs) — the cloud then parks the completion for staff grams as before.
+    grams = [item.get("usedG") for item in job.required_filaments if isinstance(item.get("usedG"), (int, float)) and not isinstance(item.get("usedG"), bool)]
+    if grams:
+        body["estGrams"] = int(math.ceil(sum(grams)))
     if job.plate is not None:
         body["plate"] = job.plate
     # Additive (cloud-side double-Send dedupe on member + VP + sha + plate + mapping): the mapping exactly
@@ -462,6 +468,9 @@ def _vp_submit_filament(item: dict[str, Any]) -> dict[str, Any]:
     tray_info_idx = item.get("trayInfoIdx") or item.get("tray_info_idx")
     if tray_info_idx is not None:
         filament["trayInfoIdx"] = tray_info_idx
+    used_g = item.get("usedG")
+    if isinstance(used_g, (int, float)) and not isinstance(used_g, bool) and used_g >= 0:
+        filament["usedG"] = used_g
     return filament
 
 
@@ -551,6 +560,11 @@ def parse_slice_info_config(raw: bytes | str) -> list[dict[str, Any]]:
         normalized = normalize_color(color)
         if normalized:
             item["color"] = normalized
+        # v0.52 (design B1 / owner decision 5): the slicer's per-filament weight for the sent plate. The cloud bills
+        # COMPLETED jobs from it (staff-confirmed), so no one types grams by hand. Bambu writes used_g on <filament>.
+        used_g = _first_float(attrs, ("used_g", "weight", "used_grams"))
+        if used_g is not None and used_g >= 0:
+            item["usedG"] = round(used_g, 2)
 
     return [by_slot[slot] for slot in sorted(by_slot)]
 
@@ -652,6 +666,20 @@ def _split_values(value: str) -> list[str]:
     if isinstance(parsed, list):
         return [str(item) for item in parsed]
     return [part.strip().strip('"') for part in re.split(r"[;,]", raw) if part.strip()]
+
+
+def _first_float(attrs: dict[str, str], keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        value = attrs.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            parsed = float(str(value).strip())
+        except ValueError:
+            continue
+        if parsed == parsed and parsed not in (float("inf"), float("-inf")):   # finite only
+            return parsed
+    return None
 
 
 def _first_int(attrs: dict[str, str], keys: tuple[str, ...]) -> int | None:

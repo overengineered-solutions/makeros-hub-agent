@@ -145,3 +145,21 @@ class TestDispatchCarriesRawPrint(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUsedGrams(unittest.TestCase):
+    def test_slice_info_used_g_rides_as_usedG_and_estGrams(self):
+        from makeros_hub.vprinter.capture import parse_slice_info_config, _vp_submit_filament
+        items = parse_slice_info_config(
+            '<config><filament id="0" type="PLA" color="#ffffff" used_m="1.2" used_g="3.67"/>'
+            '<filament id="1" type="PETG" color="#000000" used_g="0.5"/><filament id="2" type="TPU" used_g="nope"/></config>'
+        )
+        self.assertEqual([i.get("usedG") for i in items], [3.67, 0.5, None])
+        self.assertEqual(_vp_submit_filament(items[0]), {"slot": 0, "type": "PLA", "color": "FFFFFFFF", "usedG": 3.67})
+        job = CapturedJob(member_id="m", filename="a.3mf", file_path=Path("/tmp/a.3mf"), sha256="0" * 64, size=1, ams_mapping=[0],
+                          use_ams=True, required_filaments=items, submitted_at=datetime(2026, 8, 30, tzinfo=timezone.utc), submission_uid="u1")
+        body = build_vp_submit_body(job, model="A1 mini")
+        self.assertEqual(body["estGrams"], 5)                      # ceil(3.67 + 0.5) — never undercharge
+        job2 = CapturedJob(member_id="m", filename="a.3mf", file_path=Path("/tmp/a.3mf"), sha256="0" * 64, size=1, ams_mapping=[0],
+                           use_ams=True, required_filaments=[{"slot": 0, "material": "PLA"}], submitted_at=datetime(2026, 8, 30, tzinfo=timezone.utc), submission_uid="u2")
+        self.assertNotIn("estGrams", build_vp_submit_body(job2, model="A1 mini"))
