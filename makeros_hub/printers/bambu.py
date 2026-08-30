@@ -360,10 +360,11 @@ class BambuAdapter:
         channel as start_print. pause/resume/stop (universal `print`-class
         commands; pybambu's proven shape) + ams_dry (`ams_filament_drying`;
         params {amsId, temp, durationHours}) + skip_objects (cancel specific
-        objects mid-print; params {objList: [identify_id ints]}). The cloud only
+        objects mid-print; params {objList: [identify_id ints]}) +
+        clear_external_spool (no params). The cloud only
         delivers the allowlisted set + validates params, but we re-check here as
         defense-in-depth. Returns {"ok": bool, "reason": str}."""
-        if command not in {"pause", "resume", "stop", "ams_dry", "skip_objects"}:
+        if command not in {"pause", "resume", "stop", "ams_dry", "skip_objects", "clear_external_spool"}:
             return {"ok": False, "reason": "unsupported_command"}
         client = self._client
         connected = False
@@ -377,7 +378,37 @@ class BambuAdapter:
             return {"ok": False, "reason": "not_connected"}
 
         sequence_id = os.urandom(4).hex()
-        if command == "ams_dry":
+        if command == "clear_external_spool":
+            # "Clear the filament information" — exactly what Bambu Studio's own Reset button sends from the external
+            # spool's edit dialog (AMSMaterialsSetting::on_select_reset -> MachineObject::command_ams_filament_settings,
+            # source-read 2026-08-30): empty ids and type, zeroed temps, and the colour with ALPHA 00, which is the
+            # firmware's marker for "nothing set". The A1's AMS-Lite out-of-filament path can leave a GHOST external
+            # spool the touchscreen cannot clear (Bambu forum 95897; the Reset exists only in Studio) — and until it is
+            # cleared, the printer reports a spool that is not there.
+            #
+            # Deliberately NOT a general filament setter. This command takes NO parameters and hardcodes the external
+            # slot, so nothing the cloud sends can rewrite a REAL AMS tray's type or colour. Widening it later means
+            # writing a second, separately-named command, not adding a field here.
+            #   ams_id  255 = VIRTUAL_TRAY_MAIN_ID  (the main extruder's external spool)
+            #   tray_id 254 = VIRTUAL_TRAY_DEPUTY_ID — Studio sets tray_id to the DEPUTY id whenever ams_id is either
+            #                 virtual id, rather than to slot_id; mirrored verbatim rather than "corrected".
+            #   (DevDefs.h defines both; the H2D's second external spool would be ams_id 254 — a later command.)
+            payload = {
+                "print": {
+                    "sequence_id": sequence_id,
+                    "command": "ams_filament_setting",
+                    "ams_id": 255,
+                    "slot_id": 0,
+                    "tray_id": 254,
+                    "tray_info_idx": "",
+                    "setting_id": "",
+                    "tray_color": "FFFFFF00",
+                    "nozzle_temp_min": 0,
+                    "nozzle_temp_max": 0,
+                    "tray_type": "",
+                }
+            }
+        elif command == "ams_dry":
             p = params or {}
             ams_id, temp, duration = p.get("amsId"), p.get("temp"), p.get("durationHours")
             # The cloud (AmsDryParamsDTO) is the range SSOT; here we only assert

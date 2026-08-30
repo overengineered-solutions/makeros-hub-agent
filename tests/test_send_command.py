@@ -111,6 +111,45 @@ class TestSendCommand(unittest.TestCase):
             },
         )
 
+    def test_clear_external_spool_publishes_studios_own_reset(self):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True)
+        adapter._connack = "ok"
+        # Takes NO params: the external slot is hardcoded so nothing the cloud sends can rewrite a real AMS tray.
+        result = adapter.send_command("clear_external_spool")
+        self.assertEqual(result, {"ok": True})
+        doc = json.loads(adapter._client.published[0][1])["print"]
+        self.assertTrue(doc.pop("sequence_id"))
+        # Verified verbatim against BambuStudio: AMSMaterialsSetting::on_select_reset ("Are you sure you want to clear
+        # the filament information?") -> MachineObject::command_ams_filament_settings. Empty ids/type, zeroed temps,
+        # and the colour with ALPHA 00 = the firmware's "nothing set". tray_id is the DEPUTY id (254) whenever ams_id
+        # is a virtual id, per that function -- mirrored, not "corrected". DevDefs.h: MAIN 255, DEPUTY 254.
+        self.assertEqual(
+            doc,
+            {
+                "command": "ams_filament_setting",
+                "ams_id": 255,
+                "slot_id": 0,
+                "tray_id": 254,
+                "tray_info_idx": "",
+                "setting_id": "",
+                "tray_color": "FFFFFF00",
+                "nozzle_temp_min": 0,
+                "nozzle_temp_max": 0,
+                "tray_type": "",
+            },
+        )
+
+    def test_clear_external_spool_ignores_any_params_it_is_handed(self):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True)
+        adapter._connack = "ok"
+        # The narrowness IS the safety property: a params blob naming an AMS unit must not reach the wire.
+        adapter.send_command("clear_external_spool", {"amsId": 0, "tray_color": "FF0000FF"})
+        doc = json.loads(adapter._client.published[0][1])["print"]
+        self.assertEqual(doc["ams_id"], 255)
+        self.assertEqual(doc["tray_color"], "FFFFFF00")
+
     def test_ams_dry_without_params_rejected(self):
         adapter = make_adapter()
         adapter._client = FakeClient(connected=True)
