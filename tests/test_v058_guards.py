@@ -48,6 +48,14 @@ class TestAdapterInFlightGuard(unittest.TestCase):
             self.assertTrue(a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", **kw)["ok"])
             r = a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", **kw)
             self.assertEqual(r, {"ok": True, "already_dispatched": True})
+            # the manager still reports 'uploading' for the idempotent re-send (the cloud's sent_at stamp is harmless)
+            class Re:
+                def start_print(self, *a, **k):
+                    return {"ok": True, "already_dispatched": True}
+            (Path(d) / "cccccccc").mkdir(); (Path(d) / "cccccccc" / "p.3mf").write_bytes(b"3mf")
+            mm = PrinterManager(); mm._adapters["p1"] = Re()
+            rep = mm.dispatch_assignments([{"queueJobId": "q1", "printerId": "p1", "submissionUid": "cccccccc", "fileName": "p.3mf", "plate": 1, "useAms": True, "amsMapping": [0], "assignmentSeq": 4}], d)
+            self.assertEqual([(r["state"], r.get("assignmentSeq")) for r in rep], [("uploading", 4)])
             self.assertEqual((up.call_count, len(a._client.published)), (1, 1))            # nothing uploaded/published twice
             self.assertEqual(a.start_print("/tmp/y.3mf", "y.3mf", queue_job_id="q2", **kw), {"ok": False, "reason": "printer_busy"})
 
@@ -69,6 +77,11 @@ class TestPerPassReservation(unittest.TestCase):
                                               dict(base, queueJobId="q2", submissionUid="bbbbbbbb", assignmentSeq=1)], d)
             self.assertEqual(Adapter.calls, ["q1"])
             self.assertEqual([r["state"] for r in reports], ["uploading", "held"])
+            # the hook saw each report the moment it existed (durable before the pass returned)
+            seen = []
+            m2 = PrinterManager(); m2._adapters["p1"] = Adapter(); Adapter.calls.clear()
+            m2.dispatch_assignments([dict(base, queueJobId="q3", submissionUid="aaaaaaaa", assignmentSeq=9)], d, on_report=seen.append)
+            self.assertEqual([(r["state"], r["assignmentSeq"]) for r in seen], [("uploading", 9)])
             self.assertEqual(reports[0]["assignmentSeq"], 3)                                  # uploading names its assignment too
             self.assertEqual((reports[1]["reason"], reports[1]["assignmentSeq"]), ("printer_busy", 1))
 
@@ -112,3 +125,5 @@ class TestExternalSpoolIdentity(unittest.TestCase):
         with self.assertRaises(tt.TrayTranslationError):
             tt.translate_mapping([254], REQ_PLA, tt.live_trays(units, vt))
         self.assertEqual(tt.translate_mapping([254], [{"slot": 1, "type": "PETG", "color": "000000"}], tt.live_trays(units, vt)), [254])
+        with self.assertRaises(tt.TrayTranslationError):   # the second external holder (255) cannot be verified → refuse
+            tt.translate_mapping([255], [{"slot": 1, "type": "PETG", "color": "000000"}], tt.live_trays(units, vt))

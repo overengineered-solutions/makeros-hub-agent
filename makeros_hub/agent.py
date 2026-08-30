@@ -1788,13 +1788,17 @@ def run(
                     if reported_binding_count:
                         log.info("reported %d VP binding(s) to the cloud", reported_binding_count)
                     assignments = resp.body.get("assignments")
+                    def _durable(report: dict) -> None:
+                        # v0.58 r2: each dispatch report is appended + fsynced the moment the manager creates it
+                        pending_queue_reports.append(report)
+                        report_outbox.save(pending_queue_reports)
+
                     dispatch_reports = manager.dispatch_assignments(
                         assignments if isinstance(assignments, list) else [],
                         SPOOL_DIR,
+                        on_report=_durable,
                     )
                     if dispatch_reports:
-                        pending_queue_reports.extend(dispatch_reports)
-                        report_outbox.save(pending_queue_reports)
                         log.info(
                             "dispatched %d assignment report(s) from %d assignment(s)",
                             len(dispatch_reports),

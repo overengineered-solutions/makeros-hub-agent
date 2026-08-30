@@ -641,7 +641,7 @@ class PrinterManager:
                 )
         return reports
 
-    def dispatch_assignments(self, assignments, spool_dir) -> list[dict]:
+    def dispatch_assignments(self, assignments, spool_dir, *, on_report=None) -> list[dict]:
         """Start cloud-assigned queue jobs and return queue-status reports.
 
         Reports are ordered for the cloud transition map: assigned -> uploading,
@@ -651,6 +651,16 @@ class PrinterManager:
         reports: list[dict] = []
         base = Path(spool_dir)
         reserved: set[str] = set()   # printers that took a start THIS pass (audit 2026-08-30): telemetry lags the start
+
+        def emit(report: dict) -> None:
+            """Every report is handed to `on_report` the moment it exists (the agent writes it to the durable outbox
+            there — v0.58 r2: a crash between a start and the end of this pass must not lose 'uploading') and returned."""
+            reports.append(report)
+            if callable(on_report):
+                try:
+                    on_report(report)
+                except Exception as exc:  # noqa: BLE001 — persistence trouble is logged by the hook itself
+                    log.warning("report hook failed: %s", exc)
         for assignment in assignments if isinstance(assignments, list) else []:
             if not isinstance(assignment, dict):
                 continue
@@ -673,27 +683,27 @@ class PrinterManager:
                 return out
 
             if not self._assignment_path_ok(submission_uid, file_name):
-                reports.append(held("bad_assignment"))
+                emit(held("bad_assignment"))
                 continue
 
             adapter = self._adapters.get(printer_id)
             start_print = getattr(adapter, "start_print", None) if adapter is not None else None
             if not callable(start_print):
-                reports.append(held("printer_unavailable"))
+                emit(held("printer_unavailable"))
                 continue
             if printer_id in reserved:
-                reports.append(held("printer_busy"))
+                emit(held("printer_busy"))
                 continue
 
             if self._adapter_busy(adapter):
                 # v0.53: the printer is mid-job by its OWN report — never upload/start another file onto it, whatever the
                 # cloud's view (an 'assigned' re-send after a restart, or a stale idle in the cloud mirror).
-                reports.append(held("printer_busy"))
+                emit(held("printer_busy"))
                 continue
 
             local_path = base / submission_uid / file_name
             if not local_path.is_file():
-                reports.append(held("file_not_found"))
+                emit(held("file_not_found"))
                 continue
 
             plate_int = plate_of(assignment.get("plate"))   # v0.57: the same coercion the fetch used
@@ -741,10 +751,11 @@ class PrinterManager:
                 reserved.add(printer_id)
                 # v0.56 (codex r2): 'uploading' is reported only AFTER start_print succeeded — a pre-upload refusal
                 # (spool_mismatch / printer_stale) must never leave the cloud believing the file went up.
-                if not result.get("already_dispatched"):
-                    reports.append(uploading)
+                # v0.58 r2: ALWAYS report uploading — for an idempotent re-send too (the cloud's 'uploading' only stamps
+                # sent_at, so a repeat is harmless and a lost earlier report is recovered)
+                emit(uploading)
             else:
-                reports.append(held(result.get("reason", "start_failed")))
+                emit(held(result.get("reason", "start_failed")))
         return reports
 
     def collect_queue_progress(self) -> list[dict]:

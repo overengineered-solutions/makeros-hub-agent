@@ -152,6 +152,10 @@ def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[
             # a REQUIRED filament routed to the external holder must be what the holder reports (audit 2026-08-30): the
             # same material + colour (+ id) rule as an AMS tray — never "whatever is on the spool holder"
             if req is not None:
+                if v == 255:
+                    # the H2D's second external holder: we mirror only ONE vt_tray, so it cannot be verified — refuse rather
+                    # than send a required filament to a holder whose contents we do not know (codex v0.58 r1)
+                    raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} on the second external holder (not verifiable yet)")
                 ext = [x for x in trays if x["tray_id"] in EXTERNAL_TRAY_IDS]
                 if _pick(req, ext) is None:
                     raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} on the external spool (not loaded there)")
