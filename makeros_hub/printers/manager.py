@@ -614,6 +614,8 @@ class PrinterManager:
                     ams_mapping=assignment.get("amsMapping"),
                     queue_job_id=queue_job_id,
                     raw_print=raw_print,
+                    # B3 (v0.56): the job's required filaments (cloud-normalised) drive virtual→physical tray translation
+                    required_filaments=assignment.get("requiredFilaments") if isinstance(assignment.get("requiredFilaments"), list) else None,
                 )
             except Exception as e:  # noqa: BLE001
                 code = self._access_code_for(printer_id)

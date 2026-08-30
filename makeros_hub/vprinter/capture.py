@@ -378,7 +378,7 @@ def assemble_captured_job(
         size=upload.size,
         ams_mapping=ams_mapping,
         use_ams=intent.use_ams,
-        required_filaments=parse_required_filaments(upload.file_path),
+        required_filaments=parse_required_filaments(upload.file_path, intent.plate),
         submitted_at=submitted_at or datetime.now(timezone.utc),
         submission_uid=submission_uid,
         plate=intent.plate,
@@ -519,7 +519,7 @@ def filename_from_project_file(print_obj: dict[str, Any]) -> str:
     return "job.3mf"
 
 
-def parse_required_filaments(path: Path) -> list[dict[str, Any]]:
+def parse_required_filaments(path: Path, plate: int | None = None) -> list[dict[str, Any]]:
     try:
         with zipfile.ZipFile(path) as archive:
             info = archive.getinfo(SLICE_INFO_PATH)
@@ -528,10 +528,26 @@ def parse_required_filaments(path: Path) -> list[dict[str, Any]]:
             raw = archive.read(info)
     except (KeyError, OSError, zipfile.BadZipFile):
         return []
-    return parse_slice_info_config(raw)
+    return parse_slice_info_config(raw, plate)
 
 
-def parse_slice_info_config(raw: bytes | str) -> list[dict[str, Any]]:
+def _plate_element(root: ElementTree.Element, plate: int | None) -> ElementTree.Element | None:
+    """The <plate> whose <metadata key="index"> equals the sent plate, or None (→ whole file, the pre-v0.56 behaviour)."""
+    if plate is None:
+        return None
+    for element in root.iter():
+        if _strip_ns(element.tag).lower() != "plate":
+            continue
+        for meta in element.iter():
+            if _strip_ns(meta.tag).lower() != "metadata":
+                continue
+            attrs = {_strip_ns(key).lower(): value for key, value in meta.attrib.items()}
+            if (attrs.get("key") or attrs.get("name") or "").lower() == "index" and _optional_int(attrs.get("value")) == plate:
+                return element
+    return None
+
+
+def parse_slice_info_config(raw: bytes | str, plate: int | None = None) -> list[dict[str, Any]]:
     text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
     try:
         root = ElementTree.fromstring(text)
@@ -541,7 +557,10 @@ def parse_slice_info_config(raw: bytes | str) -> list[dict[str, Any]]:
     by_slot: dict[int, dict[str, Any]] = {}
     _merge_array_metadata(root, by_slot)
 
-    for element in root.iter():
+    # v0.56: a multi-plate project lists EVERY plate's filaments; only the sent plate's are required (a spool used
+    # solely on another plate must neither block dispatch nor inflate the grams estimate).
+    scope = _plate_element(root, plate) or root
+    for element in scope.iter():
         attrs = {_strip_ns(key).lower(): value for key, value in element.attrib.items()}
         tag = _strip_ns(element.tag).lower()
         if not any(token in tag for token in ("filament", "slot", "tray")):

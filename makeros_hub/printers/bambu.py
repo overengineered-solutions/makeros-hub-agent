@@ -31,7 +31,7 @@ from typing import Any
 
 import paho.mqtt.client as mqtt
 
-from . import bambu_parse, bambu_send
+from . import bambu_parse, bambu_send, tray_translate
 from .jobs import JobTracker
 from .queue_progress import QueueProgressTracker
 
@@ -236,6 +236,7 @@ class BambuAdapter:
         ams_mapping=None,
         queue_job_id: str | None = None,
         raw_print: dict | None = None,
+        required_filaments: list | None = None,
     ) -> dict:
         client = self._client
         connected = False
@@ -248,12 +249,6 @@ class BambuAdapter:
         if client is None or not connected:
             return {"ok": False, "reason": "not_connected"}
 
-        try:
-            bambu_send.upload_3mf(self.host, self._access_code, local_path, file_name)
-        except bambu_send.BambuSendError as exc:
-            log.warning("bambu %s upload failed: %s", self.printer_id, exc)
-            return {"ok": False, "reason": "upload_failed"}
-
         sequence_id = os.urandom(4).hex()
         payload = bambu_send.build_print_start_payload(
             file_name,
@@ -263,6 +258,34 @@ class BambuAdapter:
             sequence_id=sequence_id,
             raw_print=raw_print,
         )
+        # B3 (v0.56): the member's ams_mapping names VIRTUAL pool positions; rewrite it to THIS printer's physical
+        # trays from its live AMS state, or refuse before anything is uploaded (a wrong tray = the wrong material).
+        # Only when the cloud sent the job's requirements (older clouds / web uploads without them keep the replay).
+        if isinstance(required_filaments, list):
+            st = self.status()
+            if st.get("connectionState") != "connected":
+                # the AMS mirror rides only on a FRESH report (bambu_parse.normalize_status); stale trays are no basis
+                log.warning("bambu %s: refusing %s — no fresh printer report to translate trays from", self.printer_id, queue_job_id)
+                return {"ok": False, "reason": "spool_mismatch: printer has not reported its trays recently"}
+            try:
+                before = (payload["print"].get("ams_mapping"), payload["print"].get("ams_mapping2"))
+                payload["print"] = tray_translate.translate_print_trays(
+                    payload["print"], required_filaments, st.get("ams"), st.get("vtTray")
+                )
+            except tray_translate.TrayTranslationError as exc:
+                log.warning("bambu %s: refusing %s — %s", self.printer_id, queue_job_id, exc)
+                return {"ok": False, "reason": f"{exc.reason}: {exc.detail}"[:200]}
+            log.info("bambu %s: trays for %s — virtual %s → physical %s / %s", self.printer_id, queue_job_id,
+                     before, payload["print"].get("ams_mapping"), payload["print"].get("ams_mapping2"))
+        elif payload["print"].get("use_ams") is True:
+            log.warning("bambu %s: %s dispatched WITHOUT tray translation (no requirements from the cloud)",
+                        self.printer_id, queue_job_id)
+
+        try:
+            bambu_send.upload_3mf(self.host, self._access_code, local_path, file_name)
+        except bambu_send.BambuSendError as exc:
+            log.warning("bambu %s upload failed: %s", self.printer_id, exc)
+            return {"ok": False, "reason": "upload_failed"}
         # v0.54: record + persist the dispatch BEFORE the command leaves the box (codex #4) — a crash in between can only
         # leave a dispatch that never started (it times out as start_not_observed), never a running print the cloud
         # can't correlate. A failed publish discards it again.
