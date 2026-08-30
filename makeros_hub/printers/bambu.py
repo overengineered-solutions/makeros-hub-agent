@@ -68,6 +68,17 @@ PUSHALL = json.dumps({"pushing": {"command": "pushall"}})
 GET_VERSION = json.dumps({"info": {"command": "get_version"}})
 
 
+def _redact_serials(value):
+    """Strip serial-ish fields from a nested report fragment before it reaches a log. The hardware SHAPE is what we
+    need to mirror in a virtual printer; the identity of the machine is not."""
+    drop = {"sn", "dev_sn", "serial", "uid", "dev_id"}
+    if isinstance(value, dict):
+        return {k: _redact_serials(v) for k, v in value.items() if k not in drop}
+    if isinstance(value, list):
+        return [_redact_serials(v) for v in value]
+    return value
+
+
 def _classify_connect_failure(reason_code: Any) -> str:
     s = str(reason_code).lower()
     if "not authorized" in s or "bad user" in s or "password" in s or "credential" in s:
@@ -99,6 +110,7 @@ class BambuAdapter:
         self._version_logged = False
         self._version_asked_at = 0.0
         self._version_asks = 0
+        self._device_logged = False
         self._client: mqtt.Client | None = None
         # Terminal-job detection over the merged state (pure; fed under _lock).
         self._jobs = JobTracker(printer_id, serial, state_path=TERMINAL_JOBS_DIR / f"{_safe_file_component(printer_id)}.json")
@@ -192,6 +204,18 @@ class BambuAdapter:
         # ("code=-1", live 2026-08-30). We cannot hand-write those lists: guessing them is what broke filament
         # resolution the last time. So capture reality from the real printers this hub already talks to, then bake the
         # per-model tables from the log. Serial numbers are the only identifying field and are dropped here.
+        # Newer models (X1C/P2S/H2D on current firmware) never answer the legacy info.get_version — they describe
+        # their own hardware INLINE, as print.device, which is already arriving on every report. That description is
+        # what a VP of the model has to present, so capture it once, redacted, the same way.
+        if not self._device_logged:
+            device = doc.get("print", {}).get("device") if isinstance(doc.get("print"), dict) else None
+            if isinstance(device, dict) and device:
+                self._device_logged = True
+                log.info(
+                    "bambu.device_observed %s %s",
+                    self.printer_id,
+                    json.dumps(_redact_serials(device))[:4000],
+                )
         if not self._version_logged and isinstance(doc.get("info"), dict):
             modules = doc["info"].get("module")
             if isinstance(modules, list) and modules:

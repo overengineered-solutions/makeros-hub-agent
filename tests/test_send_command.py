@@ -3,6 +3,7 @@
 import json
 import sys
 import types
+import logging
 import unittest
 
 # The agent test env doesn't install paho-mqtt (the adapter module is normally
@@ -282,3 +283,35 @@ class TestVersionReask(unittest.TestCase):
             adapter._version_asked_at -= 61
             adapter.request_version_if_missing()
         self.assertEqual(len(published), 5)
+
+
+class _Msg:
+    def __init__(self, doc):
+        self.payload = json.dumps(doc).encode("utf-8")
+
+
+def _msg(doc):
+    return _Msg(doc)
+
+
+class TestDeviceCapture(unittest.TestCase):
+    """The X1C/P2S/H2D never answer info.get_version; they describe their hardware inline as print.device, which is
+    what a VP of that model must present to OrcaSlicer. Capture it once, without the machine's identity."""
+
+    def test_captures_device_once_and_drops_serials(self):
+        adapter = make_adapter()
+        report = {"print": {"device": {
+            "type": "H2D", "nozzle": {"info": 1, "sn": "SECRET-NOZZLE"},
+            "airduct": [{"state": 1, "dev_sn": "SECRET"}],
+        }}}
+        with self.assertLogs("makeros-hub.bambu", level="INFO") as logs:
+            adapter._on_message(None, None, _msg(report))
+        line = [o for o in logs.output if "device_observed" in o]
+        self.assertEqual(len(line), 1)
+        self.assertIn('"type": "H2D"', line[0])
+        self.assertNotIn("SECRET", line[0])          # serials never reach the log
+        # once only — this is a shape capture, not telemetry
+        with self.assertLogs("makeros-hub.bambu", level="INFO") as logs2:
+            adapter._on_message(None, None, _msg(report))
+            logging.getLogger("makeros-hub.bambu").info("sentinel")
+        self.assertEqual([o for o in logs2.output if "device_observed" in o], [])
