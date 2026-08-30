@@ -221,6 +221,10 @@ class BambuAdapter:
         with self._lock:
             return self._queue_progress.pending_queue_job_ids()
 
+    def pending_queue_jobs(self) -> list[dict]:
+        with self._lock:
+            return self._queue_progress.pending_queue_jobs()
+
     def pending_jobs(self) -> list[dict]:
         """Unacked terminal jobs (re-send-safe — the cloud dedupes on jobKey)."""
         with self._lock:
@@ -256,12 +260,23 @@ class BambuAdapter:
             return {"ok": False, "reason": "not_connected"}
         if queue_job_id:
             with self._lock:
-                pending = self._queue_progress.pending_queue_job_ids()
-            if queue_job_id in pending:
-                # the durable dispatch state already holds THIS job (a re-sent assignment after a restart / a lost report):
-                # idempotent success — nothing is uploaded or published twice (audit 2026-08-30)
-                log.info("bambu %s: %s already dispatched here — not starting it again", self.printer_id, queue_job_id)
-                return {"ok": True, "already_dispatched": True}
+                pending = self._queue_progress.pending_queue_jobs()
+            mine = [p for p in pending if p["queueJobId"] == queue_job_id]
+            if mine:
+                old_seq = mine[0].get("assignmentSeq")
+                if old_seq is None or assignment_seq is None or old_seq == assignment_seq:
+                    # the durable dispatch state already holds THIS assignment (a re-send after a restart / a lost report):
+                    # idempotent success — nothing is uploaded or published twice (audit 2026-08-30)
+                    log.info("bambu %s: %s already dispatched here — not starting it again", self.printer_id, queue_job_id)
+                    return {"ok": True, "already_dispatched": True}
+                # a NEW assignment of the same job (the cloud re-queued it and assigned again): the stale dispatch record is
+                # superseded (codex v0.58 r5); the live busy guard above/around still protects a print that is running
+                log.warning("bambu %s: %s re-assigned (seq %s → %s) — superseding the stale dispatch record",
+                            self.printer_id, queue_job_id, old_seq, assignment_seq)
+                with self._lock:
+                    self._queue_progress.discard_dispatch(queue_job_id)
+                    self._save_queue_progress()
+                pending = [p for p in pending if p["queueJobId"] != queue_job_id]
             if pending:
                 # another job's outcome on this printer is still unknown: never stack a second start on it
                 return {"ok": False, "reason": "printer_busy"}

@@ -136,6 +136,10 @@ class QueueProgressTracker:
         """Queue jobs dispatched to this printer whose outcome is not yet known (v0.58: the adapter's in-flight guard)."""
         return [str(d.get("queueJobId")) for d in self._dispatches if d.get("queueJobId")]
 
+    def pending_queue_jobs(self) -> list[dict]:
+        """[{queueJobId, assignmentSeq}] for the unresolved dispatches (v0.58 r5: idempotency is keyed by BOTH)."""
+        return [{"queueJobId": str(d["queueJobId"]), **_seq_of(d)} for d in self._dispatches if d.get("queueJobId")]
+
     def discard_dispatch(self, queue_job_id: str) -> None:
         """The start command never left the box (publish failed): forget the dispatch we recorded ahead of it."""
         self._dispatches = [d for d in self._dispatches if d["queueJobId"] != queue_job_id]

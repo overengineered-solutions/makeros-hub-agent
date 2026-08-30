@@ -1796,6 +1796,9 @@ def run(
                             pending_queue_reports.remove(report)
                             raise OSError("report outbox not durable")
 
+                    # v0.58 r5 (codex): drain queue PROGRESS first — a print that just finished frees its printer's in-flight
+                    # guard BEFORE new assignments are dispatched to it this beat
+                    progress_reports = manager.collect_queue_progress(on_report=_durable)   # v0.58 r3: durable before the state pop persists
                     dispatch_reports = manager.dispatch_assignments(
                         assignments if isinstance(assignments, list) else [],
                         SPOOL_DIR,
@@ -1823,7 +1826,6 @@ def run(
                                 fetch_lock.release()
 
                         threading.Thread(target=_fetch_worker, name="web-upload-fetch", daemon=True).start()
-                    progress_reports = manager.collect_queue_progress(on_report=_durable)   # v0.58 r3: durable before the state pop persists
                     if pending_queue_reports:
                         before = len(pending_queue_reports)
                         pending_queue_reports = _flush_queue_status_reports(

@@ -259,3 +259,46 @@ class TestDurabilityFailures(unittest.TestCase):
             self.assertTrue(report_outbox.save(live, Path(d) / "q.json"))
             self.assertEqual(len(live), report_outbox.MAX_REPORTS)
             self.assertFalse(report_outbox.save(live, Path(d) / "nope" / "deeper" / "q.json") if False else report_outbox.save(live, Path("/proc/q.json")))
+
+
+class TestSeqKeyedIdempotency(unittest.TestCase):
+    def test_a_new_assignment_of_the_same_job_supersedes_the_stale_guard_and_dispatch(self):
+        class Adapter:
+            def __init__(self):
+                self.calls = []; self.pending = []
+
+            def pending_queue_jobs(self):
+                return list(self.pending)
+
+            def start_print(self, *a, **k):
+                self.calls.append(k.get("assignment_seq")); return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(__import__("makeros_hub.printers.manager", fromlist=["x"]), "DISPATCHED_STATE_PATH", Path(d) / "dispatched.json"):
+            (Path(d) / "aaaaaaaa").mkdir(); (Path(d) / "aaaaaaaa" / "p.3mf").write_bytes(b"3mf")
+            m = PrinterManager(); ad = Adapter(); m._adapters["p1"] = ad
+            base = {"queueJobId": "q1", "printerId": "p1", "submissionUid": "aaaaaaaa", "fileName": "p.3mf", "plate": 1, "useAms": True, "amsMapping": [0]}
+            self.assertEqual([r["state"] for r in m.dispatch_assignments([dict(base, assignmentSeq=1)], d)], ["uploading"])
+            self.assertEqual([r["state"] for r in m.dispatch_assignments([dict(base, assignmentSeq=1)], d)], ["uploading"])   # same assignment: recovery, no start
+            self.assertEqual(ad.calls, [1])
+            self.assertEqual([r["state"] for r in m.dispatch_assignments([dict(base, assignmentSeq=2)], d)], ["uploading"])   # NEW assignment: starts again
+            self.assertEqual(ad.calls, [1, 2])
+            # the persisted guard carries the seq (v2 format) and survives a reload
+            m2 = PrinterManager()
+            self.assertTrue(m2._guard_matches("q1", 2)); self.assertFalse(m2._guard_matches("q1", 3)); self.assertTrue(m2._guard_matches("q1", None))
+            # the adapter-pending recovery path is seq-aware too: a pending dispatch for seq 2 answers seq 2, not seq 3
+            m3 = PrinterManager(); ad3 = Adapter(); ad3.pending = [{"queueJobId": "q1", "assignmentSeq": 2}]; m3._adapters["p1"] = ad3
+            m3._forget_dispatched_queue_job("q1")
+            self.assertEqual([r["state"] for r in m3.dispatch_assignments([dict(base, assignmentSeq=2)], d)], ["uploading"]); self.assertEqual(ad3.calls, [])
+            self.assertEqual([r["state"] for r in m3.dispatch_assignments([dict(base, assignmentSeq=3)], d)], ["uploading"]); self.assertEqual(ad3.calls, [3])
+
+    def test_adapter_supersedes_a_stale_dispatch_on_a_new_seq_but_is_idempotent_on_the_same(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf") as up:
+            a = adapter()
+            kw = dict(plate=1, use_ams=True, ams_mapping=[5], raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]}, required_filaments=REQ_PLA)
+            self.assertTrue(a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", assignment_seq=1, **kw)["ok"])
+            self.assertEqual(a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", assignment_seq=1, **kw), {"ok": True, "already_dispatched": True})
+            r = a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", assignment_seq=2, **kw)
+            self.assertEqual(r, {"ok": True})                                                    # a new assignment: started again
+            self.assertEqual((up.call_count, len(a._client.published)), (2, 2))
+            self.assertEqual(a.pending_queue_jobs(), [{"queueJobId": "q1", "assignmentSeq": 2}])

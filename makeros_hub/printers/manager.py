@@ -85,6 +85,7 @@ class PrinterManager:
         # resend must not re-upload or re-start the printer. Terminal progress
         # reports prune this bounded guard.
         self._dispatched_queue_jobs: OrderedDict[str, float] = OrderedDict()
+        self._dispatched_seq: dict[str, int] = {}     # queueJobId -> assignmentSeq of the guarded dispatch (v0.58 r5)
         self._dispatched_wall: dict[str, float] = {}   # queueJobId -> wall-clock stamp, the persisted twin of the above
         self._load_dispatched()
         # Same at-least-once guard for control commands. Cloud delivery is
@@ -366,17 +367,30 @@ class PrinterManager:
                 log.warning("ack_jobs failed for %s: %s", pid, safe)
                 self._record_failure(f"ack_jobs failed for {pid}: {safe}", extra_secrets=[code])
 
-    def _remember_dispatched_queue_job(self, queue_job_id: str) -> None:
+    def _remember_dispatched_queue_job(self, queue_job_id: str, assignment_seq: int | None = None) -> None:
         self._dispatched_queue_jobs[queue_job_id] = time.monotonic()
         self._dispatched_queue_jobs.move_to_end(queue_job_id)
         self._dispatched_wall[queue_job_id] = time.time()
+        if isinstance(assignment_seq, int) and not isinstance(assignment_seq, bool):
+            self._dispatched_seq[queue_job_id] = assignment_seq   # v0.58 r5: the guard is keyed by job AND assignment
+        else:
+            self._dispatched_seq.pop(queue_job_id, None)
         while len(self._dispatched_queue_jobs) > MAX_DISPATCHED_QUEUE_JOBS:
             evicted, _ = self._dispatched_queue_jobs.popitem(last=False)
             self._dispatched_wall.pop(evicted, None)
+            self._dispatched_seq.pop(evicted, None)
         self._save_dispatched()
+
+    def _guard_matches(self, queue_job_id: str, assignment_seq) -> bool:
+        """Is the guarded dispatch THIS assignment? Unknown on either side (pre-seq cloud / legacy state) counts as yes."""
+        if queue_job_id not in self._dispatched_queue_jobs:
+            return False
+        known = self._dispatched_seq.get(queue_job_id)
+        return known is None or not isinstance(assignment_seq, int) or isinstance(assignment_seq, bool) or known == assignment_seq
 
     def _forget_dispatched_queue_job(self, queue_job_id: str) -> None:
         self._dispatched_queue_jobs.pop(queue_job_id, None)
+        self._dispatched_seq.pop(queue_job_id, None)
         if self._dispatched_wall.pop(queue_job_id, None) is not None:
             self._save_dispatched()
 
@@ -390,9 +404,15 @@ class PrinterManager:
         now_wall, now_mono = time.time(), time.monotonic()
         if not isinstance(raw, dict):
             return
-        for job_id, stamp in raw.items():
+        # v2 (v0.58 r5): {"v": 2, "jobs": {id: {"t": stamp, "seq": n}}}; legacy: {id: stamp}
+        entries: dict = raw.get("jobs") if raw.get("v") == 2 and isinstance(raw.get("jobs"), dict) else raw
+        for job_id, entry in entries.items():
+            stamp = entry.get("t") if isinstance(entry, dict) else entry
+            seq = entry.get("seq") if isinstance(entry, dict) else None
             if not (isinstance(job_id, str) and isinstance(stamp, (int, float))):
                 continue
+            if isinstance(seq, int) and not isinstance(seq, bool):
+                self._dispatched_seq[job_id] = seq
             # A stamp from the "future" = the wall clock stepped BACKWARDS across the restart (a Pi before time sync,
             # codex v0.53): keep the entry — dropping it reopens the duplicate-dispatch window this guard exists for.
             age = max(0.0, now_wall - float(stamp))
@@ -405,7 +425,7 @@ class PrinterManager:
             DISPATCHED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp = DISPATCHED_STATE_PATH.with_suffix(".json.tmp")
             with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(self._dispatched_wall))
+                fh.write(json.dumps({"v": 2, "jobs": {j: {"t": t, **({"seq": self._dispatched_seq[j]} if j in self._dispatched_seq else {})} for j, t in self._dispatched_wall.items()}}))
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, DISPATCHED_STATE_PATH)
@@ -683,9 +703,15 @@ class PrinterManager:
                     out["assignmentSeq"] = seq
                 return out
 
+            seq_asg = assignment.get("assignmentSeq")
             if queue_job_id in self._dispatched_queue_jobs:
-                emit(recovery_uploading())
-                continue
+                if self._guard_matches(queue_job_id, seq_asg):
+                    emit(recovery_uploading())
+                    continue
+                # the SAME job under a NEW assignment (the cloud re-queued and re-assigned it): the old guard is stale
+                log.info("assignment %s re-issued (seq %s → %s) — the earlier dispatch guard is superseded",
+                         queue_job_id, self._dispatched_seq.get(queue_job_id), seq_asg)
+                self._forget_dispatched_queue_job(queue_job_id)
 
             def held(reason: str, _a=assignment, _q=queue_job_id) -> dict:
                 # v0.56: EVERY refusal names the assignment it answers (assignmentSeq) so the cloud binds it to that revision
@@ -708,11 +734,17 @@ class PrinterManager:
                 emit(held("printer_busy"))
                 continue
 
-            pending_ids = getattr(adapter, "pending_queue_job_ids", None)
-            if callable(pending_ids) and queue_job_id in (pending_ids() or []):
-                # the adapter's durable dispatch state already holds THIS job (started, then the agent died before the
+            pending_jobs = getattr(adapter, "pending_queue_jobs", None)
+            if callable(pending_jobs):
+                pending_list = pending_jobs() or []
+            else:   # an adapter that only knows ids (seq unknown → treated as this assignment)
+                pending_ids = getattr(adapter, "pending_queue_job_ids", None)
+                pending_list = [{"queueJobId": j} for j in (pending_ids() or [])] if callable(pending_ids) else []
+            mine = [p for p in pending_list if isinstance(p, dict) and p.get("queueJobId") == queue_job_id]
+            if mine and (mine[0].get("assignmentSeq") is None or not isinstance(seq_asg, int) or isinstance(seq_asg, bool) or mine[0]["assignmentSeq"] == seq_asg):
+                # the adapter's durable dispatch state already holds THIS assignment (started, then the agent died before the
                 # manager guard / outbox were written): report it, never 'printer_busy' (codex v0.58 r2)
-                self._remember_dispatched_queue_job(queue_job_id)
+                self._remember_dispatched_queue_job(queue_job_id, seq_asg if isinstance(seq_asg, int) and not isinstance(seq_asg, bool) else None)
                 emit(recovery_uploading())
                 continue
             if self._adapter_busy(adapter):
@@ -773,7 +805,7 @@ class PrinterManager:
                 # v0.58 r2: the report goes to the durable outbox BEFORE the manager guard is persisted (a crash in between
                 # then re-dispatches idempotently rather than going silent), and ALWAYS — an idempotent re-send too.
                 if emit(uploading):
-                    self._remember_dispatched_queue_job(queue_job_id)
+                    self._remember_dispatched_queue_job(queue_job_id, seq0 if isinstance(seq0, int) and not isinstance(seq0, bool) else None)
                 else:
                     # not durable: leave the manager guard UNSET — the adapter's pending_queue_job_ids() recovers the
                     # re-sent assignment with a fresh 'uploading' instead of a silent skip (codex v0.58 r4)
