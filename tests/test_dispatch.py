@@ -154,7 +154,7 @@ class TestDispatchAssignments(unittest.TestCase):
         self.assertEqual(second, [])
         self.assertEqual(len(fake.calls), 1)
 
-    def test_start_failure_reports_uploading_then_held(self):
+    def test_start_failure_reports_held_only(self):
         with tempfile.TemporaryDirectory() as d:
             spool_file = Path(d) / "abcdef12" / "part.3mf"
             spool_file.parent.mkdir()
@@ -166,9 +166,7 @@ class TestDispatchAssignments(unittest.TestCase):
 
         self.assertEqual(
             reports,
-            [
-                {"queueJobId": "q1", "state": "uploading"},
-                {"queueJobId": "q1", "state": "held", "reason": "upload_failed"},
+            [{"queueJobId": "q1", "state": "held", "reason": "upload_failed"},
             ],
         )
 
@@ -185,7 +183,7 @@ class TestDispatchAssignments(unittest.TestCase):
             fake.result = {"ok": True}
             second = manager.dispatch_assignments([assignment()], d)
 
-        self.assertEqual([r["state"] for r in first], ["uploading", "held"])
+        self.assertEqual([r["state"] for r in first], ["held"])
         self.assertEqual(second, [{"queueJobId": "q1", "state": "uploading"}])
         self.assertEqual(len(fake.calls), 2)
 

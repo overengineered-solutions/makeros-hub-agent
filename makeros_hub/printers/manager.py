@@ -551,43 +551,34 @@ class PrinterManager:
                 continue
             if queue_job_id in self._dispatched_queue_jobs:
                 continue
+
+            def held(reason: str, _a=assignment, _q=queue_job_id) -> dict:
+                # v0.56: EVERY refusal names the assignment it answers (assignmentSeq) so the cloud binds it to that revision
+                out = {"queueJobId": _q, "state": "held", "reason": reason}
+                seq = _a.get("assignmentSeq")
+                if isinstance(seq, int) and not isinstance(seq, bool):
+                    out["assignmentSeq"] = seq
+                return out
+
             if not self._assignment_path_ok(submission_uid, file_name):
-                reports.append(
-                    {
-                        "queueJobId": queue_job_id,
-                        "state": "held",
-                        "reason": "bad_assignment",
-                    }
-                )
+                reports.append(held("bad_assignment"))
                 continue
 
             adapter = self._adapters.get(printer_id)
             start_print = getattr(adapter, "start_print", None) if adapter is not None else None
             if not callable(start_print):
-                reports.append(
-                    {
-                        "queueJobId": queue_job_id,
-                        "state": "held",
-                        "reason": "printer_unavailable",
-                    }
-                )
+                reports.append(held("printer_unavailable"))
                 continue
 
             if self._adapter_busy(adapter):
                 # v0.53: the printer is mid-job by its OWN report — never upload/start another file onto it, whatever the
                 # cloud's view (an 'assigned' re-send after a restart, or a stale idle in the cloud mirror).
-                reports.append({"queueJobId": queue_job_id, "state": "held", "reason": "printer_busy"})
+                reports.append(held("printer_busy"))
                 continue
 
             local_path = base / submission_uid / file_name
             if not local_path.is_file():
-                reports.append(
-                    {
-                        "queueJobId": queue_job_id,
-                        "state": "held",
-                        "reason": "file_not_found",
-                    }
-                )
+                reports.append(held("file_not_found"))
                 continue
 
             plate = assignment.get("plate") or 1
@@ -599,7 +590,6 @@ class PrinterManager:
             objects = parse_plate_objects(local_path, plate_int)
             if objects:
                 uploading["objects"] = objects
-            reports.append(uploading)
             # The member's own print command (cloud-stored from the capture, agent v0.51+): replayed verbatim by
             # the adapter so dual-nozzle/H2D fields survive. Absent for web uploads → the adapter rebuilds.
             raw_print = assignment.get("rawPrint")
@@ -631,13 +621,11 @@ class PrinterManager:
 
             if result.get("ok"):
                 self._remember_dispatched_queue_job(queue_job_id)
+                # v0.56 (codex r2): 'uploading' is reported only AFTER start_print succeeded — a pre-upload refusal
+                # (spool_mismatch / printer_stale) must never leave the cloud believing the file went up.
+                reports.append(uploading)
             else:
-                held = {"queueJobId": queue_job_id, "state": "held", "reason": result.get("reason", "start_failed")}
-                # v0.56: echo the assignment's sequence so the cloud applies the refusal to THAT assignment only
-                seq = assignment.get("assignmentSeq")
-                if isinstance(seq, int) and not isinstance(seq, bool):
-                    held["assignmentSeq"] = seq
-                reports.append(held)
+                reports.append(held(result.get("reason", "start_failed")))
         return reports
 
     def collect_queue_progress(self) -> list[dict]:
