@@ -96,6 +96,7 @@ class BambuAdapter:
         self._last_report_at: float | None = None
         self._started = 0.0
         self._shape_logged = False
+        self._version_logged = False
         self._client: mqtt.Client | None = None
         # Terminal-job detection over the merged state (pure; fed under _lock).
         self._jobs = JobTracker(printer_id, serial, state_path=TERMINAL_JOBS_DIR / f"{_safe_file_component(printer_id)}.json")
@@ -182,6 +183,26 @@ class BambuAdapter:
                     "bambu.shape_observed %s %s",
                     self.printer_id,
                     json.dumps(bambu_parse.summarize_shape(self._data)),
+                )
+        # The printer's OWN get_version modules, once per connection. The virtual printers answer get_version from a
+        # module list captured field-for-field from a real A1 mini, and every other model reuses it — which is why only
+        # the A1 mini VP connects in OrcaSlicer; an H2D or P2S VP presents A1 mini hardware and Orca refuses the device
+        # ("code=-1", live 2026-08-30). We cannot hand-write those lists: guessing them is what broke filament
+        # resolution the last time. So capture reality from the real printers this hub already talks to, then bake the
+        # per-model tables from the log. Serial numbers are the only identifying field and are dropped here.
+        if not self._version_logged and isinstance(doc.get("info"), dict):
+            modules = doc["info"].get("module")
+            if isinstance(modules, list) and modules:
+                self._version_logged = True
+                redacted = [
+                    {k: v for k, v in m.items() if k != "sn"}
+                    for m in modules
+                    if isinstance(m, dict)
+                ]
+                log.info(
+                    "bambu.version_observed %s %s",
+                    self.printer_id,
+                    json.dumps({"module": redacted}),
                 )
 
     def _on_disconnect(self, *_args, **_kwargs):

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import colorsys
 import hashlib
+import logging
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 def _derive_hex(serial: str, tag: str, idx: int, length: int, upper: bool) -> str:
@@ -207,7 +210,17 @@ def build_get_version(
     sequence_id: int | str = "0",
     ams_type: str = "n3f",
 ) -> dict[str, Any]:
-    model_display = MODEL_PRODUCT_NAMES.get(model, "X1 Carbon")
+    # Case/space-insensitive on either key form. An UNMAPPED model still has to answer something, but it must not do
+    # so silently: announcing the wrong product is exactly how a VP becomes unconnectable, and the failure surfaces in
+    # OrcaSlicer as a bare code=-1 with nothing on this side.
+    key = str(model or "").strip().upper()
+    model_display = MODEL_PRODUCT_NAMES.get(model) or MODEL_PRODUCT_NAMES.get(key)
+    if model_display is None:
+        log.warning(
+            "VP model %r has no product name — announcing 'X1 Carbon', which OrcaSlicer will refuse for any other "
+            "model. Add it to MODEL_PRODUCT_NAMES.", model,
+        )
+        model_display = "X1 Carbon"
 
     modules: list[dict[str, Any]] = []
     for name, hw_ver, sw_ver, loader_ver, is_mainboard, own_serial in _A1_MINI_BASE_MODULES:
@@ -283,15 +296,36 @@ def generate_colors(count: int) -> list[str]:
     return colors
 
 
+# The product name a VP puts on its mainboard in get_version — what OrcaSlicer checks a device against.
+#
+# Keyed by BOTH the Bambu model code and the fleet's own model string, because the VP is configured with the latter:
+# manager.py passes `self.config.model`, which is virtual_printers.model ("H2D", "A1 Mini", "P2S", "X1C"). Every one of
+# those missed the code-keyed table and fell through to the "X1 Carbon" default, so EVERY virtual printer announced
+# itself as an X1 Carbon. Orca refuses a device whose product does not match the model it was configured with —
+# "Connect PS H2D (Operator) failed! [SN:…, code=-1]" (seen live 2026-08-30). The A1 mini survived only because
+# OrcaSlicer's A1 path is laxer about it.
 MODEL_PRODUCT_NAMES = {
+    # Bambu model codes
     "N1": "A1 mini",
     "N2S": "A1",
+    "N7": "P2S",
+    "O1D": "H2D",
     "3DPrinter-X1-Carbon": "X1 Carbon",
     "BL-P001": "X1 Carbon",
     "BL-P002": "X1",
     "C11": "P1P",
     "C12": "P1S",
     "C13": "X1E",
+    # fleet model strings (virtual_printers.model) — what a VP is actually configured with
+    "A1 MINI": "A1 mini",
+    "A1": "A1",
+    "X1C": "X1 Carbon",
+    "X1": "X1",
+    "X1E": "X1E",
+    "P1P": "P1P",
+    "P1S": "P1S",
+    "P2S": "P2S",
+    "H2D": "H2D",
 }
 
 

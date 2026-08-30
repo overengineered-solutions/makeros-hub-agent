@@ -346,6 +346,31 @@ class TestReportBuilders(unittest.TestCase):
             build_push_status(ams_version=123456)["print"]["ams"]["version"], 123456
         )
 
+    def test_every_configured_model_announces_its_own_product_name(self):
+        # A VP is configured with the FLEET's model string (virtual_printers.model -> manager passes config.model),
+        # not the Bambu code. Those all missed a code-keyed table and fell back to "X1 Carbon", so every virtual
+        # printer announced itself as an X1 Carbon and OrcaSlicer refused any device configured as something else:
+        # "Connect PS H2D (Operator) failed! [SN:00M09VP556855930, code=-1]" (live 2026-08-30).
+        def product(model):
+            mainboard = [m for m in build_get_version(model, "SER123")["info"]["module"] if m["product_name"]]
+            return mainboard[0]["product_name"]
+
+        for model, expected in [
+            ("H2D", "Bambu Lab H2D"),
+            ("P2S", "Bambu Lab P2S"),
+            ("A1 Mini", "Bambu Lab A1 mini"),
+            ("X1C", "Bambu Lab X1 Carbon"),
+            ("a1 mini", "Bambu Lab A1 mini"),   # case/space tolerant
+        ]:
+            self.assertEqual(product(model), expected, model)
+        # the Bambu codes keep working (the VP config could carry either form)
+        self.assertEqual(product("N1"), "Bambu Lab A1 mini")
+        self.assertEqual(product("O1D"), "Bambu Lab H2D")
+        # an unmapped model still answers, but says so — a silent wrong product is what makes a VP unconnectable
+        with self.assertLogs("makeros_hub.vprinter.report", level="WARNING") as logs:
+            self.assertEqual(product("SomeNewPrinter"), "Bambu Lab X1 Carbon")
+        self.assertIn("no product name", "".join(logs.output))
+
     def test_get_version_mirrors_real_a1_mini_modules(self):
         # Mirror a real Bambu Lab A1 mini's get_version field-for-field (captured
         # 2026-06-15). The earlier hand-written list (wrong hw_vers, an invented
