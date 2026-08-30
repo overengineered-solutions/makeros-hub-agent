@@ -140,6 +140,11 @@ def apply_update(tag: str, expected_sha: str | None = None) -> bool:
         return False
 
 
+# v0.54 (owner): updates and hot-fixes apply ANYTIME by default — finals week never has an idle fleet, and the durable
+# dispatch/progress state makes a restart mid-print safe. MAKEROS_HUB_OTA_WAIT_IDLE=1 opts back into waiting for idle.
+OTA_WAIT_IDLE = os.environ.get("MAKEROS_HUB_OTA_WAIT_IDLE", "0").strip() == "1"
+
+
 def should_defer_update(statuses) -> bool:
     """v0.53: never restart the agent while a printer is preparing/printing/paused. Pure over the heartbeat statuses
     (PrinterStatusDTO dicts): gcodeState RUNNING/PAUSE/PREPARE or activity state printing/paused ⇒ defer."""

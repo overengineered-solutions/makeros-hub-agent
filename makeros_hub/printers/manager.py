@@ -392,8 +392,19 @@ class PrinterManager:
         try:
             DISPATCHED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp = DISPATCHED_STATE_PATH.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self._dispatched_wall), encoding="utf-8")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(self._dispatched_wall))
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, DISPATCHED_STATE_PATH)
+            try:
+                fd = os.open(str(DISPATCHED_STATE_PATH.parent), os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                pass
         except OSError as e:
             log.warning("could not persist the dispatched-job guard: %s", e)
 

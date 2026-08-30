@@ -52,7 +52,7 @@ from .printers.onnx_detector import (
     build_detector_async,
 )
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
-from .update import maybe_update, should_defer_update, should_update
+from .update import OTA_WAIT_IDLE, maybe_update, should_defer_update, should_update
 from .vprinter.capture import CapturedJob, build_vp_submit_body
 from .vprinter.manager import VirtualPrinterManager
 from .vprinter.outbox import VPrinterOutbox, validate_submission_uid
@@ -1847,7 +1847,7 @@ def run(
                     target = resp.body.get("targetVersion")
                     target_sha = resp.body.get("targetVersionSha256")
                     if isinstance(target, str) and target and should_update(__version__, target):
-                        if should_defer_update(manager.statuses()):
+                        if OTA_WAIT_IDLE and should_defer_update(manager.statuses()):
                             log.info("OTA: target %s deferred — a printer is preparing/printing/paused; will retry next beat", target)
                         elif maybe_update(__version__, target, target_sha):
                             log.info("OTA: update to %s launched; the service will restart", target)

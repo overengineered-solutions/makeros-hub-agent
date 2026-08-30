@@ -41,6 +41,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import json
+import os
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
@@ -57,6 +60,20 @@ _TERMINAL_FAILED = "FAILED"
 _ACTIVE = "RUNNING"
 # PAUSE keeps the job active (a paused print resumes into the same job).
 _STILL_ACTIVE = {_ACTIVE, "PAUSE", "PREPARE", "SLICING", "INIT"}
+
+
+def _fsync_dir(path: "Path") -> None:
+    """Make an os.replace durable across a power cut (the directory entry, not just the file)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
 
 
 def _iso(ts: float) -> str:
@@ -134,12 +151,47 @@ class JobTracker:
     ack(). All methods are pure dict/list ops — thread-safety is the caller's
     concern (the Bambu adapter calls observe() under its own lock)."""
 
-    def __init__(self, printer_id: str, serial: str):
+    def __init__(self, printer_id: str, serial: str, state_path: "Path | None" = None):
         self.printer_id = printer_id
         self.serial = serial
         self._active: dict | None = None  # {key, name, startedAt(ts), material}
         self._pending: list[dict] = []
         self._last_state: str = ""
+        # v0.54 durability: unacked terminal jobs survive an update/power cut/restart (owner rule: not RAM-only) — a
+        # print that ended just before a restart still reaches the cloud, so the machine never stays "occupied".
+        self._state_path = state_path
+        self._load_pending()
+
+    def active_key(self) -> str | None:
+        """The job the printer is running right now (its dedupe key), or None."""
+        return self._active["key"] if self._active else None
+
+    def _load_pending(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            raw = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(raw, list):
+            self._pending = [j for j in raw if isinstance(j, dict) and isinstance(j.get("jobKey"), str)][-MAX_PENDING:]
+
+    def _save_pending(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            self._state_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._state_path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self._pending, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._state_path)
+            _fsync_dir(self._state_path.parent)
+        except OSError as e:
+            # A terminal cannot be refused (the print already ended); loud so the ops digest/journal shows the box is
+            # failing to make state durable. The printer-task-id recovery path still covers most restarts.
+            log.error("could not persist terminal jobs for %s (RAM-only until acked): %s", self.printer_id, e)
 
     # -- internals ----------------------------------------------------------
     def _fingerprint(self, name: str | None, started_ts: float) -> str:
@@ -186,6 +238,7 @@ class JobTracker:
 
     def _buffer(self, job: dict) -> None:
         self._pending.append(job)
+        self._save_pending()
         if len(self._pending) > MAX_PENDING:
             dropped = self._pending[: len(self._pending) - MAX_PENDING]
             self._pending = self._pending[-MAX_PENDING:]
@@ -284,4 +337,7 @@ class JobTracker:
     def ack(self, job_keys: list[str]) -> None:
         """Drop jobs the cloud confirmed receiving (heartbeat 200)."""
         keys = set(job_keys)
+        before = len(self._pending)
         self._pending = [j for j in self._pending if j["jobKey"] not in keys]
+        if len(self._pending) != before:
+            self._save_pending()

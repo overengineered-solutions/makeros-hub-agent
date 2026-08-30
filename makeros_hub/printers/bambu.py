@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 import os
 import ssl
 import threading
@@ -33,6 +34,29 @@ import paho.mqtt.client as mqtt
 from . import bambu_parse, bambu_send
 from .jobs import JobTracker
 from .queue_progress import QueueProgressTracker
+
+QUEUE_PROGRESS_DIR = Path(os.environ.get("MAKEROS_HUB_QUEUE_PROGRESS_DIR", "/var/lib/makeros-hub/queue-progress"))
+TERMINAL_JOBS_DIR = Path(os.environ.get("MAKEROS_HUB_TERMINAL_JOBS_DIR", "/var/lib/makeros-hub/terminal-jobs"))
+
+
+def _fsync_dir(path: Path) -> bool:
+    """fsync the directory so an os.replace survives a power cut. Returns False when it could NOT be made durable —
+    the pre-publish dispatch save treats that as "not persisted" (codex v0.54 round 3)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _safe_file_component(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(value))[:80] or "printer"
 
 log = logging.getLogger("makeros-hub.bambu")
 
@@ -74,12 +98,16 @@ class BambuAdapter:
         self._shape_logged = False
         self._client: mqtt.Client | None = None
         # Terminal-job detection over the merged state (pure; fed under _lock).
-        self._jobs = JobTracker(printer_id, serial)
+        self._jobs = JobTracker(printer_id, serial, state_path=TERMINAL_JOBS_DIR / f"{_safe_file_component(printer_id)}.json")
         # Queue assignment state is driven by OBSERVED telemetry, not by
         # MQTT-publish success. The tracker reports "printing" only after
         # RUNNING/PAUSE appears and links completion to the JobTracker's real
         # terminal printer job key.
         self._queue_progress = QueueProgressTracker()
+        # v0.54 durability: the queue↔print correlation survives an update/power cut/restart (owner rule: not RAM-only)
+        self._queue_progress_path = QUEUE_PROGRESS_DIR / f"{_safe_file_component(printer_id)}.json"
+        self._queue_progress_saved = ""
+        self._load_queue_progress()
 
     @property
     def _report_topic(self) -> str:
@@ -235,10 +263,26 @@ class BambuAdapter:
             sequence_id=sequence_id,
             raw_print=raw_print,
         )
+        # v0.54: record + persist the dispatch BEFORE the command leaves the box (codex #4) — a crash in between can only
+        # leave a dispatch that never started (it times out as start_not_observed), never a running print the cloud
+        # can't correlate. A failed publish discards it again.
+        task_name = payload["print"].get("subtask_name")
+        if queue_job_id:
+            with self._lock:
+                self._queue_progress.record_dispatch(
+                    queue_job_id, self._jobs.pending(), task_name=task_name, active_key=self._jobs.active_key()
+                )
+                if not self._save_queue_progress():
+                    # Durable state is the invariant (codex v0.54 r2): a print we cannot track across a restart is a
+                    # print we do not start. The cloud re-sends the assignment; a human sees 'state_persist_failed'.
+                    self._queue_progress.discard_dispatch(queue_job_id)
+                    log.error("bambu %s: refusing to start %s — dispatch state could not be persisted", self.printer_id, queue_job_id)
+                    return {"ok": False, "reason": "state_persist_failed"}
         try:
             info = client.publish(self._request_topic, json.dumps(payload))
         except Exception as exc:  # noqa: BLE001
             log.warning("bambu %s print-start publish failed: %s", self.printer_id, exc)
+            self._discard_dispatch(queue_job_id)
             return {"ok": False, "reason": "start_command_failed"}
         if getattr(info, "rc", mqtt.MQTT_ERR_SUCCESS) != mqtt.MQTT_ERR_SUCCESS:
             log.warning(
@@ -246,12 +290,16 @@ class BambuAdapter:
                 self.printer_id,
                 getattr(info, "rc", "unknown"),
             )
+            self._discard_dispatch(queue_job_id)
             return {"ok": False, "reason": "start_command_failed"}
-
-        if queue_job_id:
-            with self._lock:
-                self._queue_progress.record_dispatch(queue_job_id, self._jobs.pending())
         return {"ok": True}
+
+    def _discard_dispatch(self, queue_job_id: str | None) -> None:
+        if not queue_job_id:
+            return
+        with self._lock:
+            self._queue_progress.discard_dispatch(queue_job_id)
+            self._save_queue_progress()
 
     def send_command(self, command: str, params: dict | None = None) -> dict:
         """Publish a LAN control command to device/<serial>/request — the same
@@ -365,7 +413,40 @@ class BambuAdapter:
         """Drain queue-status reports inferred from observed printer telemetry."""
         with self._lock:
             print_obj = self._data.get("print") if isinstance(self._data.get("print"), dict) else {}
-            return self._queue_progress.collect(
+            # None until the first report after (re)start: silence is not idle (codex v0.54 #1)
+            observed = self._last_report_at is not None
+            reports = self._queue_progress.collect(
                 self._jobs.pending(),
-                print_obj.get("gcode_state"),
+                print_obj.get("gcode_state") if observed else None,
             )
+            self._save_queue_progress()
+            return reports
+
+    def _load_queue_progress(self) -> None:
+        try:
+            self._queue_progress.load_state(json.loads(self._queue_progress_path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            return
+
+    def _save_queue_progress(self) -> bool:
+        """Write only when the state changed (SD-card friendly); atomic + fsync. Returns False when the state could NOT be
+        made durable — callers on the dispatch path refuse to proceed; the collect path logs and carries on."""
+        try:
+            encoded = json.dumps(self._queue_progress.to_state(), sort_keys=True)
+            if encoded == self._queue_progress_saved:
+                return True
+            self._queue_progress_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._queue_progress_path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(encoded)
+                fh.flush()
+                os.fsync(fh.fileno())          # power-cut safe (codex v0.54 #4)
+            os.replace(tmp, self._queue_progress_path)
+            if not _fsync_dir(self._queue_progress_path.parent):
+                log.error("bambu %s: queue progress written but the directory could not be fsynced — not durable", self.printer_id)
+                return False
+            self._queue_progress_saved = encoded
+            return True
+        except OSError as exc:
+            log.error("bambu %s: could not persist queue progress: %s", self.printer_id, exc)
+            return False
