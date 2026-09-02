@@ -66,12 +66,27 @@ def live_trays(ams_units: Any, vt_tray: Any = None) -> list[dict[str, Any]]:
             material = _norm_material(tray.get("material"))
             if not material:
                 continue
-            out.append({"tray_id": ams_id * 4 + slot, "material": material, "color": _norm_color(tray.get("colorHex")),
-                        "filament_id": _norm_fid(tray.get("filamentId"))})
+            entry = {"tray_id": ams_id * 4 + slot, "material": material, "color": _norm_color(tray.get("colorHex")),
+                     "filament_id": _norm_fid(tray.get("filamentId"))}
+            remain = _norm_remain(tray.get("remainPct"))
+            if remain is not None:        # only when the AMS reports one (RFID spool) — the dict shape is pinned by tests
+                entry["remain"] = remain
+            out.append(entry)
     if isinstance(vt_tray, dict) and _norm_material(vt_tray.get("material")):
-        out.append({"tray_id": 254, "material": _norm_material(vt_tray.get("material")),
-                    "color": _norm_color(vt_tray.get("colorHex")), "filament_id": _norm_fid(vt_tray.get("filamentId"))})
+        ext = {"tray_id": 254, "material": _norm_material(vt_tray.get("material")),
+               "color": _norm_color(vt_tray.get("colorHex")), "filament_id": _norm_fid(vt_tray.get("filamentId"))}
+        remain = _norm_remain(vt_tray.get("remainPct"))
+        if remain is not None:
+            ext["remain"] = remain
+        out.append(ext)
     return out
+
+
+def _norm_remain(value: Any) -> float | None:
+    """Remaining filament %, when the AMS reports one (RFID spools; a generic spool reports nothing). None = unknown."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return max(0.0, min(100.0, float(value)))
 
 
 def unaddressable_units(ams_units: Any) -> int:
@@ -113,7 +128,10 @@ def _pick(req: dict[str, Any], trays: list[dict[str, Any]]) -> dict[str, Any] | 
             cands = exact
         elif any(t["filament_id"] for t in cands):
             raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} ({fid}) — a different {describe(req)} is loaded")
-    return min(cands, key=lambda t: (t["tray_id"] in EXTERNAL_TRAY_IDS, t["tray_id"]))
+    # Among identical spools, the FULLEST first (shop log F3, 2026-09-02): the old tie-break was the lowest tray id,
+    # which is a coin the member did not flip — three of the same black PLA at 84/6/3 % must not start a print on the
+    # 3 % one. A spool with no reported remaining (generic, no RFID) sorts after every reported one.
+    return min(cands, key=lambda t: (t["tray_id"] in EXTERNAL_TRAY_IDS, -(t.get("remain") if t.get("remain") is not None else -1.0), t["tray_id"]))
 
 
 def _by_filament_index(required: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:

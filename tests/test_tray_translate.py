@@ -76,6 +76,24 @@ class TestTranslateMapping(unittest.TestCase):
         no_ids = [{"tray_id": 0, "material": "PLA", "color": "FFFFFF", "filament_id": None}]
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFZ99"}], no_ids), [0])
 
+    def test_identical_spools_prefer_the_fullest_then_the_lowest_id(self):
+        # three of the same black PLA at 84 / 6 / 3 % (P2S02 Bolger, 2026-09-02): the fullest wins, not the lowest id
+        units = [{"unit": 0, "raw": {"id": "0"}, "trays": [
+            {"slot": 1, "material": "PLA", "colorHex": "000000FF", "filamentId": "GFA01", "remainPct": 84},
+            {"slot": 2, "material": "PLA", "colorHex": "000000FF", "filamentId": "GFA01", "remainPct": 6},
+            {"slot": 3, "material": "PLA", "colorHex": "000000FF", "filamentId": "GFA01", "remainPct": 3},
+        ]}]
+        trays = tt.live_trays(units)
+        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "000000", "idx": "GFA01"}], trays), [1])
+        # a spool that reports no remaining % sorts after every one that does; equal remaining → lowest id
+        units[0]["trays"][0]["remainPct"] = None
+        units[0]["trays"][1]["remainPct"] = 6
+        trays = tt.live_trays(units)
+        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "000000", "idx": "GFA01"}], trays), [2])
+        units[0]["trays"][2]["remainPct"] = 6
+        trays = tt.live_trays(units)
+        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "000000", "idx": "GFA01"}], trays), [2])
+
     def test_external_spool_is_a_target_when_it_is_the_only_match(self):
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "TPU", "color": "00FF00"}], self.trays), [254])
         # an AMS tray always wins over the external holder for the same requirement
