@@ -21,6 +21,16 @@ MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _RNG = random.SystemRandom()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        # Every caller carries hub credentials. A proxy redirect must never
+        # forward them to another origin (or downgrade HTTPS to HTTP).
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 @dataclass
 class Response:
     status: int
@@ -52,7 +62,7 @@ def post_json(
     while True:
         try:
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _OPENER.open(req, timeout=timeout) as resp:
                 return _parse(resp.status, _read_capped(resp))
         except urllib.error.HTTPError as exc:
             # 4xx are deterministic (bad token, revoked cred) — surface, don't retry.
@@ -85,7 +95,7 @@ def post_bytes(
         headers["Authorization"] = f"Bearer {bearer}"
     try:
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             _read_capped(resp)  # drain (bounded) so the socket can be reused
             return resp.status
     except urllib.error.HTTPError as exc:
@@ -104,7 +114,7 @@ def get_json(url: str, *, bearer: str | None = None, timeout: float = 15.0) -> R
         headers["Authorization"] = f"Bearer {bearer}"
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             return _parse(resp.status, _read_capped(resp))
     except urllib.error.HTTPError as exc:
         return Response(status=exc.code, body=_safe_read(exc))
@@ -156,7 +166,7 @@ def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 6
     size = 0
     started = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp, Path(dest).open("wb") as out:
+        with _OPENER.open(req, timeout=timeout) as resp, Path(dest).open("wb") as out:
             if resp.status != 200:
                 raise TransportError(f"GET {url}: HTTP {resp.status}")
             while True:

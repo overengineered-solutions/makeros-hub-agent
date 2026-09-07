@@ -12,13 +12,16 @@ from __future__ import annotations
 
 import copy
 import ipaddress
+import json
 import logging
 import os
 import re
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 CONFIG_PATH = Path(os.environ.get("MAKEROS_HUB_CONFIG", "/etc/makeros-hub/config.toml"))
 CREDENTIAL_PATH = Path(
@@ -29,12 +32,22 @@ DEFAULT_HEARTBEAT_SEC = 30
 # Non-privileged port the OrcaSlicer ingest HTTP server binds on the LAN. The
 # member points OrcaSlicer's Print Host at http://<hub>.local:<port>.
 DEFAULT_INGEST_PORT = 8787
-# Cap a single sliced-file upload (sliced 3MFs run a few MB; 256MB is a generous
-# guard against a runaway/abusive upload OOMing the Pi).
-DEFAULT_MAX_UPLOAD_MB = 256
+# Manual HTTP upload is buffered; 64 MiB leaves room for parsing on the shop box.
+# FTPS uses its separate streaming limit.
+DEFAULT_MAX_UPLOAD_MB = 64
 VPRINTER_CODE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 log = logging.getLogger("makeros-hub.config")
+
+
+def validate_cloud_url(value: str) -> str:
+    if not isinstance(value, str) or any(ord(c) < 33 for c in value):
+        raise ValueError("cloud URL must be an HTTPS origin")
+    parts = urlsplit(value)
+    local_http = parts.scheme == "http" and parts.hostname in {"localhost", "127.0.0.1", "::1"}
+    if (parts.scheme != "https" and not local_http) or not parts.hostname or parts.username or parts.password or parts.query or parts.fragment or parts.path not in {"", "/"}:
+        raise ValueError("cloud URL must be an HTTPS origin (HTTP only for local tests)")
+    return value.rstrip("/")
 
 
 @dataclass
@@ -43,6 +56,9 @@ class Config:
     heartbeat_sec: int = DEFAULT_HEARTBEAT_SEC
     ingest_port: int = DEFAULT_INGEST_PORT
     max_upload_mb: int = DEFAULT_MAX_UPLOAD_MB
+
+    def __post_init__(self):
+        self.cloud_url = validate_cloud_url(self.cloud_url)
 
     @property
     def enroll_url(self) -> str:
@@ -343,24 +359,35 @@ def persist_cloud_url(cloud_url: str) -> None:
     `cloud_url = …` line (commented lines don't match) or appends one; other
     lines (heartbeat_sec, comments) are preserved.
     """
-    line = f'cloud_url = "{cloud_url}"\n'
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CONFIG_PATH.write_text(line, encoding="utf-8")
-        return
+    line = f"cloud_url = {json.dumps(validate_cloud_url(cloud_url))}\n"
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    raw = CONFIG_PATH.read_text(encoding="utf-8") if CONFIG_PATH.exists() else ""
     out: list[str] = []
     replaced = False
-    for ln in CONFIG_PATH.read_text(encoding="utf-8").splitlines(keepends=True):
-        if not replaced and re.match(r"\s*cloud_url\s*=", ln):
+    in_table = False
+    for ln in raw.splitlines(keepends=True):
+        if ln.lstrip().startswith("["):
+            in_table = True
+        if not in_table and re.match(r"\s*cloud_url\s*=", ln):
+            if replaced:
+                raise ValueError("duplicate cloud_url in config")
             out.append(line)
             replaced = True
         else:
             out.append(ln)
     if not replaced:
-        if out and not out[-1].endswith("\n"):
-            out[-1] += "\n"
-        out.append(line)
-    CONFIG_PATH.write_text("".join(out), encoding="utf-8")
+        out.insert(0, line)
+    content = "".join(out)
+    tomllib.loads(content)  # refuse a broken configuration before replacing it
+    fd, name = tempfile.mkstemp(prefix=".config-", dir=CONFIG_PATH.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(name, CONFIG_PATH)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def read_credential() -> str | None:
@@ -373,9 +400,21 @@ def read_credential() -> str | None:
 
 def write_credential(credential: str) -> None:
     """Persist the per-hub bearer 0600. Never logged."""
+    if not isinstance(credential, str) or not credential.strip() or credential != credential.strip():
+        raise ValueError("refusing an empty or padded hub credential")
     CREDENTIAL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # Create with 0600 from the start (don't briefly expose it world-readable).
-    fd = os.open(str(CREDENTIAL_PATH), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(credential)
-    os.chmod(CREDENTIAL_PATH, 0o600)
+    # mkstemp starts private; a failed write must leave the working credential.
+    fd, name = tempfile.mkstemp(prefix=".credential-", dir=CREDENTIAL_PATH.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(credential)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(name, CREDENTIAL_PATH)
+        directory_fd = os.open(CREDENTIAL_PATH.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        Path(name).unlink(missing_ok=True)

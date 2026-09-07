@@ -4,12 +4,14 @@
 # Over-the-air agent update. The agent (running as the non-root makeros-hub user)
 # invokes this via a narrow sudoers rule that permits ONLY this script. It then
 # re-launches the real work in an INDEPENDENT systemd transient unit, so the
-# `systemctl restart makeros-hub` it performs at the end can't kill the update
+# `systemctl start makeros-hub` it performs at the end can't kill the update
 # mid-flight (a service can't cleanly restart itself).
 #
 # Safety: only ever acts on a real release tag (vX.Y.Z) of the one hardcoded
 # repo — never a branch, a commit, or an arbitrary ref.
 set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 
 TAG="${1:-}"
 EXPECTED_SHA="${2:-}"
@@ -24,14 +26,9 @@ echo "$EXPECTED_SHA" | grep -Eq '^[0-9a-f]{40}$' || {
   exit 2
 }
 
-# Code host: read `repo` from config.toml (bootstrap wrote it), so OTA pulls from the SAME mirror the install
-# used. Falls back to the sovereign default if the key is absent (e.g. a hub installed before this key existed).
-# The host does NOT need to be trusted: the content-trust SHA check below rejects any clone whose HEAD is not
-# the exact commit the cloud pinned, so a read-only public mirror is sufficient and GitHub is not required.
-CONFIG="${MAKEROS_HUB_CONFIG:-/etc/makeros-hub/config.toml}"
-REPO_DEFAULT="https://git.overengineeredsolutions.org/makeros-hub-agent.git"
-REPO="$(sed -n 's/^[[:space:]]*repo[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$CONFIG" 2>/dev/null | head -1)"
-[ -n "$REPO" ] || REPO="$REPO_DEFAULT"
+# This root-owned helper is the trust boundary. The service owns config.toml
+# and supplies the SHA, so neither can authorize a different repository.
+REPO="https://git.overengineeredsolutions.org/makeros-hub-agent.git"
 SELF="/opt/makeros-hub/update.sh"
 
 # Phase 1 — invoked by the agent, still inside the service's cgroup. Detach into
@@ -47,6 +44,19 @@ if [ "${MAKEROS_OTA_DETACHED:-}" != "1" ]; then
 fi
 
 # Phase 2 — running in the transient unit (own cgroup). Do the real work.
+exec 9>/run/makeros-hub-update.lock
+flock -n 9 || { echo "makeros-hub OTA: another update is running" >&2; exit 4; }
+# A service-user caller can bypass update.py. Refuse a downgrade HERE too,
+# otherwise it could reinstall an old canonical release with a vulnerable helper.
+CURRENT="$(sed -n 's/^__version__ = "\([0-9.]*\)"$/\1/p' /opt/makeros-hub/makeros_hub/__init__.py)"
+python3 -I - "$CURRENT" "$TAG" <<'VERSION_GATE'
+import re
+import sys
+current, target = sys.argv[1:]
+if (not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", current)
+        or tuple(map(int, target[1:].split("."))) <= tuple(map(int, current.split(".")))):
+    sys.exit("makeros-hub OTA: refusing unknown installed version, same version or downgrade; operator rollback requires a manual install")
+VERSION_GATE
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 echo "makeros-hub OTA: cloning $TAG"
@@ -55,17 +65,15 @@ git clone --branch "$TAG" "$REPO" "$TMP/src"
 cd "$TMP/src"
 # Content-trust: the tag must resolve to the EXACT commit the cloud pinned. A compromised/re-pointed tag on the
 # git host fails here BEFORE anything runs as root. (dual-review 2026-07-20; roadmap: signed-tag verification.)
-if [ -n "$EXPECTED_SHA" ]; then
-  GOT="$(git rev-parse HEAD)"
-  if [ "$GOT" != "$EXPECTED_SHA" ]; then
-    echo "makeros-hub OTA: REFUSING $TAG — resolved to $GOT, expected $EXPECTED_SHA" >&2
-    exit 3
-  fi
-  echo "makeros-hub OTA: content-trust verified ($TAG @ $EXPECTED_SHA)"
-else
-  echo "makeros-hub OTA: WARNING — no target SHA provided; installing $TAG UNVERIFIED" >&2
+GOT="$(git rev-parse HEAD)"
+if [ "$GOT" != "$EXPECTED_SHA" ]; then
+  echo "makeros-hub OTA: REFUSING $TAG — resolved to $GOT, expected $EXPECTED_SHA" >&2
+  exit 3
 fi
+BUILT="$(sed -n 's/^__version__ = "\([0-9.]*\)"$/\1/p' makeros_hub/__init__.py)"
+[ "v$BUILT" = "$TAG" ] || { echo "makeros-hub OTA: release version does not match tag" >&2; exit 3; }
+echo "makeros-hub OTA: content-trust verified ($TAG @ $EXPECTED_SHA)"
 ./install.sh
 echo "makeros-hub OTA: installed $TAG — restarting service"
-systemctl restart makeros-hub
+systemctl start makeros-hub
 echo "makeros-hub OTA: done -> $TAG"

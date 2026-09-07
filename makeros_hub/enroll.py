@@ -35,10 +35,11 @@ def enroll(cfg: Config, token: str, *, force: bool = False) -> str:
     if resp.status == 200:
         credential = resp.body.get("credential")
         hub_id = resp.body.get("hubId")
-        if not isinstance(credential, str) or not isinstance(hub_id, str):
+        if (not isinstance(credential, str) or not credential.strip() or credential != credential.strip()
+                or not isinstance(hub_id, str) or not hub_id.strip()):
             raise SystemExit(
-                "Enroll succeeded but the response was missing the credential/hubId — "
-                "the cloud contract may have changed. Check /admin/observability."
+                "Enrollment was not confirmed: the response was missing the credential/hubId. "
+                "The previous credential was preserved. Check /admin/hub."
             )
         write_credential(credential)
         return hub_id
@@ -46,7 +47,7 @@ def enroll(cfg: Config, token: str, *, force: bool = False) -> str:
     reason = resp.body.get("error", f"http_{resp.status}")
     hints = {
         "token_invalid": "That token isn't recognized. Mint a fresh one at "
-        "/admin/3dprinting/hubs and copy it exactly.",
+        "/admin/hub and copy it exactly.",
         "token_expired": "That token expired (15-min window). Mint a fresh one.",
         "token_consumed": "That token was already used. Mint a fresh one — each "
         "token enrolls exactly one hub.",

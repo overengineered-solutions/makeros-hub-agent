@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "makeros-hub-agent"
-version = "0.65.0"
+version = "0.66.0"
 description = "On-LAN bridge between makerspace 3D printers and the makeros cloud control plane (the SimplyPrint replacement)"
 requires-python = ">=3.11"
 # The source-of-truth version is makeros_hub/__init__.py:__version__ (reported in
@@ -12,9 +12,7 @@ requires-python = ">=3.11"
 #
 # Enrollment + heartbeat are stdlib-only. install.sh is the authoritative installer:
 # it provisions the venv and pip-installs the runtime deps below with these same pins,
-# and an offline/failed dep install degrades gracefully (printers report
-# 'agent_missing_paho'; the virtual printer / AI failure-watch report their dep missing)
-# rather than breaking heartbeats.
+# and refuses code replacement if required imports fail. Optional AI inference may degrade.
 dependencies = [
   "paho-mqtt>=2.0,<3",     # Bambu LAN MQTT telemetry + control
   "cryptography>=42,<46",  # virtual-printer self-signed TLS (CA + leaf)

@@ -43,7 +43,7 @@ def boundary_from_content_type(content_type: str | None) -> str | None:
     return (m.group(1) or m.group(2)).strip()
 
 
-_DISPOSITION_NAME = re.compile(rb'name="([^"]*)"', re.IGNORECASE)
+_DISPOSITION_NAME = re.compile(rb'(?:^|;\s*)name="([^"]*)"', re.IGNORECASE)
 _DISPOSITION_FILENAME = re.compile(rb'filename="([^"]*)"', re.IGNORECASE)
 
 
@@ -52,31 +52,30 @@ def parse_multipart(body: bytes, boundary: str) -> ParsedForm:
 
     Binary-safe: works entirely in bytes and never decodes the file payload.
     Raises MultipartError on a malformed body."""
-    if not boundary:
+    if not boundary or len(boundary) > 70 or "\r" in boundary or "\n" in boundary:
         raise MultipartError("empty boundary")
     delim = b"--" + boundary.encode("latin-1")
     # Each part is preceded by the delimiter; the stream ends with delim + "--".
     # Split and drop the preamble (before the first delim) and the closing chunk.
-    chunks = body.split(delim)
+    # A boundary is a complete delimiter line. A same-looking byte sequence
+    # inside the binary file must survive unchanged. Bound part count as well.
+    chunks = re.split(rb"\r\n" + re.escape(delim) + rb"(?=\r\n|--(?:\r\n|$))", b"\r\n" + body, maxsplit=65)
+    if chunks[0] != b"" or chunks[-1] not in (b"--", b"--\r\n") or len(chunks) > 65:
+        raise MultipartError("invalid multipart framing or too many parts")
     fields: dict[str, str] = {}
     file_part: FilePart | None = None
 
-    for chunk in chunks:
-        # Skip the preamble (''), the closing '--\r\n', and stray empties.
-        if chunk in (b"", b"--\r\n", b"--", b"\r\n"):
-            continue
-        if chunk.startswith(b"--"):  # closing delimiter tail
-            continue
+    for chunk in chunks[1:-1]:
         # A part starts with CRLF after the delimiter, then headers, then CRLFCRLF,
         # then the body, then a trailing CRLF before the next delimiter.
         part = chunk
         if part.startswith(b"\r\n"):
             part = part[2:]
         header_blob, sep, rest = part.partition(b"\r\n\r\n")
-        if not sep:
-            continue  # not a well-formed part
-        # Strip exactly one trailing CRLF that precedes the next delimiter.
-        data = rest[:-2] if rest.endswith(b"\r\n") else rest
+        if not sep or len(header_blob) > 8192:
+            raise MultipartError("invalid multipart headers")
+        # The delimiter split consumed its preceding CRLF, not the file's bytes.
+        data = rest
 
         name_m = _DISPOSITION_NAME.search(header_blob)
         if not name_m:
@@ -86,9 +85,13 @@ def parse_multipart(body: bytes, boundary: str) -> ParsedForm:
         if filename_m:
             filename = filename_m.group(1).decode("utf-8", "replace")
             if filename:  # a file part
+                if file_part is not None or name != "file":
+                    raise MultipartError("expected one file field")
                 file_part = FilePart(filename=filename, data=data)
                 continue
         # A plain text field.
+        if len(data) > 1024:
+            raise MultipartError("multipart field too large")
         fields[name] = data.decode("utf-8", "replace")
 
     return ParsedForm(fields=fields, file=file_part)

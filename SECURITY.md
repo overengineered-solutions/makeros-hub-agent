@@ -1,121 +1,41 @@
-# Security & trust model
+# Shop-box security and trust model
 
-This agent runs on a **tenant-controlled box on an untrusted LAN** and connects to the
-**shared multi-tenant makeros cloud**. It is built *certifiable* (SOC 2 / HITRUST controls
-in from day one), even though certification itself is deferred. This document is the
-auditable record of the trust model.
+This agent connects one Procrastination Station shop box to the sovereign pstation app. It is not a multi-tenant cloud and makes no SOC 2/HITRUST certification claim. The app uses Auth.js and Postgres with app-layer member ownership, not Supabase Vault or RLS. Read the app's AGENTS.md for its isolation contract.
 
-## Tenant isolation (enforced cloud-side)
+## Boundaries actually implemented
 
-- Each hub holds a **per-hub bearer credential** bound to exactly one workspace. The cloud
-  resolves the workspace **from the DB-attested hub row, never from a request envelope** —
-  a hub cannot claim to be another tenant.
-- All hub data is **row-level-security scoped** to its workspace. A compromised or malicious
-  hub can only ever read/write its **own** tenant's rows; it has no path to another tenant.
-- **Immediate revocation:** an admin revokes a hub in the dashboard → its credential hash is
-  nulled → the next request 401s. No re-deploy, no manual SQL.
+- The app resolves a hub from its bearer, checks hub ownership on printer/job operations, and checks the member's print eligibility at submission. Revoking the hub rejects its next HTTP request. A running physical print is not a remotely revocable permission grant.
+- Enrollment exchanges a short-lived one-use token for a per-hub bearer. The app stores the hash; the box stores the bare credential in `/var/lib/makeros-hub/credential`, private mode 0600. Empty credentials are refused; replacement uses a private temporary file and atomic rename. Never share config-down responses, state backups or member setup downloads.
+- Cloud URLs must be HTTPS origins (HTTP is allowed only for localhost tests). All four credentialed HTTP transports refuse redirects. Parsed acknowledgements, not just HTTP 200, release report/submission buffers. Invalid printer-list responses preserve the current physical adapters. Virtual-printer authorization still fails closed when no valid members remain.
+- The app encrypts physical printer access codes with AES-256-GCM under a key derived from its AUTH_SECRET. Config-down delivers them only to the owning hub. The box necessarily has printer credentials and member code hashes in memory; possession of that process is a compromise of the shop's printer access.
+- New member codes from pstation use ten random characters, the current OrcaSlicer input limit. Earlier eight-character hashes remain valid until explicitly revoked. Online attempts are limited, but hash disclosure permits offline guessing; code hashes are sensitive, not public identifiers.
+- MQTT reports contain the destination session's own transfer state and filename. FTPS upload notifications select that member's sessions. Tests drive two members and inspect both packets. FTPS does not implement RETR; LIST is empty and SIZE refuses. Unique spool filenames and `(member_id, filename)` capture pairing prevent one member's same-named upload from replacing another's.
+- Passive FTPS binds to the virtual printer's configured address, and accepts a data connection only from the known control peer. Unknown control peers are refused.
 
-## Credential handling
+## Root access and updates
 
-- The credential is minted **once** at enrollment and shown once. The cloud stores only its
-  **SHA-256**; the plaintext lives only on the Pi at `/var/lib/makeros-hub/credential`,
-  **mode 0600**, owned by the service user. It is **never logged** (agent or cloud).
-- Authentication is **hash-lookup + constant-time hash compare**, never a plaintext `==`.
-- The one-time enrollment token is single-use, 15-minute TTL, and likewise stored only as a hash.
+The service runs as `makeros-hub`. The installed code, venv and three sudo helpers are root-owned. Sudo permits only `update.sh`, `tailscale-setup.sh`, and `vp-network.py`; it no longer permits arbitrary `ip` or `arping` argument patterns. These are script entrypoints, not a claim that the whole service is sandboxed.
 
-## Printer credentials (config-down)
+`update.sh` fixes the canonical sovereign repository in root-owned code, requires a release tag and exact commit, rejects same-version/downgrade calls at the root boundary, checks the cloned package version against its tag, and serializes updates. Service-writable `repo` configuration cannot select executable root code. A manual operator rollback is deliberately separate from service-triggered OTA. Invalid/unwritable cooldown state refuses an update rather than causing a restart loop.
 
-- A Bambu **LAN access code** is a low-stakes secret (it's printed on the printer's own screen
-  and is rotatable there). The operator enters it in the cloud admin UI; the cloud stores it
-  **encrypted at rest in Supabase Vault** — only its last-4 lands in a regular column.
-- The agent **pulls** its printer list, access codes included, from `GET /api/print/hub/config`,
-  authenticated with its per-hub bearer over TLS. This is the **only** direction a printer
-  secret travels, and only to the one hub that owns the printer.
-- On the Pi the access code is held **only in process memory** (the MQTT password) — never
-  written to disk, never logged, and **never sent back up** on the heartbeat (which carries
-  printer telemetry only). The wire status DTO has no `accessCode`/`serial`/`ip` fields by
-  construction.
+`install.sh` stages code and helpers before stopping an active service. Copy/swap/start failures restore their previous versions and attempt restart. The old files remain under `/opt/makeros-hub/previous`. Required printer dependencies must import successfully. **This is not a complete dependency rollback:** pip changes to the venv happen earlier; take a full image/venv backup for operational rollback.
 
-## Least privilege
+`bootstrap.sh` also requires a reviewed tag and commit before executing the clone's installer. The bootstrap script itself must come from the operator's reviewed checkout, not an unauthenticated mutable pipe. The sovereign publisher and operator's release selection remain trusted. A SHA supplied by the app/service is not an independent publisher signature, and a compromised authorized release is not safe. Signed release attestation needs an operator-provisioned verification key before it can provide a stronger boundary.
 
-- Runs as a dedicated **non-login system user** (`makeros-hub`), not root.
-- **Outbound HTTPS to the cloud.** The only inbound listeners are on the **trusted shop LAN** — the OrcaSlicer
-  ingest (`:8787`) and, when a virtual printer is enabled, its Bambu-emulation ports (e.g. FTPS `990`). Never the
-  internet.
-- systemd hardening: `ProtectHome`, `PrivateTmp`, and a scoped `StateDirectory` (0700, service-user-owned).
-  `NoNewPrivileges` and `ProtectSystem=full` are **deliberately NOT set** — each would block a legitimate
-  privileged path this design needs: `NoNewPrivileges` stops `sudo` from escalating even with a valid NOPASSWD
-  rule (breaks the OTA self-update), and `ProtectSystem=full` mounts `/usr` + `/etc` read-only (breaks the
-  OTA/Tailscale installs that write there). The real controls are the unprivileged service user + the narrow,
-  arg-scoped sudoers rules below — not filesystem/privilege sandboxing. (Verified against
-  `systemd/makeros-hub.service`, which documents both omissions inline.)
-- **No secrets in this repository.**
+`tailscale-setup.sh` only operates an installed client, validates hostname/key inputs, and passes the temporary private key file to Tailscale. It no longer downloads and executes a mutable root installation script. Provision Tailscale once from its official signed OS repository as an operator. The helper does not grant an exit route or SSH access.
 
-## Supply-chain integrity
+`vp-network.py` validates exactly add/del/probe, individual IPv4 `/32` aliases and fixed probe flags. LAN addresses must belong to the primary interface's subnet and cannot be its own address, gateway, broadcast or network. Loopback aliases are limited to `198.18.0.0/15`. Failed ARP probes mean unavailable, never free. This does not reserve DHCP addresses or implement a firewall; the operator must reserve the alias range.
 
-- **Install from a pinned, versioned tag** (`git clone --branch vX.Y.Z`), **never** a
-  `curl | sudo bash` of mutable `main`. Pinning a reviewed release is the control that keeps
-  a repo compromise from reaching tenant devices.
-- The repository is **public** for transparency — tenants and auditors can review exactly what
-  runs on their hardware and talks to the shared cloud.
-- **The code host is the OES sovereign mirror** (`git.overengineeredsolutions.org`), served read-only over
-  HTTPS, not GitHub. This is not a trust downgrade: the cloud pins the exact commit SHA in each heartbeat and
-  both `bootstrap.sh` and `update.sh` **refuse any clone whose HEAD is not that commit** (content-trust). The
-  host therefore only needs to be *available*, not *trusted* — a re-pointed tag or a tampered mirror fails the
-  SHA check before anything runs as root. `--repo` overrides the host; `config.toml`'s `repo` key persists it
-  for OTA. (Integrity roadmap: signed-tag verification, on top of the SHA pin.)
-- **Roadmap (before second-tenant onboarding):** signed release artifacts (minisign/Sigstore)
-  + checksum verification in the installer, and a `--verify` step in the bootstrap one-liner.
-  Until then, install only from a tag you (or your operator) have reviewed.
+## File intake and durability
 
-## OrcaSlicer ingest server (the one inbound listener)
+Manual HTTP intake has one buffered upload at a time, at most four connection threads, a 64 MiB effective cap, a read deadline and a free-space floor. Multipart parsing respects delimiter lines and preserves binary content. A rejection returns an error, not an apparent successful upload. An unknown cloud outcome retains the spool file and tells the member to check the queue before resending. Staff must resolve these files; there is no automatic speculative resubmission.
 
-The agent runs an OctoPrint-compatible HTTP server on the LAN (default `:8787`) so members'
-OrcaSlicer can "Send" to the hub. Trust model:
+FTPS streams uploads. File and directory flushes precede success acknowledgements. The durable submission outbox and dispatch/progress state survive process restarts; failed flushes are not reported as success. The app holds legacy manual jobs without a printer model for staff, and auto-dispatch requires matching model, readable applicable filament requirements and the plate safety gates. The box rechecks printer/tray state and compares the actual sliced model with the physical printer before uploading. Missing or mismatched model metadata refuses the start. This is an accidental mismatch guard, not a full validator of arbitrary malicious G-code. Existing running/assigned jobs are not silently moved to a new printer by the audit.
 
-- **Bound to the shop LAN only**, a non-privileged port; the hub→cloud link stays
-  outbound-HTTPS. There is no inbound path from the internet (Phase 2's relay/NetBird adds
-  encrypted remote send).
-- **Every upload is authenticated by the member's print token** (OrcaSlicer's `X-Api-Key`),
-  which the hub does **not** validate itself — it forwards the token to the cloud, which
-  resolves it to a member + runs the eligibility gate. A bad/revoked token is rejected
-  (`403`); the hub stores nothing attributable without a valid member.
-- **Uploads are inert data**: the sliced file is written to a hub-local spool dir and
-  forwarded; it is never executed, and the filename is sanitized before it touches the
-  filesystem. Upload size is capped (default 256MB) to prevent a runaway upload exhausting
-  the Pi.
-- The member token rides in cleartext over the trusted LAN (like the Bambu access codes) —
-  acceptable for on-LAN send; remote send (Phase 2) is the encrypted path.
+## Required operational boundaries
 
-## Over-the-air self-update
+The software does **not** prove that the installed router, host firewall or Headscale ACL matches this design. Virtual-printer ports and manual HTTP must be reachable only on the member/shop networks, management only on the operator network, and physical printers isolated from member clients. Do not expose these listeners publicly. HTTP print-host tokens are plaintext on their local hop unless carried through the encrypted network; prefer the website or VP TLS path.
 
-The agent can update itself when the cloud (in the heartbeat response) names a newer release —
-the one remote-code-execution path in the system, so it is deliberately narrow:
+Physical Bambu links currently use self-signed TLS without verifying the server certificate. This encrypts traffic but does not authenticate the printer against an active LAN attacker. A segregated printer LAN is therefore a required current trust boundary; certificate enrollment/pinning would need observed printer certificates and an operator-controlled replacement workflow. None was invented from unavailable hardware.
 
-- **Release tags only.** The agent acts only on a well-formed `vX.Y.Z` tag, validated by regex
-  on both the agent and the root script. The cloud cannot point it at a branch, a commit,
-  `main`, or any non-release ref — only a real tagged release of the one hardcoded repo URL.
-- **Forward-only.** Never downgrades; a cooldown stops an update loop on a broken target.
-- **Scoped sudoers (not update-only).** The non-root `makeros-hub` user has an `/etc/sudoers.d/makeros-hub`
-  drop-in (validated with `visudo` at install) granting root for exactly five things (`install.sh`):
-  `update.sh` (OTA), `tailscale-setup.sh` (Tailscale install/up), and — for the per-model virtual-printer IP
-  allocator — `ip addr add|del … dev …` and `arping -c … -w … -I …`. No shell, no arbitrary command. The
-  `ip`/`arping` wildcards are the widest remaining surface (any IP/interface); moving them behind arg-validating
-  wrapper scripts (as `update.sh` already is) is a tracked hardening item. The OTA + setup scripts are root-owned
-  and not writable by the service user, so they can't be swapped; the OTA runs in an independent systemd transient
-  unit so the service restart can't kill it mid-flight.
-- **Operator-controlled.** Auto-update is **off by default**, per hub; the admin opts in (or
-  triggers a one-shot "Update now") from the dashboard.
-- **Content-trust (implemented).** The cloud sends, alongside the target tag, the exact **commit SHA** that tag
-  must resolve to. The root update script runs `git rev-parse HEAD` after cloning and **refuses to install**
-  anything that doesn't match — so a compromised or re-pointed tag on the git host can't push other code (both the
-  cloud AND the git host would have to be compromised, consistently). Signed release artifacts (minisign/Sigstore)
-  remain a roadmap second factor.
-- **Portable update transport.** `MAKEROS_HUB_UPDATE_MODE` selects `systemd` (default — the sudo root script +
-  transient-unit restart above), `exit` (container: record the target + exit a defined code so the orchestrator
-  repulls the pinned image — no sudo/systemd), or `disabled` (never self-update).
-
-## Reporting
-
-Report security issues privately to `security@overengineeredsolutions.org`. Do not open a
-public issue for a vulnerability.
+Systemd uses a non-login account, private temporary storage, ProtectHome and memory limits. NoNewPrivileges/ProtectSystem are deliberately absent because the root maintenance helpers need elevation/writes. These tradeoffs, installed ownership, controller ACLs, disk/power-loss recovery and a real print must be checked on the box before production acceptance. Never infer physical readiness from a green heartbeat alone.

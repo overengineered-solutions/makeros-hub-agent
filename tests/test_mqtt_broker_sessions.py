@@ -145,6 +145,9 @@ class TestMultiSession(unittest.TestCase):
             # the FTPS path targets the uploading MEMBER's sessions only
             broker.set_print_state("FINISH", gcode_file="bob.3mf", prepare_percent="100", member_id="m2")
             self.assertEqual((b.session(broker).gcode_file, a.session(broker).gcode_file), ("bob.3mf", "alice.3mf"))
+            await broker.push_report_now()
+            self.assertEqual(_published(a.writer)[-1]["print"]["gcode_file"], "alice.3mf")
+            self.assertEqual(_published(b.writer)[-1]["print"]["gcode_file"], "bob.3mf")
             await a.disconnect()
             await b.disconnect()
 

@@ -34,9 +34,17 @@ import paho.mqtt.client as mqtt
 from . import bambu_parse, bambu_send, tray_translate
 from .jobs import JobTracker
 from .queue_progress import QueueProgressTracker
+from ..vprinter.capture import parse_printer_model_id
+from ..vprinter.report import MODEL_PRODUCT_NAMES
 
 QUEUE_PROGRESS_DIR = Path(os.environ.get("MAKEROS_HUB_QUEUE_PROGRESS_DIR", "/var/lib/makeros-hub/queue-progress"))
 TERMINAL_JOBS_DIR = Path(os.environ.get("MAKEROS_HUB_TERMINAL_JOBS_DIR", "/var/lib/makeros-hub/terminal-jobs"))
+
+
+def _sliced_model_matches(path, model: str | None) -> bool:
+    expected = MODEL_PRODUCT_NAMES.get(model) or MODEL_PRODUCT_NAMES.get((model or "").upper())
+    actual = MODEL_PRODUCT_NAMES.get(parse_printer_model_id(Path(path)))
+    return expected is not None and actual == expected
 
 
 def _fsync_dir(path: Path) -> bool:
@@ -381,6 +389,11 @@ class BambuAdapter:
                 return {"ok": False, "reason": f"{exc.reason}: {exc.detail}"[:200]}
             log.info("bambu %s: trays for %s — virtual %s → physical %s / %s", self.printer_id, queue_job_id,
                      before, payload["print"].get("ams_mapping"), payload["print"].get("ams_mapping2"))
+
+        # Every submission path converges here. The chosen virtual pool is not proof of the file's model.
+        if not _sliced_model_matches(local_path, self.model):
+            log.warning("bambu %s: refusing %s — sliced model missing or mismatched", self.printer_id, queue_job_id)
+            return {"ok": False, "reason": "model_mismatch"}
 
         try:
             bambu_send.upload_3mf(self.host, self._access_code, local_path, file_name)

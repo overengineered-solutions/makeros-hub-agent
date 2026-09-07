@@ -42,9 +42,26 @@ class TestDispatchOrder(unittest.TestCase):
         a._last_report_at = time.monotonic()   # a FRESH report: the AMS mirror rides only on connected status
         return a
 
+    def test_actual_file_model_checked_before_any_physical_upload(self):
+        import zipfile
+        for model_id, allowed in [(None, False), ("C12", False), ("UNKNOWN", False), ("N1", True)]:
+            with self.subTest(model_id=model_id), tempfile.TemporaryDirectory() as d, \
+                    mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
+                    mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), \
+                    mock.patch.object(bambu_send, "upload_3mf") as upload:
+                path = Path(d) / "part.3mf"
+                metadata = f'<metadata key="printer_model_id" value="{model_id}"/>' if model_id else ""
+                with zipfile.ZipFile(path, "w") as archive:
+                    archive.writestr("Metadata/slice_info.config", f"<config><plate>{metadata}</plate></config>")
+                adapter = self._adapter(d)
+                result = adapter.start_print(path, "part.3mf")
+                self.assertEqual(result, {"ok": True} if allowed else {"ok": False, "reason": "model_mismatch"})
+                self.assertEqual(upload.call_count, int(allowed))
+                self.assertEqual(len(adapter._client.published), int(allowed))
+
     def test_refuses_before_upload_when_a_required_spool_is_missing(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5], queue_job_id="q1",
                               raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]},
@@ -58,7 +75,7 @@ class TestDispatchOrder(unittest.TestCase):
     def test_translates_then_uploads_then_publishes(self):
         import json
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5, 9], queue_job_id="q1",
                               raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5, 9], "ams_mapping2": [-1, 9]},
@@ -73,7 +90,7 @@ class TestDispatchOrder(unittest.TestCase):
 
     def test_stale_report_is_a_refusal_not_a_guess(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             a._last_report_at = time.monotonic() - 3600
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5], queue_job_id="q1",
@@ -85,7 +102,7 @@ class TestDispatchOrder(unittest.TestCase):
     def test_without_requirements_an_ams_print_is_refused_and_an_external_print_passes(self):
         import json
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5], queue_job_id="q1",
                               raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]})

@@ -42,7 +42,7 @@ def adapter():
 class TestAdapterInFlightGuard(unittest.TestCase):
     def test_same_job_twice_is_idempotent_and_a_second_job_is_refused_while_the_first_is_unresolved(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = adapter()
             kw = dict(plate=1, use_ams=True, ams_mapping=[5], raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]}, required_filaments=REQ_PLA)
             self.assertTrue(a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", **kw)["ok"])
@@ -190,7 +190,7 @@ class TestProgressReportsDurableBeforeStatePop(unittest.TestCase):
     def test_the_hook_runs_while_the_dispatch_is_still_on_disk(self):
         import json as _json
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf"):
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf"):
             a = adapter()
             kw = dict(plate=1, use_ams=True, ams_mapping=[5], raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]}, required_filaments=REQ_PLA)
             self.assertTrue(a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", assignment_seq=3, **kw)["ok"])
@@ -218,7 +218,7 @@ class TestDurabilityFailures(unittest.TestCase):
     def test_a_failed_outbox_write_keeps_the_dispatch_and_regenerates_the_report_next_beat(self):
         import json as _json
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf"):
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf"):
             a = adapter()
             kw = dict(plate=1, use_ams=True, ams_mapping=[5], raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]}, required_filaments=REQ_PLA)
             self.assertTrue(a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", assignment_seq=2, **kw)["ok"])
@@ -293,7 +293,7 @@ class TestSeqKeyedIdempotency(unittest.TestCase):
 
     def test_adapter_supersedes_a_stale_dispatch_on_a_new_seq_but_is_idempotent_on_the_same(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = adapter()
             kw = dict(plate=1, use_ams=True, ams_mapping=[5], raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]}, required_filaments=REQ_PLA)
             self.assertTrue(a.start_print("/tmp/x.3mf", "x.3mf", queue_job_id="q1", assignment_seq=1, **kw)["ok"])

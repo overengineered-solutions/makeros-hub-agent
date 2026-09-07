@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import tempfile
 import os
 import re
 import subprocess
@@ -86,17 +88,28 @@ def should_update(current_version, target_version) -> bool:
 
 def _read_state() -> dict:
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {}
+    if (not isinstance(state, dict) or not is_release_tag(state.get("target")) or
+            not isinstance(state.get("at"), (int, float)) or isinstance(state.get("at"), bool) or
+            not math.isfinite(state["at"]) or state["at"] < 0 or
+            type(state.get("attempts", 0)) is not int or state.get("attempts", 0) < 0):
+        raise ValueError("invalid update cooldown state; operator repair required")
+    return state
 
 
 def _write_state(d: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix=".update-", dir=STATE_PATH.parent)
     try:
-        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps(d), encoding="utf-8")
-    except OSError as e:
-        log.warning("could not persist update state: %s", e)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(d, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(name, STATE_PATH)
+    finally:
+        Path(name).unlink(missing_ok=True)
 
 
 def _request_exit(code: int) -> None:
@@ -144,9 +157,13 @@ def apply_update(tag: str, expected_sha: str | None = None) -> bool:
     if UPDATE_MODE == "disabled":
         log.info("OTA: update to %s requested but MAKEROS_HUB_UPDATE_MODE=disabled — ignoring", tag)
         return False
-    prev = _read_state()
-    attempts = int(prev.get("attempts", 0)) + 1 if _same_target(prev, tag, expected_sha) else 1
-    _write_state({"target": tag, "sha": expected_sha, "at": time.time(), "attempts": attempts})
+    try:
+        prev = _read_state()
+        attempts = int(prev.get("attempts", 0)) + 1 if _same_target(prev, tag, expected_sha) else 1
+        _write_state({"target": tag, "sha": expected_sha, "at": time.time(), "attempts": attempts})
+    except (OSError, ValueError) as exc:
+        log.error("OTA refused: cannot safely record update attempt: %s", exc)
+        return False
     if UPDATE_MODE == "exit":
         log.warning("OTA: MAKEROS_HUB_UPDATE_MODE=exit — recorded target %s; exiting %d for the orchestrator to "
                     "repull the pinned image", tag, EXIT_FOR_UPDATE_CODE)
@@ -186,13 +203,17 @@ def maybe_update(current_version: str, target_version, target_sha=None) -> bool:
     Returns True if a systemd update launched; honors the cooldown so a broken target can't loop."""
     if not isinstance(target_version, str) or not should_update(current_version, target_version):
         return False
-    if attempts_exhausted(target_version, target_sha):
-        log.error("OTA: target %s was installed %d times but this agent still reports %s — the release is not "
-                  "reporting its own version (bump makeros_hub/__init__.py:__version__); refusing to loop until a "
-                  "NEW target (version or sha) is set", target_version, MAX_ATTEMPTS_PER_TARGET, current_version)
-        return False
-    if recently_attempted(target_version, sha=target_sha):
-        log.info("OTA: target %s @ %s attempted recently — waiting out the cooldown", target_version, str(target_sha)[:12])
+    try:
+        if attempts_exhausted(target_version, target_sha):
+            log.error("OTA: target %s was installed %d times but this agent still reports %s — the release is not "
+                      "reporting its own version (bump makeros_hub/__init__.py:__version__); refusing to loop until a "
+                      "NEW target (version or sha) is set", target_version, MAX_ATTEMPTS_PER_TARGET, current_version)
+            return False
+        if recently_attempted(target_version, sha=target_sha):
+            log.info("OTA: target %s @ %s attempted recently — waiting out the cooldown", target_version, str(target_sha)[:12])
+            return False
+    except (OSError, ValueError) as exc:
+        log.error("OTA refused: invalid or unreadable cooldown state: %s", exc)
         return False
     if not is_commit_sha(target_sha):
         # content trust is not optional (audit 2026-08-30): the cloud pins every target to a commit; a target without a

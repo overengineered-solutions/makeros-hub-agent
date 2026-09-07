@@ -554,14 +554,14 @@ class PrinterManager:
                         reporter({"queueJobId": job_id, "sha256": got})   # the cloud fails the job + tells the member
                         continue
                     _os.replace(tmp, dest)
-                    try:   # the rename itself must be on disk before we tell the cloud the file is ours to print (codex r2)
-                        dfd = _os.open(str(dest_dir), _os.O_RDONLY)
-                        try:
-                            _os.fsync(dfd)
-                        finally:
-                            _os.close(dfd)
-                    except OSError as exc:
-                        log.warning("web upload %s: directory fsync failed (%s) — continuing", job_id, exc)
+                # Also on retry with an existing file: the prior rename may
+                # have succeeded while its directory flush failed. No ACK yet.
+                for directory in (dest_dir, base):
+                    dfd = _os.open(str(directory), _os.O_RDONLY)
+                    try:
+                        _os.fsync(dfd)
+                    finally:
+                        _os.close(dfd)
                 items = parse_required_filaments(dest, plate)
                 body: dict = {"queueJobId": job_id, "sha256": got, "requiredFilaments": [_vp_submit_filament(i) for i in items]}
                 model_id = parse_printer_model_id(dest)

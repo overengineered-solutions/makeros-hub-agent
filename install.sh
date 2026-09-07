@@ -25,19 +25,6 @@ echo "==> service user ($SERVICE_USER)"
 id "$SERVICE_USER" >/dev/null 2>&1 || \
   useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
 
-echo "==> code -> $INSTALL_DIR"
-mkdir -p "$INSTALL_DIR"
-rm -rf "$INSTALL_DIR/makeros_hub"
-cp -r "$HERE/makeros_hub" "$INSTALL_DIR/"
-# OTA update script — run as root via the narrow sudoers rule below. Kept
-# root-owned + non-writable by the service user (else it'd be a priv-esc path).
-cp "$HERE/update.sh" "$INSTALL_DIR/update.sh"
-cp "$HERE/scripts/tailscale-setup.sh" "$INSTALL_DIR/tailscale-setup.sh"
-chmod -R a+rX "$INSTALL_DIR"
-chown root:root "$INSTALL_DIR/update.sh" "$INSTALL_DIR/tailscale-setup.sh"
-chmod 0755 "$INSTALL_DIR/update.sh"
-chmod 0755 "$INSTALL_DIR/tailscale-setup.sh"
-
 echo "==> python venv + deps ($VENV)"
 PYBIN="$VENV/bin/python"
 if [ ! -x "$PYBIN" ]; then
@@ -48,8 +35,8 @@ if [ ! -x "$PYBIN" ]; then
       python3 -m venv "$VENV"
     else
       echo "    !! could not create a venv and apt-get isn't available."
-      echo "    !! install python3-venv yourself, then re-run. Continuing without paho —"
-      echo "    !! enrollment/heartbeat work; printers will report 'agent_missing_paho'."
+      echo "    !! install python3-venv yourself, then re-run. Existing agent code is unchanged."
+      exit 1
     fi
   fi
 fi
@@ -91,12 +78,20 @@ if [ -x "$PYBIN" ]; then
   chmod -R a+rX "$VENV"
 fi
 
+# Do not replace working code when the required runtime cannot start. Optional
+# camera inference may degrade, but member printer intake must be available.
+"$PYBIN" -c 'import paho.mqtt.client; import cryptography.x509' || {
+  echo "Required printer dependencies are unavailable; existing agent code is unchanged." >&2
+  exit 1
+}
+
 echo "==> state dir -> $STATE_DIR (credential lands here, 0700, owned by $SERVICE_USER)"
 mkdir -p "$STATE_DIR"
 chown "$SERVICE_USER:$SERVICE_USER" "$STATE_DIR"
 chmod 0700 "$STATE_DIR"
 
 echo "==> config -> $CONFIG_DIR/config.toml"
+[ ! -L "$CONFIG_DIR" ] && [ ! -L "$CONFIG_DIR/config.toml" ] || { echo "Refusing linked config path" >&2; exit 1; }
 mkdir -p "$CONFIG_DIR"
 if [ ! -f "$CONFIG_DIR/config.toml" ]; then
   cp "$HERE/config.toml.example" "$CONFIG_DIR/config.toml"
@@ -105,7 +100,8 @@ fi
 # enroll runs as $SERVICE_USER and persists the enrolled cloud_url into this
 # file, so it must be writable by that user. It's non-secret config (the bearer
 # credential lives 0600 in $STATE_DIR). Unconditional so re-runs fix ownership.
-chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR/config.toml"
+chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR" "$CONFIG_DIR/config.toml"
+chmod 0700 "$CONFIG_DIR"
 
 echo "==> wrapper -> /usr/local/bin/makeros-hub"
 cat > /usr/local/bin/makeros-hub <<'WRAP'
@@ -123,14 +119,12 @@ SUDOERS=/etc/sudoers.d/makeros-hub
 # v0.39.0 adds the per-model VP IP allocator (Option A). It needs to:
 #   - add/remove individual /32 IPs on the primary interface (one per VP)
 #   - arping target addresses to detect collisions before claiming
-# Pattern wildcards keep the surface narrow — no shell, no privilege escalation,
-# no arbitrary iface, just the two ip-addr verbs + the read-only arping verb.
+# The root-owned helper validates /32 aliases against the primary LAN subnet or
+# reserved loopback range. No sudoers argument wildcards or arbitrary ip flags.
 {
   echo "$SERVICE_USER ALL=(root) NOPASSWD: $INSTALL_DIR/update.sh"
   echo "$SERVICE_USER ALL=(root) NOPASSWD: $INSTALL_DIR/tailscale-setup.sh"
-  echo "$SERVICE_USER ALL=(root) NOPASSWD: /sbin/ip addr add * dev *"
-  echo "$SERVICE_USER ALL=(root) NOPASSWD: /sbin/ip addr del * dev *"
-  echo "$SERVICE_USER ALL=(root) NOPASSWD: /usr/sbin/arping -c * -w * -I * *"
+  echo "$SERVICE_USER ALL=(root) NOPASSWD: $INSTALL_DIR/vp-network.py"
 } > "$SUDOERS.tmp"
 chmod 0440 "$SUDOERS.tmp"
 if visudo -cf "$SUDOERS.tmp" >/dev/null 2>&1; then
@@ -138,12 +132,59 @@ if visudo -cf "$SUDOERS.tmp" >/dev/null 2>&1; then
   echo "    OTA self-update + Tailscale setup + per-VP IP allocation enabled (web-controlled)"
 else
   rm -f "$SUDOERS.tmp"
-  echo "    !! sudoers validation failed — root helpers off (bootstrap/manual updates still work)"
+  echo "    !! sudoers validation failed — previous policy retained; install refused" >&2
+  exit 1
 fi
 
 echo "==> systemd unit"
 cp "$HERE/systemd/makeros-hub.service" /etc/systemd/system/makeros-hub.service
 systemctl daemon-reload
+
+# --- staged code install ---
+echo "==> code -> $INSTALL_DIR"
+mkdir -p "$INSTALL_DIR"
+STAGED="$(mktemp -d "$INSTALL_DIR/.code-XXXXXX")"
+BACKUP="$INSTALL_DIR/previous"
+RESTART=0; CHANGED=0; COMMITTED=0
+FILES=(makeros_hub update.sh tailscale-setup.sh vp-network.py)
+finish_install() {
+  rc=$?
+  trap - EXIT
+  if [ "$CHANGED" = 1 ] && [ "$COMMITTED" = 0 ]; then
+    echo "Install did not complete; restoring the previous code and root helpers." >&2
+    for item in "${FILES[@]}"; do
+      rm -rf "$INSTALL_DIR/$item"
+      [ ! -e "$BACKUP/$item" ] || cp -a "$BACKUP/$item" "$INSTALL_DIR/$item"
+    done
+  fi
+  rm -rf "$STAGED"
+  if [ "$RESTART" = 1 ] && [ "$COMMITTED" = 0 ]; then
+    systemctl start makeros-hub || { echo "Agent did not restart; inspect journalctl -u makeros-hub" >&2; rc=1; }
+  fi
+  exit "$rc"
+}
+trap finish_install EXIT
+cp -r "$HERE/makeros_hub" "$STAGED/makeros_hub"
+cp "$HERE/update.sh" "$STAGED/update.sh"
+cp "$HERE/scripts/tailscale-setup.sh" "$STAGED/tailscale-setup.sh"
+cp "$HERE/scripts/vp-network.py" "$STAGED/vp-network.py"
+chown -R root:root "$STAGED"
+chmod -R a+rX,go-w "$STAGED"
+chmod 0755 "$STAGED/update.sh" "$STAGED/tailscale-setup.sh" "$STAGED/vp-network.py"
+rm -rf "$BACKUP"; mkdir "$BACKUP"
+for item in "${FILES[@]}"; do
+  [ ! -e "$INSTALL_DIR/$item" ] || cp -a "$INSTALL_DIR/$item" "$BACKUP/$item"
+done
+systemctl is-active --quiet makeros-hub && RESTART=1
+[ "$RESTART" = 0 ] || systemctl stop makeros-hub
+CHANGED=1
+for item in "${FILES[@]}"; do
+  rm -rf "$INSTALL_DIR/$item"
+  mv "$STAGED/$item" "$INSTALL_DIR/$item"
+done
+if [ "$RESTART" = 1 ]; then systemctl start makeros-hub; fi
+COMMITTED=1
+# --- end staged code install ---
 
 # ── one-time pstation migration ── only the bootstrap release ships scripts/bootstrap-pstation.sh, so this is a
 # no-op for every normal install/upgrade. Failure is swallowed on purpose: a failed enroll leaves the hub on
@@ -158,7 +199,7 @@ fi
 cat <<DONE
 
 Installed. Next:
-  1) Mint a token at <cloud>/admin/3dprinting/hubs and run the command it shows
+  1) Mint a token at <cloud>/admin/hub and run the command it shows
      (it includes --cloud-url, which enroll saves into config.toml):
        sudo -u $SERVICE_USER makeros-hub enroll --token <token> --cloud-url <url>
   2) Start the loop:

@@ -6,13 +6,11 @@ set -euo pipefail
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 export PATH
 
-CURL_BIN="/usr/bin/curl"
 CHMOD_BIN="/usr/bin/chmod"
 CHOWN_BIN="/usr/bin/chown"
 ID_BIN="/usr/bin/id"
 MKTEMP_BIN="/usr/bin/mktemp"
 RM_BIN="/bin/rm"
-SH_BIN="/bin/sh"
 SHRED_BIN="/usr/bin/shred"
 
 usage() {
@@ -58,11 +56,11 @@ case "$cmd" in
           ;;
       esac
     done
-    [ -n "$hostname" ] || usage
+    [[ "$hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] || usage
 
     auth_key=""
     IFS= read -r auth_key || true
-    if [ -z "$auth_key" ]; then
+    if [ -z "$auth_key" ] || [ "${#auth_key}" -gt 512 ] || [[ "$auth_key" == *[[:space:]]* ]]; then
       echo "tailscale setup: missing auth key on stdin" >&2
       exit 2
     fi
@@ -90,25 +88,10 @@ case "$cmd" in
 
     tailscale_bin="$(find_tailscale)"
     if [ -z "$tailscale_bin" ] && ! is_dry_run; then
-      # Fetch the Tailscale installer with whatever the Pi has. The agent is
-      # pure-Python, so curl/wget may both be absent on a minimal Pi OS — but
-      # python3 is ALWAYS present (the agent runs on it), so it's the guaranteed
-      # fallback. Capture output so a failure reports the real reason.
-      if command -v curl >/dev/null 2>&1; then
-        fetch_installer() { curl -fsSL "$1"; }
-      elif command -v wget >/dev/null 2>&1; then
-        fetch_installer() { wget -qO- "$1"; }
-      elif command -v python3 >/dev/null 2>&1; then
-        fetch_installer() { python3 -c 'import sys,urllib.request; sys.stdout.buffer.write(urllib.request.urlopen(sys.argv[1]).read())' "$1"; }
-      else
-        echo "tailscale setup: install failed: no downloader (curl/wget/python3) on PATH" >&2
-        exit 1
-      fi
-      install_out="$( { fetch_installer https://tailscale.com/install.sh | "$SH_BIN"; } 2>&1 )" || {
-        echo "tailscale setup: install failed: $(printf '%s' "$install_out" | tr '\n' ' ' | tail -c 280)" >&2
-        exit 1
-      }
-      tailscale_bin="$(find_tailscale)"
+      # Package provisioning belongs to the operator's root install, not a
+      # service-invokable helper fetching and executing mutable network code.
+      echo "tailscale setup: Tailscale is not installed. Provision it from the official signed OS repository, then retry from the admin page." >&2
+      exit 1
     fi
     if [ -z "$tailscale_bin" ]; then
       tailscale_bin="/usr/bin/tailscale"

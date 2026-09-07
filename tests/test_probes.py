@@ -127,7 +127,7 @@ class TestRunProbe(unittest.TestCase):
 
         run.assert_not_called()
         self.assertEqual(result["status"], "ok")
-        self.assertIn("cloudUrl", result["output"])
+        self.assertIn("configError", result["output"])
         self.assertNotIn("topsecret", result["output"])
         self.assertNotIn("credential-secret", result["output"])
 

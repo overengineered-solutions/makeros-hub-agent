@@ -7,10 +7,9 @@ an unused IP from the Pi's primary subnet via `arping`, claim it via
 across restarts.
 
 Allocation policy (deliberately conservative on the operator's LAN):
-  - **Scan from the TOP** of the host range (e.g. .254 → .200). The DHCP
-    pool on consumer routers is almost always .100-.199 + the .1 gateway;
-    starting from .254 keeps us clear of any actively-leased addresses
-    without requiring operator config.
+  - **Scan from the TOP** of the host range. This is a search order, not
+    evidence of a DHCP reservation; the operator must reserve the alias range.
+    A sleeping device may not answer ARP.
   - **Verify with TWO arpings** (1s window, 1 packet each). Some devices
     are slow to respond — one arping is unreliable on a quiet LAN.
   - **Persist before claim** — write the binding to disk BEFORE running
@@ -25,11 +24,8 @@ Allocation policy (deliberately conservative on the operator's LAN):
 Test seam: every subprocess call goes through `_run` (overridable) so tests
 inject a fake without touching the real system.
 
-Sudoers: bootstrap.sh installs narrow patterns for
-  /sbin/ip addr add * dev *
-  /sbin/ip addr del * dev *
-  /usr/sbin/arping -c * -w * *
-— no shell escape, no wildcard verbs.
+Sudoers permits only the root-owned vp-network.py entrypoint. It validates
+verbs, individual /32 aliases, the primary subnet and the reserved loopback range.
 """
 
 from __future__ import annotations
@@ -418,39 +414,19 @@ class IpAllocator:
 
     def _arping_replied(self, ip: str, iface: str) -> bool:
         """One arping. Returns True if SOMEONE answered (IP is taken)."""
-        argv = [
-            "sudo",
-            "-n",
-            "/usr/sbin/arping",
-            "-c",
-            str(ARPING_COUNT),
-            "-w",
-            str(ARPING_WAIT_SEC),
-            "-I",
-            iface,
-            ip,
-        ]
+        argv = ["sudo", "-n", "/opt/makeros-hub/vp-network.py", "probe", ip, iface]
         try:
             result = self._run(argv, ARPING_TIMEOUT_SEC)
         except (OSError, subprocess.TimeoutExpired) as e:
             log.debug("ip-allocator: arping %s failed: %s", ip, e)
-            return False  # treat failure as "no reply" — we'll try claim
+            return True  # unknown is occupied; never claim an address after a failed probe
         # arping exits 0 on reply, 1 on no reply, other on error.
-        return result.returncode == 0
+        return result.returncode != 1  # only the documented no-reply result is free
 
     def _claim_ip(self, ip: str, iface: str) -> AllocationResult:
-        """Run `sudo ip addr add <ip>/32 dev <iface>`. Returns ok=True on
+        """Run `scoped vp-network helper: ip addr add <ip>/32 dev <iface>`. Returns ok=True on
         success or if the IP is already on the iface ('File exists')."""
-        argv = [
-            "sudo",
-            "-n",
-            "/sbin/ip",
-            "addr",
-            "add",
-            f"{ip}/32",
-            "dev",
-            iface,
-        ]
+        argv = ["sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", ip, iface]
         try:
             result = self._run(argv, IP_CMD_TIMEOUT_SEC)
         except (OSError, subprocess.TimeoutExpired) as e:
@@ -469,16 +445,7 @@ class IpAllocator:
         )
 
     def _release_ip(self, ip: str, iface: str) -> AllocationResult:
-        argv = [
-            "sudo",
-            "-n",
-            "/sbin/ip",
-            "addr",
-            "del",
-            f"{ip}/32",
-            "dev",
-            iface,
-        ]
+        argv = ["sudo", "-n", "/opt/makeros-hub/vp-network.py", "del", ip, iface]
         try:
             result = self._run(argv, IP_CMD_TIMEOUT_SEC)
         except (OSError, subprocess.TimeoutExpired) as e:

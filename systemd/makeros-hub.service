@@ -22,19 +22,10 @@ RestartSec=5
 TimeoutStopSec=25
 # Modest hardening (a box on the shop LAN). The credential + state live under
 # the StateDirectory, which systemd creates 0700 owned by the service user.
-# NOTE: deliberately NO NoNewPrivileges — it blocks the agent's one privileged
-# path, the sudo-scoped OTA self-update (`sudo /opt/makeros-hub/update.sh`),
-# which is the ONLY thing the service user may run as root. With NoNewPrivileges
-# set, sudo can't escalate even with a valid NOPASSWD rule, so OTA silently
-# fails ("no new privileges flag is set"). The narrow sudoers rule is the real
-# control here.
-# NOTE: deliberately NO ProtectSystem — the agent legitimately installs/manages
-# system software (Tailscale via apt, and OTA self-update), which write to /usr
-# (e.g. /usr/share/keyrings, /usr/bin) and /etc. ProtectSystem=full mounts those
-# read-only, so even the sudo-scoped install fails ("Read-only file system" when
-# tee'ing the Tailscale APT keyring) — confirmed live via the diagnostics bundle.
-# The unprivileged service user + the narrow sudoers rules (update.sh /
-# tailscale-setup.sh only) are the real control. ProtectHome + PrivateTmp stay.
+# NoNewPrivileges/ProtectSystem are intentionally absent: root-owned OTA,
+# Tailscale and VP-network helpers need elevation and maintenance writes.
+# Sudo is restricted to those three validated entrypoints, not arbitrary ip or
+# arping commands. See SECURITY.md for the actual boundary and its limits.
 ProtectHome=true
 PrivateTmp=true
 StateDirectory=makeros-hub

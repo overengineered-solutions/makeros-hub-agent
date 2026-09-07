@@ -83,6 +83,29 @@ VPRINTER_RETRY_MAX_SEC = 300
 VP_CAPTURE_RECENT_UIDS_MAX = 64
 
 
+def _accepted_submission(body: dict) -> bool:
+    return body.get("ok") is True and isinstance(body.get("jobId"), str) and bool(body["jobId"].strip())
+
+
+def _rejected_submission(body: dict) -> bool:
+    return body.get("ok") is False and isinstance(body.get("reason"), str) and bool(body["reason"].strip())
+
+
+def _validate_heartbeat(body: dict) -> None:
+    # Validate before acknowledging any jobs, command results or bindings. An
+    # empty/proxy 200 is not confirmation that the control plane committed them.
+    if any(not isinstance(body.get(k), str) or not body[k].strip() for k in ("hubId", "configVersion")):
+        raise TransportError("heartbeat response missing hub/config identity")
+    interval = body.get("nextPollMs")
+    if type(interval) not in (int, float) or not 5_000 <= interval <= 300_000:
+        raise TransportError("heartbeat response has invalid poll interval")
+    if type(body.get("applied")) is not int or body["applied"] < 0:
+        raise TransportError("heartbeat response missing applied count")
+    for k in ("assignments", "pendingProbes", "pendingCommands", "fetches"):
+        if k in body and (not isinstance(body[k], list) or any(not isinstance(x, dict) for x in body[k])):
+            raise TransportError(f"heartbeat response has invalid {k}")
+
+
 def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
     """Closure the ingest server calls to register an OrcaSlicer upload with the
     cloud. Maps the /api/print/hub/submit response to an ingest outcome dict."""
@@ -108,12 +131,14 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
             return {"status": "error", "detail": f"transport: {safe}"}
 
         if resp.status == 200:
-            if resp.body.get("ok"):
-                return {"status": "queued", "jobId": resp.body.get("jobId")}
-            return {"status": "rejected", "reason": resp.body.get("reason", "rejected")}
-        if resp.status == 401:
-            # invalid member token (the hub's own bearer is valid — we're enrolled).
-            return {"status": "bad_token"}
+            if _accepted_submission(resp.body):
+                return {"status": "queued", "jobId": resp.body["jobId"]}
+            if _rejected_submission(resp.body):
+                if resp.body["reason"] == "invalid_token":
+                    return {"status": "bad_token"}
+                return {"status": "rejected", "reason": resp.body["reason"]}
+        # 401 is the HUB credential, not the member token. An unknown response
+        # may follow a committed job: preserve its file and surface uncertainty.
         _record_diagnostic(diagnostics, "ingest", f"cloud submit unexpected {resp.status}")
         return {"status": "error", "detail": f"http_{resp.status}"}
 
@@ -155,9 +180,9 @@ def make_queue_status_reporter(cfg: Config, credential: str, diagnostics=None):
                 safe,
             )
             return QUEUE_STATUS_RETRY
-        if 200 <= resp.status < 300:
+        if resp.status == 200 and resp.body.get("ok") is True:
             return QUEUE_STATUS_SENT
-        if 400 <= resp.status < 500:
+        if resp.status in (400, 404, 409, 410, 413, 422):
             safe = redact(resp.body.get("error"))
             _record_diagnostic(diagnostics, "heartbeat", f"queue status HTTP {resp.status}: {safe}")
             log.warning(
@@ -440,7 +465,7 @@ def _drain_vprinter_submissions(
             )
             continue
 
-        if resp.status == 200 and resp.body.get("ok") is True:
+        if resp.status == 200 and _accepted_submission(resp.body):
             submitted += 1
             log.info(
                 "vprinter.submit.ok member_id=%s filename=%s submission_uid=%s jobId=%s",
@@ -453,7 +478,7 @@ def _drain_vprinter_submissions(
                 outbox.remove(job.submission_uid)
             continue
 
-        if resp.status == 200 and resp.body.get("ok") is False:
+        if resp.status == 200 and _rejected_submission(resp.body):
             reason = redact(resp.body.get("reason") or "rejected")
             log.warning(
                 "vprinter.submit.rejected member_id=%s filename=%s submission_uid=%s reason=%s",
@@ -986,11 +1011,18 @@ def _pull_config(
     if resp.status == 200:
         printers = resp.body.get("printers")
         version = resp.body.get("version")
+        if (not isinstance(version, str) or not version.strip()
+                or not isinstance(printers, list)
+                or any(not isinstance(p, dict) or not isinstance(p.get("id"), str)
+                       or not p["id"] or not isinstance(p.get("vendor"), str) for p in printers)):
+            _record_diagnostic(diagnostics, "config", "config response has an invalid version/printer list")
+            log.error("config response invalid; keeping current printers and retrying next beat")
+            return None
         # Cloud-triggered restart (admin "Restart agent" button): exit on a
         # changed nonce → systemd brings us back. Checked before reconcile — no
         # point applying config we're about to drop on the restart.
         _maybe_restart_on_nonce(resp.body.get("restartNonce"))
-        manager.reconcile(printers if isinstance(printers, list) else [], version)
+        manager.reconcile(printers, version)
         # Multi-VP config-down (v0.40.0+): the cloud emits a `virtualPrinters`
         # array (plural). For each VP without a bind_ip, run the IP allocator
         # to claim one + queue the allocation for the next heartbeat
@@ -1773,8 +1805,10 @@ def run(
                     retries=3,
                     backoff_base=2.0,
                 )
-                tailscale_state.mark_reported()
                 if resp.status == 200:
+                    _validate_heartbeat(resp.body)
+                    tailscale_state.mark_reported()
+                    log.info("heartbeat status rows processed=%d, expected=%d", resp.body["applied"], len(statuses))
                     reported_probe_count = len(pending_probe_results)
                     pending_probe_results = []
                     if reported_probe_count:

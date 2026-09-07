@@ -1505,6 +1505,7 @@ class TestFtpSession(unittest.TestCase):
 
                 self.assertEqual(passive.port, 50000)
                 self.assertTrue(start.await_args.kwargs["reuse_address"])
+                self.assertEqual(start.await_args.kwargs["host"], "100.64.0.10")
                 await passive.close()
 
         asyncio.run(run())
@@ -1530,6 +1531,14 @@ class TestFtpSession(unittest.TestCase):
                 await captured["handler"](asyncio.StreamReader(), bad_writer)
                 self.assertTrue(bad_writer.closed)
                 self.assertFalse(passive.connection.done())
+
+                # An unknown control peer is not permission for any data peer.
+                session.peer_ip = None
+                unknown_writer = _FakeWriter(("100.64.0.20", 5001))
+                await captured["handler"](asyncio.StreamReader(), unknown_writer)
+                self.assertTrue(unknown_writer.closed)
+                self.assertFalse(passive.connection.done())
+                session.peer_ip = "100.64.0.20"
 
                 good_reader = asyncio.StreamReader()
                 good_writer = _FakeWriter(("100.64.0.20", 5002))
@@ -1998,4 +2007,3 @@ class TestVpCaSubjectIsUnique(unittest.TestCase):
                 extensions = good.extensions
 
             self.assertFalse(certmod._is_expected_ca(_OldStyle(), ca_id))
-

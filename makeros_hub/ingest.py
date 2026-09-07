@@ -24,7 +24,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
@@ -42,10 +44,12 @@ VERSION_BODY = {
 
 # A submit_fn returns one of these outcome dicts.
 #   {"status": "queued",   "jobId": "..."}     -> 201
-#   {"status": "rejected", "reason": "..."}    -> 201 (upload ok; portal shows why)
+#   {"status": "rejected", "reason": "..."}    -> 403 (no queue row was created)
 #   {"status": "bad_token"}                    -> 403 (OrcaSlicer "invalid API key")
 #   {"status": "error",    "detail": "..."}    -> 502
 SubmitFn = Callable[..., dict]
+MAX_BUFFERED_UPLOAD_BYTES = 64 * 1024 * 1024
+MIN_FREE_BYTES = 128 * 1024 * 1024
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -61,8 +65,9 @@ class _Handler(BaseHTTPRequestHandler):
     submit_fn: SubmitFn
     spool_dir: Path
     max_bytes: int
+    upload_slot: threading.BoundedSemaphore
     # Per-request socket timeout — bounds a slow/stalled connection (a partial
-    # upload won't hold a thread forever). A real 256MB LAN upload is seconds;
+    # upload won't hold a thread forever). A normal LAN upload is seconds;
     # 120s is generous headroom.
     timeout = 120
 
@@ -88,6 +93,17 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        # ponytail: one buffered upload at a time; use a streaming multipart
+        # library if larger/concurrent manual uploads become necessary.
+        if not self.upload_slot.acquire(blocking=False):
+            self._json(503, {"error": "upload_busy", "detail": "Another upload is in progress. Try again shortly."})
+            return
+        try:
+            self._upload()
+        finally:
+            self.upload_slot.release()
+
+    def _upload(self) -> None:
         if self.path.split("?")[0].rstrip("/") != "/api/files/local":
             self._json(404, {"error": "not_found"})
             return
@@ -112,14 +128,28 @@ class _Handler(BaseHTTPRequestHandler):
         if length > self.max_bytes:
             self._json(413, {"error": "file_too_large", "maxBytes": self.max_bytes})
             return
+        try:
+            free = shutil.disk_usage(self.spool_dir).free
+        except OSError:
+            log.exception("cannot inspect upload spool")
+            self._json(507, {"error": "spool_unavailable"})
+            return
+        if free < length + MIN_FREE_BYTES:
+            self._json(507, {"error": "spool_full", "detail": "The shop needs to free disk space before another upload."})
+            return
 
-        body = self._read_exact(length)
+        try:
+            body = self._read_exact(length)
+        except TimeoutError:
+            self._json(408, {"error": "upload_timeout"})
+            return
         if body is None:
             self._json(400, {"error": "truncated_body"})
             return
 
         try:
             form = parse_multipart(body, boundary)
+            del body
         except Exception as exc:  # noqa: BLE001 — surface a clean 400, log detail
             log.warning("multipart parse failed: %s", exc)
             self._json(400, {"error": "bad_multipart"})
@@ -139,7 +169,16 @@ class _Handler(BaseHTTPRequestHandler):
         dest_dir = self.spool_dir / submission_uid
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            (dest_dir / file_name).write_bytes(form.file.data)
+            with (dest_dir / file_name).open("wb") as fh:
+                fh.write(form.file.data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            for directory in (dest_dir, self.spool_dir):
+                fd = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
         except OSError as exc:
             log.error("spool write failed: %s", exc)
             self._json(507, {"error": "spool_write_failed"})
@@ -156,31 +195,28 @@ class _Handler(BaseHTTPRequestHandler):
             )
         except Exception as exc:  # noqa: BLE001
             log.error("cloud submit raised: %s", exc)
-            self._json(502, {"error": "cloud_unreachable"})
-            return
+            outcome = {"status": "error"}
 
-        status = outcome.get("status")
+        status = outcome.get("status") if isinstance(outcome, dict) else None
         if status == "bad_token":
             # Bad member — the spooled file will never print; don't leak it.
             self._discard_spool(dest_dir)
             # OrcaSlicer treats 403 as "invalid API key" — the right hint.
             self._json(403, {"error": "invalid_api_key"})
             return
-        if status == "error":
-            # The job never registered (cloud unreachable/error) — OrcaSlicer
-            # will retry with a fresh submission; drop this orphan so a flaky
-            # cloud can't slowly fill the spool disk.
+        if status == "rejected" and isinstance(outcome.get("reason"), str) and outcome["reason"]:
+            # The app creates no job on rejection; 201 would hide the failure.
             self._discard_spool(dest_dir)
-            self._json(502, {"error": "cloud_error", "detail": outcome.get("detail")})
+            self._json(403, {"error": "print_rejected", "reason": outcome["reason"]})
             return
-        if status == "rejected":
-            # Eligibility rejection: the queue row records WHY (member sees it in
-            # the portal), but the file won't print — discard it to bound disk use.
-            self._discard_spool(dest_dir)
+        if status != "queued" or not isinstance(outcome.get("jobId"), str) or not outcome["jobId"].strip():
+            # A timed-out response can follow a committed job. Deleting its file
+            # strands that job; retain it for reconciliation, bounded by free space.
+            log.error("ingest outcome unconfirmed submission_uid=%s; file retained for staff review", submission_uid)
+            self._json(502, {"error": "submission_unconfirmed", "detail": "Check Your prints before resending; ask the shop if the job is missing."})
+            return
 
-        # queued OR rejected → the UPLOAD succeeded (OctoPrint's 201 contract is
-        # "did the file land"); an eligibility rejection is surfaced in the
-        # member portal, the reliable channel (OrcaSlicer's result UI is thin).
+        # A durable file and an actual cloud job receipt are both required.
         log.info(
             "ingest accepted %s (%d bytes, print=%s) -> %s",
             file_name,
@@ -217,14 +253,19 @@ class _Handler(BaseHTTPRequestHandler):
             for child in dest_dir.iterdir():
                 child.unlink(missing_ok=True)
             dest_dir.rmdir()
-        except OSError:
-            pass  # best-effort; a leftover dir is harmless
+        except OSError as exc:
+            log.warning("could not discard rejected spool directory %s: %s", dest_dir, exc)
 
     def _read_exact(self, n: int) -> bytes | None:
         buf = bytearray()
         remaining = n
+        deadline = time.monotonic() + self.timeout
         while remaining > 0:
-            chunk = self.rfile.read(min(remaining, 1 << 20))
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError("upload deadline exceeded")
+            self.connection.settimeout(left)
+            chunk = self.rfile.read1(min(remaining, 1 << 20))
             if not chunk:
                 return None
             buf.extend(chunk)
@@ -242,7 +283,35 @@ def make_handler(submit_fn: SubmitFn, spool_dir: Path, max_bytes: int):
     Handler.submit_fn = staticmethod(submit_fn)
     Handler.spool_dir = spool_dir
     Handler.max_bytes = max_bytes
+    Handler.upload_slot = threading.BoundedSemaphore(1)
     return Handler
+
+
+class _BoundedServer(ThreadingHTTPServer):
+    # Bound threads even before headers arrive; body limits alone miss slow clients.
+    def __init__(self, *args):
+        self.connections = threading.BoundedSemaphore(4)
+        super().__init__(*args)
+
+    def process_request(self, request, client_address):
+        if not self.connections.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 5\r\nContent-Length: 0\r\n\r\n")
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.connections.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.connections.release()
 
 
 class IngestServer:
@@ -252,8 +321,10 @@ class IngestServer:
     def __init__(self, submit_fn: SubmitFn, *, port: int, spool_dir: Path, max_bytes: int):
         self.port = port
         spool_dir.mkdir(parents=True, exist_ok=True)
-        handler = make_handler(submit_fn, spool_dir, max_bytes)
-        self._server = ThreadingHTTPServer(("0.0.0.0", port), handler)
+        if max_bytes > MAX_BUFFERED_UPLOAD_BYTES:
+            log.warning("manual upload buffer capped at 64 MiB (configured %d bytes)", max_bytes)
+        handler = make_handler(submit_fn, spool_dir, min(max_bytes, MAX_BUFFERED_UPLOAD_BYTES))
+        self._server = _BoundedServer(("0.0.0.0", port), handler)
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:

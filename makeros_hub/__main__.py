@@ -37,17 +37,17 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(cloud_url_override=args.cloud_url)
         hub_id = enroll(cfg, args.token, force=args.force)
         # Persist the enrolled cloud_url so the heartbeat loop targets this host
-        # instead of falling back to the template placeholder. Best-effort: if
-        # config.toml isn't writable by this user, tell the operator exactly
-        # what to run (directional error) rather than failing the enroll.
+        # instead of falling back to the template placeholder. Refuse to report
+        # a ready installation if config persistence failed.
         try:
             persist_cloud_url(cfg.cloud_url)
-        except OSError as e:
+        except (OSError, ValueError) as e:
             print(
                 f"Enrolled, but couldn't write cloud_url to config ({e}). Set it manually:\n"
-                f"  sudo sed -i 's|^cloud_url = .*|cloud_url = \"{cfg.cloud_url}\"|' /etc/makeros-hub/config.toml",
+                f"  Edit /etc/makeros-hub/config.toml and set cloud_url to {cfg.cloud_url} before starting the service.",
                 file=sys.stderr,
             )
+            return 1
         print(f"Enrolled. hubId={hub_id}. Credential written. Start the loop with: "
               f"sudo systemctl enable --now makeros-hub")
         return 0

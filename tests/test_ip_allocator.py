@@ -95,7 +95,7 @@ class TestIpAllocatorAllocate(unittest.TestCase):
         # arping all replies =1 (no reply = free) on every IP. Claim
         # succeeds returncode=0 for the first candidate.
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "192.168.1.254/32", "dev", "eth0"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "192.168.1.254", "eth0"): StubResult(returncode=0),
         }
         with tempfile.TemporaryDirectory() as tmp:
             alloc = IpAllocator(
@@ -115,7 +115,7 @@ class TestIpAllocatorAllocate(unittest.TestCase):
         # Re-claim on an IP that's already on the iface returns "File exists"
         # — allocator treats as success without changing the bind.
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "192.168.1.250/32", "dev", "eth0"): StubResult(
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "192.168.1.250", "eth0"): StubResult(
                 returncode=2,
                 stderr="RTNETLINK answers: File exists",
             ),
@@ -161,7 +161,7 @@ class TestIpAllocatorAllocate(unittest.TestCase):
         )
         routes = {
             arping_top: StubResult(returncode=0),  # taken
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "192.168.1.253/32", "dev", "eth0"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "192.168.1.253", "eth0"): StubResult(returncode=0),
         }
         with tempfile.TemporaryDirectory() as tmp:
             alloc = IpAllocator(
@@ -180,7 +180,7 @@ class TestIpAllocatorAllocate(unittest.TestCase):
         # Existing binding for X1C uses .254 — A1 mini's fresh allocation must
         # NOT pick .254 even though it's the top.
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "192.168.1.253/32", "dev", "eth0"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "192.168.1.253", "eth0"): StubResult(returncode=0),
         }
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "b.json"
@@ -213,7 +213,7 @@ class TestIpAllocatorAllocate(unittest.TestCase):
 
     def test_allocation_persisted_to_disk(self):
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "192.168.1.254/32", "dev", "eth0"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "192.168.1.254", "eth0"): StubResult(returncode=0),
         }
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "b.json"
@@ -240,7 +240,7 @@ class TestIpAllocatorAllocate(unittest.TestCase):
             # Build a stub run that ALWAYS reports arping replied (taken)
             # so no candidate is free.
             def all_taken_run(argv, timeout):
-                if argv[2].endswith("arping"):
+                if argv[3] == "probe":
                     return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
                 # Should never reach claim path since nothing's free.
                 return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="")
@@ -276,7 +276,7 @@ class TestIpAllocatorAllocate(unittest.TestCase):
 class TestIpAllocatorRelease(unittest.TestCase):
     def test_release_drops_binding_and_iface(self):
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "del", "192.168.1.250/32", "dev", "eth0"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "del", "192.168.1.250", "eth0"): StubResult(returncode=0),
         }
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp) / "b.json"
@@ -316,7 +316,7 @@ class TestIpAllocatorRelease(unittest.TestCase):
 
     def test_release_treats_already_gone_iface_as_success(self):
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "del", "192.168.1.250/32", "dev", "eth0"): StubResult(
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "del", "192.168.1.250", "eth0"): StubResult(
                 returncode=2,
                 stderr="RTNETLINK answers: Cannot assign requested address",
             ),
@@ -382,7 +382,7 @@ class TestIpAllocatorEnsureClaimed(unittest.TestCase):
     def test_routed_ip_claims_on_lo_without_arping(self):
         calls: list[tuple] = []
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.1/32", "dev", "lo"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "198.18.10.1", "lo"): StubResult(returncode=0),
         }
         base = make_run(routes)
 
@@ -402,11 +402,11 @@ class TestIpAllocatorEnsureClaimed(unittest.TestCase):
         self.assertEqual(res.iface, "lo")
         self.assertEqual(res.bind_ip, "198.18.10.1")
         self.assertFalse(any("arping" in c[0] or (len(c) > 2 and "arping" in c[2]) for c in calls))
-        self.assertEqual(calls, [("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.1/32", "dev", "lo")])
+        self.assertEqual(calls, [("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "198.18.10.1", "lo")])
 
     def test_lan_ip_reclaims_on_iface_and_file_exists_is_ok(self):
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "192.168.1.240/32", "dev", "eth0"): StubResult(returncode=2, stderr="RTNETLINK answers: File exists"),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "192.168.1.240", "eth0"): StubResult(returncode=2, stderr="RTNETLINK answers: File exists"),
         }
         with tempfile.TemporaryDirectory() as tmp:
             alloc = IpAllocator(
@@ -452,9 +452,9 @@ class TestIpAllocatorEnsureClaimed(unittest.TestCase):
         # codex blocker #1: model moves LAN eth0 -> routed lo; the OLD /32 must be released, not leaked.
         calls: list[tuple] = []
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "192.168.1.240/32", "dev", "eth0"): StubResult(returncode=0),
-            ("sudo", "-n", "/sbin/ip", "addr", "del", "192.168.1.240/32", "dev", "eth0"): StubResult(returncode=0),
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.2/32", "dev", "lo"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "192.168.1.240", "eth0"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "del", "192.168.1.240", "eth0"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "198.18.10.2", "lo"): StubResult(returncode=0),
         }
         base = make_run(routes)
 
@@ -473,13 +473,13 @@ class TestIpAllocatorEnsureClaimed(unittest.TestCase):
             res = alloc.ensure_claimed("A1 mini", "198.18.10.2")
         self.assertTrue(res.ok)
         self.assertEqual(res.iface, "lo")
-        self.assertIn(("sudo", "-n", "/sbin/ip", "addr", "del", "192.168.1.240/32", "dev", "eth0"), calls)
+        self.assertIn(("sudo", "-n", "/opt/makeros-hub/vp-network.py", "del", "192.168.1.240", "eth0"), calls)
 
     def test_routed_ip_churn_releases_old_lo_claim(self):
         routes = {
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.1/32", "dev", "lo"): StubResult(returncode=0),
-            ("sudo", "-n", "/sbin/ip", "addr", "del", "198.18.10.1/32", "dev", "lo"): StubResult(returncode=0),
-            ("sudo", "-n", "/sbin/ip", "addr", "add", "198.18.10.5/32", "dev", "lo"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "198.18.10.1", "lo"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "del", "198.18.10.1", "lo"): StubResult(returncode=0),
+            ("sudo", "-n", "/opt/makeros-hub/vp-network.py", "add", "198.18.10.5", "lo"): StubResult(returncode=0),
         }
         calls: list[tuple] = []
         base = make_run(routes)
@@ -497,7 +497,7 @@ class TestIpAllocatorEnsureClaimed(unittest.TestCase):
             )
             self.assertTrue(alloc.ensure_claimed("X1 Carbon", "198.18.10.1").ok)
             self.assertTrue(alloc.ensure_claimed("X1 Carbon", "198.18.10.5").ok)
-        self.assertIn(("sudo", "-n", "/sbin/ip", "addr", "del", "198.18.10.1/32", "dev", "lo"), calls)
+        self.assertIn(("sudo", "-n", "/opt/makeros-hub/vp-network.py", "del", "198.18.10.1", "lo"), calls)
 
 
 if __name__ == "__main__":

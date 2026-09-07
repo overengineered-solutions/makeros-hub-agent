@@ -6,6 +6,7 @@ import json
 import tempfile
 import unittest
 import urllib.request
+from unittest import mock
 from pathlib import Path
 
 from makeros_hub.multipart import boundary_from_content_type, parse_multipart
@@ -46,6 +47,11 @@ class TestBoundary(unittest.TestCase):
 
 
 class TestParseMultipart(unittest.TestCase):
+    def test_boundary_like_bytes_and_trailing_newline_survive_exactly(self):
+        data = b"prefix--EXACTBOUNDmiddle\r\n--EXACTBOUNDnot-a-delimiter\r\nlast\r\n"
+        form = parse_multipart(build_multipart("EXACTBOUND", "part.3mf", data, {}), "EXACTBOUND")
+        self.assertEqual(form.file.data, data)
+
     def test_parses_file_and_fields_binary_safe(self):
         # Include CRLF + the boundary-ish bytes inside the payload to prove the
         # parser doesn't corrupt binary data.
@@ -154,11 +160,42 @@ class TestIngestServer(unittest.TestCase):
         status, _ = self._upload("bad")
         self.assertEqual(status, 403)
 
-    def test_rejected_still_returns_201_upload_ok(self):
-        # Eligibility rejection is surfaced in the portal, not as an upload error.
+    def test_rejection_is_visible_because_no_portal_job_was_created(self):
         status, body = self._upload("ineligible")
-        self.assertEqual(status, 201)
-        self.assertTrue(body["done"])
+        self.assertEqual(status, 403)
+        self.assertEqual(body["error"], "print_rejected")
+
+    def test_unknown_receipt_keeps_file_and_never_reports_success(self):
+        handler = self.server._server.RequestHandlerClass
+        for outcome in ({}, {"status": "queued"}, {"status": "error"}, None):
+            with mock.patch.object(handler, "submit_fn", staticmethod(lambda **kwargs: outcome)):
+                status, body = self._upload("good")
+                self.assertEqual(status, 502)
+                self.assertEqual(body["error"], "submission_unconfirmed")
+        self.assertEqual(len(list(Path(self.tmp.name).rglob("*.3mf"))), 4)
+
+    def test_busy_and_disk_failures_never_reach_cloud(self):
+        handler = self.server._server.RequestHandlerClass
+        with handler.upload_slot:
+            self.assertEqual(self._upload("good")[0], 503)
+        with mock.patch("makeros_hub.ingest.os.fsync", side_effect=OSError("disk error")):
+            self.assertEqual(self._upload("good")[0], 507)
+        self.assertEqual(self.calls, [])
+        with mock.patch("makeros_hub.ingest.shutil.disk_usage", return_value=mock.Mock(free=0)):
+            self.assertEqual(self._upload("good")[0], 507)
+        self.assertEqual(self.calls, [])
+
+    def test_connection_threads_are_bounded_before_headers(self):
+        slots = self.server._server.connections
+        for _ in range(4):
+            slots.acquire()
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                urllib.request.urlopen(self._url("/api/version"), timeout=5)
+            self.assertEqual(caught.exception.code, 503)
+        finally:
+            for _ in range(4):
+                slots.release()
 
     def test_rejected_discards_the_spooled_file(self):
         # A rejected job's file won't print — it must not leak on disk.

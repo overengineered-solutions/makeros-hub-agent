@@ -327,6 +327,11 @@ class FtpSession:
             )
             total, sha256 = await self.receive_file(data_reader, data_writer, partial)
             partial.replace(target)
+            directory_fd = os.open(target.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
             self._partial_path = None
             self.log(f"FTPS stored {target} from {self.peer}: {total} bytes")
             await self.reply("226 Transfer complete")
@@ -401,7 +406,7 @@ class FtpSession:
                 peer = writer.get_extra_info("peername")
                 data_peer_ip = _peer_ip(peer)
                 self.log(f"FTPS data TLS connection from {peer} on passive port {bound_port}")
-                if self.peer_ip is not None and data_peer_ip != self.peer_ip:
+                if self.peer_ip is None or data_peer_ip != self.peer_ip:
                     self.log(
                         "vprinter.ftp.passive_peer_mismatch "
                         f"control_peer_ip={self.peer_ip} data_peer_ip={data_peer_ip} "
@@ -420,7 +425,7 @@ class FtpSession:
             try:
                 server = await asyncio.start_server(
                     handle_data,
-                    host="0.0.0.0",
+                    host=self.config.ip,
                     port=port,
                     ssl=self.ssl_context,
                     reuse_address=True,
@@ -455,6 +460,8 @@ class FtpSession:
                         raise ValueError("upload exceeds 4 GiB limit")
                     digest.update(chunk)
                     handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
         finally:
             data_writer.close()
             await _wait_closed(data_writer)

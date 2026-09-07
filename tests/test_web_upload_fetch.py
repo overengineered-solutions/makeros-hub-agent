@@ -2,10 +2,12 @@
 parses the sent plate and reports `fetched`."""
 
 import hashlib
+import os
 import io
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 from pathlib import Path
 
 from makeros_hub.printers.manager import PrinterManager
@@ -31,6 +33,26 @@ class _Resp:
 
 
 class TestFetchUploads(unittest.TestCase):
+    def test_directory_flush_failure_keeps_file_but_never_acknowledges_it(self):
+        data = three_mf()
+        calls, reports = [], []
+        def getter(path, dest):
+            calls.append(path)
+            Path(dest).write_bytes(data)
+            return hashlib.sha256(data).hexdigest(), len(data)
+        def reporter(body):
+            reports.append(body)
+            return _Resp()
+        with tempfile.TemporaryDirectory() as d:
+            manager = PrinterManager()
+            with mock.patch.object(os, "fsync", side_effect=OSError("disk error")):
+                for _ in range(2):
+                    self.assertEqual(manager.fetch_uploads([self._fetch(data)], d, getter=getter, reporter=reporter), 0)
+            self.assertEqual(reports, [])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(manager.fetch_uploads([self._fetch(data)], d, getter=getter, reporter=reporter), 1)
+            self.assertEqual(len(calls), 1)
+
     def _fetch(self, data: bytes, plate=1):
         return {"queueJobId": "11111111-2222-4333-8444-555555555555", "submissionUid": "abcdef1234567890", "fileName": "part.3mf",
                 "sha256": hashlib.sha256(data).hexdigest(), "sizeBytes": len(data), "plate": plate, "path": "/api/print/hub/file/1111"}
@@ -173,7 +195,7 @@ class TestGetToFileDeadline(unittest.TestCase):
                 return False
 
         clock = iter([0.0] + [i * 100.0 for i in range(1, 2000)])
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(http_module.urllib.request, "urlopen", return_value=Drip()), \
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(http_module._OPENER, "open", return_value=Drip()), \
                 mock.patch.object(http_module.time, "monotonic", side_effect=lambda: next(clock)):
             with self.assertRaises(http_module.TransportError) as ctx:
                 http_module.get_to_file("https://cloud/x", Path(d) / "f", max_seconds=300.0)

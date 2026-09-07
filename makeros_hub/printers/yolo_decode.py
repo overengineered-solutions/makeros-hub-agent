@@ -78,15 +78,16 @@ def decode_failure_probability(
     # Per-class max over the 8400 anchor predictions. Shape: (NUM_CLASSES,).
     class_max = arr[4:NUM_CHANNELS, :].max(axis=1)
 
-    # If any per-class max is materially outside the expected sigmoid range
+    # If any class score is materially outside the expected sigmoid range
     # [0, 1] (allowing a small float-precision slop), the model was likely
     # exported without sigmoid'd class heads — let the caller log that
     # actionably (not on every frame). Threshold is loose so genuine 1.0001
     # numerical artifacts don't trip.
     if on_out_of_range is not None:
         max_observed = float(class_max.max())
-        if max_observed > 1.01 or float(class_max.min()) < -0.01:
-            on_out_of_range(max_observed)
+        min_observed = float(arr[4:NUM_CHANNELS, :].min())
+        if max_observed > 1.01 or min_observed < -0.01:
+            on_out_of_range(max_observed if max_observed > 1.01 else min_observed)
 
     # Weight + reduce. Clamp each class score to [0, 1] first so a sigmoid
     # that landed at 1.0001 doesn't push weighted past 1.0; clamp at the end
