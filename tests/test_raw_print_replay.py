@@ -136,11 +136,16 @@ class TestDispatchCarriesRawPrint(unittest.TestCase):
         return fake.calls
 
     def test_raw_print_reaches_the_adapter_only_when_it_is_a_dict(self):
-        base = {"queueJobId": "q1", "printerId": "p1", "submissionUid": "abcdef12", "fileName": "part.3mf", "plate": 2}
-        self.assertEqual(self._dispatch({**base, "rawPrint": RAW})[0]["raw_print"], RAW)
-        self.assertIsNone(self._dispatch(base)[0]["raw_print"])
-        self.assertIsNone(self._dispatch({**base, "rawPrint": "garbage"})[0]["raw_print"])
-        self.assertIsNone(self._dispatch({**base, "rawPrint": {}})[0]["raw_print"])
+        # A DISTINCT queueJobId per case, deliberately. These are four independent dispatches; reusing one id
+        # makes cases 2-4 the SAME job, which the dispatched-job guard then correctly refuses to start again,
+        # and the adapter is never called. That only passed while the persisted guard was silently failing to
+        # write (see tests/conftest.py) — with state isolation working, reusing the id tests the dedupe guard
+        # instead of the thing this test is about.
+        base = {"printerId": "p1", "submissionUid": "abcdef12", "fileName": "part.3mf", "plate": 2}
+        self.assertEqual(self._dispatch({**base, "queueJobId": "q-raw", "rawPrint": RAW})[0]["raw_print"], RAW)
+        self.assertIsNone(self._dispatch({**base, "queueJobId": "q-absent"})[0]["raw_print"])
+        self.assertIsNone(self._dispatch({**base, "queueJobId": "q-garbage", "rawPrint": "garbage"})[0]["raw_print"])
+        self.assertIsNone(self._dispatch({**base, "queueJobId": "q-empty", "rawPrint": {}})[0]["raw_print"])
 
 
 if __name__ == "__main__":
