@@ -65,7 +65,7 @@ class CapturedJob:
     vp_model: str = ""
     # OrcaSlicer's own `print` command as sent to the VP (bounded copy, v0.51). The hub REPLAYS it to the assigned
     # printer (bambu_send.build_print_start_payload raw_print=...) so every option the member chose — plate, bed
-    # type, calibration flags, timelapse, and the H2D's dual-nozzle `ams_mapping2`/nozzle fields we cannot
+    # type, calibration flags, timelapse, structured `ams_mapping2` and separate nozzle fields we cannot
     # enumerate — reaches the machine verbatim; only file/url/ids/sequence are forced. None = no captured
     # command (web upload) → the dispatcher rebuilds the command exactly as before.
     raw_print: dict[str, Any] | None = None
@@ -414,7 +414,7 @@ def build_vp_submit_body(job: CapturedJob, *, model: str) -> dict[str, Any]:
     if job.plate is not None:
         body["plate"] = job.plate
     # Additive (cloud-side double-Send dedupe on member + VP + sha + plate + mapping): the mapping exactly
-    # as OrcaSlicer sent it (list, or {ams_mapping, ams_mapping2} for dual-nozzle prints) + the VP serial.
+    # as OrcaSlicer sent it (list, or {ams_mapping, ams_mapping2} when both tray maps are present) + the VP serial.
     if job.ams_mapping is not None:
         body["amsMappingRaw"] = job.ams_mapping
     if job.vp_serial:
