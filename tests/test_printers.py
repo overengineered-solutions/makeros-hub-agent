@@ -2,7 +2,10 @@
 fully covered without paho or a printer; the manager is covered on its non-paho
 paths (klipper/incomplete/removal). Run: python3 -m unittest discover -s tests"""
 
+import sys
+import types
 import unittest
+from unittest import mock
 
 from makeros_hub import diagnostics
 from makeros_hub.printers import bambu_parse
@@ -568,6 +571,113 @@ class TestSummarizeShape(unittest.TestCase):
 
 
 class TestManagerNonPahoPaths(unittest.TestCase):
+    def test_heartbeat_retries_failed_bambu_without_a_config_change(self):
+        instances = []
+        # Stands in for the adapter's DURABLE terminal-job buffer (JobTracker
+        # persists per printer id): every rebuilt adapter re-reads the same
+        # unacked job, exactly as the real one does after a teardown.
+        durable_jobs = {"gaudi": [{"jobKey": "task_TEST_1", "printerId": "gaudi", "status": "done"}]}
+
+        class FakeBambu:
+            fail_start = False
+
+            def __init__(self, printer_id, **config):
+                self.printer_id = printer_id
+                self.config = config
+                self.state = "error"
+                self.stopped = False
+                instances.append(self)
+
+            def start(self):
+                if FakeBambu.fail_start:
+                    raise OSError("printer unreachable")
+
+            def stop(self):
+                self.stopped = True
+
+            def status(self):
+                return {"printerId": self.printer_id, "connectionState": self.state}
+
+            def pending_jobs(self):
+                return list(durable_jobs.get(self.printer_id, []))
+
+            def ack_jobs(self, keys):
+                durable_jobs[self.printer_id] = [
+                    j for j in durable_jobs.get(self.printer_id, []) if j["jobKey"] not in set(keys)
+                ]
+
+        module = types.ModuleType("makeros_hub.printers.bambu")
+        module.BambuAdapter = FakeBambu
+        printer = {"id": "gaudi", "vendor": "bambu", "host": "192.0.2.1", "serial": "TEST", "accessCode": "test-only", "model": "X1C"}
+        with mock.patch.dict(sys.modules, {module.__name__: module}), mock.patch(
+            "makeros_hub.printers.manager.time.monotonic", return_value=0
+        ) as clock:
+            manager = PrinterManager()
+            manager.reconcile([printer], "unchanged")
+            clock.return_value = 119
+            manager.statuses()
+            self.assertEqual(len(instances), 1)
+            clock.return_value = 120
+            manager.statuses()  # The heartbeat reads statuses; it does not re-fetch unchanged config.
+            self.assertEqual(len(instances), 2)
+            self.assertTrue(instances[0].stopped)
+            self.assertEqual(instances[1].config["model"], "X1C")
+            self.assertEqual(manager.config_version, "unchanged")
+            manager.statuses()
+            self.assertEqual(len(instances), 2)  # Still failing: bounded retry, not every heartbeat.
+
+            # A retry whose start() RAISES leaves no adapter behind. The printer
+            # must still be retried on the next window (it was stranded until an
+            # operator edited the config) — and only on the next window.
+            FakeBambu.fail_start = True
+            clock.return_value = 240
+            failed = manager.statuses()
+            self.assertEqual(len(instances), 3)
+            self.assertEqual(failed, [{"printerId": "gaudi", "connectionState": "error", "errorReason": "agent_start_failed"}])
+            clock.return_value = 359
+            manager.statuses()
+            self.assertEqual(len(instances), 3)  # No hot loop between windows.
+
+            # The start failure clears: the next window
+            # rebuilds and the heartbeat reports the live connection, with the
+            # 'agent_start_failed' row gone.
+            FakeBambu.fail_start = False
+            clock.return_value = 360
+            manager.statuses()
+            self.assertEqual(len(instances), 4)
+            instances[3].state = "connected"
+            self.assertEqual(manager.statuses(), [{"printerId": "gaudi", "connectionState": "connected"}])
+            clock.return_value = 800
+            manager.statuses()
+            self.assertEqual(len(instances), 4)  # Leave a recovered connection alone.
+
+            # Terminal (billable) evidence survived all four rebuilds — reported
+            # once, not once per rebuild, and never dropped.
+            self.assertEqual([j["jobKey"] for j in manager.pending_jobs()], ["task_TEST_1"])
+            self.assertEqual(len(manager._orphan_jobs), 1)
+
+            manager.ack_jobs(["task_TEST_1"])  # a confirmed send clears orphan + adapter
+            self.assertEqual(manager.pending_jobs(), [])
+
+            manager.reconcile([], "removed")
+            self.assertEqual(manager.statuses(), [])
+            self.assertEqual(len(instances), 4)  # Never resurrect a removed printer.
+            self.assertEqual(manager._bambu_configs, {})  # the cached accessCode goes with it
+            self.assertEqual(manager._stuck_retry_at, {})
+
+            manager.reconcile([dict(printer, accessCode=None)], "incomplete")
+            with mock.patch.object(manager, "_reconcile_bambu", wraps=manager._reconcile_bambu) as retry:
+                self.assertEqual(manager.statuses()[0]["errorReason"], "incomplete_config")
+                retry.assert_not_called()  # Incomplete config does not hot-loop.
+            manager.reconcile([printer], "restored")
+            self.assertEqual(len(instances), 5)
+            manager.stop_all()
+            clock.return_value = 1200
+            self.assertEqual(manager.statuses(), [])
+            self.assertEqual(len(instances), 5)
+            self.assertEqual(manager._bambu_configs, {})
+            self.assertEqual(manager._camera_meta, {})
+
     def test_klipper_with_moonraker_url_starts_polling(self):
         # The Klipper adapter is now real — given a URL it spins up a
         # polling thread + reports 'connecting' until the first poll lands.

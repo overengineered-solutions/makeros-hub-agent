@@ -37,12 +37,10 @@ BUSY_ACTIVITY_STATES = frozenset({"printing", "paused"})
 DISPATCHED_STATE_PATH = Path(os.environ.get("MAKEROS_HUB_DISPATCHED_STATE", "/var/lib/makeros-hub/dispatched.json"))
 DISPATCHED_TTL_SEC = 24 * 3600
 MAX_DISPATCHED_COMMANDS = 1000
-# A paho client that got a CONNACK auth-rejection (or never completed its first
-# connect) does NOT reliably auto-retry — so an adapter built while a printer was
-# unreachable / mis-coded stays dead even after the printer RECOVERS (operator
-# resets LAN mode, fixes the access code, powers it back on). The manager tears
-# down + rebuilds such a wedged adapter at most this often so it SELF-HEALS with
-# no agent restart. Bounded to avoid thrashing a genuinely-dead printer.
+# Fallback rebuild for adapters that remain in error. Paho normally retries
+# network/authentication failures itself (observed in the shop on 2026-09-09),
+# but an adapter whose start() failed needs the manager to try again. This
+# bounds rebuilds; it cannot repair a wrong access code.
 STUCK_ADAPTER_RETRY_S = 120.0
 _SUBMISSION_UID_RE = re.compile(r"^[a-f0-9]{8,64}$")
 
@@ -72,9 +70,14 @@ class PrinterManager:
         self.laser = laser if laser is not None else LaserHub()
         self._adapters: dict[str, Any] = {}
         self._fingerprints: dict[str, tuple] = {}
+        # The cloud's connection facts per Bambu printer, kept so the heartbeat
+        # can retry a failed build without waiting for a config edit. Holds the
+        # accessCode — never log a row of this map.
+        self._bambu_configs: dict[str, dict] = {}
         # Earliest monotonic time to rebuild a wedged adapter (see
-        # STUCK_ADAPTER_RETRY_S). Set on every (re)build; checked when the
-        # fingerprint is unchanged so a recovered printer self-heals.
+        # STUCK_ADAPTER_RETRY_S). Set on every (re)build AND on every failed
+        # build, so a printer with no adapter at all is retried on the same
+        # backoff instead of every heartbeat.
         self._stuck_retry_at: dict[str, float] = {}
         self._diagnostics = diagnostics or get_default()
         # Static status for printers the agent can't drive yet (klipper, or a
@@ -83,7 +86,7 @@ class PrinterManager:
         # Unacked terminal jobs rescued from torn-down adapters (config change
         # rebuilds the adapter; its in-memory buffer must NOT die with it —
         # Codex review finding). Drained by pending_jobs / cleared by ack_jobs.
-        self._orphan_jobs: list[dict] = []
+        self._orphan_jobs: dict[str, dict] = {}
         # Queue assignments are at-least-once from the cloud. Once this process
         # has successfully sent a start command for a queueJobId, a same-window
         # resend must not re-upload or re-start the printer. Terminal progress
@@ -114,7 +117,7 @@ class PrinterManager:
         if isinstance(fp, tuple) and len(fp) >= 4 and fp[3]:
             return fp[3]
         adapter = self._adapters.get(pid)
-        return getattr(adapter, "_access_code", None)
+        return getattr(adapter, "_access_code", None) or self._bambu_configs.get(pid, {}).get("accessCode")
 
     def _redact_printer_exception(self, exc, code=None) -> str:
         return redact(str(exc), extra_secrets=[code] if code else None)
@@ -122,6 +125,7 @@ class PrinterManager:
     def reconcile(self, printers: list[dict], version: str | None) -> None:
         self.config_version = version
         desired_ids = {p["id"] for p in printers if isinstance(p.get("id"), str)}
+        self._bambu_configs = {p["id"]: dict(p) for p in printers if isinstance(p.get("id"), str) and p.get("vendor") == "bambu"}
 
         # Rebuild camera-routing meta from the full desired list (no stale rows).
         self._camera_meta = {
@@ -160,6 +164,12 @@ class PrinterManager:
         for pid in list(self._static):
             if pid not in desired_ids:
                 self._static.pop(pid, None)
+        # A printer whose build FAILED has no adapter, so the loop above never
+        # reaches it — drop its retry deadline here or the map grows for the
+        # life of the process.
+        for pid in list(self._stuck_retry_at):
+            if pid not in desired_ids:
+                self._stuck_retry_at.pop(pid, None)
 
         for p in printers:
             pid = p.get("id")
@@ -236,7 +246,11 @@ class PrinterManager:
         host, serial, code = p.get("host"), p.get("serial"), p.get("accessCode")
         if not (host and serial and code):
             # Incomplete config — can't connect. Make it visible, don't crash.
+            # The backoff is armed even though nothing was built: statuses()
+            # walks every Bambu config each heartbeat, and an unfixable one must
+            # not re-log/re-record a failure on every beat (hot loop).
             self._stop(pid)
+            self._defer_retry(pid)
             self._record_failure(f"printer {pid} incomplete_config")
             self._static[pid] = {
                 "printerId": pid,
@@ -261,6 +275,7 @@ class PrinterManager:
             from .bambu import BambuAdapter  # lazy: needs paho
         except ImportError as e:  # paho not installed
             safe = self._redact_printer_exception(e, code)
+            self._defer_retry(pid)
             log.error("cannot start Bambu adapter for %s — paho-mqtt missing: %s", pid, safe)
             self._record_failure(
                 f"cannot start Bambu adapter for {pid}: paho-mqtt missing: {safe}",
@@ -277,6 +292,11 @@ class PrinterManager:
             adapter.start()
         except Exception as e:  # noqa: BLE001 - one bad printer must not sink config-down
             safe = self._redact_printer_exception(e, code)
+            self._defer_retry(pid)
+            try:
+                adapter.stop()  # start() may have created a client before failing.
+            except Exception as stop_error:  # noqa: BLE001
+                log.warning("partial Bambu teardown failed for %s: %s", pid, self._redact_printer_exception(stop_error, code))
             log.warning("cannot start Bambu adapter for %s: %s", pid, safe)
             self._record_failure(f"cannot start Bambu adapter for {pid}: {safe}", extra_secrets=[code])
             self._static[pid] = {
@@ -289,15 +309,18 @@ class PrinterManager:
         self._fingerprints[pid] = fp
         self._stuck_retry_at[pid] = time.monotonic() + STUCK_ADAPTER_RETRY_S
 
+    def _defer_retry(self, pid: str) -> None:
+        """Arm the rebuild backoff after a build that produced no adapter. Set
+        AFTER _stop() (which clears the deadline along with the adapter)."""
+        self._stuck_retry_at[pid] = time.monotonic() + STUCK_ADAPTER_RETRY_S
+
     def _stuck_needs_retry(self, pid: str) -> bool:
-        """True when the existing adapter is wedged in a hard 'error' state paho
-        won't recover from on its own (CONNACK auth-rejection or a connect that
-        never completed) AND we're past the rebuild backoff. A healthy or merely
-        'offline' (transient, paho-recoverable) adapter returns False; a missing
-        adapter returns True (build it)."""
+        """Retry a missing/errored adapter after its deadline; leave healthy and
+        temporarily offline adapters to their own reconnect loop."""
         adapter = self._adapters.get(pid)
         if adapter is None:
-            return True
+            # No deadline recorded = never attempted → build it now.
+            return time.monotonic() >= self._stuck_retry_at.get(pid, 0.0)
         try:
             state = adapter.status().get("connectionState")
         except Exception:  # noqa: BLE001 — a status read must never sink reconcile
@@ -317,9 +340,11 @@ class PrinterManager:
             # would otherwise vanish with it.
             try:
                 rescued = adapter.pending_jobs()
+                # Rebuilt adapters reload these same durable jobs. Keying them
+                # avoids duplicate growth without discarding unacked evidence.
+                self._orphan_jobs.update((j["jobKey"], j) for j in rescued)
                 if rescued:
-                    self._orphan_jobs.extend(rescued)
-                    log.info("rescued %d unacked job(s) from %s before teardown", len(rescued), pid)
+                    log.info("rescued jobs from %s: processed=%d, expected=%d", pid, len(rescued), len(rescued))
             except Exception as e:  # noqa: BLE001
                 safe = self._redact_printer_exception(e, code)
                 log.warning("could not rescue pending jobs from %s: %s", pid, safe)
@@ -327,6 +352,13 @@ class PrinterManager:
             adapter.stop()
 
     def statuses(self) -> list[dict]:
+        # Heartbeats keep running when configVersion is unchanged. Retry failed connections here too,
+        # using the same backoff/rebuild path; waiting for the next config edit can strand a printer forever.
+        # Printers with NO adapter are included: a retry whose start() raised leaves none behind, and it is
+        # exactly that printer (off, unplugged, LAN mode off) that must be retried again next window.
+        for pid, config in list(self._bambu_configs.items()):
+            if self._stuck_needs_retry(pid):
+                self._reconcile_bambu(pid, config)
         out: list[dict] = []
         for pid, adapter in self._adapters.items():
             try:
@@ -356,26 +388,25 @@ class PrinterManager:
         return list(self._camera_meta.values())
 
     def pending_jobs(self) -> list[dict]:
-        """Unacked terminal jobs across all adapters + any rescued from
-        torn-down adapters. Safe to send repeatedly — the cloud dedupes on
-        jobKey."""
-        out: list[dict] = list(self._orphan_jobs)
+        """Unacked evidence, once per jobKey even after an adapter reloads its
+        durable buffer. JobTracker namespaces keys by printer serial."""
+        out = dict(self._orphan_jobs)
         for pid, adapter in self._adapters.items():
             try:
-                out.extend(adapter.pending_jobs())
+                out.update((j["jobKey"], j) for j in adapter.pending_jobs())
             except Exception as e:  # noqa: BLE001 — one adapter can't sink the loop
                 code = self._access_code_for(pid)
                 safe = self._redact_printer_exception(e, code)
                 log.warning("pending_jobs failed for %s: %s", pid, safe)
                 self._record_failure(f"pending_jobs failed for {pid}: {safe}", extra_secrets=[code])
-        return out
+        return list(out.values())
 
     def ack_jobs(self, job_keys: list[str]) -> None:
         """Fan a confirmed-send ack out to every adapter + the orphan buffer."""
         if not job_keys:
             return
         keys = set(job_keys)
-        self._orphan_jobs = [j for j in self._orphan_jobs if j["jobKey"] not in keys]
+        self._orphan_jobs = {k: j for k, j in self._orphan_jobs.items() if k not in keys}
         for pid, adapter in self._adapters.items():
             try:
                 adapter.ack_jobs(job_keys)
@@ -880,5 +911,9 @@ class PrinterManager:
         return reports
 
     def stop_all(self) -> None:
+        self._bambu_configs.clear()  # A later status read must never restart a stopped manager.
         for pid in list(self._adapters):
             self._stop(pid)
+        self._stuck_retry_at.clear()
+        self._camera_meta.clear()
+        self._static.clear()
