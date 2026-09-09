@@ -90,13 +90,21 @@ def _spools(status: Any):
     shows them from the DTO field instead."""
     if not isinstance(status, dict):
         return
+    dual = status.get("extruderCount") == 2
+    if _model_key(status.get("model")) in {"h2d", "o1d"} and not dual:
+        return  # no observed H2D hardware yet: no unverifiable nozzle paths
     for unit in status.get("ams") or []:
         if isinstance(unit, dict):
             for tray in unit.get("trays") or []:
                 if isinstance(tray, dict):
-                    yield tray
+                    if dual:
+                        eid = unit.get("extruderId")
+                        if not isinstance(eid, bool) and eid in (0, 1):
+                            yield dict(tray, extruderId=eid)
+                    else:
+                        yield tray
     vt_tray = status.get("vtTray")
-    if isinstance(vt_tray, dict):
+    if isinstance(vt_tray, dict) and not dual:
         yield vt_tray
 
 
@@ -163,6 +171,8 @@ def vp_pool_from_statuses(
                 else -1,
             }
         )
+        if "extruderId" in t:
+            pool[-1]["extruderId"] = t["extruderId"]
         if len(pool) >= capacity:
             break
     return pool
@@ -171,7 +181,7 @@ def vp_pool_from_statuses(
 # The display-identity fields OrcaSlicer renders (and that the runtime's
 # ams.version gates on). Volatile fields (remain%, temps) are excluded so a
 # spool ticking down doesn't churn the version.
-_IDENTITY_KEYS = ("tray_type", "tray_info_idx", "tray_sub_brands", "tray_color", "cols")
+_IDENTITY_KEYS = ("tray_type", "tray_info_idx", "tray_sub_brands", "tray_color", "cols", "extruderId")
 
 
 def _pool_identity(pool: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -191,9 +201,35 @@ def updated_config_if_pool_changed(current_config: Any, statuses: list[dict[str,
         return None
     live = vp_pool_from_statuses(statuses, current_config.units, current_config.trays)
     cap = max(1, int(current_config.units) * int(current_config.trays))
-    if _pool_identity(live) == _pool_identity(list(current_config.pool)[:cap]):
+    nozzles = _observed_dual_nozzles(statuses)
+    if _pool_identity(live) == _pool_identity(list(current_config.pool)[:cap]) and current_config.nozzles == nozzles:
         return None
-    return dataclasses.replace(current_config, pool=tuple(live))
+    return dataclasses.replace(current_config, pool=tuple(live), nozzles=nozzles)
+
+
+def _observed_dual_nozzles(statuses: list[dict]) -> tuple[dict, ...]:
+    """Advertise a dual setup only when every source agrees on the observed pair.
+
+    Mixed/unknown H2D hardware is not a model-group capability we can invent.
+    """
+    if not statuses:
+        return ()
+    agreed: tuple[dict, ...] | None = None
+    for status in statuses:
+        if status.get("connectionState") != "connected" or status.get("extruderCount") != 2:
+            return ()
+        nozzles = status.get("nozzles")
+        if not isinstance(nozzles, list) or len(nozzles) != 2:
+            return ()
+        if any(not isinstance(n, dict) or type(n.get("id")) is not int or type(n.get("extruderId")) is not int for n in nozzles):
+            return ()
+        if {n["id"] for n in nozzles} != {0, 1} or {n["extruderId"] for n in nozzles} != {0, 1}:
+            return ()
+        pair = tuple(sorted(nozzles, key=lambda n: n["id"]))
+        if agreed is not None and agreed != pair:
+            return ()
+        agreed = pair
+    return agreed or ()
 
 
 # ── Multi-VP, model-scoped, RANKED live mirror (v0.49; §10.2) ─────────────────────────────────────────────
@@ -207,13 +243,14 @@ def tray_key(tray: dict[str, Any]) -> str | None:
     uses, exposed for the ranking signals."""
     if not isinstance(tray, dict) or not _clean_optional(tray.get("material")):
         return None
-    return "|".join(
+    key = "|".join(
         (
             _norm_material(tray.get("material")),
             _clean_optional(tray.get("filamentId")) or "",
             _norm_color(tray.get("colorHex")),
         )
     )
+    return f"{key}|extruder:{tray['extruderId']}" if "extruderId" in tray else key
 
 
 # Per-VP scope outcome ("matched" | "empty" | "compat"), logged on TRANSITIONS only so the journal shows
@@ -376,8 +413,9 @@ def updated_configs_if_pools_changed(
             scoped = scoped_statuses(statuses, getattr(cfg, "model", None))
             live = vp_pool_from_statuses_ranked(scoped, cfg.units, cfg.trays, ranking, now)
             cap = max(1, int(cfg.units) * int(cfg.trays))
-            if _pool_identity(live) != _pool_identity(list(cfg.pool)[:cap]):
-                out.append(dataclasses.replace(cfg, pool=tuple(live)))
+            nozzles = _observed_dual_nozzles(scoped)
+            if _pool_identity(live) != _pool_identity(list(cfg.pool)[:cap]) or cfg.nozzles != nozzles:
+                out.append(dataclasses.replace(cfg, pool=tuple(live), nozzles=nozzles))
                 changed = True
             else:
                 out.append(cfg)

@@ -5,8 +5,9 @@ from makeros_hub.printers import camera
 
 
 class FakeResp:
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, headers=None):
         self._data = data
+        self.headers = headers or {}
 
     def read(self, _n: int = -1) -> bytes:
         return self._data
@@ -23,6 +24,21 @@ def _bambu(**over):
 
 
 class TestSourceKind(unittest.TestCase):
+    def test_external_camera_overrides_bambu_without_needing_printer_credentials(self):
+        for model in ("A1 mini", "H2D"):
+            printer = _bambu(model=model, host="", accessCode="", cameraSnapshotUrl=" http://pi:8080/snapshot ")
+            self.assertEqual(camera.camera_source_kind(printer), "http-snapshot")
+            jpeg = b"\xff\xd8\xff\xe0camera\xff\xd9"
+            with mock.patch.object(camera.urllib.request, "urlopen", return_value=FakeResp(jpeg)) as fetch, \
+                 mock.patch.object(camera, "_bambu_capture_frame") as lan, \
+                 mock.patch.object(camera, "_rtsp_capture_frame") as rtsp:
+                self.assertEqual(camera.capture_printer_frame(printer), jpeg)
+                self.assertEqual(camera.capture_printer_frame_with_reason(printer), (jpeg, None, ""))
+                self.assertEqual(fetch.call_args.args[0].full_url, "http://pi:8080/snapshot")
+                lan.assert_not_called()
+                rtsp.assert_not_called()
+        self.assertEqual(camera.camera_source_kind(_bambu(cameraSnapshotUrl=" ")), "bambu-lan")
+
     def test_bambu_a1_is_lan(self):
         self.assertEqual(camera.camera_source_kind(_bambu()), "bambu-lan")
 
@@ -84,6 +100,14 @@ class TestSnapshotUrl(unittest.TestCase):
 
 
 class TestHttpSnapshot(unittest.TestCase):
+    def test_disconnected_ustreamer_placeholder_is_not_a_camera_frame(self):
+        jpeg = b"\xff\xd8\xff\xe0placeholder\xff\xd9"
+        for online in ("false", "garbage"):
+            with mock.patch.object(camera.urllib.request, "urlopen", return_value=FakeResp(jpeg, {"X-UStreamer-Online": online})):
+                self.assertEqual(camera._http_snapshot_with_reason("http://pi/snapshot")[:2], (None, "unreachable"))
+        with mock.patch.object(camera.urllib.request, "urlopen", return_value=FakeResp(jpeg, {"X-UStreamer-Online": "true"})):
+            self.assertEqual(camera.http_snapshot("http://pi/snapshot"), jpeg)
+
     def test_returns_jpeg_bytes(self):
         jpeg = b"\xff\xd8\xff\xe0body\xff\xd9"
         with mock.patch.object(camera.urllib.request, "urlopen", return_value=FakeResp(jpeg)):
@@ -214,6 +238,27 @@ class TestCameraScheduler(unittest.TestCase):
 
 
 class TestCollectCameraFrames(unittest.TestCase):
+    def test_source_identity_and_change_capture_immediately(self):
+        target = {"printerId": "p", "vendor": "bambu", "model": "A1 mini", "host": "192.0.2.2", "serial": "test", "cameraSnapshotUrl": "http://pi:8080/snapshot"}
+        # Same fixed wire vector asserted in pstation's DB suite.
+        self.assertEqual(camera.camera_source_id(target), "3560a72d7d65e1a4c913b515a6c1accbd2a004da910f4752cc62128cbfb69c90")
+        scheduler = camera.CameraScheduler()
+        frames, _ = camera.collect_camera_frames([target], {}, scheduler, now=0, capture=lambda _: b"jpeg")
+        self.assertEqual(frames[0]["sourceId"], camera.camera_source_id(target))
+        self.assertEqual(camera.collect_camera_frames([target], {}, scheduler, now=1, capture=lambda _: b"jpeg"), ([], []))
+        for i, change in enumerate(({"cameraSnapshotUrl": ""}, {"host": "192.0.2.4"}, {"moonrakerUrl": "http://sovol:7125"}, {"model": "H2D"}), 2):
+            target = dict(target, **change)
+            frames, failures = camera.collect_camera_frames([target], {}, scheduler, now=i, capture=lambda _: b"jpeg")
+            self.assertEqual(len(frames), 1)
+            self.assertEqual(failures, [])
+            self.assertEqual(frames[0]["sourceId"], camera.camera_source_id(target))
+        target = dict(target, cameraSnapshotUrl="http://offline/snapshot")
+        frames, failures = camera.collect_camera_frames([target], {}, scheduler, now=7, capture=lambda _: None)
+        self.assertEqual(frames, [])
+        self.assertEqual(failures[0]["sourceId"], camera.camera_source_id(target))
+        scheduler.forget(set())
+        self.assertEqual(scheduler._last_source, {})
+
     def _targets(self):
         return [{"printerId": "p1", "vendor": "bambu"}, {"printerId": "p2", "vendor": "bambu"}]
 

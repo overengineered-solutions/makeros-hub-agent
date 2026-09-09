@@ -554,6 +554,8 @@ class _VirtualPrinterRuntime:
                 prepare_percent=prepare_percent,
                 ams_version=self._ams_version,
                 serial=self.config.serial,
+                model=self.config.model,
+                nozzles=self.config.nozzles,
             ),
             version_builder=lambda sequence_id: build_get_version(
                 model=self.config.model,
@@ -684,7 +686,7 @@ class _VirtualPrinterRuntime:
         # member-only changes). max(now, prev+1) keeps it strictly increasing
         # even for rapid successive changes within the same second.
         new_sig = _pool_signature(config.pool[: config.units * config.trays])
-        if new_sig != self._pool_sig:
+        if new_sig != self._pool_sig or config.nozzles != self.config.nozzles:
             self._ams_version = max(int(time.time()), self._ams_version + 1)
             self._pool_sig = new_sig
             self._persist_ams_version()
@@ -739,11 +741,12 @@ def _hot_state(config: VirtualPrinterConfig) -> tuple[Any, ...]:
     return (
         tuple((member.member_id, member.access_code_sha256) for member in config.members),
         json.dumps(_pool_identity(config.pool), sort_keys=True, separators=(",", ":"), default=str),
+        json.dumps(config.nozzles, sort_keys=True, separators=(",", ":")),
     )
 
 
 def _pool_identity(pool: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
-    keys = ("tray_type", "tray_info_idx", "tray_sub_brands", "tray_color", "cols")
+    keys = ("tray_type", "tray_info_idx", "tray_sub_brands", "tray_color", "cols", "extruderId")
     return [{key: tray.get(key) for key in keys if key in tray} for tray in pool]
 
 

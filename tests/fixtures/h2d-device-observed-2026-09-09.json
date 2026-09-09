@@ -1,0 +1,107 @@
+{
+  "capturedAt": "2026-09-09T16:44:29.088801+00:00",
+  "source": "Read-only MQTT pushall from the physical H2D; selected hardware fields only.",
+  "raw": {
+    "device": {
+      "nozzle": {
+        "exist": 3,
+        "info": [
+          {
+            "diameter": 0.4,
+            "id": 0,
+            "tm": 0,
+            "type": "HS01",
+            "wear": 0
+          },
+          {
+            "diameter": 0.4,
+            "id": 1,
+            "tm": 0,
+            "type": "HS01",
+            "wear": 0
+          }
+        ],
+        "state": 0
+      },
+      "extruder": {
+        "info": [
+          {
+            "filam_bak": [
+              6
+            ],
+            "hnow": 0,
+            "hpre": 0,
+            "htar": 0,
+            "id": 0,
+            "info": 9,
+            "snow": 65535,
+            "spre": 65535,
+            "star": 255,
+            "stat": 0,
+            "temp": 27
+          },
+          {
+            "filam_bak": [],
+            "hnow": 1,
+            "hpre": 1,
+            "htar": 1,
+            "id": 1,
+            "info": 24,
+            "snow": 65279,
+            "spre": 65279,
+            "star": 65279,
+            "stat": 0,
+            "temp": 27
+          }
+        ],
+        "state": 2
+      }
+    },
+    "ams": {
+      "ams": [
+        {
+          "id": "0",
+          "info": "1003",
+          "trayIds": [
+            "0",
+            "1",
+            "2",
+            "3"
+          ]
+        },
+        {
+          "id": "128",
+          "info": "2104",
+          "trayIds": [
+            "0"
+          ]
+        }
+      ]
+    }
+  },
+  "decoded": {
+    "nozzleIdConvention": {
+      "0": "right",
+      "1": "left"
+    },
+    "ams": [
+      {
+        "id": "0",
+        "model": "AMS 2 Pro",
+        "extruderId": 0,
+        "side": "right"
+      },
+      {
+        "id": "128",
+        "model": "AMS HT",
+        "extruderId": 1,
+        "side": "left"
+      }
+    ]
+  },
+  "protocolReferences": [
+    "https://github.com/bambulab/BambuStudio/blob/master/src/slic3r/GUI/DeviceCore/DevFilaSystem.cpp",
+    "https://github.com/bambulab/BambuStudio/blob/master/src/slic3r/GUI/DeviceCore/DevExtruderSystem.h",
+    "https://github.com/bambulab/BambuStudio/blob/master/src/slic3r/GUI/DeviceCore/DevUtil.cpp"
+  ]
+}

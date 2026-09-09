@@ -22,6 +22,7 @@ Field references (verified against ha-bambulab/pybambu + bambulabs_api):
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -255,6 +256,17 @@ def build_ams(print_obj: dict) -> list[dict] | None:
         # handled by the dual-pool VP work, not this telemetry index.)
         unit_out: dict[str, Any] = {"unit": emitted_unit_idx, "trays": []}
         emitted_unit_idx += 1
+        # BambuStudio DevFilaSystem::ParseAmsInfo: info is HEX, not decimal.
+        # Missing/unknown bindings must not make a dual-extruder spool look reachable.
+        info = unit.get("info")
+        if isinstance(info, str) and re.fullmatch(r"[0-9a-fA-F]{1,16}", info):
+            bits = int(info, 16)
+            ams_type = {1: "ams", 2: "ams_lite", 3: "ams_2_pro", 4: "ams_ht"}.get(bits & 15)
+            if ams_type:
+                unit_out["amsType"] = ams_type
+            extruder = (bits >> 8) & 15
+            if extruder in (0, 1):  # 0xE needs switcher topology; never guess it is the right nozzle.
+                unit_out["extruderId"] = extruder
 
         # `humidity` is a 1-5 dryness LEVEL (verified live on the AMS 2 Pro);
         # `humidity_raw` is the actual percentage (e.g. "44"). Capture both — the
@@ -295,6 +307,56 @@ def build_ams(print_obj: dict) -> list[dict] | None:
         units.append(unit_out)
 
     return units or None
+
+
+def build_nozzle_hardware(print_obj: dict) -> dict[str, Any]:
+    """Selected observed device fields only; physical extruder 0=right, 1=left.
+
+    BambuStudio DeviceCore/DevExtruderSystem.cpp ParseV2_0 and DevNozzleSystem.cpp ParseV2_0.
+    A missing nozzle/binding is unknown, never a synthetic 0.4mm or a default right nozzle.
+    """
+    device = print_obj.get("device")
+    if not isinstance(device, dict):
+        return {}
+    out: dict[str, Any] = {}
+    extruders = device.get("extruder")
+    bindings: dict[int, set[int]] = {}
+    if isinstance(extruders, dict):
+        state = _to_int(extruders.get("state"))
+        if state is not None and state >= 0 and 1 <= (state & 15) <= 2:
+            out["extruderCount"] = state & 15
+        for ext in extruders.get("info", []) if isinstance(extruders.get("info"), list) else []:
+            if not isinstance(ext, dict):
+                continue
+            eid, nid = _to_int(ext.get("id")), _to_int(ext.get("hnow"))
+            if eid in (0, 1) and nid is not None and 0 <= nid <= 15:
+                bindings.setdefault(nid, set()).add(eid)
+    nozzle = device.get("nozzle")
+    if not isinstance(nozzle, dict) or not isinstance(nozzle.get("info"), list):
+        return out
+    nozzles = []
+    seen: set[int] = set()
+    exist = _to_int(nozzle.get("exist"))
+    for item in nozzle["info"]:
+        if not isinstance(item, dict):
+            continue
+        nid, diameter, kind = _to_int(item.get("id")), _num(item.get("diameter")), item.get("type")
+        if nid is None or not 0 <= nid <= 15 or nid in seen:
+            continue
+        if exist is not None and (exist < 0 or not exist & (1 << nid)):
+            continue
+        if diameter is None or not math.isfinite(diameter) or not 0 < diameter <= 2:
+            continue
+        if not isinstance(kind, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", kind):
+            continue
+        seen.add(nid)
+        entry: dict[str, Any] = {"id": nid, "diameterMm": diameter, "type": kind}
+        if len(bindings.get(nid, set())) == 1:
+            entry["extruderId"] = next(iter(bindings[nid]))
+        nozzles.append(entry)
+    if nozzles:
+        out["nozzles"] = nozzles
+    return out
 
 
 def _has_material(tray: dict) -> bool:
@@ -440,6 +502,7 @@ def normalize_status(
         out["etaMinutes"] = int(eta)
 
     if connection_state == "connected":
+        out.update(build_nozzle_hardware(print_obj))
         ams = build_ams(print_obj)
         if ams:
             out["ams"] = ams

@@ -59,6 +59,8 @@ def build_push_status(
     prepare_percent: str = "0",
     ams_version: int = 4,
     serial: str = "",
+    model: str | None = None,
+    nozzles: tuple[dict[str, Any], ...] = (),
 ) -> dict[str, Any]:
     if units <= 0:
         raise ValueError("units must be positive")
@@ -66,14 +68,32 @@ def build_push_status(
         raise ValueError("trays must be positive")
 
     total_trays = units * trays
+    dual = len(nozzles) == 2 and {n.get("extruderId") for n in nozzles} == {0, 1}
+    if str(model or "").strip().upper() in {"H2D", "O1D"} and not dual:
+        filaments = []  # do not advertise unobserved H2D nozzle paths
+    # Virtual AMS units each have ONE binding. Keep both pools separate even
+    # when identical filament is loaded on each physical nozzle's feeder.
+    per_extruder = {eid: [t for t in filaments or [] if t.get("extruderId") == eid] for eid in (0, 1)}
+    split = max(1, units // 2)
     colors = generate_colors(total_trays) if filaments is None else []
     ams_units = []
     filled_indices: list[int] = []  # global slot indices that carry filament
     for unit_idx in range(units):
         tray_items = []
+        extruder_id = 0 if unit_idx < split else 1
         for tray_idx in range(trays):
             global_idx = unit_idx * trays + tray_idx
-            if filaments is None:
+            if dual:
+                local_unit = unit_idx if extruder_id == 0 else unit_idx - split
+                index = local_unit * trays + tray_idx
+                pool = per_extruder[extruder_id] if units >= 2 else []
+                if index < len(pool):
+                    tray = _coerce_pool_tray(pool[index], tray_idx)
+                    tray.pop("extruderId", None)  # represented on its AMS unit in the Bambu report
+                    filled_indices.append(global_idx)
+                else:
+                    tray = _empty_tray(tray_idx)
+            elif filaments is None:
                 tray = _synthetic_tray(global_idx, tray_idx, colors[global_idx])
                 filled_indices.append(global_idx)
             elif global_idx < len(filaments):
@@ -92,7 +112,7 @@ def build_push_status(
                 # churns ams.version.
                 "ams_id": ams_unit_serial(serial, unit_idx),
                 "chip_id": ams_chip_id(serial, unit_idx),
-                "info": "2003",
+                "info": f"{0x2003 | (extruder_id << 8):x}" if dual else "2003",
                 "temp": "25.0",
                 "check": 1,
                 "dry_time": 0,
@@ -102,7 +122,7 @@ def build_push_status(
             }
         )
 
-    return {
+    report = {
         "print": {
             "command": "push_status",
             "msg": 0,
@@ -183,6 +203,23 @@ def build_push_status(
             },
         }
     }
+    if dual:
+        # Hardware comes from the agreed live pair. Activity fields describe
+        # this idle VIRTUAL device; hnow is the observed nozzle/extruder binding.
+        report["print"]["device"] = {
+            "nozzle": {"exist": sum(1 << n["id"] for n in nozzles), "state": 0,
+                       "info": [{"id": n["id"], "diameter": n["diameterMm"], "type": n["type"]} for n in nozzles]},
+            "extruder": {"state": 2, "info": [
+                {"id": n["extruderId"], "hnow": n["id"], "info": 8, "temp": 25,
+                 "spre": 65535, "snow": 65535, "star": 65535, "stat": 0, "filam_bak": []}
+                for n in sorted(nozzles, key=lambda n: n["extruderId"])
+            ]},
+        }
+        right = next(n for n in nozzles if n["extruderId"] == 0)
+        report["print"]["nozzle_diameter"] = str(right["diameterMm"])
+        if right["type"].startswith("HS"):
+            report["print"]["nozzle_type"] = "hardened_steel"
+    return report
 
 
 # Printer (non-AMS) modules, captured FIELD-FOR-FIELD from a live Bambu Lab

@@ -619,6 +619,7 @@ def push_camera_frames(
     fails to push is logged and skipped, never raised into the heartbeat loop. A capture failure this beat is signaled
     with ?failed=1 + an empty body so the board can show 'reconnecting'. Frames carry {printerId, jpegBase64}."""
     import base64
+    from urllib.parse import urlencode
 
     for f in camera_frames or []:
         pid = f.get("printerId")
@@ -627,7 +628,10 @@ def push_camera_frames(
             continue
         try:
             raw = base64.b64decode(b64)
-            post_bytes(f"{camera_url}?printerId={pid}", raw, content_type="image/jpeg", bearer=credential, timeout=15.0)
+            query = {"printerId": pid}
+            if f.get("sourceId"):
+                query["sourceId"] = f["sourceId"]
+            post_bytes(f"{camera_url}?{urlencode(query)}", raw, content_type="image/jpeg", bearer=credential, timeout=15.0)
         except Exception as exc:  # noqa: BLE001 — best-effort; a bad frame must never sink the heartbeat
             log.warning("camera push failed for %s: %s", pid, str(exc)[:200])
     for fail in camera_failures or []:
@@ -635,9 +639,12 @@ def push_camera_frames(
         if not pid:
             continue
         try:
-            post_bytes(f"{camera_url}?printerId={pid}&failed=1", b"", content_type="image/jpeg", bearer=credential, timeout=10.0)
-        except Exception:  # noqa: BLE001
-            pass
+            query = {"printerId": pid, "failed": "1"}
+            if isinstance(fail, dict) and fail.get("sourceId"):
+                query["sourceId"] = fail["sourceId"]
+            post_bytes(f"{camera_url}?{urlencode(query)}", b"", content_type="image/jpeg", bearer=credential, timeout=10.0)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("camera failure report push failed for %s: %s", pid, str(exc)[:200])
 
 
 def heartbeat_payload(
@@ -1062,9 +1069,10 @@ def _pull_config(
                 # placeholder (pstation never writes it), so applying it would blank every Device tab
                 # until the next heartbeat's mirror re-derived it — the 0-30 s empty-AMS flicker.
                 _get_cfgs = getattr(virtual_printer_manager, "current_configs", None)
-                live_pools = {c.serial: c.pool for c in (_get_cfgs() if callable(_get_cfgs) else [])}
+                live_configs = {c.serial: c for c in (_get_cfgs() if callable(_get_cfgs) else [])}
                 multi_vp_configs = [
-                    replace(c, pool=live_pools[c.serial]) if c.serial in live_pools else c
+                    replace(c, pool=live_configs[c.serial].pool, nozzles=live_configs[c.serial].nozzles)
+                    if c.serial in live_configs and c.model == live_configs[c.serial].model else c
                     for c in multi_vp_configs
                 ]
                 # v0.40.0 multi-broker path — pass the full list to the manager

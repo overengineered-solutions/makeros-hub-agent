@@ -13,17 +13,17 @@ UNITS = [
         {"slot": 2, "material": "pla", "colorHex": "ffffffff", "filamentId": "GFA00"},   # same white PLA, other brand
         {"slot": 3},                                                                     # empty
     ]},
-    {"unit": 1, "raw": {"id": "128"}, "trays": [{"slot": 0, "material": "PLA-CF", "colorHex": "333333FF"}]},  # AMS-HT
+    {"unit": 1, "amsType": "ams_ht", "raw": {"id": "128"}, "trays": [{"slot": 0, "material": "PLA-CF", "colorHex": "333333FF"}]},  # AMS-HT
     {"unit": 2, "trays": [{"slot": 0, "material": "ABS", "colorHex": "FF0000FF"}]},                           # no raw id
 ]
 VT = {"material": "TPU", "colorHex": "00FF00FF"}
 
 
 class TestLiveTrays(unittest.TestCase):
-    def test_ids_are_raw_unit_times_4_plus_slot_and_unaddressable_units_are_skipped(self):
+    def test_command_addresses_use_the_observed_ams_type(self):
         trays = tt.live_trays(UNITS, VT)
-        self.assertEqual([t["tray_id"] for t in trays], [0, 1, 2, 512, 254])
-        self.assertEqual(trays[3], {"tray_id": 512, "material": "PLA-CF", "color": "333333", "filament_id": None})
+        self.assertEqual([t["tray_id"] for t in trays], [0, 1, 2, 128, 254])
+        self.assertEqual(trays[3], {"tray_id": 128, "ams_id": 128, "slot_id": 0, "material": "PLA-CF", "color": "333333", "filament_id": None})
         self.assertEqual(trays[4]["material"], "TPU")
         self.assertEqual(tt.unaddressable_units(UNITS), 1)
 
@@ -60,10 +60,10 @@ class TestTranslateMapping(unittest.TestCase):
         # …and a required spool that is not loaded still refuses, even when the short list never mentioned it
         with self.assertRaises(tt.TrayTranslationError):
             tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF"}, {"slot": 2, "type": "ABS", "color": "FF0000"}], self.trays)
-        # the H2D's second-nozzle map keeps -1 = "not on this nozzle", and the primary map is not filled for a filament the
-        # second map covers (a two-colour dual-nozzle plate: PLA on the left, PETG on the right)
-        out = tt.translate_print_trays({"use_ams": True, "ams_mapping": [5, -1], "ams_mapping2": [-1, 9]}, required, UNITS, VT)
-        self.assertEqual((out["ams_mapping"], out["ams_mapping2"]), ([1, -1], [-1, 0]))
+        # Mapping2 is the SAME filaments as AMS/slot pairs, not a second nozzle.
+        out = tt.translate_print_trays({"use_ams": True, "ams_mapping": [5, -1], "ams_mapping2": [{"ams_id": 1, "slot_id": 1}, {"ams_id": 2, "slot_id": 1}]}, required, UNITS, VT)
+        self.assertEqual(out["ams_mapping"], [1, 0])
+        self.assertEqual(out["ams_mapping2"], [{"ams_id": 0, "slot_id": 1}, {"ams_id": 0, "slot_id": 0}])
 
     def test_filament_id_is_exact_when_the_loaded_spools_carry_ids(self):
         self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFA00"}], self.trays), [2])
@@ -109,7 +109,7 @@ class TestTranslateMapping(unittest.TestCase):
         self.assertEqual(tt.translate_mapping([254, -1], [], self.trays), [254, -1])
 
     def test_ht_unit_and_colour_alpha_and_case(self):
-        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "pla-cf", "color": "#333333ff"}], self.trays), [512])
+        self.assertEqual(tt.translate_mapping([0], [{"slot": 1, "type": "pla-cf", "color": "#333333ff"}], self.trays), [128])
 
     def test_half_identity_is_never_a_wildcard(self):
         # codex r3: "PETG, any colour" / "black, any material" would print the wrong spool — refuse instead
@@ -136,11 +136,11 @@ class TestTranslateMapping(unittest.TestCase):
 
 
 class TestTranslatePrint(unittest.TestCase):
-    def test_rewrites_both_nozzle_maps_and_leaves_external_prints_alone(self):
-        cmd = {"use_ams": True, "ams_mapping": [5, 9], "ams_mapping2": [-1, 9], "bed_type": "cool_plate"}
+    def test_rewrites_both_address_formats_and_leaves_external_prints_alone(self):
+        cmd = {"use_ams": True, "ams_mapping": [5, 9], "ams_mapping2": [{"ams_id": 1, "slot_id": 1}, {"ams_id": 2, "slot_id": 1}], "bed_type": "cool_plate"}
         required = [{"slot": 1, "type": "PLA", "color": "FFFFFF"}, {"slot": 2, "type": "PETG", "color": "000000"}]
         out = tt.translate_print_trays(cmd, required, UNITS, VT)
-        self.assertEqual((out["ams_mapping"], out["ams_mapping2"], out["bed_type"]), ([1, 0], [-1, 0], "cool_plate"))
+        self.assertEqual((out["ams_mapping"], out["ams_mapping2"], out["bed_type"]), ([1, 0], [{"ams_id": 0, "slot_id": 1}, {"ams_id": 0, "slot_id": 0}], "cool_plate"))
         self.assertEqual(cmd["ams_mapping"], [5, 9])   # input untouched
         # a direct-spool print (use_ams false) is not translated, but the holder must carry what the plate needs (audit)
         ext = {"use_ams": False, "ams_mapping": [254]}

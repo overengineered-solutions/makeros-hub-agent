@@ -27,7 +27,7 @@ RAW = {
     "timelapse": True,
     "use_ams": True,
     "ams_mapping": [4, 5],
-    "ams_mapping2": [128, 129],
+    "ams_mapping2": [{"ams_id": 1, "slot_id": 0}, {"ams_id": 128, "slot_id": 0}],
     "nozzles_info": [{"nozzle_id": 0, "diameter": 0.4}, {"nozzle_id": 1, "diameter": 0.6}],
     "ams_mapping_info": "{\"left\":[0]}",
 }
@@ -51,7 +51,7 @@ class TestReplayBuilder(unittest.TestCase):
         self.assertIs(p["timelapse"], True)
         self.assertIs(p["use_ams"], True)
         self.assertEqual(p["ams_mapping"], [4, 5])
-        self.assertEqual(p["ams_mapping2"], [128, 129])
+        self.assertEqual(p["ams_mapping2"], RAW["ams_mapping2"])
         self.assertEqual(p["nozzles_info"], RAW["nozzles_info"])
         self.assertEqual(p["ams_mapping_info"], RAW["ams_mapping_info"])
 
@@ -59,7 +59,7 @@ class TestReplayBuilder(unittest.TestCase):
         raw = {"command": "project_file", "ams_mapping": "3,1", "ams_mapping2": "x", "bed_type": "", "use_ams": "yes"}
         p = build_print_start_payload("a.3mf", sequence_id="s", use_ams=False, raw_print=raw)["print"]
         self.assertEqual(p["ams_mapping"], [3, 1])          # string form is what BambuLAN sometimes sends
-        self.assertNotIn("ams_mapping2", p)                 # malformed → DROPPED (presence is a dual-nozzle signal)
+        self.assertEqual(p["ams_mapping2"], "x")            # retained for an explicit pre-upload validation refusal
         self.assertEqual(p["bed_type"], "textured_plate")   # empty member value → our default
         self.assertIs(p["use_ams"], False)                  # non-bool member value → the argument wins
         self.assertEqual(p["subtask_name"], "a")            # no member name → derived from the file
@@ -91,7 +91,7 @@ class TestCaptureAndOutbox(unittest.TestCase):
     def _job(self, raw):
         return CapturedJob(
             member_id="m1", filename="a.3mf", file_path=Path("/tmp/a.3mf"), sha256="0" * 64, size=3,
-            ams_mapping={"ams_mapping": [4, 5], "ams_mapping2": [128]}, use_ams=True, required_filaments=[],
+            ams_mapping={"ams_mapping": [4, 5], "ams_mapping2": [{"ams_id": 1, "slot_id": 0}, {"ams_id": 1, "slot_id": 1}]}, use_ams=True, required_filaments=[],
             submitted_at=datetime(2026, 8, 29, tzinfo=timezone.utc), submission_uid="abc123", plate=3,
             vp_serial="00M09VP1", vp_model="H2D", raw_print=raw,
         )
@@ -109,7 +109,7 @@ class TestCaptureAndOutbox(unittest.TestCase):
         body = build_vp_submit_body(job, model="H2D")
         self.assertEqual(body["rawPrint"], RAW)
         self.assertEqual(body["amsMapping"], [4, 5])            # the cloud contract stays a flat list
-        self.assertEqual(body["amsMappingRaw"], {"ams_mapping": [4, 5], "ams_mapping2": [128]})
+        self.assertEqual(body["amsMappingRaw"], {"ams_mapping": [4, 5], "ams_mapping2": [{"ams_id": 1, "slot_id": 0}, {"ams_id": 1, "slot_id": 1}]})
         self.assertNotIn("rawPrint", build_vp_submit_body(self._job(None), model="H2D"))
         self.assertIsNone(from_record({"submission_uid": "x", "rawPrint": "not-a-dict"}).raw_print)
 

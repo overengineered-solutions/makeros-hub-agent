@@ -115,10 +115,9 @@ def build_print_start_payload(
 
     With `raw_print` (the member's own `print` command captured by the Virtual Printer, agent v0.51 / design
     B1 + owner decision 6) the command is REPLAYED: every option OrcaSlicer set — bed type, calibration flags,
-    timelapse, and the H2D's dual-nozzle `ams_mapping2`/nozzle fields we cannot enumerate — reaches the
+    timelapse, structured AMS mappings and nozzle metadata — reaches the
     physical printer verbatim. Only the job identity is forced (command, ids, file, url, param, md5, sequence).
-    ponytail: virtual→physical tray translation is the identity today (a single-machine model group's VP pool
-    is 1:1 with that machine's trays); B3's `match` rewrites ams_mapping/ams_mapping2 here.
+    The adapter validates nozzle requirements and translates both AMS address representations before upload.
     """
     task_name = subtask_name or os.path.splitext(os.path.basename(file_name))[0]
     replay = raw_print if isinstance(raw_print, dict) and raw_print else None
@@ -132,14 +131,9 @@ def build_print_start_payload(
     merged = {k: v for k, v in replay.items() if k not in _FORCED_KEYS and k not in _DROPPED_KEYS}
     merged["use_ams"] = merged["use_ams"] if isinstance(merged.get("use_ams"), bool) else bool(use_ams)
     merged["ams_mapping"] = _coerce_ams_mapping(merged["ams_mapping"] if "ams_mapping" in merged else ams_mapping)
-    if "ams_mapping2" in merged:
-        # codex round 1: presence of ams_mapping2 is itself a dual-nozzle signal — a malformed one is DROPPED, never
-        # replaced by an empty list the printer might read as "second nozzle, no trays".
-        mapping2 = _coerce_ams_mapping(merged["ams_mapping2"])
-        if mapping2:
-            merged["ams_mapping2"] = mapping2
-        else:
-            merged.pop("ams_mapping2")
+    # ams_mapping2 is a parallel list of {ams_id, slot_id}, NOT the second nozzle's
+    # integer map (BambuStudio SelectMachine.cpp get_ams_mapping_result). Preserve
+    # it here; shared tray translation validates it before any physical upload.
     if not isinstance(merged.get("bed_type"), str) or not merged["bed_type"].strip():
         merged["bed_type"] = bed_type
     for key in _FORCED_KEYS:

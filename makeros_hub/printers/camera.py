@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+import hashlib
+import json
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,6 +55,13 @@ _HTTP_TIMEOUT = 4.0
 _MAX_FRAME_BYTES = 2 * 1024 * 1024
 
 
+def camera_source_id(printer: dict[str, Any]) -> str:
+    """Shared camera-v1 wire contract with pstation/src/lib/camera-source.ts."""
+    keys = ("vendor", "model", "host", "serial", "moonrakerUrl", "cameraSnapshotUrl")
+    facts = ["camera-v1"] + [str(printer.get(key) or "").strip() for key in keys]
+    return hashlib.sha256(json.dumps(facts, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
 def _http_snapshot_with_reason(
     url: str,
     *,
@@ -71,6 +80,11 @@ def _http_snapshot_with_reason(
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "makeros-hub-agent"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured LAN URL
+            # uStreamer can return a valid placeholder JPEG when its USB camera is disconnected.
+            # Its own online header distinguishes that placeholder from a real camera frame.
+            online = resp.headers.get("X-UStreamer-Online")
+            if online is not None and online.strip().lower() != "true":
+                return (None, "unreachable", "camera source reports offline")
             data = resp.read(max_bytes + 1)
     except urllib.error.HTTPError as exc:
         reason = "auth-fail" if exc.code in (401, 403) else "unreachable"
@@ -119,6 +133,11 @@ def _bambu_camera_transport(model: Any) -> Optional[str]:
 def camera_source_kind(printer: dict[str, Any]) -> Optional[str]:
     """Which capture strategy applies to this printer (for logging/diagnostics),
     or None when we have no camera path for it."""
+    # An operator-selected external camera belongs to the same printer record,
+    # including Bambu printers whose built-in camera is unavailable.
+    explicit = printer.get("cameraSnapshotUrl")
+    if isinstance(explicit, str) and explicit.strip():
+        return "http-snapshot"
     vendor = str(printer.get("vendor") or "").lower()
     if vendor == "bambu":
         if not (printer.get("host") and printer.get("accessCode")):
@@ -135,7 +154,7 @@ def camera_source_kind(printer: dict[str, Any]) -> Optional[str]:
 
 
 def _snapshot_url(printer: dict[str, Any]) -> Optional[str]:
-    """Resolve a webcam snapshot URL for a non-Bambu printer. Prefer an explicit
+    """Resolve a webcam snapshot URL for any printer. Prefer an explicit
     cameraSnapshotUrl from config; else derive the Moonraker/OctoPrint default
     from the moonraker/base URL we already have."""
     explicit = printer.get("cameraSnapshotUrl")
@@ -222,9 +241,11 @@ class CameraScheduler:
     def __init__(self) -> None:
         self._last_capture: dict[str, float] = {}
         self._last_state: dict[str, str] = {}
+        self._last_source: dict[str, str] = {}
 
     def should_capture(
-        self, printer_id: str, state: Optional[str], progress_pct: Any, now: float, dense: bool = False
+        self, printer_id: str, state: Optional[str], progress_pct: Any, now: float, dense: bool = False,
+        source_id: Optional[str] = None,
     ) -> bool:
         """Decide whether to attempt a capture this beat. Side-effects ONLY the
         last-state tracking — does NOT stamp last_capture. Callers must call
@@ -238,6 +259,10 @@ class CameraScheduler:
         the dense cadence instead. It clears itself the moment the plate is
         confirmed, so this costs nothing on a shop where nothing is waiting."""
         state = state or ""
+        if source_id is not None:
+            if printer_id in self._last_source and self._last_source[printer_id] != source_id:
+                self._last_capture.pop(printer_id, None)
+            self._last_source[printer_id] = source_id
         prev_state = self._last_state.get(printer_id)
         last = self._last_capture.get(printer_id)
         self._last_state[printer_id] = state
@@ -273,7 +298,7 @@ class CameraScheduler:
 
     def forget(self, keep_ids: set[str]) -> None:
         """Drop tracking for printers no longer present (called on reconcile)."""
-        for d in (self._last_capture, self._last_state):
+        for d in (self._last_capture, self._last_state, self._last_source):
             for pid in [p for p in d if p not in keep_ids]:
                 d.pop(pid, None)
 
@@ -323,6 +348,7 @@ def collect_camera_frames(
             (status_by_id.get(t["printerId"]) or {}).get("progressPct"),
             now,
             dense=bool(t.get("cameraDense")),
+            source_id=camera_source_id(t),
         )
     ]
     if not due:
@@ -393,4 +419,7 @@ def collect_camera_frames(
         if f is None:
             f = {"printerId": pid, "reason": "timeout", "stderrTail": ""}
         failures.append(f)
+    sources = {t["printerId"]: camera_source_id(t) for t in due}
+    for result in frames + failures:
+        result["sourceId"] = sources[result["printerId"]]
     return frames, failures

@@ -78,14 +78,14 @@ class TestDispatchOrder(unittest.TestCase):
                 mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5, 9], queue_job_id="q1",
-                              raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5, 9], "ams_mapping2": [-1, 9]},
+                              raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5, 9], "ams_mapping2": [{"ams_id": 1, "slot_id": 1}, {"ams_id": 2, "slot_id": 1}]},
                               required_filaments=[{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFL99"},
                                                   {"slot": 2, "type": "PETG", "color": "000000"}])
             self.assertTrue(r["ok"], r)
             up.assert_called_once()
             sent = json.loads(a._client.published[0])["print"]
             self.assertEqual(sent["ams_mapping"], [1, 0])
-            self.assertEqual(sent["ams_mapping2"], [-1, 0])
+            self.assertEqual(sent["ams_mapping2"], [{"ams_id": 0, "slot_id": 1}, {"ams_id": 0, "slot_id": 0}])
             self.assertIs(sent["use_ams"], True)
 
     def test_stale_report_is_a_refusal_not_a_guess(self):
@@ -98,6 +98,29 @@ class TestDispatchOrder(unittest.TestCase):
                               required_filaments=[{"slot": 1, "type": "PLA", "color": "FFFFFF"}])
             self.assertEqual(r, {"ok": False, "reason": "printer_stale: printer has not reported its trays recently"})
             up.assert_not_called()
+
+    def test_h2d_unknown_hardware_or_nozzle_command_refuses_before_upload(self):
+        import copy
+        import json
+        for observed in (False, True):
+            with self.subTest(observed=observed), tempfile.TemporaryDirectory() as d, \
+                    mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
+                    mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), \
+                    mock.patch.object(bambu_send, "upload_3mf") as upload:
+                adapter = self._adapter(d)
+                adapter.model = "H2D"
+                adapter._data = copy.deepcopy(RAW_STATE)
+                if observed:
+                    fixture = json.loads((Path(__file__).parent / "fixtures/h2d-device-observed-2026-09-09.json").read_text())
+                    adapter._data["print"]["device"] = fixture["raw"]["device"]
+                result = adapter.start_print("/tmp/part.3mf", "part.3mf", use_ams=True,
+                    raw_print={"use_ams": True, "ams_mapping": [0], "ams_mapping2": [{"ams_id": 0, "slot_id": 0}]},
+                    required_filaments=[{"slot": 1, "type": "PLA", "color": "FFFFFF"}], queue_job_id="q-h2d")
+                self.assertFalse(result["ok"])
+                self.assertTrue(result["reason"].startswith("unsupported_nozzle_mapping:"), result)
+                upload.assert_not_called()
+                self.assertEqual(adapter._client.published, [])
+                self.assertEqual(adapter._queue_progress.to_state()["dispatches"], [])
 
     def test_without_requirements_an_ams_print_is_refused_and_an_external_print_passes(self):
         import json

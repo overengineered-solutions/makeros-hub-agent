@@ -1,6 +1,6 @@
 # Procrastination Station shop-box agent
 
-The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.66.0 review candidate**, not evidence that the installed shop box has been updated.
+The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.67.0 review candidate**, not evidence that the installed shop box has been updated.
 
 The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Read [SECURITY.md](SECURITY.md) for the boundaries and limitations.
 
@@ -70,3 +70,11 @@ sh -n update.sh
 ```
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
+
+## 0.67.0 candidate: observed H2D hardware and external cameras
+
+Normalizes observed H2D nozzle/AMS bindings, advertises them through the existing VP pool and refuses missing or incompatible task nozzle metadata before upload/start. `ams_mapping2` contains AMS/slot objects; it is not a second-nozzle selector. AMS HT slot command addresses use the raw AMS id (128 here), not that id multiplied by four. Actual Orca/plugin command capture and a supervised physical canary remain required.
+
+An explicit HTTP camera snapshot overrides the native source for any printer. Every frame/failure upload carries a `camera-v1` identity derived from vendor/model/host/serial/Moonraker URL/snapshot URL; changing that source makes a fresh capture due. uStreamer offline placeholders are rejected.
+
+Paired pstation rollout: install the reviewed hub candidate FIRST and verify accepted images/version against the current website, then ship the preview-tested website with required source identity and migration 0093. Old website versions ignore the new query parameter; new versions reject source-less uploads. Updating the live OTA target requires independent operator approval. The separate adapter-retry branch is not included in this candidate.

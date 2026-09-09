@@ -51,3 +51,17 @@ def test_push_is_best_effort(monkeypatch):
     # must NOT raise — a failed frame push can never sink the heartbeat loop
     agent.push_camera_frames("http://c/api/print/hub/camera", "tok", frames, None, log)
     assert log.warnings  # logged the failure
+
+
+def test_source_identity_survives_upload_and_failure_errors_are_visible(monkeypatch):
+    calls = []
+    source = "a" * 64
+    monkeypatch.setattr(agent, "post_bytes", lambda url, *args, **kwargs: calls.append(url))
+    agent.push_camera_frames("http://c/camera", "tok", [{"printerId": "p1", "sourceId": source, "jpegBase64": base64.b64encode(b"jpeg").decode()}], [{"printerId": "p2", "sourceId": source}], _Log())
+    assert calls == [f"http://c/camera?printerId=p1&sourceId={source}", f"http://c/camera?printerId=p2&failed=1&sourceId={source}"]
+    def fail(*args, **kwargs):
+        raise RuntimeError("connection failed")
+    monkeypatch.setattr(agent, "post_bytes", fail)
+    log = _Log()
+    agent.push_camera_frames("http://c/camera", "tok", [], [{"printerId": "p2"}], log)
+    assert log.warnings

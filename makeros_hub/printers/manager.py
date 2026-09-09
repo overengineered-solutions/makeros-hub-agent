@@ -126,6 +126,7 @@ class PrinterManager:
                 "vendor": p.get("vendor"),
                 "model": p.get("model"),
                 "host": p.get("host"),
+                "serial": p.get("serial"),
                 "accessCode": p.get("accessCode"),
                 "moonrakerUrl": p.get("moonrakerUrl"),
                 "cameraSnapshotUrl": p.get("cameraSnapshotUrl"),

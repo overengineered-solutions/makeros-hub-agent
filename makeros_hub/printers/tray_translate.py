@@ -3,9 +3,9 @@
 The Virtual Printer shows a member a RANKED, DEDUPED pool of the model group's spools (vprinter/live_pool.py: virtual
 slot i is the i-th key in sorted/ranked order), so the `ams_mapping` OrcaSlicer sends names VIRTUAL positions, never
 physical trays. Replaying it verbatim (the v0.51 "identity") printed from whatever tray happened to sit at that index —
-right only by coincidence, even on a single printer. The id a printer wants is `ams_id * 4 + slot` for EVERY unit
-(BambuStudio DeviceManager.cpp `get_tray_id_by_ams_id_and_slot_id`: an AMS-HT with id 128 is 512+slot) and 254/255
-for the external spools.
+right only by coincidence, even on a single printer. BambuStudio DevMapping.cpp uses `ams_id * 4 + slot`
+for four-slot AMS units and `ams_id + slot` for AMS HT in flat COMMAND mappings. The parallel ams_mapping2
+uses explicit {ams_id, slot_id} objects. This is distinct from legacy telemetry tray-number helpers.
 
 We translate by what the member actually chose — material + colour (+ Bambu filament id when it disambiguates) per
 project filament — against the printer's LIVE trays, and REFUSE (never guess) when a required spool is not loaded:
@@ -14,6 +14,7 @@ the cloud puts the job back in the queue with the reason. Pure functions; the ad
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 EXTERNAL_TRAY_IDS = frozenset({254, 255})
@@ -42,6 +43,15 @@ def _norm_fid(value: Any) -> str | None:
     return s or None
 
 
+def _ams_id(value: Any) -> int | None:
+    if isinstance(value, str):
+        value = value.strip()
+        if not 1 <= len(value) <= 3 or not value.isascii() or not value.isdigit():
+            return None
+        value = int(value)
+    return value if type(value) is int and 0 <= value <= 253 else None
+
+
 def live_trays(ams_units: Any, vt_tray: Any = None) -> list[dict[str, Any]]:
     """Addressable spools: [{tray_id, material, color, filament_id}] from the adapter DTO (bambu_parse.build_ams units,
     which keep the printer's raw unit id under `raw.id`). A unit whose raw id is missing cannot be addressed, so its
@@ -51,11 +61,8 @@ def live_trays(ams_units: Any, vt_tray: Any = None) -> list[dict[str, Any]]:
         if not isinstance(unit, dict):
             continue
         raw = unit.get("raw") if isinstance(unit.get("raw"), dict) else {}
-        try:
-            ams_id = int(raw.get("id"))  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            continue
-        if ams_id < 0:
+        ams_id = _ams_id(raw.get("id"))
+        if ams_id is None:
             continue
         for tray in unit.get("trays") or []:
             if not isinstance(tray, dict):
@@ -63,17 +70,27 @@ def live_trays(ams_units: Any, vt_tray: Any = None) -> list[dict[str, Any]]:
             slot = tray.get("slot")
             if not isinstance(slot, int) or isinstance(slot, bool) or not 0 <= slot <= 3:
                 continue
+            if unit.get("amsType") == "ams_ht" and slot != 0:
+                continue
             material = _norm_material(tray.get("material"))
             if not material:
                 continue
-            entry = {"tray_id": ams_id * 4 + slot, "material": material, "color": _norm_color(tray.get("colorHex")),
+            # BambuStudio DevMapping.cpp: N3S/AMS HT uses ams_id+slot in the
+            # legacy flat COMMAND map; mapping2 carries the explicit pair.
+            if ams_id >= 128 and unit.get("amsType") != "ams_ht":
+                continue  # old/unknown hardware cannot establish this address format
+            entry = {"tray_id": ams_id + slot if unit.get("amsType") == "ams_ht" else ams_id * 4 + slot,
+                     "ams_id": ams_id, "slot_id": slot,
+                     "material": material, "color": _norm_color(tray.get("colorHex")),
                      "filament_id": _norm_fid(tray.get("filamentId"))}
+            if unit.get("extruderId") in (0, 1) and not isinstance(unit.get("extruderId"), bool):
+                entry["extruderId"] = unit["extruderId"]
             remain = _norm_remain(tray.get("remainPct"))
             if remain is not None:        # only when the AMS reports one (RFID spool) — the dict shape is pinned by tests
                 entry["remain"] = remain
             out.append(entry)
     if isinstance(vt_tray, dict) and _norm_material(vt_tray.get("material")):
-        ext = {"tray_id": 254, "material": _norm_material(vt_tray.get("material")),
+        ext = {"tray_id": 254, "ams_id": 255, "slot_id": 0, "material": _norm_material(vt_tray.get("material")),
                "color": _norm_color(vt_tray.get("colorHex")), "filament_id": _norm_fid(vt_tray.get("filamentId"))}
         remain = _norm_remain(vt_tray.get("remainPct"))
         if remain is not None:
@@ -94,9 +111,7 @@ def unaddressable_units(ams_units: Any) -> int:
     for unit in ams_units or []:
         if isinstance(unit, dict):
             raw = unit.get("raw") if isinstance(unit.get("raw"), dict) else {}
-            try:
-                int(raw.get("id"))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+            if _ams_id(raw.get("id")) is None:
                 n += 1
     return n
 
@@ -104,7 +119,10 @@ def unaddressable_units(ams_units: Any) -> int:
 def describe(req: dict[str, Any]) -> str:
     material = _norm_material(req.get("type") or req.get("material")) or "any material"
     color = _norm_color(req.get("color"))
-    return f"{material} #{color}" if color else material
+    label = f"{material} #{color}" if color else material
+    if "extruderId" in req:
+        label += " on the right nozzle" if req["extruderId"] == 0 else " on the left nozzle"
+    return label
 
 
 def _pick(req: dict[str, Any], trays: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -119,7 +137,8 @@ def _pick(req: dict[str, Any], trays: list[dict[str, Any]]) -> dict[str, Any] | 
         # codex v0.56 r3: a half identity is not a wildcard — "PLA, any colour" would map to black when the member chose
         # white. The cloud may PARK on partial identity; the hub never PRINTS on it.
         raise TrayTranslationError("spool_mismatch", f"filament identity incomplete ({describe(req)}) — re-send it from OrcaSlicer")
-    cands = [t for t in trays if t["material"] == material and t["color"] == color]
+    cands = [t for t in trays if t["material"] == material and t["color"] == color
+             and ("extruderId" not in req or t.get("extruderId") == req["extruderId"])]
     if not cands:
         return None
     if fid:
@@ -145,22 +164,18 @@ def _by_filament_index(required: list[dict[str, Any]]) -> dict[int, dict[str, An
     return {r["slot"] - base: r for r in required if isinstance(r, dict) and isinstance(r.get("slot"), int) and not isinstance(r.get("slot"), bool)}
 
 
-def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[dict[str, Any]], *,
-                      fill_required: bool = True, skip_fill: frozenset[int] = frozenset()) -> list[int]:
+def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[dict[str, Any]]) -> list[int]:
     """Rewrite one ams_mapping list: position k (the k-th project filament) → the physical tray holding required
     filament k. -1 and 254/255 pass through for positions the plate does not use; a mapped position with no requirement
-    record becomes -1 rather than a guessed tray. With `fill_required` (the PRIMARY map) every required filament ends
-    up mapped: a list that is truncated, or carries -1 where the plate needs a spool, is extended/filled from the
-    requirements (codex v0.56 r4 — a short list must never start a print with a required spool unmapped) — except the
-    positions in `skip_fill` (filaments the H2D's second-nozzle map already covers). Without it (`ams_mapping2`) -1
-    keeps its meaning: "this filament is not on this nozzle". Raises TrayTranslationError('spool_mismatch') when a
-    required spool is not loaded on this printer."""
+    record becomes -1 rather than a guessed tray. Every required filament is mapped: truncated or missing
+    entries are filled from requirements. Nozzle-specific requirements constrain the same shared picker.
+    Raises TrayTranslationError('spool_mismatch') when a required spool is not reachable."""
     by_index = _by_filament_index(required or [])
     mapping = mapping if isinstance(mapping, list) else []
     if not by_index and any(isinstance(v, int) and not isinstance(v, bool) and v >= 0 and v not in EXTERNAL_TRAY_IDS for v in mapping):
         # codex v0.56 r1: no requirements + AMS trays mapped = nothing to translate FROM; blanking them would print
         raise TrayTranslationError("spool_mismatch", "no filament requirements recorded for this job (re-send it from OrcaSlicer)")
-    length = max([len(mapping)] + ([k + 1 for k in by_index if k not in skip_fill] if fill_required else []))
+    length = max([len(mapping)] + [k + 1 for k in by_index])
     out: list[int] = []
     for k in range(length):
         v = mapping[k] if k < len(mapping) else -1
@@ -179,7 +194,7 @@ def translate_mapping(mapping: Any, required: list[dict[str, Any]], trays: list[
                     raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} on the external spool (not loaded there)")
             out.append(v)
             continue
-        if req is None or (v < 0 and (not fill_required or k in skip_fill)):
+        if req is None:
             out.append(-1)
             continue
         tray = _pick(req, trays)
@@ -204,14 +219,68 @@ def mapping_from_requirements(required: list[dict[str, Any]], trays: list[dict[s
     return out
 
 
+def _mapping2(value: Any) -> list[dict[str, int]]:
+    if not isinstance(value, list) or len(value) > 256:
+        raise TrayTranslationError("unsupported_mapping", "ams_mapping2 must contain AMS/slot objects; re-send from OrcaSlicer")
+    for item in value:
+        if not isinstance(item, dict) or set(item) != {"ams_id", "slot_id"} or any(
+            isinstance(item[k], bool) or not isinstance(item[k], int) or not 0 <= item[k] <= 255
+            for k in ("ams_id", "slot_id")
+        ):
+            raise TrayTranslationError("unsupported_mapping", "ams_mapping2 must contain integer ams_id/slot_id pairs")
+    return value
+
+
+def _json_array(value: Any) -> list:
+    if isinstance(value, str) and len(value) <= 16_384:
+        try:
+            value = json.loads(value)
+        except (ValueError, RecursionError):
+            return []
+    return value if isinstance(value, list) and len(value) <= 256 else []
+
+
+def _dual_nozzle_requirements(command: dict, required: list[dict], nozzles: Any) -> list[dict]:
+    # Task nozzleId (0=right, 1=left) is explicit in SelectMachine.cpp's
+    # ams_mapping_info. ams_mapping2 says NOTHING about the selected nozzle.
+    # Automatic nozzle_mapping uses another protocol/version; do not infer it.
+    if command.get("nozzle_mapping") not in (None, [], "", "[]"):
+        raise TrayTranslationError("unsupported_nozzle_mapping", "automatic nozzle mapping needs a captured Orca command before H2D dispatch")
+    mapping = _json_array(command.get("ams_mapping_info"))
+    expected = _json_array(command.get("nozzles_info"))
+    observed = nozzles if isinstance(nozzles, list) else []
+    by_index = _by_filament_index(required)
+    if not by_index or len(by_index) != len(required) or any(not 0 <= k < 256 for k in by_index):
+        raise TrayTranslationError("unsupported_nozzle_mapping", "H2D filament indices are missing or ambiguous; re-send from OrcaSlicer")
+    result = []
+    for index, req in by_index.items():
+        entry = mapping[index] if 0 <= index < len(mapping) else None
+        eid = entry.get("nozzleId") if isinstance(entry, dict) else None
+        if type(eid) is not int or eid not in (0, 1):
+            raise TrayTranslationError("unsupported_nozzle_mapping", "H2D filament nozzle is unknown; capture Orca ams_mapping_info/nozzles_info before dispatch")
+        actual = [n for n in observed if isinstance(n, dict) and n.get("extruderId") == eid]
+        wanted = [n for n in expected if isinstance(n, dict) and type(n.get("id")) is int and n.get("id") == eid]
+        if len(actual) != 1 or len(wanted) != 1 or isinstance(wanted[0].get("diameter"), bool) or wanted[0].get("diameter") != actual[0].get("diameterMm"):
+            raise TrayTranslationError("unsupported_nozzle_mapping", f"H2D nozzle {eid} diameter is missing or differs from the sliced job")
+        result.append(dict(req, extruderId=eid))
+    return result
+
+
 def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, Any]] | None, ams_units: Any, vt_tray: Any = None,
+                          *, extruder_count: int | None = None, nozzles: Any = None,
                           ) -> dict[str, Any]:
-    """Return a copy of a built `print` command with ams_mapping (and ams_mapping2 when present — the H2D's second
-    nozzle uses the same tray-id space) translated to this printer's physical trays. use_ams=false (external spool)
-    is left untouched. An AMS print WITHOUT a mapping (a web upload, or a malformed replay coerced to []) gets one built
-    from the requirements — never sent bare (codex v0.56 r3). Raises TrayTranslationError."""
+    """Translate one filament selection into both physical address representations.
+
+    Dual-extruder jobs require proven per-filament nozzle metadata; no array name or missing hardware
+    implies a nozzle. Single-extruder web uploads can still derive mappings from filament requirements.
+    """
     out = dict(print_cmd)
     trays = live_trays(ams_units, vt_tray)
+    mapping2 = _mapping2(out["ams_mapping2"]) if "ams_mapping2" in out else None
+    if extruder_count == 2:
+        required = _dual_nozzle_requirements(out, required or [], nozzles)
+        if out.get("use_ams") is not True or any(m["ams_id"] in (254, 255) and m["slot_id"] != 255 for m in mapping2 or []):
+            raise TrayTranslationError("unsupported_nozzle_mapping", "H2D external holders are not yet observed per nozzle; use a verified AMS path")
     if out.get("use_ams") is not True:
         # a direct-spool print (use_ams false): the external holder must carry EVERY required filament — nothing to
         # translate, but the identity gate still applies (audit 2026-08-30). No requirements known = nothing to check.
@@ -219,6 +288,8 @@ def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, An
         by_index = _by_filament_index(required or [])
         mapping = out.get("ams_mapping") if isinstance(out.get("ams_mapping"), list) else []
         for k, req in by_index.items():
+            if mapping2 is not None and (k >= len(mapping2) or mapping2[k] != {"ams_id": 255, "slot_id": 0}):
+                raise TrayTranslationError("unsupported_mapping", "direct-spool command does not name the observed external holder")
             if k < len(mapping) and mapping[k] == 255:
                 raise TrayTranslationError("spool_mismatch", f"needs {describe(req)} on the second external holder (not verifiable yet)")
             if _pick(req, ext) is None:
@@ -226,17 +297,32 @@ def translate_print_trays(print_cmd: dict[str, Any], required: list[dict[str, An
         return out
     if not trays and unaddressable_units(ams_units):
         raise TrayTranslationError("spool_mismatch", f"{unaddressable_units(ams_units)} AMS unit(s) report no id — cannot address trays")
-    mapping2 = out.get("ams_mapping2")
-    # H2D: a filament the second-nozzle map covers is deliberately -1 in the primary map — never "fill" it there
-    on_second = frozenset(k for k, v in enumerate(mapping2 if isinstance(mapping2, list) else [])
-                          if isinstance(v, int) and not isinstance(v, bool) and v >= 0)
     mapping = out.get("ams_mapping")
+    if mapping2 is not None:
+        # A mapped external holder is represented only in mapping2; the v0 map
+        # carries -1. Keep the old external identity check for single extruders.
+        mapping = list(mapping) if isinstance(mapping, list) else []
+        for k, pair in enumerate(mapping2):
+            if pair["ams_id"] in (254, 255) and pair["slot_id"] != 255:
+                if pair != {"ams_id": 255, "slot_id": 0}:
+                    raise TrayTranslationError("unsupported_mapping", "external AMS/slot pair is not supported")
+                mapping.extend([-1] * max(0, k + 1 - len(mapping)))
+                mapping[k] = 254
     if isinstance(mapping, list) and mapping:
-        out["ams_mapping"] = translate_mapping(mapping, required or [], trays, skip_fill=on_second)
-    elif on_second:
-        out["ams_mapping"] = translate_mapping([], required or [], trays, skip_fill=on_second)
+        out["ams_mapping"] = translate_mapping(mapping, required or [], trays)
     else:
         out["ams_mapping"] = mapping_from_requirements(required or [], trays)
-    if isinstance(mapping2, list) and mapping2:
-        out["ams_mapping2"] = translate_mapping(mapping2, required or [], trays, fill_required=False)
+    if "ams_mapping_info" in out:
+        info = _json_array(out["ams_mapping_info"])
+        info = [dict(item, ams=out["ams_mapping"][i]) if isinstance(item, dict) and i < len(out["ams_mapping"]) else item
+                for i, item in enumerate(info)]
+        out["ams_mapping_info"] = json.dumps(info, separators=(",", ":")) if isinstance(out["ams_mapping_info"], str) else info
+    if mapping2 is not None or extruder_count == 2:
+        physical = {t["tray_id"]: t for t in trays}
+        out["ams_mapping2"] = [
+            {"ams_id": physical[v]["ams_id"], "slot_id": physical[v]["slot_id"]}
+            if v in physical else {"ams_id": 255, "slot_id": 255}
+            for v in out["ams_mapping"]
+        ]
+        out["ams_mapping"] = [-1 if v in EXTERNAL_TRAY_IDS else v for v in out["ams_mapping"]]
     return out

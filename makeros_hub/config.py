@@ -118,6 +118,8 @@ class VirtualPrinterConfig:
     ams_type: str
     members: tuple[VirtualPrinterMember, ...]
     pool: tuple[dict[str, Any], ...]
+    # Live-mirrored observed hardware; omitted on older config-downs.
+    nozzles: tuple[dict[str, Any], ...] = ()
 
 
 def parse_virtual_printer_config(raw: Any) -> VirtualPrinterConfig | None:
