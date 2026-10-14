@@ -81,6 +81,13 @@ def _gcode_state(value: Any) -> str | None:
     return value.upper() if isinstance(value, str) else ""
 
 
+def _list(value: Any) -> list:
+    """A persisted list, or [] for anything else: a valid-JSON file of the wrong shape ({"dispatches": 17}) raised
+    TypeError in an adapter constructor, outside the manager's handler, and crash-looped the agent (codex review of
+    release-0.68.0)."""
+    return value if isinstance(value, list) else []
+
+
 def _seq_of(dispatch: dict) -> dict:
     """The assignment sequence this dispatch answers (v0.58) — the cloud binds every report to that assignment."""
     seq = dispatch.get("assignmentSeq")
@@ -124,7 +131,7 @@ class QueueProgressTracker:
         now = time.monotonic() if now is None else now
         now_wall = time.time() if now_wall is None else now_wall
         self._dispatches = []
-        for d in state.get("dispatches") or []:
+        for d in _list(state.get("dispatches")):
             if not isinstance(d, dict) or not isinstance(d.get("queueJobId"), str):
                 continue
             wall = d.get("dispatched_wall")
@@ -136,13 +143,13 @@ class QueueProgressTracker:
                     "started_monotonic": now - age,
                     "dispatched_wall": float(wall) if isinstance(wall, (int, float)) else now_wall,
                     "reported_printing": bool(d.get("reported_printing")),
-                    "baselineKeys": {k for k in (d.get("baselineKeys") or []) if isinstance(k, str)},
+                    "baselineKeys": {k for k in _list(d.get("baselineKeys")) if isinstance(k, str)},
                     "taskName": d.get("taskName") if isinstance(d.get("taskName"), str) else None,
                     **({"assignmentSeq": d["assignmentSeq"]} if isinstance(d.get("assignmentSeq"), int) and not isinstance(d.get("assignmentSeq"), bool) else {}),
                     "rehydrated_monotonic": now,
                 }
             )
-        self._linked_job_keys = {k for k in (state.get("linked") or []) if isinstance(k, str)}
+        self._linked_job_keys = {k for k in _list(state.get("linked")) if isinstance(k, str)}
 
     def record_dispatch(
         self,

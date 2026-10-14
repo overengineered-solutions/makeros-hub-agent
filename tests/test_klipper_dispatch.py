@@ -492,6 +492,19 @@ class TestManagerKlipper(KlipperCase):
         m.ack_jobs([job["jobKey"]])
         self.assertEqual(m.pending_jobs(), [])
 
+    def test_a_queue_state_file_of_the_wrong_shape_never_stops_the_agent(self):
+        # valid JSON, wrong shapes: each one raised TypeError in the adapter constructor, outside the manager's handler
+        path = klipper.QUEUE_PROGRESS_DIR / "k1.json"
+        good = {"queueJobId": JOB, "dispatched_wall": time.time(), "baselineKeys": ["fp_a"], "taskName": "makeros/x.gcode"}
+        for state in ({"dispatches": 17}, {"dispatches": [good], "linked": 17},
+                      {"dispatches": [{**good, "baselineKeys": 17}, {**good, "queueJobId": OTHER_JOB}]}):
+            path.write_text(json.dumps(state), encoding="utf-8")
+            m = self.manager()
+            self.assertIn("k1", m._adapters)
+            kept = [d["queueJobId"] for d in m._adapters["k1"]._queue_progress.to_state()["dispatches"]]
+            self.assertEqual(kept, [] if state["dispatches"] == 17 else [d["queueJobId"] for d in state["dispatches"]])
+            m.stop_all()
+
     def test_an_assignment_goes_uploading_then_printing(self):
         m = self.manager()
         assignment = {"queueJobId": JOB, "printerId": "k1", "submissionUid": UID, "fileName": "cube.gcode", "assignmentSeq": 3}

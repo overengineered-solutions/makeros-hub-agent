@@ -93,7 +93,8 @@ print twice.
 **Laser status and cutting runs.** The OMTech laser's plug readings arrive from Home Assistant on a second listener (`POST /ha/laser`, port 8788, one
 allowed source address, a bearer from a 0600 file). The agent derives each laser's state (off, on but not cutting,
 cutting, unknown) and its cutting runs (a run closes after 60 s without cutting, on power-off, or when telemetry stops)
-and reports them on the heartbeat until the cloud has them. It polls the laser gate's `/status` and has the gate
+and reports them on the heartbeat until the cloud has them; open and unacked runs are saved to
+`/var/lib/makeros-hub/laser-runs.json`, so a restart loses none. It polls the laser gate's `/status` and has the gate
 `/check` member files the cloud offers. All of this is inert without an `[laser]` table and the operator's secret files.
 
 Two laser commands exist and nothing else: `laser_power_on` POSTs to an HA webhook (HA decides, then runs

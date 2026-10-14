@@ -254,6 +254,31 @@ class H2Runs(Base):
         hub.ack(rep)
         self.assertEqual(len(hub.report(now=1011, mono=21, poll=False).lasers[0]["runs"]), 1)
 
+    def test_runs_the_cloud_has_not_acked_survive_a_restart(self):
+        self.secret(laser.PUSH_TOKEN_FILE, PUSH_TOKEN)
+        hub = self.hub()
+        hub.push({"laser": SLUG, "switch": "on", "currentA": 3}, now=1000, mono=10)
+        hub.push({"laser": SLUG, "switch": "off", "currentA": 0}, now=1010, mono=20)    # run A closes
+        hub.push({"laser": SLUG, "switch": "on", "currentA": 3}, now=1020, mono=30)     # run B opens
+        before = {r["runKey"]: r for r in hub.report(now=1021, mono=31, poll=False).lasers[0]["runs"]}
+        self.assertEqual(len(before), 2)
+        # the hub restarts; a report before config-down arrives must not drop the saved runs
+        reborn = LaserHub(hub.cfg, secrets_dir=self.secrets)
+        self.assertIsNone(reborn.report(now=1030, poll=False).lasers)
+        reborn.set_lasers([{"id": LASER_ID, "slug": SLUG, "name": "X"}, {"id": "11111111-1111-4111-8111-111111111111",
+                                                                        "slug": "other", "name": "Y"}])
+        after = reborn.report(now=1031, mono=5, poll=False)   # no push yet: B closes on the hub's own rule
+        runs = {r["runKey"]: r for r in after.lasers[0]["runs"]}
+        self.assertEqual(set(runs), set(before))
+        (a,) = [r for k, r in runs.items() if before[k]["endedAt"] is not None]
+        self.assertEqual(a, next(r for r in before.values() if r["endedAt"] is not None))
+        (b,) = [r for k, r in runs.items() if before[k]["endedAt"] is None]
+        self.assertEqual((b["startedAt"], b["endedAt"], b["endReason"]),
+                         (laser.iso_z(1020), laser.iso_z(1020), "telemetry_lost"))
+        self.assertEqual(after.lasers[1]["runs"], [])
+        reborn.ack(after)
+        self.assertEqual(LaserHub(hub.cfg, secrets_dir=self.secrets)._unclaimed_runs[LASER_ID]["closed"], [])
+
     def test_at_most_32_kept_oldest_dropped(self):
         r = RunTracker(60)
         for i in range(40):

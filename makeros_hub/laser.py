@@ -37,6 +37,7 @@ from pathlib import Path
 from urllib.parse import urlencode, urlsplit
 
 from .http import _OPENER
+from .printers.queue_progress import write_json_durably
 
 log = logging.getLogger("makeros-hub.laser")
 
@@ -45,6 +46,8 @@ SECRETS_DIR = Path(os.environ.get("MAKEROS_HUB_LASER_SECRETS_DIR", "/var/lib/mak
 GATE_TOKEN_FILE = "laser-gate-token"
 WEBHOOK_URL_FILE = "ha-laser-webhook-url"
 PUSH_TOKEN_FILE = "ha-laser-push-token"
+# Open and unacked closed runs per laser, so a restart loses none (owner rule: nothing that matters lives only in RAM).
+RUNS_STATE_PATH = Path(os.environ.get("MAKEROS_HUB_LASER_RUNS", "/var/lib/makeros-hub/laser-runs.json"))
 
 LASER_COMMANDS = ("laser_power_on", "laser_load")
 HA_STALE_S = 75            # haLink goes down this long after the last push (HA pushes every 30 s)
@@ -211,8 +214,26 @@ def derive_state(*, configured: bool, push_age_s: float | None, switch: str | No
     return "up", "on_idle"
 
 
+_END_REASONS = ("switch_off", "telemetry_lost", "idle")
+_RUN_KEY_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _finite(v) -> bool:
+    return type(v) in (int, float) and math.isfinite(v)
+
+
+def _saved_run(r, closed: bool) -> dict | None:
+    keys = ("runKey", "startedAt", "lastCuttingAt") + (("endedAt", "endReason") if closed else ())
+    if not (isinstance(r, dict) and isinstance(r.get("runKey"), str) and _RUN_KEY_RE.fullmatch(r["runKey"])
+            and all(_finite(r.get(k)) for k in keys[1:4]) and (not closed or r.get("endReason") in _END_REASONS)):
+        return None
+    return {k: r[k] for k in keys}
+
+
 class RunTracker:
-    """Cutting runs for one laser. Memory only: a restart loses the open run, and pstation closes it as hub_restart.
+    """Cutting runs for one laser. LaserHub saves to_state() whenever it changes (codex review of release-0.68.0: a
+    closed run the cloud had not acked was lost to a restart), so an open run comes back and closes on the hub's own
+    rules, and a closed one is re-sent until acked.
     sample() takes a pushed reading at its receipt time; tick() runs every heartbeat and only ever closes a run, so a
     stale "cutting" reading can never open a second, overlapping run."""
 
@@ -254,6 +275,17 @@ class RunTracker:
     def ack(self, run_keys) -> None:
         keys = set(run_keys)
         self.closed = [r for r in self.closed if r["runKey"] not in keys]
+
+    def to_state(self) -> dict:
+        return {"open": self.open, "closed": self.closed}
+
+    def load(self, state) -> None:
+        """A saved to_state(); anything malformed is skipped."""
+        if not isinstance(state, dict):
+            return
+        self.open = _saved_run(state.get("open"), False)
+        closed = state.get("closed") if isinstance(state.get("closed"), list) else []
+        self.closed = [r for r in (_saved_run(c, True) for c in closed) if r][-MAX_RUNS:]
 
 
 # --- HTTP to the gate and to HA --------------------------------------------------------------------------------------
@@ -363,6 +395,10 @@ class LaserHub:
         self._seen: dict[str, None] = {}   # laser requestIds already attempted (an HA POST sent, or a load accepted)
         self._command_results: list[dict] = []
         self._server: ThreadingHTTPServer | None = None
+        # Saved runs per laser id, claimed when config-down lists that laser; until the first set_lasers they are
+        # written back as they were, so a save before config arrives never drops them.
+        self._unclaimed_runs = self._load_runs()
+        self._runs_saved = json.dumps(self._unclaimed_runs, sort_keys=True)
 
     # secrets and the gate
     def _secret(self, name: str) -> str | None:
@@ -379,6 +415,23 @@ class LaserHub:
         if self.cfg.gate_laser:
             return next((lz.id for lz in self._lasers.values() if lz.slug == self.cfg.gate_laser), None)
         return next(iter(self._lasers)) if len(self._lasers) == 1 else None
+
+    @staticmethod
+    def _load_runs() -> dict:
+        try:
+            raw = json.loads(RUNS_STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        items = raw.items() if isinstance(raw, dict) else ()
+        return dict([(k, v) for k, v in items if isinstance(k, str) and _UUID_RE.fullmatch(k) and isinstance(v, dict)]
+                    [:MAX_LASERS])
+
+    def _save_runs(self) -> None:   # caller holds the lock
+        # ponytail: one small write per change, so about one per HA push (30 s) while a laser cuts.
+        state = {**self._unclaimed_runs, **{lid: lz.runs.to_state() for lid, lz in self._lasers.items()}}
+        encoded = json.dumps(state, sort_keys=True)
+        if encoded != self._runs_saved and write_json_durably(RUNS_STATE_PATH, encoded):
+            self._runs_saved = encoded
 
     def _record(self, message: str) -> None:
         if self._diagnostics is not None:
@@ -408,6 +461,9 @@ class LaserHub:
                     self._lasers[lid].slug, self._lasers[lid].name = slug, name
                 else:
                     self._lasers[lid] = _Laser(lid, slug, name, gap, now)
+                    self._lasers[lid].runs.load(self._unclaimed_runs.get(lid))
+            self._unclaimed_runs = {}   # a laser config-down no longer lists takes its runs with it
+            self._save_runs()
 
     # Home Assistant's pushes
     def handle_push(self, peer: str, method: str, path: str, headers, rfile) -> tuple[int, dict]:
@@ -451,6 +507,7 @@ class LaserHub:
             laser.seen_wall, laser.seen_mono = now, mono
             self._derive(laser, now, mono)
             laser.runs.sample(laser.state, now)
+            self._save_runs()
         return True
 
     def _derive(self, laser: _Laser, now: float, mono: float) -> None:
@@ -507,6 +564,7 @@ class LaserHub:
                     "gateLink": link, "gateDetail": detail, "gate": reading, "runs": runs,
                 })
             checks = self._check_results[:MAX_FILE_CHECKS]
+            self._save_runs()   # tick() may have closed a run
         return LaserReport(lasers=entries or None, file_checks=list(checks), run_keys=run_keys, check_items=checks)
 
     def ack(self, report: LaserReport) -> None:
@@ -515,6 +573,7 @@ class LaserHub:
             for lid, keys in report.run_keys.items():
                 if lid in self._lasers:
                     self._lasers[lid].runs.ack(keys)
+            self._save_runs()
             carried = {id(c) for c in report.check_items}
             self._check_results = [c for c in self._check_results if id(c) not in carried]
 

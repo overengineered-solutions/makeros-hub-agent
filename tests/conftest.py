@@ -10,6 +10,7 @@ from an env var with a real system default:
     klipper.QUEUE_PROGRESS_DIR     -> /var/lib/makeros-hub/queue-progress   (same dirs, one file per printer)
     klipper.TERMINAL_JOBS_DIR      -> /var/lib/makeros-hub/terminal-jobs
     update.STATE_PATH              -> /var/lib/makeros-hub/last_update.json
+    laser.RUNS_STATE_PATH          -> /var/lib/makeros-hub/laser-runs.json
 
 That is right for the agent and wrong for a test suite. A fresh PrinterManager() calls _load_dispatched(),
 so state written by one test is loaded by the next: the dispatch guards then correctly refuse to re-start a
@@ -39,6 +40,7 @@ _STATE_PATHS = [
     (klipper, "QUEUE_PROGRESS_DIR", True),
     (klipper, "TERMINAL_JOBS_DIR", True),
     (update, "STATE_PATH", False),
+    (laser, "RUNS_STATE_PATH", False),
     (laser, "SECRETS_DIR", True),   # v0.68: the operator's laser secret files; a test never reads the real ones
 ]
 
