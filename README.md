@@ -71,9 +71,26 @@ sh -n update.sh
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
 
-## 0.68.0 candidate: laser status, cutting runs, Turn on and Load
+## 0.68.0 candidate: Klipper/SV08 dispatch, laser status and runs, Turn on and Load, the laser gate
 
-The OMTech laser's plug readings arrive from Home Assistant on a second listener (`POST /ha/laser`, port 8788, one
+**Klipper printers (the SV08 Max first).** The website can now send a queue job to a Klipper printer. The agent
+refuses a G-code sliced for another model (its `printer_model` must equal the printer's model on the website),
+checks that klippy is ready and the printer is between prints (no start behind a screen macro), records the dispatch
+before it uploads, streams the file to Moonraker's `POST /server/files/upload`, then starts it with
+`POST /printer/print/start`. Progress, the running print's job key and the terminal job are durable across a restart
+or an adapter rebuild, so one print keeps one key and is reported once. Moonraker's `cancelled` reports as cancelled.
+The adapter talks only to the printer's `moonrakerUrl` as entered on the website, with Moonraker's own paths: no port
+is assumed, so `http://<printer>` (nginx on port 80 in front of a loopback-only Moonraker) works as well as `:7125`.
+The OctoPrint-style shim now also sends what an OrcaSlicer G-code says about itself (`printerModel`, `estGrams`,
+`requiredFilaments`); the fields are omitted when absent, and whether such a job still waits for review is the
+website's decision.
+
+**Adapter retry (2e26af0).** A Bambu adapter whose start failed is retried on the 120 s backoff from the heartbeat,
+without waiting for a config edit (a Klipper adapter keeps polling on its own). Unacked finished prints rescued from a
+rebuilt adapter are keyed by `jobKey`, so a rebuild (a model edit, a recovered printer) no longer reports the same
+print twice.
+
+**Laser status and cutting runs.** The OMTech laser's plug readings arrive from Home Assistant on a second listener (`POST /ha/laser`, port 8788, one
 allowed source address, a bearer from a 0600 file). The agent derives each laser's state (off, on but not cutting,
 cutting, unknown) and its cutting runs (a run closes after 60 s without cutting, on power-off, or when telemetry stops)
 and reports them on the heartbeat until the cloud has them. It polls the laser gate's `/status` and has the gate
@@ -84,6 +101,15 @@ Two laser commands exist and nothing else: `laser_power_on` POSTs to an HA webho
 no off command. Both carry an expiry the agent enforces. They are routed before any printer adapter is looked up. The HA
 YAML and the hub's settings are in [docs/laser-ha.md](docs/laser-ha.md); the gate is a separate service with its own
 installer and is never installed or updated by this agent.
+
+**The laser gate (`laser_gate/`, its own 0.1.0).** A stdlib-only service in front of the OMTech's Ruida controller:
+`POST /check` (never contacts the controller), `POST /store` (checks again, then stores the file in the controller's
+memory, refusing while the head moves) and `GET /status`, and nothing else; members start a job at the laser's panel.
+It runs as its own `laser-gate` user under `laser_gate/install.sh`, with nftables rules in their own boot unit.
+The agent never imports it, and this repo's `install.sh` and `update.sh` never mention it (G13), so a hub OTA cannot
+install or change it. The agent waits 60 s for `/check` and 120 s for `/store`. The command table and the store
+envelope are unverified against the real controller and operator sample files; see
+[docs/laser-gate.md](docs/laser-gate.md) for T0-T7 before enabling Load.
 
 ## 0.67.0 candidate: observed H2D hardware and external cameras
 
