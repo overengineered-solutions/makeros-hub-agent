@@ -1,6 +1,6 @@
 # Procrastination Station shop-box agent
 
-The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.67.0 review candidate**, not evidence that the installed shop box has been updated.
+The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.68.0 review candidate**, not evidence that the installed shop box has been updated.
 
 The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Read [SECURITY.md](SECURITY.md) for the boundaries and limitations.
 
@@ -70,6 +70,20 @@ sh -n update.sh
 ```
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
+
+## 0.68.0 candidate: laser status, cutting runs, Turn on and Load
+
+The OMTech laser's plug readings arrive from Home Assistant on a second listener (`POST /ha/laser`, port 8788, one
+allowed source address, a bearer from a 0600 file). The agent derives each laser's state (off, on but not cutting,
+cutting, unknown) and its cutting runs (a run closes after 60 s without cutting, on power-off, or when telemetry stops)
+and reports them on the heartbeat until the cloud has them. It polls the laser gate's `/status` and has the gate
+`/check` member files the cloud offers. All of this is inert without an `[laser]` table and the operator's secret files.
+
+Two laser commands exist and nothing else: `laser_power_on` POSTs to an HA webhook (HA decides, then runs
+`switch.turn_on`) and `laser_load` fetches a checked file from the cloud and hands it to the gate's `/store`. There is
+no off command. Both carry an expiry the agent enforces. They are routed before any printer adapter is looked up. The HA
+YAML and the hub's settings are in [docs/laser-ha.md](docs/laser-ha.md); the gate is a separate service with its own
+installer and is never installed or updated by this agent.
 
 ## 0.67.0 candidate: observed H2D hardware and external cameras
 

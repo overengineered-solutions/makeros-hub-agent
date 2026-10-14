@@ -65,7 +65,11 @@ def _fingerprint(p: dict) -> tuple:
 
 
 class PrinterManager:
-    def __init__(self, diagnostics=None) -> None:
+    def __init__(self, diagnostics=None, laser=None) -> None:
+        # v0.68: laser_* commands go here and never reach a printer adapter. The default knows no lasers, so every laser
+        # command it sees fails closed (unknown_command / bad_params / expired / laser_unavailable).
+        from ..laser import LaserHub
+        self.laser = laser if laser is not None else LaserHub()
         self._adapters: dict[str, Any] = {}
         self._fingerprints: dict[str, tuple] = {}
         # Earliest monotonic time to rebuild a wedged adapter (see
@@ -618,6 +622,11 @@ class PrinterManager:
                 # result report was lost. Doesn't consume a rate-limit slot.
                 reports.append({"requestId": request_id, "command": command, "status": "ok"})
                 continue
+            if command.startswith("laser_") and self.laser.seen(request_id):
+                # A laser requestId is attempted once: a redelivery gets no second HA call or store and no second,
+                # contradicting result (an accepted load's one result comes from its worker).
+                log.warning("ignoring a redelivered laser command %s", request_id)
+                continue
             if index >= max_per_heartbeat:
                 reports.append(
                     {
@@ -629,6 +638,18 @@ class PrinterManager:
                 )
                 continue
             params = item.get("params") if isinstance(item.get("params"), dict) else None
+            if command.startswith("laser_"):
+                # Lasers (v0.68): before the adapter lookup, so a laser row can never reach a printer adapter. A load
+                # answers later (None now); its one result rides a later heartbeat via laser.take_command_results().
+                report = self.laser.dispatch(request_id, printer_id, command, params)
+                if report is not None:
+                    if report.get("status") == "ok":
+                        self._dispatched_commands[request_id] = time.monotonic()
+                        self._dispatched_commands.move_to_end(request_id)
+                        while len(self._dispatched_commands) > MAX_DISPATCHED_COMMANDS:
+                            self._dispatched_commands.popitem(last=False)
+                    reports.append(report)
+                continue
             adapter = self._adapters.get(printer_id)
             send = getattr(adapter, "send_command", None) if adapter is not None else None
             if not callable(send):

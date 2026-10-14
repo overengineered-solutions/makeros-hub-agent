@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from .laser import parse_laser_config
+
 CONFIG_PATH = Path(os.environ.get("MAKEROS_HUB_CONFIG", "/etc/makeros-hub/config.toml"))
 CREDENTIAL_PATH = Path(
     os.environ.get("MAKEROS_HUB_CREDENTIAL", "/var/lib/makeros-hub/credential")
@@ -56,6 +58,8 @@ class Config:
     heartbeat_sec: int = DEFAULT_HEARTBEAT_SEC
     ingest_port: int = DEFAULT_INGEST_PORT
     max_upload_mb: int = DEFAULT_MAX_UPLOAD_MB
+    # v0.68: the optional [laser] table (makeros_hub.laser.LaserConfig); None = every laser reports not_configured.
+    laser: Any = None
 
     def __post_init__(self):
         self.cloud_url = validate_cloud_url(self.cloud_url)
@@ -343,11 +347,18 @@ def load_config(cloud_url_override: str | None = None) -> Config:
         or data.get("max_upload_mb")
         or DEFAULT_MAX_UPLOAD_MB
     )
+    try:
+        laser = parse_laser_config(data.get("laser"))
+    except ValueError as exc:
+        # A bad [laser] table never stops the printers: lasers run not_configured and the reason is logged.
+        log.error("%s; lasers stay not configured until it is fixed", exc)
+        laser = None
     return Config(
         cloud_url=cloud_url,
         heartbeat_sec=heartbeat,
         ingest_port=ingest_port,
         max_upload_mb=max_upload_mb,
+        laser=laser,
     )
 
 

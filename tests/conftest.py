@@ -27,7 +27,7 @@ Reads happen through the module global at call time, so rebinding the attribute 
 
 import pytest
 
-from makeros_hub import report_outbox, update
+from makeros_hub import laser, report_outbox, update
 from makeros_hub.printers import bambu, klipper, manager
 
 # (module, attribute, is_dir) — a directory is created so code that lists it finds an empty dir, not a missing one.
@@ -39,6 +39,7 @@ _STATE_PATHS = [
     (klipper, "QUEUE_PROGRESS_DIR", True),
     (klipper, "TERMINAL_JOBS_DIR", True),
     (update, "STATE_PATH", False),
+    (laser, "SECRETS_DIR", True),   # v0.68: the operator's laser secret files; a test never reads the real ones
 ]
 
 
