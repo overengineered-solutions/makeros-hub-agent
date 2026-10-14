@@ -1,0 +1,22 @@
+# laser-gate-firewall.service. install.sh copies it unchanged to /etc/systemd/system/ and enables it. It loads the laser
+# NIC's table (only the laser-gate uid may reach the controller; nothing is routed to or from the NIC) at every boot,
+# before any network, Docker or Tailscale comes up, and whether or not the gate itself runs. The rules match the NIC by
+# name, so they load before the NIC exists. No ExecStop on purpose: stopping this unit leaves the rules in place.
+[Unit]
+Description=Laser gate firewall (the laser NIC is closed to everything but the laser-gate user)
+DefaultDependencies=no
+Wants=network-pre.target
+# After nftables.service: Debian's /etc/nftables.conf starts with "flush ruleset" and would wipe this table if it ran
+# later. PartOf: `systemctl restart nftables` (its stop flushes everything too) reloads this table right after.
+After=nftables.service
+PartOf=nftables.service
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/laser-gate/laser-gate.nft
+
+[Install]
+WantedBy=sysinit.target nftables.service

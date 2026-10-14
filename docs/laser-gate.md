@@ -58,6 +58,9 @@ On the shop box, isolation comes from four things:
 - an output rule that lets only the `laser-gate` uid reach the laser NIC;
 - systemd's `IPAddressAllow`.
 
+The nftables rules have their own unit, `laser-gate-firewall.service`. It loads them at every boot, before any
+network, Docker or Tailscale comes up, and they hold whether or not the gate runs. The gate won't start without it.
+
 Global `ip_forward` stays on, because Docker and Tailscale need it. The limit: the hub's OTA runs its `install.sh` as
 root on this same box. "No OTA on the gate" therefore holds by convention, backed by a test that the hub's scripts
 never mention the gate (G13). It is not a hardware boundary.
@@ -104,7 +107,8 @@ the same command again. The second run:
 - generates `/etc/laser-gate/token` (0600, never printed) and, with `--hub-local`, installs the same value as
   `/var/lib/makeros-hub/laser-gate-token`;
 - renders `/etc/laser-gate/laser-gate.nft` and `/etc/laser-gate/unit.env`;
-- installs `laser-gate.service` and starts it.
+- installs and enables `laser-gate-firewall.service` (it loads the firewall at every boot) and `laser-gate.service`,
+  then starts both.
 
 It refuses to continue if any of these is true:
 - `bind_ip` is not on `--iface`;
@@ -116,7 +120,7 @@ To update, pull the new version and re-run the same command. That is the only wa
 Check it:
 
 ```sh
-systemctl status laser-gate
+systemctl status laser-gate-firewall laser-gate
 journalctl -u laser-gate -n 20
 sudo nft list table inet laser_gate
 ```
@@ -162,8 +166,11 @@ To check one file by hand (no network): `python3 -m laser_gate check FILE.rd --m
 
 - **The read-only probe and the gate can't run at the same time.** `ruida-readonly.py udp:` binds UDP 40200, which
   the gate holds; the controller always answers to that port.
-- **The firewall lets only the `laser-gate` uid reach the laser NIC**, and the rules stay loaded when the gate stops.
-  To probe over Ethernet, stop the gate, then run the probe as that user:
+- **The firewall lets only the `laser-gate` uid reach the laser NIC.** `laser-gate-firewall.service` loads the rules at
+  every boot, before the network, and they stay loaded when the gate stops. `systemctl restart nftables` reloads them
+  by itself. `systemctl stop nftables` flushes every table, this one included, and stops the gate with it; restore both
+  with `sudo systemctl start laser-gate-firewall laser-gate`. To probe over Ethernet, stop the gate, then run the probe
+  as that user:
 
   ```sh
   sudo install -m 0644 ruida-readonly.py /tmp/ruida-readonly.py     # pstation's scripts/ruida-readonly.py
@@ -188,10 +195,12 @@ To check one file by hand (no network): `python3 -m laser_gate check FILE.rd --m
 
 - The store envelope `E8 02` + `E7 01 <name> 00`, and the ACK byte `0xC6`. Settled by T0, or by a passive capture.
 - The stored-file count address. Settled by T0.
-- Parameter lengths, and the power and speed encodings. Settled by the samples, plus T1 and T5.
+- Parameter lengths, the power and speed encodings, and the single-copy values the checker requires of the repeat
+  and array commands (`NEUTRAL`: a count above one is refused as `repeat_or_array`). Settled by the samples, plus
+  T1 and T5.
 - Whether `D8 00` in a stored header starts the job. Settled by T1.
 - The bed check assumes absolute coordinates. With LightBurn's "current position" start mode (`D8 12`), the controller
   adds the head's position at Start, which no file check can see; the controller's own soft limits cover that case.
-- `RestrictAddressFamilies` and the other sandboxing options don't apply to the unit's two `+` (root) start commands,
-  `nft` and `sysctl`. That is systemd's documented behaviour for `+`, but it hasn't been tried on the shop box yet.
-  If `nft` fails at start with "Address family not supported", that is the place to look.
+- The sandboxing options don't apply to the gate unit's one `+` (root) start command, `sysctl`. That is systemd's
+  documented behaviour for `+`, but it hasn't been tried on the shop box yet. `nft` runs in its own unsandboxed unit,
+  `laser-gate-firewall.service`.

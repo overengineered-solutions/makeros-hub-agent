@@ -103,12 +103,16 @@ chmod 0644 "$ETC/laser-gate.nft" "$ETC/unit.env"
 sed -e "s/@CONTROLLER_IP@/$CONTROLLER_IP/g" -e "s/@ALLOWED_PEER@/$ALLOWED_PEER/g" \
     "$HERE/laser-gate.service" > /etc/systemd/system/laser-gate.service
 chmod 0644 /etc/systemd/system/laser-gate.service
+# The firewall has its own unit so it loads at every boot before any network, and holds whether or not the gate runs.
+install -m 0644 -o root -g root "$HERE/laser-gate-firewall.service" /etc/systemd/system/laser-gate-firewall.service
 systemctl daemon-reload
-systemctl enable laser-gate.service >/dev/null
+systemctl enable laser-gate-firewall.service laser-gate.service >/dev/null
+systemctl restart laser-gate-firewall.service
+nft list table inet laser_gate >/dev/null || die "the laser NIC firewall did not load (journalctl -u laser-gate-firewall)"
 systemctl restart laser-gate.service
 
 sleep 2
 systemctl is-active --quiet laser-gate.service || { journalctl -u laser-gate -n 20 --no-pager; die "the gate did not start"; }
 echo
 echo "laser-gate $(cd "$INSTALL_DIR" && /usr/bin/python3 -E -s -B -c 'import laser_gate; print(laser_gate.__version__)') is running."
-echo "Check it: journalctl -u laser-gate -n 5    and    sudo nft list table inet laser_gate"
+echo "Check it: systemctl status laser-gate-firewall laser-gate    and    sudo nft list table inet laser_gate"

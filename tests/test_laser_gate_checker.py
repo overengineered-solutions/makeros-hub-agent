@@ -157,5 +157,38 @@ class Limits(unittest.TestCase):
         self.assertEqual(refused(bad)["code"], "out_of_bed")
 
 
+class RepeatAndArray(unittest.TestCase):
+    """The check walks one copy of the path, once: repeat and array commands may carry only their do-nothing values."""
+
+    def test_process_repeat_above_one_is_refused(self):
+        plain = fx.square_plain()
+        at = plain.index(b"\xE7\x04")
+        v = refused(plain.replace(b"\xE7\x04" + fx.e14(1) * 2, b"\xE7\x04" + fx.e14(50) + fx.e14(1)))
+        self.assertEqual((v["code"], v["offset"]), ("repeat_or_array", at))
+        self.assertEqual(v["reason"], f"command E7 04 at byte {at} sets process repeat to 50, 1; only 1, 1 (one copy, "
+                                      "run once) is allowed")
+
+    def test_feed_repeat_other_than_zero_is_refused(self):
+        plain = fx.square_plain()
+        at = plain.index(b"\xE7\x06")
+        v = refused(plain.replace(b"\xE7\x06" + fx.e35(0) * 2, b"\xE7\x06" + fx.e35(0) + fx.e35(3)))
+        self.assertEqual((v["code"], v["offset"]), ("repeat_or_array", at))
+        self.assertIn("sets feed repeat to 0, 3", v["reason"])
+
+    def test_element_array_needs_one_by_one(self):
+        # MeerK40t's LightBurn-style values: counts 1 x 1, then spacing fields the check leaves alone
+        tail = fx.e14(0) + fx.e14(257) + fx.e14(-3072) + fx.e14(2) + fx.e14(5232)
+        ok, _ = fx.insert_before(fx.square_plain(), 0xEA, b"\xF2\x05" + fx.e14(1) * 2 + tail)
+        self.assertEqual(check(swizzle(ok), 100, CFG)["verdict"], "checked")
+        plain, at = fx.insert_before(fx.square_plain(), 0xEA, b"\xF2\x05" + fx.e14(10) * 2 + tail)
+        v = refused(plain)
+        self.assertEqual((v["code"], v["offset"]), ("repeat_or_array", at))
+        self.assertIn("sets element array to 10, 10", v["reason"])
+
+    def test_array_repeat_is_not_allowed_at_all_yet(self):
+        plain, at = fx.insert_before(fx.square_plain(), 0xEA, b"\xE7\x08" + fx.e14(1) * 2 + fx.e14(0) * 5)
+        self.assertEqual((refused(plain)["code"], refused(plain)["offset"]), ("command_not_allowed", at))
+
+
 if __name__ == "__main__":
     unittest.main()

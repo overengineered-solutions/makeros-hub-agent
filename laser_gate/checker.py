@@ -103,6 +103,20 @@ NEVER = {
 
 # Leading client-envelope command keys to drop before checking (a client's own E8 02 / E7 01, if samples carry one).
 ENVELOPE_STRIP = ()
+
+# Repeat and array commands may carry only their do-nothing values (check step 14): check() walks one copy of the path,
+# once, so a count above one would run passes or copies (possibly off the bed) that nothing here looked at. Research
+# values (MeerK40t's LightBurn-style header): process repeat 1, 1, 0...; feed repeat 0, 0; element array 1, 1, ...;
+# array repeat 1, 1, .... Only the leading counts are held; the later fields differ between writers (spacing) and act
+# only with a count above one. A sample that is refused for this shows its values in the reason (`learn` prints it).
+# key -> (name, leading values from the parameter bytes, the only values allowed)
+NEUTRAL = {
+    (0xE7, 0x04): ("process repeat", lambda p: (u14(p[0:2]), u14(p[2:4])), (1, 1)),
+    (0xE7, 0x06): ("feed repeat", lambda p: (u35(p[0:5]), u35(p[5:10])), (0, 0)),
+    # E7 08 is not in ALLOWED; if a sample brings it in, this already holds it
+    (0xE7, 0x08): ("array repeat", lambda p: (u14(p[0:2]), u14(p[2:4])), (1, 1)),
+    (0xF2, 0x05): ("element array", lambda p: (u14(p[0:2]), u14(p[2:4])), (1, 1)),
+}
 # ---------------------------------------------------------------------------------------------------------------------
 
 START, END = (0xD8, 0x00), (0xD7,)
@@ -327,6 +341,15 @@ def check(body, max_power_pct, cfg):
         if not (0 <= px <= w and 0 <= py <= h):
             return refuse("out_of_bed", f"a path leaves the bed ({_mm(px):.1f}, {_mm(py):.1f} mm is outside "
                           f"{_mm(w):.1f} × {_mm(h):.1f} mm)", at(t))
+    # 14. repeat_or_array: one copy, run once (see NEUTRAL)
+    for t in toks:
+        if t.key in NEUTRAL:
+            name, values, want = NEUTRAL[t.key]
+            got = values(data[t.ps:t.end])
+            if got != want:
+                return refuse("repeat_or_array", f"command {op_str(t.key)} at byte {at(t)} sets {name} to "
+                              f"{', '.join(map(str, got))}; only {', '.join(map(str, want))} (one copy, run once) is "
+                              "allowed", at(t))
 
     by_layer = {}
     for n, is_max, v, _ in powers:

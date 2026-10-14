@@ -3,7 +3,9 @@
 # hub's OTA never touches it.
 [Unit]
 Description=Laser gate (check, store to memory, status for the OMTech's Ruida controller; nothing else)
-After=network-online.target
+# The laser NIC's firewall is its own unit, loaded at boot before any network; the gate never starts without it.
+Requires=laser-gate-firewall.service
+After=laser-gate-firewall.service network-online.target
 Wants=network-online.target
 
 [Service]
@@ -12,9 +14,8 @@ User=laser-gate
 Group=laser-gate
 WorkingDirectory=/opt/laser-gate
 EnvironmentFile=/etc/laser-gate/unit.env
-# "+" runs these two as root: the laser NIC's firewall (only this uid may reach the controller) and no forwarding
-# on that NIC. Global ip_forward is left alone: Docker and Tailscale need it on the shop box.
-ExecStartPre=+/usr/sbin/nft -f /etc/laser-gate/laser-gate.nft
+# "+" runs this as root: no forwarding on the laser NIC (it exists by now; at boot the firewall unit loads before
+# it does). Global ip_forward is left alone: Docker and Tailscale need it on the shop box.
 ExecStartPre=+/usr/sbin/sysctl -w net.ipv4.conf.${LASER_IFACE_SYSCTL}.forwarding=0
 ExecStart=/usr/bin/python3 -E -s -B -m laser_gate serve --config /etc/laser-gate/config.toml
 Restart=on-failure

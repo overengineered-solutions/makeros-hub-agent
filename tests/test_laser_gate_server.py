@@ -174,6 +174,33 @@ class Static(unittest.TestCase):
                 self.assertNotIn("laser_gate", text)
                 self.assertNotIn("laser-gate", text)
 
+    def test_the_firewall_loads_at_boot_whether_or_not_the_gate_runs(self):
+        def unit(name):
+            out = {}
+            for line in (PKG / name).read_text().splitlines():
+                if "=" in line and not line.startswith(("#", "[")):
+                    k, v = line.split("=", 1)
+                    out.setdefault(k, []).extend(v.split())
+            return out
+
+        fw = unit("laser-gate-firewall.service")
+        self.assertEqual(fw["DefaultDependencies"], ["no"])
+        self.assertIn("network-pre.target", fw["Before"])
+        self.assertIn("network-pre.target", fw["Wants"])
+        self.assertIn("nftables.service", fw["After"])  # Debian's nftables.conf flushes the ruleset when it loads
+        self.assertIn("nftables.service", fw["PartOf"])
+        self.assertIn("sysinit.target", fw["WantedBy"])
+        self.assertEqual((fw["Type"], fw["RemainAfterExit"]), (["oneshot"], ["yes"]))
+        self.assertEqual(fw["ExecStart"], ["/usr/sbin/nft", "-f", "/etc/laser-gate/laser-gate.nft"])
+        self.assertNotIn("ExecStop", fw)  # stopping the unit leaves the rules loaded
+        gate = unit("laser-gate.service")
+        self.assertIn("laser-gate-firewall.service", gate["Requires"])
+        self.assertIn("laser-gate-firewall.service", gate["After"])
+        self.assertFalse([c for c in gate.get("ExecStartPre", []) if "nft" in c])  # one loader only
+        install = (PKG / "install.sh").read_text()
+        self.assertIn("systemctl enable laser-gate-firewall.service laser-gate.service", install)
+        self.assertIn('"$HERE/laser-gate-firewall.service" /etc/systemd/system/laser-gate-firewall.service', install)
+
     def test_g13_install_script_parses(self):
         r = subprocess.run(["bash", "-n", str(PKG / "install.sh")], capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)

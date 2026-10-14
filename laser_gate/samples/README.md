@@ -20,7 +20,9 @@ has not yet been compared with a real file from the shop. These samples are what
    sample carries it: anything new needs a review, and a new power command (`C6 xx`) also needs a cap rule in
    `check()`. Pay special attention to:
    - any `DA 01 …` tail, which is a settings write (contract C10);
-   - any leading `E8`/`E7 01`, a client envelope that would go into `ENVELOPE_STRIP`.
+   - any leading `E8`/`E7 01`, a client envelope that would go into `ENVELOPE_STRIP`;
+   - a sample refused with `repeat_or_array`: its reason shows the repeat or array values it carries. If they are
+     LightBurn's plain single-copy values, correct `NEUTRAL` to them; never allow a count above one.
 5. Run the tests: `python3 -m pytest -q tests/test_laser_gate_checker.py tests/test_laser_gate_store.py tests/test_laser_gate_server.py`.
    G2 checks every `*.rd` here at maxPowerPct 100.
 
