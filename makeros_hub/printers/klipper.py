@@ -218,9 +218,13 @@ class KlipperAdapter:
 
     def stop(self) -> None:
         self._stop.set()
-        # Don't join — the thread is daemon, polls are 4s timeouts max.
-        # On start(), we'll join any still-alive thread before clearing
-        # self._stop so we never race two pollers.
+        # Join (codex review of release-0.68.0): the manager builds the replacement adapter right after this, and it
+        # loads the same state file. A poll still in flight would record and save a finished print after that load,
+        # and the replacement's next save would drop it. ponytail: bounded by one HTTP GET; a poll stuck past that
+        # still races (the thread is daemon). start() also joins before it clears self._stop.
+        t = self._thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=HTTP_GET_TIMEOUT_SEC + 1.0)
 
     def _diag(self, subsystem: str, message: str) -> None:
         """Cloud-visible diagnostic record. Resolves the default diagnostics

@@ -346,6 +346,31 @@ class TestCollectQueueProgress(KlipperCase):
 
 
 class TestDurability(KlipperCase):
+    def test_stop_waits_for_a_poll_in_flight_so_a_rebuild_keeps_its_finished_print(self):
+        # codex review of release-0.68.0: stop() returned while a poll was in flight; the replacement loaded the state
+        # file, the old poll then saved the finished print, and the replacement's next save dropped it.
+        self.fake.state, self.fake.filename = "printing", "makeros/a_cube.gcode"
+        self.poll()
+        self.fake.state, self.fake.duration = "complete", 3600.0
+        finished, release = self.fake.status(), threading.Event()
+        in_flight = threading.Event()
+
+        def slow_fetch(*_a, **_kw):
+            in_flight.set()
+            release.wait(5)
+            return finished
+
+        threading.Timer(0.3, release.set).start()
+        with mock.patch.object(self.adapter, "_fetch_once", side_effect=slow_fetch):
+            self.adapter.start()
+            self.assertTrue(in_flight.wait(2))
+            self.adapter.stop()
+        reborn = self.make()                      # what manager._reconcile_klipper builds next
+        self.fake.state, self.fake.filename, self.fake.duration = "printing", "makeros/b_other.gcode", 0.0
+        self.poll(reborn)                         # print B begins, and the replacement saves its state
+        self.assertEqual([j["status"] for j in reborn.pending_jobs()], ["done"])
+        self.assertEqual([j["status"] for j in self.make().pending_jobs()], ["done"])   # and on disk
+
     def test_a_restarted_adapter_rehydrates_the_dispatch_and_the_terminal_jobs(self):
         self.start()
         self.poll()
