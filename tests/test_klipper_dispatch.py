@@ -37,9 +37,12 @@ class _Server(http.server.ThreadingHTTPServer):
 class FakeMoonraker:
     def __init__(self):
         self.klippy = "ready"
+        self.idle = "Ready"          # idle_timeout.state: "Printing" while klippy runs commands (a macro, or a print)
         self.state = "standby"
         self.filename = ""
         self.duration = 0.0
+        self.print_started_at = None  # wall clock; total_duration = now - this, as klippy computes it while printing
+        self.start_raw = None         # bytes written verbatim as the start POST's reply (a broken answer)
         self.upload_status, self.upload_body = 201, None
         self.start_status, self.start_body, self.start_delay = 200, {"result": "ok"}, 0.0
         self.start_begins_printing = True
@@ -78,6 +81,11 @@ class FakeMoonraker:
                     time.sleep(outer.start_delay)
                     if outer.start_status == 200 and outer.start_begins_printing:
                         outer.state, outer.filename, outer.duration = "printing", name, 0.0
+                        outer.print_started_at = time.time()
+                    if outer.start_raw is not None:
+                        self.wfile.write(outer.start_raw)
+                        self.close_connection = True
+                        return None
                     return self._send(outer.start_status, outer.start_body)
                 self._send(404, {"error": {"message": "Not Found"}})
 
@@ -89,8 +97,10 @@ class FakeMoonraker:
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
 
     def status(self):
-        return {"webhooks": {"state": self.klippy},
-                "print_stats": {"state": self.state, "filename": self.filename, "print_duration": self.duration}}
+        total = time.time() - self.print_started_at if self.print_started_at is not None else 0.0
+        return {"webhooks": {"state": self.klippy}, "idle_timeout": {"state": self.idle},
+                "print_stats": {"state": self.state, "filename": self.filename, "print_duration": self.duration,
+                                "total_duration": total}}
 
     def close(self):
         self._server.shutdown()
@@ -130,11 +140,16 @@ class TestStartPrint(KlipperCase):
         self.assertEqual((self.fake.uploads, self.fake.queries), ([], 0))
 
     def test_a_printer_that_is_not_between_prints_is_refused(self):
-        cases = [("ready", "printing", "printer_busy: printing"), ("ready", "paused", "printer_busy: printing"),
-                 ("ready", "error", "printer_busy: klipper_error"), ("shutdown", "standby", "printer_busy: klippy_shutdown")]
-        for klippy, state, reason in cases:
-            with self.subTest(klippy=klippy, state=state):
-                self.fake.klippy, self.fake.state = klippy, state
+        cases = [("ready", "printing", "Ready", "printer_busy: printing"), ("ready", "paused", "Ready", "printer_busy: printing"),
+                 ("ready", "error", "Ready", "printer_busy: klipper_error"),
+                 ("shutdown", "standby", "Ready", "printer_busy: klippy_shutdown"),
+                 # a QGL / bed-mesh macro from the screen: print_stats says standby, klippy is busy — a start would queue
+                 # behind it, time out, and run later untracked
+                 ("ready", "standby", "Printing", "printer_busy: klippy_busy"),
+                 ("ready", "complete", "Printing", "printer_busy: klippy_busy")]
+        for klippy, state, idle, reason in cases:
+            with self.subTest(klippy=klippy, state=state, idle=idle):
+                self.fake.klippy, self.fake.state, self.fake.idle = klippy, state, idle
                 self.assertEqual(self.start(), {"ok": False, "reason": reason})
         self.assertEqual(self.fake.uploads, [])
         self.assertEqual(self.adapter.pending_queue_jobs(), [])
@@ -188,6 +203,16 @@ class TestStartPrint(KlipperCase):
         with mock.patch.object(klipper, "HTTP_CONTROL_TIMEOUT_SEC", 0.2):
             self.assertEqual(self.start(), {"ok": True})
         self.assertEqual(self.adapter.pending_queue_jobs(), [{"queueJobId": JOB, "assignmentSeq": 3}])
+
+    def test_a_broken_start_reply_keeps_the_dispatch_for_telemetry(self):
+        # BadStatusLine (an http.client.HTTPException, not an OSError) and a truncated 200 body: the start may have reached
+        # klippy, so the dispatch must outlive it exactly like an unanswered start
+        for raw in (b"garbage\r\n\r\n", b'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{"res'):
+            with self.subTest(raw=raw):
+                adapter = self.make(pid=f"k-{len(raw)}")
+                self.fake.state, self.fake.start_raw = "standby", raw
+                self.assertEqual(self.start(adapter=adapter), {"ok": True})
+                self.assertEqual(adapter.pending_queue_jobs(), [{"queueJobId": JOB, "assignmentSeq": 3}])
 
     def test_a_resent_assignment_is_not_uploaded_twice(self):
         self.assertEqual(self.start(), {"ok": True})
@@ -245,6 +270,32 @@ class TestCollectQueueProgress(KlipperCase):
         self.assertEqual(self.adapter.collect_queue_progress(),
                          [{"queueJobId": JOB, "state": "held", "reason": "start_not_observed", "assignmentSeq": 3}])
 
+    def test_another_file_running_is_never_this_jobs_print(self):
+        # the start never reached klippy; a member starts a walk-up print at the screen inside the start window
+        self.fake.start_begins_printing = False
+        self.start()
+        self.fake.state, self.fake.filename, self.fake.print_started_at = "printing", "walkup_vase.gcode", time.time()
+        self.poll()
+        self.assertEqual(self.adapter.collect_queue_progress(), [])
+        self.adapter._queue_progress._start_timeout_sec = 0
+        self.assertEqual(self.adapter.collect_queue_progress(),
+                         [{"queueJobId": JOB, "state": "held", "reason": "start_not_observed", "assignmentSeq": 3}])
+
+    def test_the_printing_report_never_carries_another_prints_key(self):
+        # ours runs and finishes between two beats, then a walk-up print starts before the next collect: the synthesized
+        # 'printing' must not carry the walk-up's key (active_key's filename guard), and 'completed' carries ours
+        self.start()
+        self.poll()
+        ours = self.adapter._job_tracker.active_key()
+        self.fake.state, self.fake.duration = "complete", 3600.0
+        self.poll()
+        self.fake.state, self.fake.filename, self.fake.duration = "printing", "walkup_vase.gcode", 0.0
+        self.poll()
+        self.assertNotEqual(self.adapter._job_tracker.active_key(), ours)
+        self.assertEqual(self.adapter.collect_queue_progress(),
+                         [{"queueJobId": JOB, "state": "printing", "assignmentSeq": 3},
+                          {"queueJobId": JOB, "state": "completed", "printerJobKey": ours, "assignmentSeq": 3}])
+
     def test_silence_is_not_idle(self):
         self.fake.start_begins_printing = False
         self.start()
@@ -280,6 +331,49 @@ class TestDurability(KlipperCase):
         self.assertEqual([j["jobKey"] for j in reborn.pending_jobs()], [key])
         reports = reborn.collect_queue_progress()
         self.assertEqual([(r["state"], r.get("printerJobKey")) for r in reports], [("printing", None), ("completed", key)])
+
+    def test_a_restart_mid_print_keeps_the_job_key(self):
+        # an OTA / config re-pull / power blip of the hub mid-print: the cloud holds hub_job_ref = the key from 'printing',
+        # so the terminal after the restart must carry that same key or the queue job is never completed
+        self.start()
+        self.poll()
+        (printing,) = self.adapter.collect_queue_progress()
+        key = printing["printerJobKey"]
+        reborn = self.make()
+        self.fake.duration = 1200.0
+        self.poll(reborn)
+        self.assertEqual(reborn._job_tracker.active_key(), key)
+        again = self.make()   # restarted twice: still the same print
+        self.poll(again)
+        self.fake.state, self.fake.duration = "complete", 3600.0
+        self.poll(again)
+        self.assertEqual([(j["jobKey"], j["status"]) for j in again.pending_jobs()], [(key, "done")])
+        self.assertEqual(again.collect_queue_progress(),
+                         [{"queueJobId": JOB, "state": "completed", "printerJobKey": key, "assignmentSeq": 3}])
+
+    def test_a_print_that_finished_while_the_hub_was_down_keeps_its_key(self):
+        self.start()
+        self.poll()
+        key = self.adapter._job_tracker.active_key()
+        self.fake.state, self.fake.duration = "complete", 3600.0
+        reborn = self.make()
+        self.poll(reborn)
+        self.assertEqual([(j["jobKey"], j["status"]) for j in reborn.pending_jobs()], [(key, "done")])
+
+    def test_a_different_print_after_the_restart_gets_a_new_key(self):
+        self.start()
+        self.poll()
+        key = self.adapter._job_tracker.active_key()
+        for change in ("restarted", "standby"):
+            with self.subTest(change=change):
+                if change == "restarted":   # the same file printed again from the screen while the hub was down
+                    self.fake.print_started_at = time.time() + 600
+                else:                       # reset after it ended: outcome unknown, nothing invented
+                    self.fake.state, self.fake.filename = "standby", ""
+                reborn = self.make(pid="k1")
+                self.poll(reborn)
+                self.assertNotEqual(reborn._job_tracker.active_key(), key)
+                self.assertEqual(reborn.pending_jobs(), [])
 
     def test_a_restart_onto_a_finished_printer_does_not_report_the_print_twice(self):
         self.fake.state, self.fake.filename = "printing", "makeros/x_cube.gcode"

@@ -27,6 +27,7 @@ needs Moonraker bound to its LAN interface only.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import logging
 import os
@@ -89,6 +90,11 @@ POLL_BACKOFF_MAX_SEC = 30.0
 STALE_SEC = 30.0
 # How long to give the FIRST poll before declaring 'unreachable'.
 CONNECT_TIMEOUT_SEC = 20.0
+# A print the tracker saved as running is the same print after a restart when the printer still shows that file and its
+# start (wall now − print_stats.total_duration) agrees within this. ponytail: a cancel + re-start of the SAME file within
+# this window while the hub was down is taken for the saved print; a wall-clock step across the restart falls back to a
+# new key (the old behaviour).
+RESUME_START_SLACK_SEC = 30.0
 # Filename truncation — matches the cloud's PrinterStatusDTO + NativeJobDTO
 # (apps/web/lib/print/hub-jobs.ts, max 300). Single source of truth here.
 JOB_NAME_MAX_CHARS = 300
@@ -126,8 +132,10 @@ _GCODE_STATE_MAP = {
     "cancelled": "FAILED",
     "error": "FAILED",
 }
-# start_print's live check: is klippy up, and is the printer between prints?
-_LIVE_QUERY = "webhooks=state&print_stats=state,filename"
+# start_print's live check: is klippy up, is the printer between prints, and is klippy not busy running commands (a QGL /
+# bed mesh / heat-soak macro from the screen leaves print_stats at standby but idle_timeout at "Printing"; a start sent
+# then waits behind it on klippy's gcode mutex and our start POST times out)?
+_LIVE_QUERY = "webhooks=state&print_stats=state,filename&idle_timeout=state"
 _STARTABLE_STATES = frozenset({"standby", "complete", "cancelled"})
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -359,15 +367,18 @@ class KlipperAdapter:
             self._diag("klipper", f"print start for {queue_job_id[:8]} refused: {detail}")
             self._discard_dispatch(queue_job_id)
             return {"ok": False, "reason": "start_command_failed"}
-        except (urllib.error.URLError, OSError) as exc:
-            # The command may have reached klippy: keep the dispatch and let telemetry decide (RUNNING → printing;
-            # nothing within the start timeout → start_not_observed). Never a second start on top of a maybe-first.
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
+            # The command may have reached klippy (no answer, or a broken one): keep the dispatch and let telemetry decide
+            # (RUNNING → printing; nothing within the start timeout → start_not_observed). Never a second start on top of a
+            # maybe-first.
             log.warning("klipper %s: start of %s unconfirmed (%s) — waiting on telemetry", self.printer_id, uploaded, _classify_error(exc))
             return {"ok": True}
         try:
             parsed = json.loads(body.decode("utf-8", errors="replace"))
         except ValueError:
-            parsed = None
+            # a truncated / garbled 2xx body is a broken reply too, not a refusal: same no-answer path
+            log.warning("klipper %s: start of %s answered unreadably — waiting on telemetry", self.printer_id, uploaded)
+            return {"ok": True}
         if not (isinstance(parsed, dict) and parsed.get("result") == "ok"):
             self._diag("klipper", f"print start for {queue_job_id[:8]} answered without ok")
             self._discard_dispatch(queue_job_id)
@@ -396,6 +407,9 @@ class KlipperAdapter:
             return "printer_busy: klipper_error"
         if state not in _STARTABLE_STATES:
             return f"printer_busy: {_UNSAFE_NAME.sub('_', state)[:24]}"
+        idle = status.get("idle_timeout")
+        if isinstance(idle, dict) and idle.get("state") == "Printing":
+            return "printer_busy: klippy_busy"
         return None
 
     def _record_dispatch(self, queue_job_id: str, task_name: str, assignment_seq) -> bool:
@@ -478,6 +492,11 @@ class KlipperAdapter:
             gcode_state = _GCODE_STATE_MAP.get(raw_state) if fresh and isinstance(raw_state, str) else None
             before = self._queue_progress.to_state()
             task_names = {d["queueJobId"]: d.get("taskName") for d in before["dispatches"]}
+            head_task = before["dispatches"][0].get("taskName") if before["dispatches"] else None
+            if gcode_state in ("RUNNING", "PAUSE") and head_task and _job_filename(stats) != head_task:
+                # Another file is running (a walk-up print from the screen): it is not this job's print, so it must never
+                # report 'printing' for it. The job can only time out to start_not_observed (or link its own terminal).
+                gcode_state = "IDLE"
             reports = self._queue_progress.collect(self._job_tracker.pending(), gcode_state)
             for report in reports:
                 task = task_names.get(report.get("queueJobId"))
@@ -966,6 +985,10 @@ class KlipperJobTracker:
         self._state_path = state_path
         self._last_terminal: Optional[dict] = None
         self._seen_duration: Optional[float] = None
+        # The print that was running when the state was last saved. One print must keep ONE key across a restart (the
+        # cloud stamps hub_job_ref from it while printing and links the terminal by it): the first observation adopts it
+        # when it is provably the same print, else drops it.
+        self._restored: Optional[dict] = None
         self._load()
         # Track print_duration across polls so a printing→complete→printing
         # cycle that fits inside one 5s poll window is detected via the
@@ -995,10 +1018,15 @@ class KlipperJobTracker:
         # window is detected via the reset edge.
         print_duration = _num(print_stats.get("print_duration"))
         self._seen_duration = print_duration
+        total = _num(print_stats.get("total_duration"))
+        # When this print started, on the wall clock (only meaningful while it runs: total_duration freezes at the end).
+        print_start = _wall(now) - total if total is not None and state in ("printing", "paused") else None
+        if self._restored is not None:
+            self._resume_or_drop(state, filename, print_start)
 
         if self._active is None:
             if state in _ACTIVE_STATES:
-                self._open(filename, now)
+                self._open(filename, now, print_start)
             elif prev_state == "" and state in _TERMINAL_DONE_STATES.union(
                 _TERMINAL_FAILED_STATES
             ):
@@ -1042,14 +1070,15 @@ class KlipperJobTracker:
                     # same file, the operator re-printed it after the prior
                     # one finished — close as 'done', not 'cancelled'.
                     self._close("cancelled" if filename_changed else "done", now)
-                    self._open(filename, now)
+                    self._open(filename, now, print_start)
                 elif filename_changed:
                     # Filename swap without a duration reset — we missed
                     # the gap between two prints; close old as cancelled.
                     self._close("cancelled", now)
-                    self._open(filename, now)
+                    self._open(filename, now, print_start)
                 elif filename and not self._active.get("name"):
                     self._active["name"] = filename
+                    self._save()
             elif state == "paused":
                 # Paused doesn't open or close; just remember the state for
                 # the next observe call.
@@ -1097,21 +1126,55 @@ class KlipperJobTracker:
         last = raw.get("lastTerminal")
         if isinstance(last, dict) and isinstance(last.get("filename"), str):
             self._last_terminal = {"filename": last["filename"], "printDuration": _num(last.get("printDuration"))}
+        active = raw.get("active")
+        if (isinstance(active, dict) and isinstance(active.get("key"), str) and isinstance(active.get("name"), str)
+                and _num(active.get("startedWall")) is not None):
+            self._restored = {"key": active["key"], "name": active["name"], "startedWall": _num(active["startedWall"]),
+                              "printStart": _num(active.get("printStart"))}
+
+    def _resume_or_drop(self, state: str, filename: Optional[str], print_start: Optional[float]) -> None:
+        """First observation after a load: adopt the saved running print, or forget it."""
+        saved, self._restored = self._restored, None
+        if filename != saved["name"]:
+            same = False
+        elif state in ("printing", "paused"):
+            same = (saved["printStart"] is not None and print_start is not None
+                    and abs(saved["printStart"] - print_start) <= RESUME_START_SLACK_SEC)
+        else:
+            # It ended while the hub was down and the printer still shows it: close it under its own key (observe's normal
+            # branch does, from this state). ponytail: a same-file re-print that ALSO finished while the hub was down is
+            # booked under the saved key. Standby (reset, filename gone) is never adopted: its outcome is unknown, and the
+            # queue's outcome_unknown_after_restart covers that, not an invented "cancelled".
+            same = state in _TERMINAL_DONE_STATES.union(_TERMINAL_FAILED_STATES)
+        if same:
+            self._active = {"key": saved["key"], "name": saved["name"], "printStart": saved["printStart"],
+                            "startedAt": time.monotonic() - (time.time() - saved["startedWall"])}
+            return
+        log.info("klipper %s: %s is no longer the running print after the restart — its key is dropped", self.printer_id, saved["name"])
+        self._save()
 
     def _save(self) -> None:
         if self._state_path is None:
             return
-        state = json.dumps({"pending": self._pending, "lastTerminal": self._last_terminal}, sort_keys=True)
+        running = None
+        if self._active is not None and self._active.get("name"):
+            running = {"key": self._active["key"], "name": self._active["name"],
+                       "startedWall": _wall(self._active["startedAt"]), "printStart": self._active.get("printStart")}
+        elif self._restored is not None:
+            running = self._restored   # not observed yet since the load: keep it on disk
+        state = json.dumps({"pending": self._pending, "lastTerminal": self._last_terminal, "active": running}, sort_keys=True)
         if not write_json_durably(self._state_path, state):
             # A terminal cannot be refused (the print already ended); loud so the journal shows it.
             log.error("klipper %s: terminal jobs not durable (RAM-only until acked)", self.printer_id)
 
-    def _open(self, filename: Optional[str], now: float) -> None:
+    def _open(self, filename: Optional[str], now: float, print_start: Optional[float] = None) -> None:
         self._active = {
             "key": _job_key(self.printer_id, filename, now),
             "name": filename,
             "startedAt": now,
+            "printStart": print_start,
         }
+        self._save()   # a restart mid-print must find this key again
 
     def _close(self, status: str, now: float) -> None:
         if self._active is None:
@@ -1127,8 +1190,8 @@ class KlipperJobTracker:
         if self._active.get("name"):
             job["filename"] = self._active["name"]
             self._last_terminal = {"filename": self._active["name"], "printDuration": self._seen_duration}
+        self._active = None   # before the save in _buffer: the closed print is no longer the running one
         self._buffer(job)
-        self._active = None
 
     def _emit_recovered(
         self,
@@ -1211,10 +1274,14 @@ def _job_key(printer_id: str, filename: Optional[str], started_ts: float) -> str
     return "fp_" + hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
 
 
+def _wall(monotonic_ts: float) -> float:
+    return time.time() - (time.monotonic() - monotonic_ts)
+
+
 def _iso(monotonic_ts: float) -> str:
     """`time.monotonic` is not wall-clock — convert to ISO via wall time at
     *now* offset by the monotonic delta. Resolution is per-second since
     the cloud doesn't care about sub-second; same as the Bambu tracker."""
-    wall = time.time() - (time.monotonic() - monotonic_ts)
+    wall = _wall(monotonic_ts)
     # 2026-06-16T22:30:00Z shape.
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall))
