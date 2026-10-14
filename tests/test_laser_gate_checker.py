@@ -1,5 +1,7 @@
 """Laser gate checker, contract G1-G7. Pure: no sockets."""
 import random
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -155,6 +157,42 @@ class Limits(unittest.TestCase):
         plain = fx.square_plain()
         bad = plain.replace(b"\xE7\x07" + fx.xy(30, 30), b"\xE7\x07" + fx.xy(30, 700), 1)
         self.assertEqual(refused(bad)["code"], "out_of_bed")
+
+    def test_limits_compare_unrounded_values_within_one_step(self):
+        plain = fx.square_plain(layers=((70, 20),))
+        self.assertEqual(check(swizzle(plain), 70, CFG)["verdict"], "checked")  # 70% as LightBurn-style rounding writes it
+        one_step = plain.replace(b"\xC6\x02" + fx.pw(70), b"\xC6\x02" + fx.e14(fx.u14(fx.pw(70)) + 1))
+        self.assertEqual(check(swizzle(one_step), 70, CFG)["verdict"], "checked")  # a writer that rounds up
+        over = plain.replace(b"\xC6\x02" + fx.pw(70), b"\xC6\x02\x59\x54")  # 70.048%: rounds to 70.0, still over
+        self.assertEqual((refused(over, cap=70)["code"], refused(over, cap=70)["reason"]),
+                         ("power_over_cap", "layer 1 power 70.0% is over the 70.0% cap"))
+        under = fx.square_plain().replace(b"\xC6\x02" + fx.pw(30), b"\xC6\x02" + fx.e14(4913))  # 29.99%
+        self.assertEqual(refused(under, Config(min_power_pct=30.0))["code"], "power_under_min")
+        self.assertEqual(check(fx.square(), 100, Config(min_power_pct=30.0))["verdict"], "checked")
+        self.assertEqual(refused(fx.square_plain(layers=((30, 1000.049),)))["code"], "speed_out_of_range")
+        self.assertEqual(check(fx.square(layers=((30, 1000),)), 100, CFG)["verdict"], "checked")
+
+    def test_size_counts_both_ends_of_every_cut(self):
+        # after the square, travel to (100, 100) and cut back to (10, 10): the cutting spans 10..100 on both axes
+        plain = fx.square_plain().replace(b"\xE7\x00\xEB\xD7", b"\x88" + fx.xy(100, 100) + b"\xA8" + fx.xy(10, 10)
+                                          + b"\xE7\x00\xEB\xD7")
+        v = check(swizzle(plain), 100, CFG)
+        self.assertEqual((v["verdict"], v["widthMm"], v["heightMm"]), ("checked", 90.0, 90.0))
+
+
+class Memory(unittest.TestCase):
+    def test_one_byte_commands_fit_the_units_memory(self):
+        # MemoryMax=128M. As a list of Tok, 4 MiB of 1-byte commands took ~750 MB; 1 MiB took ~190 MB. Now ~25 MB.
+        code = ("import resource, sys; sys.path.insert(0, 'tests'); import laser_gate_fixtures as fx;"
+                "from laser_gate.checker import check, swizzle; from laser_gate.gate import Config;"
+                "p = fx.square_plain(); h = p.index(b'\\xD8\\x00') + 2;"
+                "v = check(swizzle(p[:h] + b'\\xF0' * (1 << 20) + b'\\xD7'), 100, Config());"
+                "print(v['verdict'], resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)")
+        r = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                           text=True, timeout=60)
+        verdict, mb = r.stdout.split()
+        self.assertEqual(verdict, "checked", r.stderr)
+        self.assertLess(int(mb), 64)
 
 
 class RepeatAndArray(unittest.TestCase):

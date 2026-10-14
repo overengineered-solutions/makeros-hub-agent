@@ -57,6 +57,22 @@ class Http(ServerBase):
         self.assertTrue(reply.startswith(b"HTTP/1.0 413"), reply)
         self.assertIn(b'"limit": 4194304', reply)
 
+    def test_any_method_takes_the_peer_and_token_path(self):
+        self.assertTrue(self.running(allowed_peer="127.0.0.2").raw(b"TRACE /status HTTP/1.1\r\nHost: x\r\n\r\n")
+                        .startswith(b"HTTP/1.0 403"))
+        srv = self.running()
+        self.assertEqual(srv.call("TRACE", "/status", token=None), (401, {"error": "unauthorized"}))
+        self.assertEqual(srv.call("TRACE", "/status"), (405, {"error": "method_not_allowed"}))
+        self.assertEqual(srv.call("BREW", "/status"), (405, {"error": "method_not_allowed"}))
+
+    def test_odd_content_lengths_are_answered(self):
+        srv = self.running()
+        auth = b"Authorization: Bearer " + fx.TOKEN.encode() + b"\r\n\r\n"
+        reply = srv.raw(b"POST /check?maxPowerPct=50 HTTP/1.1\r\nHost: x\r\nContent-Length: " + b"9" * 5000 + b"\r\n" + auth)
+        self.assertTrue(reply.startswith(b"HTTP/1.0 413"), reply[:80])
+        reply = srv.raw(b"POST /check?maxPowerPct=50 HTTP/1.1\r\nHost: x\r\nContent-Length: \xb2\r\n" + auth)
+        self.assertTrue(reply.startswith(b"HTTP/1.0 400"), reply[:80])
+
     def test_check_endpoint(self):
         srv = self.running()
         code, v = srv.call("POST", "/check?maxPowerPct=50", fx.square())

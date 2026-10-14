@@ -11,7 +11,10 @@ Wire facts (MeerK40t ruida driver, jnweiger/ruida-laser protocol.md, kkaempf/rui
   signed 32; relative: signed 14-bit).
 """
 import hashlib
+import itertools
 import re
+from array import array
+from collections.abc import Sequence
 from typing import NamedTuple
 
 # Codec copied from pstation scripts/ruida-readonly.py (_swizzle/_unswizzle, enc14/dec14/decu35; proven against the
@@ -152,22 +155,41 @@ class Tok(NamedTuple):
         return self.end - self.ps
 
 
+_SPAN = re.compile(rb"[\x80-\xff][\x00-\x7f]*|[\x00-\x7f]+")  # one command (opcode + parameter bytes), or a lead-in
+
+
+def _tok(data, off, end):
+    op = data[off]
+    if op < 0x80:
+        return Tok((), off, off, end)
+    if op in SUBCODED and off + 1 < end:
+        return Tok((op, data[off + 1]), off, off + 2, end)
+    return Tok((op,), off, off + 1, end)
+
+
+class Tokens(Sequence):
+    """The commands of `data`, made into Tok on demand. Only a 4-byte offset per command is held: as a list of Tok, a
+    4 MiB file of 1-byte commands took ~750 MB, and the unit's MemoryMax is 128M."""
+
+    def __init__(self, data):
+        self.data = data
+        self.starts = array("I", (m.start() for m in _SPAN.finditer(data)))
+
+    def __len__(self):
+        return len(self.starts)
+
+    def __getitem__(self, i):
+        i = range(len(self.starts))[i]  # negative indexes; IndexError past either end
+        return _tok(self.data, self.starts[i], self.starts[i + 1] if i + 1 < len(self.starts) else len(self.data))
+
+    def __iter__(self):
+        data, starts = self.data, self.starts
+        for off, end in zip(starts, itertools.chain(itertools.islice(starts, 1, None), (len(data),))):
+            yield _tok(data, off, end)
+
+
 def tokenize(data):
-    out, i, n = [], 0, len(data)
-    while i < n:
-        op = data[i]
-        if op < 0x80:
-            key, ps = (), i
-        elif op in SUBCODED and i + 1 < n and data[i + 1] < 0x80:
-            key, ps = (op, data[i + 1]), i + 2
-        else:
-            key, ps = (op,), i + 1
-        end = ps
-        while end < n and data[end] < 0x80:
-            end += 1
-        out.append(Tok(key, i, ps, end))
-        i = end
-    return out
+    return Tokens(data)
 
 
 def op_str(key):
@@ -207,13 +229,16 @@ def pct(p):
     return u14(p) * 100 / 16383
 
 
+POWER_STEP = 100 / 16383  # one 14-bit power step, in percent
+
+
 def job_bytes(body):
     """Unswizzled job with any ENVELOPE_STRIP lead-in removed -> (data, offset of data in the file)."""
     data, cut = unswizzle(body), 0
-    for t in tokenize(data):
-        if t.key not in ENVELOPE_STRIP:
+    for m in _SPAN.finditer(data):  # lazily: this stops at the first command that isn't envelope
+        if _tok(data, m.start(), m.end()).key not in ENVELOPE_STRIP:
             break
-        cut = t.end
+        cut = m.end()
     return data[cut:], cut
 
 
@@ -272,35 +297,37 @@ def check(body, max_power_pct, cfg):
     # 8. no_end, 9. data_after_end
     if last.key != END:
         return refuse("no_end", "the file doesn't end with D7")
-    for t in toks[:-1]:
+    for t in itertools.islice(toks, len(toks) - 1):
         if t.key == END:
             return refuse("data_after_end", f"there is data after the end mark (D7) at byte {at(t)}", at(t))
 
-    # Collect per-layer power and speed. C6 01/02 and C9 02 apply to the layer set by the last CA 02.
-    powers, speeds, layer = [], [], 0  # (layer, is_max, pct, tok), (layer, mm/s, tok)
+    # Collect per-layer power and speed, unrounded: the limits compare these, and only reasons and the result round.
+    # C6 01/02 and C9 02 apply to the layer set by the last CA 02.
+    powers, speeds, layer = [], [], 0  # (layer, is_max, pct, tok), (layer, um/s, tok)
     for t in toks:
         p, k = data[t.ps:t.end], t.key
         if k == (0xCA, 0x02):
             layer = p[0]
         elif k in ((0xC6, 0x01), (0xC6, 0x02)):
-            powers.append((layer, k[1] == 0x02, round(pct(p), 1), t))
+            powers.append((layer, k[1] == 0x02, pct(p), t))
         elif k in ((0xC6, 0x31), (0xC6, 0x32)):
-            powers.append((p[0], k[1] == 0x32, round(pct(p[1:]), 1), t))
+            powers.append((p[0], k[1] == 0x32, pct(p[1:]), t))
         elif k == (0xC9, 0x02):
-            speeds.append((layer, round(u35(p) / 1000, 1), t))
+            speeds.append((layer, u35(p), t))
         elif k == (0xC9, 0x04):
-            speeds.append((p[0], round(u35(p[1:]) / 1000, 1), t))
+            speeds.append((p[0], u35(p[1:]), t))
 
-    # 10. power_over_cap: every power value, min and max, is held under the cap (min above max would fire hotter)
+    # 10. power_over_cap: every power value, min and max, is held under the cap (min above max would fire hotter).
+    #     Within one 14-bit step of a limit counts as at it: writers turn a percent into 14 bits with different rounding.
     cap = min(max_power_pct, cfg.max_power_pct)
     for n, _, v, t in powers:
-        if v > cap:
+        if v > cap + POWER_STEP:
             return refuse("power_over_cap", f"layer {n + 1} power {v:.1f}% is over the {cap:.1f}% cap", at(t))
     # 11. power_under_min: max-power values only (min power is the corner power). A file that cuts with no power
     #     setting at all would run at whatever the controller last held, so it is refused here too.
     if cfg.min_power_pct > 0:
         for n, is_max, v, t in powers:
-            if is_max and v < cfg.min_power_pct:
+            if is_max and v < cfg.min_power_pct - POWER_STEP:
                 return refuse("power_under_min", f"layer {n + 1} power {v:.1f}% is under the {cfg.min_power_pct:.1f}% "
                               "minimum (below it the exhaust fans don't start)", at(t))
         if not any(is_max for _, is_max, _, _ in powers) and any(t.key[0] in CUTS for t in toks):
@@ -309,8 +336,9 @@ def check(body, max_power_pct, cfg):
     # 12. speed_out_of_range
     lo, hi = cfg.speed_mm_s
     for n, v, t in speeds:
-        if not lo <= v <= hi:
-            return refuse("speed_out_of_range", f"layer {n + 1} speed {v:.1f} mm/s is outside {lo:g}–{hi:g} mm/s", at(t))
+        if not lo * 1000 <= v <= hi * 1000:
+            return refuse("speed_out_of_range", f"layer {n + 1} speed {v / 1000:.1f} mm/s is outside {lo:g}–{hi:g} mm/s",
+                          at(t))
     # 13. out_of_bed. Every head position (moves and cuts; relative steps accumulate from the last absolute point, or
     #     from 0,0 before one) and every E7 03/07/50/51 bound must lie in [0, bed]. Every point inside the bed means the
     #     overall extent fits too. ponytail: with "current position" reference mode (D8 12) the controller adds the
@@ -334,7 +362,7 @@ def check(body, max_power_pct, cfg):
                 y += s14(p)
             if op in CUTS:
                 cut = cut or [ox, oy, ox, oy]
-                cut[:] = [min(cut[0], x), min(cut[1], y), max(cut[2], x), max(cut[3], y)]
+                cut[:] = [min(cut[0], ox, x), min(cut[1], oy, y), max(cut[2], ox, x), max(cut[3], oy, y)]
             px, py = x, y
         else:
             continue
@@ -355,10 +383,10 @@ def check(body, max_power_pct, cfg):
     for n, is_max, v, _ in powers:
         e = by_layer.setdefault(n, {"index": n, "maxPowerPct": None, "minPowerPct": None, "speedMmS": None})
         f, pick = ("maxPowerPct", max) if is_max else ("minPowerPct", min)
-        e[f] = v if e[f] is None else pick(e[f], v)
+        e[f] = round(v, 1) if e[f] is None else pick(e[f], round(v, 1))
     for n, v, _ in speeds:
         e = by_layer.setdefault(n, {"index": n, "maxPowerPct": None, "minPowerPct": None, "speedMmS": None})
-        e["speedMmS"] = v if e["speedMmS"] is None else max(e["speedMmS"], v)
+        e["speedMmS"] = round(v / 1000, 1) if e["speedMmS"] is None else max(e["speedMmS"], round(v / 1000, 1))
     cut = cut or [0, 0, 0, 0]
     return {"verdict": "checked", "sha256": sha, "sizeBytes": size, "maxPowerPct": cap,
             "widthMm": _mm(cut[2] - cut[0]), "heightMm": _mm(cut[3] - cut[1]),

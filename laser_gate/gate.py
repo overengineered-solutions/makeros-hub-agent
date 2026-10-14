@@ -381,9 +381,9 @@ class Handler(BaseHTTPRequestHandler):
         raw = self.headers.get("Content-Length")
         if raw is None:
             return None, self._reply(411, {"error": "length_required"})
-        if not raw.isdigit():
+        if not re.fullmatch(r"[0-9]+", raw):  # ASCII digits only (str.isdigit takes "²")
             return None, self._reply(400, {"error": "bad_request", "detail": "Content-Length"})
-        n = int(raw)
+        n = int(raw) if len(raw) <= 12 else gate.cfg.max_file_bytes + 1  # longer is never under the limit
         if n > gate.cfg.max_file_bytes:
             return None, self._reply(413, {"error": "too_large", "limit": gate.cfg.max_file_bytes})
         return n, None
@@ -445,7 +445,12 @@ class Handler(BaseHTTPRequestHandler):
             return 400, {"error": "bad_request", "detail": "body shorter than Content-Length"}
         return gate.store(body, p["name"], _power(p["maxPowerPct"]), p["sha256"])
 
-    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _route
+    def __getattr__(self, name):
+        # Every method (TRACE, CONNECT, made-up ones too) takes the same path: peer, token, route, method. Without this,
+        # the base class answers an unlisted method with 501 before the peer check.
+        if name.startswith("do_"):
+            return self._route
+        raise AttributeError(name)
 
 
 class Server(ThreadingHTTPServer):

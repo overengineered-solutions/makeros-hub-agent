@@ -23,6 +23,10 @@ to one controller address, over a NIC or VLAN that is cabled only to the laser.
 | `POST /store?name=MD0412&maxPowerPct=N&sha256=…` | Checks the file again, then stores it in the controller's memory under that name. |
 | `GET /status` | Reads the controller's status word (moving or not) and its stored-file count. |
 
+A file at the 4 MiB limit takes about 4 s to check on a desktop, and about 10 s in the worst case (all one-byte
+commands), more on a Pi, in under 64 MB. `/store` checks the file again before it sends. The hub's timeouts for
+both calls must allow for that.
+
 How a store works:
 - It refuses while the head is moving.
 - It sends packets of at most 1000 bytes. Packets are cut only between commands, and each one is sent only after
@@ -179,10 +183,11 @@ To check one file by hand (no network): `python3 -m laser_gate check FILE.rd --m
   sudo systemctl start laser-gate
   ```
 - **The gate answers 403 to everyone but `allowed_peer`, and 401 without the token.** From the hub's box, with the
-  hub's copy of the token:
+  hub's copy of the token. The header goes to curl on stdin (`printf` is a shell builtin), so the token never shows in
+  a process list:
 
   ```sh
-  sudo -u makeros-hub sh -c 'curl -s -H "Authorization: Bearer $(cat /var/lib/makeros-hub/laser-gate-token)" http://127.0.0.1:7650/status'
+  sudo -u makeros-hub sh -c 'printf "Authorization: Bearer %s\n" "$(cat /var/lib/makeros-hub/laser-gate-token)" | curl -s -H @- http://127.0.0.1:7650/status'
   ```
 - **What `/status` says:**
   - `"controller": "down"`: no ACK within `ack_timeout_s`. Check that the laser is on, the cable is in, the panel
