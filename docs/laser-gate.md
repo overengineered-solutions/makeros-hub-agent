@@ -200,6 +200,9 @@ To check one file by hand (no network): `python3 -m laser_gate check FILE.rd --m
 
 - The store envelope `E8 02` + `E7 01 <name> 00`, and the ACK byte `0xC6`. Settled by T0, or by a passive capture.
 - The stored-file count address. Settled by T0.
+- Which commands set a layer's power and speed. The checker refuses a cut (`settings_missing`) unless its layer
+  (the last `CA 02`) has had a max power, a min power and a speed set before it, by `C6 01/02`, `C9 02` in that
+  layer or `C6 31/32`, `C9 04` naming it. Settled by the samples.
 - Parameter lengths, the power and speed encodings, and the single-copy values the checker requires of the repeat
   and array commands (`NEUTRAL`: a count above one is refused as `repeat_or_array`). Settled by the samples, plus
   T1 and T5.

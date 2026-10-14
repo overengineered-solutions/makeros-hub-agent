@@ -125,6 +125,8 @@ NEUTRAL = {
 START, END = (0xD8, 0x00), (0xD7,)
 MOVES = frozenset({0x88, 0x89, 0x8A, 0x8B, 0xA8, 0xA9, 0xAA, 0xAB})
 CUTS = frozenset({0xA8, 0xA9, 0xAA, 0xAB})
+POWERS = frozenset({(0xC6, 0x01), (0xC6, 0x02), (0xC6, 0x31), (0xC6, 0x32)})  # min, max; layer min, layer max
+SPEEDS = frozenset({(0xC9, 0x02), (0xC9, 0x04)})                              # speed; layer speed
 BOUNDS = frozenset({(0xE7, 0x03), (0xE7, 0x07), (0xE7, 0x50), (0xE7, 0x51)})
 # Every opcode the research catalogue names (allowed or not). A file most of whose commands fall outside this is not an
 # .rd file at all (random bytes, text, the wrong swizzle), rather than an .rd file with one bad command.
@@ -301,44 +303,61 @@ def check(body, max_power_pct, cfg):
         if t.key == END:
             return refuse("data_after_end", f"there is data after the end mark (D7) at byte {at(t)}", at(t))
 
-    # Collect per-layer power and speed, unrounded: the limits compare these, and only reasons and the result round.
-    # C6 01/02 and C9 02 apply to the layer set by the last CA 02.
-    powers, speeds, layer = [], [], 0  # (layer, is_max, pct, tok), (layer, um/s, tok)
+    # 10-12 and 12b in one pass that keeps per-layer summaries only: a tuple per power command once took ~212 MiB for a
+    # 2 MiB file of them, over the unit's MemoryMax=128M. Values are unrounded: the limits compare these, and only
+    # reasons and the result round. C6 01/02 and C9 02 apply to the layer set by the last CA 02. The first offender of
+    # each rule is kept, and the rules still answer in step order.
+    cap = min(max_power_pct, cfg.max_power_pct)
+    lo, hi = cfg.speed_mm_s
+    first = {}     # code -> (reason, offset)
+    by_layer = {}  # layer -> the result's summary
+    have = {}      # layer -> the settings it has had so far: "max power", "min power", "speed"
+    layer, any_max, any_cut = 0, False, False
     for t in toks:
         p, k = data[t.ps:t.end], t.key
         if k == (0xCA, 0x02):
             layer = p[0]
-        elif k in ((0xC6, 0x01), (0xC6, 0x02)):
-            powers.append((layer, k[1] == 0x02, pct(p), t))
-        elif k in ((0xC6, 0x31), (0xC6, 0x32)):
-            powers.append((p[0], k[1] == 0x32, pct(p[1:]), t))
-        elif k == (0xC9, 0x02):
-            speeds.append((layer, u35(p), t))
-        elif k == (0xC9, 0x04):
-            speeds.append((p[0], u35(p[1:]), t))
-
-    # 10. power_over_cap: every power value, min and max, is held under the cap (min above max would fire hotter).
-    #     Within one 14-bit step of a limit counts as at it: writers turn a percent into 14 bits with different rounding.
-    cap = min(max_power_pct, cfg.max_power_pct)
-    for n, _, v, t in powers:
-        if v > cap + POWER_STEP:
-            return refuse("power_over_cap", f"layer {n + 1} power {v:.1f}% is over the {cap:.1f}% cap", at(t))
-    # 11. power_under_min: max-power values only (min power is the corner power). A file that cuts with no power
-    #     setting at all would run at whatever the controller last held, so it is refused here too.
-    if cfg.min_power_pct > 0:
-        for n, is_max, v, t in powers:
-            if is_max and v < cfg.min_power_pct - POWER_STEP:
-                return refuse("power_under_min", f"layer {n + 1} power {v:.1f}% is under the {cfg.min_power_pct:.1f}% "
-                              "minimum (below it the exhaust fans don't start)", at(t))
-        if not any(is_max for _, is_max, _, _ in powers) and any(t.key[0] in CUTS for t in toks):
-            return refuse("power_under_min", f"layer 1 power 0.0% is under the {cfg.min_power_pct:.1f}% minimum "
-                          "(below it the exhaust fans don't start)", None)
-    # 12. speed_out_of_range
-    lo, hi = cfg.speed_mm_s
-    for n, v, t in speeds:
-        if not lo * 1000 <= v <= hi * 1000:
-            return refuse("speed_out_of_range", f"layer {n + 1} speed {v / 1000:.1f} mm/s is outside {lo:g}–{hi:g} mm/s",
-                          at(t))
+            continue
+        if k in POWERS or k in SPEEDS:
+            n, p = (layer, p) if k in ((0xC6, 0x01), (0xC6, 0x02), (0xC9, 0x02)) else (p[0], p[1:])
+            e = by_layer.setdefault(n, {"index": n, "maxPowerPct": None, "minPowerPct": None, "speedMmS": None})
+        if k in POWERS:
+            v, is_max = pct(p), k in ((0xC6, 0x02), (0xC6, 0x32))
+            # 10. power_over_cap: every power value, min and max, is held under the cap (min above max would fire
+            #     hotter). Within one 14-bit step of a limit counts as at it: writers round a percent differently.
+            if v > cap + POWER_STEP:
+                first.setdefault("power_over_cap", (f"layer {n + 1} power {v:.1f}% is over the {cap:.1f}% cap", at(t)))
+            # 11. power_under_min: max-power values only (min power is the corner power)
+            if is_max and cfg.min_power_pct > 0 and v < cfg.min_power_pct - POWER_STEP:
+                first.setdefault("power_under_min", (f"layer {n + 1} power {v:.1f}% is under the "
+                                 f"{cfg.min_power_pct:.1f}% minimum (below it the exhaust fans don't start)", at(t)))
+            any_max |= is_max
+            f, pick = ("maxPowerPct", max) if is_max else ("minPowerPct", min)
+            e[f] = round(v, 1) if e[f] is None else pick(e[f], round(v, 1))
+            have.setdefault(n, set()).add("max power" if is_max else "min power")
+        elif k in SPEEDS:
+            v = u35(p)
+            # 12. speed_out_of_range
+            if not lo * 1000 <= v <= hi * 1000:
+                first.setdefault("speed_out_of_range", (f"layer {n + 1} speed {v / 1000:.1f} mm/s is outside "
+                                 f"{lo:g}–{hi:g} mm/s", at(t)))
+            e["speedMmS"] = round(v / 1000, 1) if e["speedMmS"] is None else max(e["speedMmS"], round(v / 1000, 1))
+            have.setdefault(n, set()).add("speed")
+        elif k[0] in CUTS:
+            any_cut = True
+            # 12b. settings_missing: a cut on a layer with no power or speed set before it would run at whatever the
+            #      controller last held, which nothing here checked.
+            missing = [w for w in ("max power", "min power", "speed") if w not in have.get(layer, ())]
+            if missing:
+                first.setdefault("settings_missing", (f"layer {layer + 1} cuts at byte {at(t)} with no "
+                                 f"{' or '.join(missing)} setting before it", at(t)))
+    # 11, again: a file that cuts with no max power setting at all
+    if cfg.min_power_pct > 0 and any_cut and not any_max:
+        first.setdefault("power_under_min", (f"layer 1 power 0.0% is under the {cfg.min_power_pct:.1f}% minimum "
+                                             "(below it the exhaust fans don't start)", None))
+    for code in ("power_over_cap", "power_under_min", "speed_out_of_range", "settings_missing"):
+        if code in first:
+            return refuse(code, *first[code])
     # 13. out_of_bed. Every head position (moves and cuts; relative steps accumulate from the last absolute point, or
     #     from 0,0 before one) and every E7 03/07/50/51 bound must lie in [0, bed]. Every point inside the bed means the
     #     overall extent fits too. ponytail: with "current position" reference mode (D8 12) the controller adds the
@@ -379,14 +398,6 @@ def check(body, max_power_pct, cfg):
                               f"{', '.join(map(str, got))}; only {', '.join(map(str, want))} (one copy, run once) is "
                               "allowed", at(t))
 
-    by_layer = {}
-    for n, is_max, v, _ in powers:
-        e = by_layer.setdefault(n, {"index": n, "maxPowerPct": None, "minPowerPct": None, "speedMmS": None})
-        f, pick = ("maxPowerPct", max) if is_max else ("minPowerPct", min)
-        e[f] = round(v, 1) if e[f] is None else pick(e[f], round(v, 1))
-    for n, v, _ in speeds:
-        e = by_layer.setdefault(n, {"index": n, "maxPowerPct": None, "minPowerPct": None, "speedMmS": None})
-        e["speedMmS"] = round(v / 1000, 1) if e["speedMmS"] is None else max(e["speedMmS"], round(v / 1000, 1))
     cut = cut or [0, 0, 0, 0]
     return {"verdict": "checked", "sha256": sha, "sizeBytes": size, "maxPowerPct": cap,
             "widthMm": _mm(cut[2] - cut[0]), "heightMm": _mm(cut[3] - cut[1]),

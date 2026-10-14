@@ -127,7 +127,25 @@ class Limits(unittest.TestCase):
             "power_under_min", "layer 1 power 30.0% is under the 40.0% minimum (below it the exhaust fans don't start)"))
         powerless = fx.square_plain().replace(b"\xC6\x32\x00" + fx.pw(30), b"").replace(b"\xC6\x02" + fx.pw(30), b"")
         self.assertEqual(refused(powerless)["code"], "power_under_min")
-        self.assertEqual(check(swizzle(powerless), 100, Config())["verdict"], "checked")  # no minimum before T5
+        self.assertEqual(check(fx.square(layers=((5, 20),)), 100, Config())["verdict"], "checked")  # no minimum before T5
+        self.assertEqual(refused(powerless, Config())["code"], "settings_missing")   # but a cut still needs its power
+
+    def test_every_cut_needs_its_own_layers_power_and_speed(self):
+        # codex review of release-0.68.0: layer 2's max power stood in for layer 1's, and a file with no speed at all
+        # was checked; either cut would run at whatever the controller last held
+        two = fx.square_plain(layers=((30, 20), (40, 25)))
+        no_max = two.replace(b"\xC6\x32\x00" + fx.pw(30), b"").replace(b"\xC6\x02" + fx.pw(30), b"")
+        v = refused(no_max)
+        self.assertEqual(v["code"], "settings_missing")
+        self.assertRegex(v["reason"], r"^layer 1 cuts at byte \d+ with no max power setting before it$")
+        no_speed = two.replace(b"\xC9\x04\x00" + fx.sp(20), b"").replace(b"\xC9\x02" + fx.sp(20), b"")
+        self.assertIn("with no speed setting", refused(no_speed)["reason"])
+        no_min = two.replace(b"\xC6\x31\x01" + fx.pw(30), b"").replace(b"\xC6\x01" + fx.pw(30), b"")
+        self.assertRegex(refused(no_min)["reason"], r"^layer 2 cuts .* no min power setting")
+        # a setting after the cut does not cover it
+        late = no_speed.replace(b"\xE7\x00\xEB\xD7", b"\xCA\x02\x00\xC9\x02" + fx.sp(20) + b"\xE7\x00\xEB\xD7")
+        self.assertEqual(refused(late)["code"], "settings_missing")
+        self.assertEqual(check(swizzle(two), 100, CFG)["verdict"], "checked")
 
     def test_g7_speed_range(self):
         v = refused(fx.square_plain(layers=((30, 1500),)))
@@ -181,6 +199,20 @@ class Limits(unittest.TestCase):
 
 
 class Memory(unittest.TestCase):
+    def test_a_flood_of_power_commands_fits_the_units_memory(self):
+        # codex review of release-0.68.0: 2 MiB of C6 02 took ~212 MiB when every power command was kept
+        code = ("import re, sys; sys.path.insert(0, 'tests'); import laser_gate_fixtures as fx;"
+                "from laser_gate.checker import check, swizzle; from laser_gate.gate import Config;"
+                "p = fx.square_plain(); h = p.index(b'\\xD8\\x00') + 2;"
+                "v = check(swizzle(p[:h] + (b'\\xC6\\x02' + fx.pw(30)) * (1 << 19) + p[h:]), 100, Config(min_power_pct=10.0));"
+                "kb = int(re.search(r'VmHWM:\\s+(\\d+) kB', open('/proc/self/status').read()).group(1));"
+                "print(v['verdict'], kb // 1024)")
+        r = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                           text=True, timeout=60)
+        verdict, mb = r.stdout.split()
+        self.assertEqual(verdict, "checked", r.stderr)
+        self.assertLess(int(mb), 64)
+
     def test_one_byte_commands_fit_the_units_memory(self):
         # MemoryMax=128M. As a list of Tok, 4 MiB of 1-byte commands took ~750 MB; 1 MiB took ~190 MB. Now ~25 MB.
         # The peak is this process's own VmHWM. ru_maxrss would not do: Linux carries the parent's peak across exec, so
