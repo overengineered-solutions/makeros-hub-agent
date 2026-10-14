@@ -174,7 +174,11 @@ class JobTracker:
         except (OSError, ValueError):
             return
         if isinstance(raw, list):
-            self._pending = [j for j in raw if isinstance(j, dict) and isinstance(j.get("jobKey"), str)][-MAX_PENDING:]
+            rows = [j for j in raw if isinstance(j, dict) and isinstance(j.get("jobKey"), str)]
+            first = {}
+            for j in rows:   # one row per key, the first: an older agent may have saved a recovered duplicate
+                first.setdefault(j["jobKey"], j)
+            self._pending = list(first.values())[-MAX_PENDING:]
 
     def _save_pending(self) -> None:
         if self._state_path is None:
@@ -237,6 +241,10 @@ class JobTracker:
         self._active = None
 
     def _buffer(self, job: dict) -> None:
+        # One row per jobKey. A reloaded tracker's first FINISH re-emits a print it already holds (_emit_recovered: no
+        # start, no duration, endedAt = now); the full row stays, and queue progress never sees two candidates for one print.
+        if any(j["jobKey"] == job["jobKey"] for j in self._pending):
+            return
         self._pending.append(job)
         self._save_pending()
         if len(self._pending) > MAX_PENDING:

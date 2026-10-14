@@ -2,6 +2,7 @@
 fully covered without paho or a printer; the manager is covered on its non-paho
 paths (klipper/incomplete/removal). Run: python3 -m unittest discover -s tests"""
 
+import json
 import sys
 import tempfile
 import types
@@ -574,8 +575,9 @@ class TestSummarizeShape(unittest.TestCase):
 
 class TestManagerNonPahoPaths(unittest.TestCase):
     def test_a_rebuilt_bambu_tracker_keeps_the_full_record_not_the_recovered_one(self):
-        # codex review of release-0.68.0: a reloaded JobTracker's first FINISH appends a recovered row under the same
-        # task key (no startedAt, no printTimeSeconds, endedAt = now). The manager must report the full one.
+        # codex review of release-0.68.0: a reloaded JobTracker's first FINISH re-emits a print it already holds
+        # (_emit_recovered: no startedAt, no printTimeSeconds, endedAt = now). One row per key, the full one, for the
+        # heartbeat AND queue progress (two rows were two candidates: held ambiguous_queue_correlation).
         from makeros_hub.printers.jobs import JobTracker
 
         with tempfile.TemporaryDirectory() as d:
@@ -587,28 +589,32 @@ class TestManagerNonPahoPaths(unittest.TestCase):
             first.observe(done, 4600.0)
             reloaded = JobTracker("gaudi", "TEST", state_path=path)   # the rebuilt adapter's tracker
             reloaded.observe(done, 4660.0)
-            self.assertEqual(len(reloaded.pending()), 2)              # full + recovered, same key
-
-            class Adapter:
-                def __init__(self, tracker):
-                    self.tracker = tracker
-
-                def pending_jobs(self):
-                    return self.tracker.pending()
-
-                def stop(self):
-                    pass
-
-            manager = PrinterManager()
-            manager._adapters["gaudi"] = Adapter(first)
-            manager._stop("gaudi")                                    # rescue into the orphan buffer
-            manager._adapters["gaudi"] = Adapter(reloaded)
-            (job,) = manager.pending_jobs()
+            (job,) = reloaded.pending()
             self.assertEqual((job["jobKey"], job["printTimeSeconds"]), ("task_TEST_77", 3600))
-            self.assertIn("startedAt", job)
-            manager._orphan_jobs.clear()                              # and from the adapter alone
-            (job,) = manager.pending_jobs()
+            (job,) = JobTracker("gaudi", "TEST", state_path=path).pending()   # and what it saved
             self.assertEqual(job["printTimeSeconds"], 3600)
+
+            # a duplicate an older agent already saved: the load keeps the first
+            poor = {"jobKey": "task_TEST_77", "printerId": "gaudi", "status": "done", "endedAt": "2026-10-14T00:00:00Z"}
+            path.write_text(json.dumps([job, poor]))
+            self.assertEqual(JobTracker("gaudi", "TEST", state_path=path).pending(), [job])
+
+        # the manager merges the rescued orphan copy and an adapter's rows the same way: first per key
+        class Adapter:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def pending_jobs(self):
+                return list(self.rows)
+
+            def stop(self):
+                pass
+
+        manager = PrinterManager()
+        manager._adapters["gaudi"] = Adapter([job, poor])
+        manager._stop("gaudi")
+        manager._adapters["gaudi"] = Adapter([poor])
+        self.assertEqual(manager.pending_jobs(), [job])
 
     def test_heartbeat_retries_failed_bambu_without_a_config_change(self):
         instances = []
