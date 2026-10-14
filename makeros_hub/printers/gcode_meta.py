@@ -74,7 +74,8 @@ def read_gcode_meta(path) -> dict[str, Any] | None:
         fh.seek(tail_at)
         tail = fh.read().decode("utf-8", errors="replace")
         fh.seek(0)
-        head = fh.read(min(WINDOW_BYTES, tail_at)).decode("utf-8", errors="replace")   # only what the tail did not cover
+        # the whole first window, overlapping the tail: a top config block the tail cut in half is read whole here
+        head = fh.read(WINDOW_BYTES if tail_at else 0).decode("utf-8", errors="replace")
 
     config = _config_block(tail)
     if config is None:
@@ -100,12 +101,13 @@ def read_gcode_meta(path) -> dict[str, Any] | None:
             item["color"] = normalize_color(colours[slot - 1])
         if slot <= len(used_g) and used_g[slot - 1] is not None and used_g[slot - 1] >= 0:
             item["usedG"] = round(used_g[slot - 1], 2)
-            grams.append(used_g[slot - 1])
+            grams.append(item["usedG"])
         filaments.append(_vp_submit_filament(item))
 
-    total = math.ceil(sum(grams)) if grams else 0
+    # ceil of the sum of the usedG values sent (rounded first so float noise on a whole sum never adds a gram)
+    total = math.ceil(round(sum(grams), 2)) if grams else None
     return {
         "printerModel": model,
-        "estGrams": total if 0 < total <= MAX_EST_GRAMS else None,
+        "estGrams": total if total is not None and total <= MAX_EST_GRAMS else None,
         "requiredFilaments": filaments,
     }

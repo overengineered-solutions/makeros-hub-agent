@@ -42,6 +42,7 @@ class FakeMoonraker:
         self.filename = ""
         self.duration = 0.0
         self.print_started_at = None  # wall clock; total_duration = now - this, as klippy computes it while printing
+        self.total = None             # a frozen total_duration (klippy freezes it when a print ends)
         self.start_raw = None         # bytes written verbatim as the start POST's reply (a broken answer)
         self.upload_status, self.upload_body = 201, None
         self.start_status, self.start_body, self.start_delay = 200, {"result": "ok"}, 0.0
@@ -97,10 +98,14 @@ class FakeMoonraker:
         self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
 
     def status(self):
-        total = time.time() - self.print_started_at if self.print_started_at is not None else 0.0
-        return {"webhooks": {"state": self.klippy}, "idle_timeout": {"state": self.idle},
-                "print_stats": {"state": self.state, "filename": self.filename, "print_duration": self.duration,
-                                "total_duration": total}}
+        total = self.total if self.total is not None else (
+            time.time() - self.print_started_at if self.print_started_at is not None else 0.0)
+        out = {"webhooks": {"state": self.klippy},
+               "print_stats": {"state": self.state, "filename": self.filename, "print_duration": self.duration,
+                               "total_duration": total}}
+        if self.idle is not None:
+            out["idle_timeout"] = {"state": self.idle}
+        return out
 
     def close(self):
         self._server.shutdown()
@@ -146,7 +151,8 @@ class TestStartPrint(KlipperCase):
                  # a QGL / bed-mesh macro from the screen: print_stats says standby, klippy is busy — a start would queue
                  # behind it, time out, and run later untracked
                  ("ready", "standby", "Printing", "printer_busy: klippy_busy"),
-                 ("ready", "complete", "Printing", "printer_busy: klippy_busy")]
+                 ("ready", "complete", "Printing", "printer_busy: klippy_busy"),
+                 ("ready", "standby", None, "printer_stale: shape_mismatch")]   # cannot rule a macro out
         for klippy, state, idle, reason in cases:
             with self.subTest(klippy=klippy, state=state, idle=idle):
                 self.fake.klippy, self.fake.state, self.fake.idle = klippy, state, idle
@@ -296,6 +302,28 @@ class TestCollectQueueProgress(KlipperCase):
                          [{"queueJobId": JOB, "state": "printing", "assignmentSeq": 3},
                           {"queueJobId": JOB, "state": "completed", "printerJobKey": ours, "assignmentSeq": 3}])
 
+    def test_a_print_paused_before_its_first_poll_still_carries_its_key(self):
+        self.start()
+        self.fake.state = "paused"
+        self.poll()
+        key = self.adapter._job_tracker.active_key()
+        self.assertTrue(key)
+        self.assertEqual(self.adapter.collect_queue_progress(),
+                         [{"queueJobId": JOB, "state": "printing", "assignmentSeq": 3, "printerJobKey": key}])
+
+    def test_a_key_that_is_not_durable_is_never_stamped(self):
+        # a restart could not find it again, and the cloud would then refuse the real terminal; without a key the cloud's
+        # time-window match still links it
+        self.start()
+        with mock.patch.object(klipper, "write_json_durably", return_value=False):
+            self.poll()
+        self.assertEqual(self.adapter.collect_queue_progress(), [{"queueJobId": JOB, "state": "printing", "assignmentSeq": 3}])
+        key = self.adapter._job_tracker.active_key()
+        self.poll()   # the disk is back: the next observation saves it
+        reborn = self.make()
+        self.poll(reborn)
+        self.assertEqual(reborn._job_tracker.active_key(), key)
+
     def test_silence_is_not_idle(self):
         self.fake.start_begins_printing = False
         self.start()
@@ -360,14 +388,29 @@ class TestDurability(KlipperCase):
         self.poll(reborn)
         self.assertEqual([(j["jobKey"], j["status"]) for j in reborn.pending_jobs()], [(key, "done")])
 
+    def test_a_print_that_ended_while_the_hub_was_down_ends_when_the_printer_says(self):
+        # saved an hour ago as running (started then); it ran 10 minutes; the hub comes back now
+        now = time.time()
+        state = {"pending": [], "lastTerminal": None,
+                 "active": {"key": "fp_saved", "name": "makeros/0123abcd_cube.gcode", "startedWall": now - 3600, "printStart": now - 3600}}
+        (klipper.TERMINAL_JOBS_DIR / "k9.json").write_text(json.dumps(state), encoding="utf-8")
+        self.fake.state, self.fake.filename, self.fake.duration, self.fake.total = "complete", "makeros/0123abcd_cube.gcode", 590.0, 600.0
+        reborn = self.make(pid="k9")
+        self.poll(reborn)
+        (job,) = reborn.pending_jobs()
+        self.assertEqual((job["jobKey"], job["status"]), ("fp_saved", "done"))
+        self.assertAlmostEqual(job["printTimeSeconds"], 600, delta=2)
+        self.assertEqual(job["endedAt"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3000)))
+
     def test_a_different_print_after_the_restart_gets_a_new_key(self):
         self.start()
+        self.fake.print_started_at = time.time() - 3600   # it has been printing for an hour
         self.poll()
         key = self.adapter._job_tracker.active_key()
         for change in ("restarted", "standby"):
             with self.subTest(change=change):
                 if change == "restarted":   # the same file printed again from the screen while the hub was down
-                    self.fake.print_started_at = time.time() + 600
+                    self.fake.print_started_at = time.time() - 60
                 else:                       # reset after it ended: outcome unknown, nothing invented
                     self.fake.state, self.fake.filename = "standby", ""
                 reborn = self.make(pid="k1")

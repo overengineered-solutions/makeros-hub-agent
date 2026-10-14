@@ -408,7 +408,10 @@ class KlipperAdapter:
         if state not in _STARTABLE_STATES:
             return f"printer_busy: {_UNSAFE_NAME.sub('_', state)[:24]}"
         idle = status.get("idle_timeout")
-        if isinstance(idle, dict) and idle.get("state") == "Printing":
+        idle_state = idle.get("state") if isinstance(idle, dict) else None
+        if not isinstance(idle_state, str):
+            return "printer_stale: shape_mismatch"   # klippy always loads idle_timeout: without it we cannot rule out a macro
+        if idle_state == "Printing":
             return "printer_busy: klippy_busy"
         return None
 
@@ -500,7 +503,10 @@ class KlipperAdapter:
             reports = self._queue_progress.collect(self._job_tracker.pending(), gcode_state)
             for report in reports:
                 task = task_names.get(report.get("queueJobId"))
-                key = self._job_tracker.active_key(task) if report.get("state") == "printing" and task else None
+                # only a DURABLE key: a key a restart cannot find again would make the cloud refuse the real terminal
+                # (hub_job_ref set to another key); without one the cloud's time-window match still finds the print
+                key = (self._job_tracker.active_key(task)
+                       if report.get("state") == "printing" and task and not self._job_tracker.unsaved else None)
                 if key:
                     report["printerJobKey"] = key   # the cloud stamps hub_job_ref from it, so the terminal job links
             if callable(on_report):
@@ -989,6 +995,7 @@ class KlipperJobTracker:
         # cloud stamps hub_job_ref from it while printing and links the terminal by it): the first observation adopts it
         # when it is provably the same print, else drops it.
         self._restored: Optional[dict] = None
+        self.unsaved = False   # the last save failed: retried on every observation
         self._load()
         # Track print_duration across polls so a printing→complete→printing
         # cycle that fits inside one 5s poll window is detected via the
@@ -1021,11 +1028,14 @@ class KlipperJobTracker:
         total = _num(print_stats.get("total_duration"))
         # When this print started, on the wall clock (only meaningful while it runs: total_duration freezes at the end).
         print_start = _wall(now) - total if total is not None and state in ("printing", "paused") else None
+        if self.unsaved:
+            self._save()
         if self._restored is not None:
-            self._resume_or_drop(state, filename, print_start)
+            self._resume_or_drop(state, filename, print_start, total, now)
 
         if self._active is None:
-            if state in _ACTIVE_STATES:
+            # paused opens too: a print paused before its first poll is still this print (and needs its key)
+            if state in _ACTIVE_STATES or state == "paused":
                 self._open(filename, now, print_start)
             elif prev_state == "" and state in _TERMINAL_DONE_STATES.union(
                 _TERMINAL_FAILED_STATES
@@ -1132,7 +1142,8 @@ class KlipperJobTracker:
             self._restored = {"key": active["key"], "name": active["name"], "startedWall": _num(active["startedWall"]),
                               "printStart": _num(active.get("printStart"))}
 
-    def _resume_or_drop(self, state: str, filename: Optional[str], print_start: Optional[float]) -> None:
+    def _resume_or_drop(self, state: str, filename: Optional[str], print_start: Optional[float],
+                        total: Optional[float], now: float) -> None:
         """First observation after a load: adopt the saved running print, or forget it."""
         saved, self._restored = self._restored, None
         if filename != saved["name"]:
@@ -1148,7 +1159,12 @@ class KlipperJobTracker:
             same = state in _TERMINAL_DONE_STATES.union(_TERMINAL_FAILED_STATES)
         if same:
             self._active = {"key": saved["key"], "name": saved["name"], "printStart": saved["printStart"],
-                            "startedAt": time.monotonic() - (time.time() - saved["startedWall"])}
+                            "startedAt": now - (_wall(now) - saved["startedWall"])}
+            if state not in ("printing", "paused") and saved["printStart"] is not None and total is not None:
+                # it ended at its start + the frozen total_duration, not when the hub came back
+                ended = now - (_wall(now) - (saved["printStart"] + total))
+                if self._active["startedAt"] <= ended <= now:
+                    self._active["endedAt"] = ended
             return
         log.info("klipper %s: %s is no longer the running print after the restart — its key is dropped", self.printer_id, saved["name"])
         self._save()
@@ -1163,9 +1179,10 @@ class KlipperJobTracker:
         elif self._restored is not None:
             running = self._restored   # not observed yet since the load: keep it on disk
         state = json.dumps({"pending": self._pending, "lastTerminal": self._last_terminal, "active": running}, sort_keys=True)
-        if not write_json_durably(self._state_path, state):
-            # A terminal cannot be refused (the print already ended); loud so the journal shows it.
-            log.error("klipper %s: terminal jobs not durable (RAM-only until acked)", self.printer_id)
+        was_unsaved, self.unsaved = self.unsaved, not write_json_durably(self._state_path, state)
+        if self.unsaved and not was_unsaved:
+            # A terminal cannot be refused (the print already ended); loud once so the journal shows it. Retried every poll.
+            log.error("klipper %s: terminal jobs not durable (RAM-only until a save succeeds)", self.printer_id)
 
     def _open(self, filename: Optional[str], now: float, print_start: Optional[float] = None) -> None:
         self._active = {
@@ -1179,6 +1196,7 @@ class KlipperJobTracker:
     def _close(self, status: str, now: float) -> None:
         if self._active is None:
             return
+        now = self._active.get("endedAt", now)
         job = {
             "jobKey": self._active["key"],
             "printerId": self.printer_id,

@@ -67,6 +67,27 @@ class TestReadGcodeMeta(unittest.TestCase):
         self.assertEqual(meta["requiredFilaments"], [{"slot": 1, "type": "PETG", "color": "00FF00FF", "usedG": 0.9}])
         self.assertEqual(meta["estGrams"], 1)
 
+    def test_a_top_config_block_the_tail_window_cuts_in_half(self):
+        # just over one window: the tail starts inside the top config block (after its START marker, before printer_model),
+        # so the head must be read whole, not only up to where the tail begins
+        head = "; CONFIG_BLOCK_START\n" + "; pad = x\n" * 40 + "; printer_model = Bambu Lab A1 mini\n; filament_type = PLA\n; CONFIG_BLOCK_END\n"
+        stats = "; filament used [mm] = 10.00\n"
+        moves = "G1 X1\n" * ((gcode_meta.WINDOW_BYTES + 100 - len(head) - len(stats)) // 6)
+        path = self.write(head + moves + stats)
+        tail_at = path.stat().st_size - gcode_meta.WINDOW_BYTES
+        self.assertTrue(0 < tail_at < head.index("; printer_model"), tail_at)
+        self.assertEqual(read_gcode_meta(path)["printerModel"], "Bambu Lab A1 mini")
+
+    def test_est_grams_is_the_ceil_of_the_used_grams_sent(self):
+        for g, used, est in (("1.004", 1.0, 1), ("1.004, 1.004", 1.0, 2), ("0.00", 0.0, 0), ("1.10, 1.90", None, 3)):
+            with self.subTest(g=g):
+                mm = "5.00, 5.00" if "," in g else "5.00"
+                types = "PLA;PLA" if "," in g else "PLA"
+                meta = read_gcode_meta(self.write(sv08_gcode(mm=mm, g=g, types=types, colours="#FFFFFF;#FFFFFF")))
+                if used is not None:
+                    self.assertEqual(meta["requiredFilaments"][0]["usedG"], used)
+                self.assertEqual(meta["estGrams"], est)
+
     def test_only_slots_that_print_are_required(self):
         meta = read_gcode_meta(self.write(sv08_gcode(mm="0.00, 12.34", g="0.00, 37.21", types="PLA;PETG", colours="#FFFFFF;#000000")))
         self.assertEqual(meta["requiredFilaments"], [{"slot": 2, "type": "PETG", "color": "000000FF", "usedG": 37.21}])
