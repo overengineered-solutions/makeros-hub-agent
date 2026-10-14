@@ -1,0 +1,32 @@
+#!/usr/sbin/nft -f
+# laser-gate.nft template. install.sh renders the @...@ values into /etc/laser-gate/laser-gate.nft; the unit loads it
+# (as root) before every start. Re-loading replaces the table atomically. The rules stay in place when the gate stops,
+# so the laser NIC stays closed.
+table inet laser_gate
+delete table inet laser_gate
+
+table inet laser_gate {
+	chain output {
+		type filter hook output priority 0; policy accept;
+		# Only the gate's own uid, only to the controller, only its job/settings UDP port.
+		oifname "@IFACE@" meta skuid "laser-gate" ip daddr @CONTROLLER_IP@ udp dport 50200 accept
+		oifname "@IFACE@" drop
+	}
+
+	chain input {
+		type filter hook input priority 0; policy accept;
+		# The controller's replies, and nothing else: no ssh, no DHCP, no ping on the laser side.
+		iifname "@IFACE@" ip saddr @CONTROLLER_IP@ udp dport 40200 accept
+		iifname "@IFACE@" drop
+		# The HTTP listener answers only the hub.
+		tcp dport @LISTEN_PORT@ ip saddr != @ALLOWED_PEER@ drop
+		meta nfproto ipv6 tcp dport @LISTEN_PORT@ drop
+	}
+
+	chain forward {
+		# Ahead of Docker's and Tailscale's forward rules: nothing is routed to or from the laser side.
+		type filter hook forward priority -10; policy accept;
+		iifname "@IFACE@" drop
+		oifname "@IFACE@" drop
+	}
+}

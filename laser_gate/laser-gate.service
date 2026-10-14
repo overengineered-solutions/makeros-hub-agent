@@ -1,0 +1,40 @@
+# laser-gate.service. install.sh fills in IPAddressAllow from /etc/laser-gate/config.toml (controller_ip, allowed_peer)
+# and installs it as /etc/systemd/system/laser-gate.service. Separate user, unit and code from the hub agent; the
+# hub's OTA never touches it.
+[Unit]
+Description=Laser gate (check, store to memory, status for the OMTech's Ruida controller; nothing else)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=laser-gate
+Group=laser-gate
+WorkingDirectory=/opt/laser-gate
+EnvironmentFile=/etc/laser-gate/unit.env
+# "+" runs these two as root: the laser NIC's firewall (only this uid may reach the controller) and no forwarding
+# on that NIC. Global ip_forward is left alone: Docker and Tailscale need it on the shop box.
+ExecStartPre=+/usr/sbin/nft -f /etc/laser-gate/laser-gate.nft
+ExecStartPre=+/usr/sbin/sysctl -w net.ipv4.conf.${LASER_IFACE_SYSCTL}.forwarding=0
+ExecStart=/usr/bin/python3 -E -s -B -m laser_gate serve --config /etc/laser-gate/config.toml
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+IPAddressDeny=any
+IPAddressAllow=127.0.0.1 @CONTROLLER_IP@ @ALLOWED_PEER@
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
