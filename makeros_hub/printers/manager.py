@@ -342,7 +342,10 @@ class PrinterManager:
                 rescued = adapter.pending_jobs()
                 # Rebuilt adapters reload these same durable jobs. Keying them
                 # avoids duplicate growth without discarding unacked evidence.
-                self._orphan_jobs.update((j["jobKey"], j) for j in rescued)
+                # First row per key wins: a reloaded Bambu tracker's FINISH adds
+                # a later, poorer row (no start, no duration) under the same key.
+                for j in rescued:
+                    self._orphan_jobs.setdefault(j["jobKey"], j)
                 if rescued:
                     log.info("rescued jobs from %s: processed=%d, expected=%d", pid, len(rescued), len(rescued))
             except Exception as e:  # noqa: BLE001
@@ -393,7 +396,8 @@ class PrinterManager:
         out = dict(self._orphan_jobs)
         for pid, adapter in self._adapters.items():
             try:
-                out.update((j["jobKey"], j) for j in adapter.pending_jobs())
+                for j in adapter.pending_jobs():
+                    out.setdefault(j["jobKey"], j)   # first wins, as in _stop()
             except Exception as e:  # noqa: BLE001 — one adapter can't sink the loop
                 code = self._access_code_for(pid)
                 safe = self._redact_printer_exception(e, code)

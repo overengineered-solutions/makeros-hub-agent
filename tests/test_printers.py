@@ -3,8 +3,10 @@ fully covered without paho or a printer; the manager is covered on its non-paho
 paths (klipper/incomplete/removal). Run: python3 -m unittest discover -s tests"""
 
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from makeros_hub import diagnostics
@@ -571,6 +573,43 @@ class TestSummarizeShape(unittest.TestCase):
 
 
 class TestManagerNonPahoPaths(unittest.TestCase):
+    def test_a_rebuilt_bambu_tracker_keeps_the_full_record_not_the_recovered_one(self):
+        # codex review of release-0.68.0: a reloaded JobTracker's first FINISH appends a recovered row under the same
+        # task key (no startedAt, no printTimeSeconds, endedAt = now). The manager must report the full one.
+        from makeros_hub.printers.jobs import JobTracker
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "gaudi.json"
+            running = {"print": {"gcode_state": "RUNNING", "task_id": "77", "subtask_name": "cube"}}
+            done = {"print": {"gcode_state": "FINISH", "task_id": "77", "subtask_name": "cube"}}
+            first = JobTracker("gaudi", "TEST", state_path=path)
+            first.observe(running, 1000.0)
+            first.observe(done, 4600.0)
+            reloaded = JobTracker("gaudi", "TEST", state_path=path)   # the rebuilt adapter's tracker
+            reloaded.observe(done, 4660.0)
+            self.assertEqual(len(reloaded.pending()), 2)              # full + recovered, same key
+
+            class Adapter:
+                def __init__(self, tracker):
+                    self.tracker = tracker
+
+                def pending_jobs(self):
+                    return self.tracker.pending()
+
+                def stop(self):
+                    pass
+
+            manager = PrinterManager()
+            manager._adapters["gaudi"] = Adapter(first)
+            manager._stop("gaudi")                                    # rescue into the orphan buffer
+            manager._adapters["gaudi"] = Adapter(reloaded)
+            (job,) = manager.pending_jobs()
+            self.assertEqual((job["jobKey"], job["printTimeSeconds"]), ("task_TEST_77", 3600))
+            self.assertIn("startedAt", job)
+            manager._orphan_jobs.clear()                              # and from the adapter alone
+            (job,) = manager.pending_jobs()
+            self.assertEqual(job["printTimeSeconds"], 3600)
+
     def test_heartbeat_retries_failed_bambu_without_a_config_change(self):
         instances = []
         # Stands in for the adapter's DURABLE terminal-job buffer (JobTracker
