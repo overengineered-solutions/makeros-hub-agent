@@ -1,0 +1,19 @@
+# /etc/laser-gate/config.toml (root:laser-gate 0640). install.sh writes this on its first run; edit, then re-run it.
+# Every key is required to be one of these; an unknown key means the gate refuses to start.
+# Until T0, T1 and T5 are done the gate is inert for storing: store_enabled = false, file_count_addr = "",
+# min_power_pct = 0. /status works from the start; /check works once min_power_pct is set.
+
+listen = "127.0.0.1:7650"      # the one HTTP listener. Shop box: loopback. A Pi: its shop-LAN address. Never 0.0.0.0.
+allowed_peer = "127.0.0.1"     # the hub; every other source gets 403 before any body byte is read
+token_file = "/etc/laser-gate/token"
+controller_ip = "10.0.3.3"     # set on the panel: Z/U menu -> IP Setup+, netmask 255.255.255.0
+bind_ip = "10.0.3.1"           # this host's static address on the laser-only NIC/VLAN (no gateway)
+ack_timeout_s = 0.5            # T2 sets this
+store_enabled = false          # a person flips this during T1, and only for and after T1
+file_count_addr = ""           # T0: hex address of the controller's stored-file count, e.g. "0x0123"; empty = /store refuses
+min_power_pct = 0              # T5: lowest power that reads >= 2.3 A on the plug; 0 = /check answers not_calibrated
+max_power_pct = 100            # absolute ceiling; a request's maxPowerPct is clamped under it
+bed_mm = [1000, 600]           # controller travel (pstation migration 0126)
+speed_mm_s = [1, 1000]         # TO CONFIRM against the operator's samples
+max_file_bytes = 4194304
+packet_max_bytes = 1000
