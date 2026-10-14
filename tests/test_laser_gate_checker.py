@@ -183,11 +183,14 @@ class Limits(unittest.TestCase):
 class Memory(unittest.TestCase):
     def test_one_byte_commands_fit_the_units_memory(self):
         # MemoryMax=128M. As a list of Tok, 4 MiB of 1-byte commands took ~750 MB; 1 MiB took ~190 MB. Now ~25 MB.
-        code = ("import resource, sys; sys.path.insert(0, 'tests'); import laser_gate_fixtures as fx;"
+        # The peak is this process's own VmHWM. ru_maxrss would not do: Linux carries the parent's peak across exec, so
+        # under a long pytest run it reports pytest's size, not the check's.
+        code = ("import re, sys; sys.path.insert(0, 'tests'); import laser_gate_fixtures as fx;"
                 "from laser_gate.checker import check, swizzle; from laser_gate.gate import Config;"
                 "p = fx.square_plain(); h = p.index(b'\\xD8\\x00') + 2;"
                 "v = check(swizzle(p[:h] + b'\\xF0' * (1 << 20) + b'\\xD7'), 100, Config());"
-                "print(v['verdict'], resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024)")
+                "kb = int(re.search(r'VmHWM:\\s+(\\d+) kB', open('/proc/self/status').read()).group(1));"
+                "print(v['verdict'], kb // 1024)")
         r = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], capture_output=True,
                            text=True, timeout=60)
         verdict, mb = r.stdout.split()

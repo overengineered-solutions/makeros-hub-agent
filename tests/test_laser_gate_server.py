@@ -182,13 +182,21 @@ class Static(unittest.TestCase):
                 and panel_port in f.read_text(errors="replace")]
         self.assertEqual(hits, [])
 
-    def test_g13_the_hub_never_mentions_the_gate(self):
-        hub = [ROOT / "install.sh", ROOT / "update.sh", *(ROOT / "makeros_hub").rglob("*.py")]
-        for f in hub:
+    def test_g13_the_hub_never_installs_or_imports_the_gate(self):
+        # The hub's OTA runs these as root: they never mention the gate, so an OTA cannot install or update it.
+        for f in (ROOT / "install.sh", ROOT / "update.sh"):
             text = f.read_text(errors="replace")
-            with self.subTest(file=str(f.relative_to(ROOT))):
+            with self.subTest(file=f.name):
                 self.assertNotIn("laser_gate", text)
                 self.assertNotIn("laser-gate", text)
+        # The agent never imports the gate. It may name the gate's token file (/var/lib/makeros-hub/laser-gate-token),
+        # so this is an import check, not a text ban (the 0.68.0 merge decision).
+        for f in (ROOT / "makeros_hub").rglob("*.py"):
+            for node in ast.walk(ast.parse(f.read_text())):
+                names = [a.name for a in node.names] if isinstance(node, ast.Import) else \
+                    [node.module or ""] if isinstance(node, ast.ImportFrom) and node.level == 0 else []
+                with self.subTest(file=str(f.relative_to(ROOT))):
+                    self.assertFalse([n for n in names if n.split(".")[0] == "laser_gate"], names)
 
     def test_the_firewall_loads_at_boot_whether_or_not_the_gate_runs(self):
         def unit(name):

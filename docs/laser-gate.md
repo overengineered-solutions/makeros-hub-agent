@@ -25,7 +25,7 @@ to one controller address, over a NIC or VLAN that is cabled only to the laser.
 
 A file at the 4 MiB limit takes about 4 s to check on a desktop, and about 10 s in the worst case (all one-byte
 commands), more on a Pi, in under 64 MB. `/store` checks the file again before it sends. The hub's timeouts for
-both calls must allow for that.
+both calls must allow for that: it waits 60 s for `/check` and 120 s for `/store`.
 
 How a store works:
 - It refuses while the head is moving.
@@ -66,8 +66,8 @@ The nftables rules have their own unit, `laser-gate-firewall.service`. It loads 
 network, Docker or Tailscale comes up, and they hold whether or not the gate runs. The gate won't start without it.
 
 Global `ip_forward` stays on, because Docker and Tailscale need it. The limit: the hub's OTA runs its `install.sh` as
-root on this same box. "No OTA on the gate" therefore holds by convention, backed by a test that the hub's scripts
-never mention the gate (G13). It is not a hardware boundary.
+root on this same box. "No OTA on the gate" therefore holds by convention, backed by a test that the hub's `install.sh` and
+`update.sh` never mention the gate and that the agent never imports it (G13). It is not a hardware boundary.
 
 The hub's root helper `vp-network.py` adds addresses only on an interface that carries a default route, or on `lo`
 inside 198.18.0.0/15. The laser NIC has no gateway, and `install.sh` refuses to continue if it has one, so the helper

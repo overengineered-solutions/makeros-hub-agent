@@ -871,6 +871,11 @@ class H10ConfigDown(Base):
 # --- H11 ------------------------------------------------------------------------------------------------------------
 
 class H11Static(unittest.TestCase):
+    def test_the_gate_calls_allow_a_slow_check(self):
+        # the gate's note: a worst-case file takes ~10 s on a desktop and longer on a Pi; /store checks it again first
+        self.assertGreaterEqual(laser.CHECK_TIMEOUT_S, 60)
+        self.assertGreaterEqual(laser.STORE_TIMEOUT_S, laser.CHECK_TIMEOUT_S)
+
     def test_no_off_verb_and_no_gate_import_in_the_agent(self):
         for f in (ROOT / "makeros_hub").rglob("*.py"):
             text = f.read_text()
