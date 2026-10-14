@@ -335,15 +335,18 @@ class PrinterManager:
         self._fingerprints.pop(pid, None)
         self._stuck_retry_at.pop(pid, None)
         if adapter is not None:
-            # Rescue unacked terminal jobs BEFORE teardown — a config edit
-            # (e.g. rotated access code) rebuilds the adapter and its buffer
-            # would otherwise vanish with it.
+            # Stop FIRST, then rescue unacked terminal jobs (codex review of
+            # release-0.68.0): a stopped adapter records nothing more, so the
+            # rescue sees its final buffer. A config edit (e.g. rotated access
+            # code) rebuilds the adapter and its buffer would otherwise vanish.
+            try:
+                adapter.stop()
+            except Exception as e:  # noqa: BLE001 - a failed teardown must not lose the rescue
+                log.warning("stopping %s failed: %s", pid, self._redact_printer_exception(e, code))
             try:
                 rescued = adapter.pending_jobs()
                 # Rebuilt adapters reload these same durable jobs. Keying them
                 # avoids duplicate growth without discarding unacked evidence.
-                # First row per key wins: a reloaded Bambu tracker's FINISH adds
-                # a later, poorer row (no start, no duration) under the same key.
                 for j in rescued:
                     self._orphan_jobs.setdefault(j["jobKey"], j)
                 if rescued:
@@ -352,7 +355,6 @@ class PrinterManager:
                 safe = self._redact_printer_exception(e, code)
                 log.warning("could not rescue pending jobs from %s: %s", pid, safe)
                 self._record_failure(f"could not rescue pending jobs from {pid}: {safe}", extra_secrets=[code])
-            adapter.stop()
 
     def statuses(self) -> list[dict]:
         # Heartbeats keep running when configVersion is unchanged. Retry failed connections here too,
@@ -391,19 +393,21 @@ class PrinterManager:
         return list(self._camera_meta.values())
 
     def pending_jobs(self) -> list[dict]:
-        """Unacked evidence, once per jobKey even after an adapter reloads its
-        durable buffer. JobTracker namespaces keys by printer serial."""
-        out = dict(self._orphan_jobs)
+        """Unacked evidence: every adapter's rows as they are, plus a rescued
+        orphan only when no adapter holds its key (a rebuilt adapter reloads the
+        same durable rows; codex review of release-0.68.0: deduping an adapter's
+        own rows dropped a real same-key print). The cloud dedupes on jobKey."""
+        rows: list[dict] = []
         for pid, adapter in self._adapters.items():
             try:
-                for j in adapter.pending_jobs():
-                    out.setdefault(j["jobKey"], j)   # first wins, as in _stop()
+                rows.extend(adapter.pending_jobs())
             except Exception as e:  # noqa: BLE001 — one adapter can't sink the loop
                 code = self._access_code_for(pid)
                 safe = self._redact_printer_exception(e, code)
                 log.warning("pending_jobs failed for %s: %s", pid, safe)
                 self._record_failure(f"pending_jobs failed for {pid}: {safe}", extra_secrets=[code])
-        return list(out.values())
+        held = {j.get("jobKey") for j in rows}
+        return [j for k, j in self._orphan_jobs.items() if k not in held] + rows
 
     def ack_jobs(self, job_keys: list[str]) -> None:
         """Fan a confirmed-send ack out to every adapter + the orphan buffer."""

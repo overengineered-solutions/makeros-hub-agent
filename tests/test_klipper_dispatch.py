@@ -346,28 +346,31 @@ class TestCollectQueueProgress(KlipperCase):
 
 
 class TestDurability(KlipperCase):
-    def test_stop_waits_for_a_poll_in_flight_so_a_rebuild_keeps_its_finished_print(self):
-        # codex review of release-0.68.0: stop() returned while a poll was in flight; the replacement loaded the state
-        # file, the old poll then saved the finished print, and the replacement's next save dropped it.
+    def test_a_poll_in_flight_at_stop_records_nothing_and_the_replacement_reports_the_print(self):
+        # codex review of release-0.68.0: a poll still in flight after stop() saved print A after the replacement loaded
+        # the state file, and the replacement's next save dropped A. Now a stopped adapter never records or saves.
         self.fake.state, self.fake.filename = "printing", "makeros/a_cube.gcode"
         self.poll()
         self.fake.state, self.fake.duration = "complete", 3600.0
-        finished, release = self.fake.status(), threading.Event()
-        in_flight = threading.Event()
+        finished, release, in_flight = self.fake.status(), threading.Event(), threading.Event()
 
         def slow_fetch(*_a, **_kw):
             in_flight.set()
             release.wait(5)
             return finished
 
-        threading.Timer(0.3, release.set).start()
         with mock.patch.object(self.adapter, "_fetch_once", side_effect=slow_fetch):
             self.adapter.start()
             self.assertTrue(in_flight.wait(2))
             self.adapter.stop()
-        reborn = self.make()                      # what manager._reconcile_klipper builds next
+            reborn = self.make()                  # what manager._reconcile_klipper builds next, on the same state file
+            release.set()
+            self.adapter._thread.join(2)
+        self.assertFalse(self.adapter._thread.is_alive())
+        self.assertEqual(self.adapter.pending_jobs(), [])          # the late poll was dropped, not applied
+        self.poll(reborn)                         # the printer still shows A finished
         self.fake.state, self.fake.filename, self.fake.duration = "printing", "makeros/b_other.gcode", 0.0
-        self.poll(reborn)                         # print B begins, and the replacement saves its state
+        self.poll(reborn)                         # then B begins, and the replacement saves its state
         self.assertEqual([j["status"] for j in reborn.pending_jobs()], ["done"])
         self.assertEqual([j["status"] for j in self.make().pending_jobs()], ["done"])   # and on disk
 

@@ -207,24 +207,24 @@ class KlipperAdapter:
                 self._thread.join(timeout=HTTP_GET_TIMEOUT_SEC + 1.0)
             except RuntimeError:
                 pass
-        self._stop.clear()
+        # Each poller gets its own stop event (codex review of release-0.68.0): an old poller that outlived the join
+        # above still sees ITS event set and records nothing, so two pollers never both write.
+        self._stop = threading.Event()
         self._started = time.monotonic()
         self._consecutive_failures = 0
         self._thread = threading.Thread(
-            target=self._poll_loop, name=f"klipper-{self.printer_id[:8]}", daemon=True
+            target=self._poll_loop, args=(self._stop,), name=f"klipper-{self.printer_id[:8]}", daemon=True
         )
         self._thread.start()
         log.info("klipper adapter %s polling %s", self.printer_id, self.moonraker_url)
 
     def stop(self) -> None:
-        self._stop.set()
-        # Join (codex review of release-0.68.0): the manager builds the replacement adapter right after this, and it
-        # loads the same state file. A poll still in flight would record and save a finished print after that load,
-        # and the replacement's next save would drop it. ponytail: bounded by one HTTP GET; a poll stuck past that
-        # still races (the thread is daemon). start() also joins before it clears self._stop.
-        t = self._thread
-        if t is not None and t is not threading.current_thread():
-            t.join(timeout=HTTP_GET_TIMEOUT_SEC + 1.0)
+        # Under the lock (codex review of release-0.68.0): a poll records under it and checks its event first, so once
+        # stop() returns this adapter never records or saves again. The manager rescues its jobs after this and builds
+        # the replacement on the same state file; a poll still in flight is dropped, and the replacement's first poll
+        # sees the same printer. No join: the thread is daemon, and nothing it does after this reaches state.
+        with self._lock:
+            self._stop.set()
 
     def _diag(self, subsystem: str, message: str) -> None:
         """Cloud-visible diagnostic record. Resolves the default diagnostics
@@ -671,8 +671,8 @@ class KlipperAdapter:
         }
 
     # --- polling loop -----------------------------------------------------
-    def _poll_loop(self) -> None:
-        while not self._stop.is_set():
+    def _poll_loop(self, stop: threading.Event) -> None:
+        while not stop.is_set():
             try:
                 data = self._fetch_once()
             except Exception as e:  # noqa: BLE001 - never let the thread die
@@ -710,7 +710,9 @@ class KlipperAdapter:
                     POLL_BACKOFF_MAX_SEC,
                 )
             else:
-                was_first = self._record_poll(data)
+                was_first = self._record_poll(data, stop)
+                if was_first is None:
+                    return   # stopped while this poll was in flight
                 # Adversarial review MED #14: explicit "connected" log on
                 # the first-poll-success transition so the cloud admin diag
                 # gets a clear event (mirrors the Bambu adapter's
@@ -723,12 +725,14 @@ class KlipperAdapter:
                     )
                 wait = POLL_INTERVAL_SEC
             # `wait` returns True if .set() fires mid-sleep — exit immediately.
-            if self._stop.wait(wait):
+            if stop.wait(wait):
                 return
 
-    def _record_poll(self, data: dict[str, Any]) -> bool:
-        """Apply one successful poll; True on the first one since start."""
+    def _record_poll(self, data: dict[str, Any], stop: Optional[threading.Event] = None) -> Optional[bool]:
+        """Apply one successful poll; True on the first one since start. None (nothing applied) once `stop` is set."""
         with self._lock:
+            if stop is not None and stop.is_set():
+                return None
             was_first = self._last_poll_ok_at is None
             self._data = data
             self._last_poll_ok_at = time.monotonic()

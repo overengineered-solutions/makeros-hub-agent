@@ -174,11 +174,7 @@ class JobTracker:
         except (OSError, ValueError):
             return
         if isinstance(raw, list):
-            rows = [j for j in raw if isinstance(j, dict) and isinstance(j.get("jobKey"), str)]
-            first = {}
-            for j in rows:   # one row per key, the first: an older agent may have saved a recovered duplicate
-                first.setdefault(j["jobKey"], j)
-            self._pending = list(first.values())[-MAX_PENDING:]
+            self._pending = [j for j in raw if isinstance(j, dict) and isinstance(j.get("jobKey"), str)][-MAX_PENDING:]
 
     def _save_pending(self) -> None:
         if self._state_path is None:
@@ -241,10 +237,6 @@ class JobTracker:
         self._active = None
 
     def _buffer(self, job: dict) -> None:
-        # One row per jobKey. A reloaded tracker's first FINISH re-emits a print it already holds (_emit_recovered: no
-        # start, no duration, endedAt = now); the full row stays, and queue progress never sees two candidates for one print.
-        if any(j["jobKey"] == job["jobKey"] for j in self._pending):
-            return
         self._pending.append(job)
         self._save_pending()
         if len(self._pending) > MAX_PENDING:
@@ -277,8 +269,14 @@ class JobTracker:
                 self.printer_id,
             )
             return
+        key = self._task_key(task_id)
+        if any(j["jobKey"] == key for j in self._pending):
+            # A reloaded tracker (restart or adapter rebuild) already holds this print, observed in full (codex review
+            # of release-0.68.0): a second, poorer row under the same key made queue progress see two candidates for
+            # one print and hold the job (ambiguous_queue_correlation).
+            return
         job = {
-            "jobKey": self._task_key(task_id),
+            "jobKey": key,
             "printerId": self.printer_id,
             "status": "done" if state == _TERMINAL_DONE else "failed",
             "endedAt": _iso(now),

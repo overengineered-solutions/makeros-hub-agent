@@ -2,7 +2,6 @@
 fully covered without paho or a printer; the manager is covered on its non-paho
 paths (klipper/incomplete/removal). Run: python3 -m unittest discover -s tests"""
 
-import json
 import sys
 import tempfile
 import types
@@ -575,9 +574,9 @@ class TestSummarizeShape(unittest.TestCase):
 
 class TestManagerNonPahoPaths(unittest.TestCase):
     def test_a_rebuilt_bambu_tracker_keeps_the_full_record_not_the_recovered_one(self):
-        # codex review of release-0.68.0: a reloaded JobTracker's first FINISH re-emits a print it already holds
-        # (_emit_recovered: no startedAt, no printTimeSeconds, endedAt = now). One row per key, the full one, for the
-        # heartbeat AND queue progress (two rows were two candidates: held ambiguous_queue_correlation).
+        # codex review of release-0.68.0: a reloaded JobTracker's first FINISH re-emitted a print it already held
+        # (_emit_recovered: no startedAt, no printTimeSeconds, endedAt = now). Two rows under one key were two queue
+        # candidates for one print (held ambiguous_queue_correlation), and a keyed merge could report the poorer one.
         from makeros_hub.printers.jobs import JobTracker
 
         with tempfile.TemporaryDirectory() as d:
@@ -591,15 +590,12 @@ class TestManagerNonPahoPaths(unittest.TestCase):
             reloaded.observe(done, 4660.0)
             (job,) = reloaded.pending()
             self.assertEqual((job["jobKey"], job["printTimeSeconds"]), ("task_TEST_77", 3600))
-            (job,) = JobTracker("gaudi", "TEST", state_path=path).pending()   # and what it saved
-            self.assertEqual(job["printTimeSeconds"], 3600)
+            # a real print reusing the task id, observed in full, is still buffered (the cloud decides on the key)
+            reloaded.observe(running, 5000.0)
+            reloaded.observe(done, 6000.0)
+            self.assertEqual([j["printTimeSeconds"] for j in reloaded.pending()], [3600, 1000])
 
-            # a duplicate an older agent already saved: the load keeps the first
-            poor = {"jobKey": "task_TEST_77", "printerId": "gaudi", "status": "done", "endedAt": "2026-10-14T00:00:00Z"}
-            path.write_text(json.dumps([job, poor]))
-            self.assertEqual(JobTracker("gaudi", "TEST", state_path=path).pending(), [job])
-
-        # the manager merges the rescued orphan copy and an adapter's rows the same way: first per key
+        # the manager: an adapter's rows as they are; a rescued orphan only when no adapter holds its key
         class Adapter:
             def __init__(self, rows):
                 self.rows = rows
@@ -610,11 +606,29 @@ class TestManagerNonPahoPaths(unittest.TestCase):
             def stop(self):
                 pass
 
+        other = {"jobKey": "task_TEST_78", "printerId": "gaudi", "status": "done"}
         manager = PrinterManager()
-        manager._adapters["gaudi"] = Adapter([job, poor])
+        manager._adapters["gaudi"] = Adapter([job, other])
         manager._stop("gaudi")
-        manager._adapters["gaudi"] = Adapter([poor])
-        self.assertEqual(manager.pending_jobs(), [job])
+        manager._adapters["gaudi"] = Adapter([job])               # the rebuilt one reloads job; other was acked away
+        self.assertEqual(manager.pending_jobs(), [other, job])
+
+    def test_teardown_stops_the_adapter_before_it_rescues_its_jobs(self):
+        # codex review of release-0.68.0: the rescue ran before stop(), so a terminal recorded during the stop of a
+        # removed printer reached neither the orphan buffer nor any replacement
+        class Adapter:
+            rows = []
+
+            def stop(self):
+                self.rows.append({"jobKey": "fp_last", "status": "done"})
+
+            def pending_jobs(self):
+                return list(self.rows)
+
+        manager = PrinterManager()
+        manager._adapters["gone"] = Adapter()
+        manager.reconcile([], "removed")
+        self.assertEqual([j["jobKey"] for j in manager.pending_jobs()], ["fp_last"])
 
     def test_heartbeat_retries_failed_bambu_without_a_config_change(self):
         instances = []
