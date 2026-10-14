@@ -64,8 +64,8 @@ Before accepting a production rollout, perform a small supervised canary: member
 ## Develop and verify
 
 ```sh
-python3 -m unittest discover -s tests
-bash -n install.sh bootstrap.sh scripts/tailscale-setup.sh
+python3 -m pytest -q    # tests/conftest.py gives each test its own state dirs; plain unittest discover does not
+bash -n install.sh bootstrap.sh scripts/tailscale-setup.sh laser_gate/install.sh
 sh -n update.sh
 ```
 
