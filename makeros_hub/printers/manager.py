@@ -192,11 +192,12 @@ class PrinterManager:
             }
             return
         self._static.pop(pid, None)
-        # Klipper fingerprint = (vendor, moonrakerUrl) — same shape contract
+        # Klipper fingerprint = (vendor, moonrakerUrl, model) — same shape contract
         # as Bambu's (vendor, host, serial, accessCode) so reconcile() can
         # treat them uniformly. Different from _fingerprint() so we compute
-        # it inline here.
-        fp = ("klipper", moonraker_url)
+        # it inline here. The model is in it because start_print refuses a
+        # G-code sliced for another model: an edited model must reach the adapter.
+        fp = ("klipper", moonraker_url, p.get("model"))
         if self._fingerprints.get(pid) == fp and pid in self._adapters:
             return
         self._stop(pid)
@@ -211,7 +212,7 @@ class PrinterManager:
                 "errorReason": "agent_klipper_module_missing",
             }
             return
-        adapter = KlipperAdapter(pid, moonraker_url=moonraker_url)
+        adapter = KlipperAdapter(pid, moonraker_url=moonraker_url, model=p.get("model"))
         try:
             adapter.start()
         except Exception as e:  # noqa: BLE001 - one bad printer can't sink config-down

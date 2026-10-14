@@ -16,12 +16,51 @@ the normal heartbeat billing path.
 from __future__ import annotations
 
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("makeros-hub.queue-progress")
 
 START_TIMEOUT_SEC = 120
+
+
+def _fsync_dir(path: Path) -> bool:
+    """fsync the directory so an os.replace survives a power cut. Returns False when it could NOT be made durable —
+    the pre-publish dispatch save treats that as "not persisted" (codex v0.54 round 3)."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _safe_file_component(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(value))[:80] or "printer"
+
+
+def write_json_durably(path: Path, encoded: str) -> bool:
+    """Atomic replace with the file AND its directory fsynced (power-cut safe). False = not durable; the dispatch path
+    refuses to start a print it could not record."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(encoded)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.error("could not persist %s: %s", path, exc)
+        return False
+    return _fsync_dir(path.parent)
 _ACTIVE_GCODE_STATES = {"RUNNING", "PAUSE"}
 _IDLE_GCODE_STATES = {"", "IDLE", "FINISH", "FAILED", "UNKNOWN"}
 

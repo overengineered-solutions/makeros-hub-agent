@@ -109,9 +109,9 @@ class TestIngestServer(unittest.TestCase):
         self.assertIn("api", body)
         self.assertTrue(body["text"].startswith("OctoPrint"))  # slicer's validity check
 
-    def _upload(self, token, print_flag="true", data=b"PK\x03\x04sliced"):
+    def _upload(self, token, print_flag="true", data=b"PK\x03\x04sliced", file_name="cube.gcode.3mf"):
         boundary = "----makerosTEST"
-        body = build_multipart(boundary, "cube.gcode.3mf", data, {"print": print_flag, "path": ""})
+        body = build_multipart(boundary, file_name, data, {"print": print_flag, "path": ""})
         req = urllib.request.Request(
             self._url("/api/files/local"),
             data=body,
@@ -140,6 +140,26 @@ class TestIngestServer(unittest.TestCase):
         spooled = list(Path(self.tmp.name).rglob("cube.gcode.3mf"))
         self.assertEqual(len(spooled), 1)
         self.assertEqual(spooled[0].read_bytes(), b"PK\x03\x04sliced")
+
+    def test_gcode_upload_hands_its_sliced_metadata_to_the_cloud(self):
+        from test_gcode_meta import sv08_gcode
+
+        status, _ = self._upload("good-token", data=sv08_gcode().encode(), file_name="cube.gcode")
+        self.assertEqual(status, 201)
+        call = self.calls[-1]
+        self.assertEqual(call["printer_model"], "Sovol SV08 MAX")
+        self.assertEqual(call["est_grams"], 5)
+        self.assertEqual(call["required_filaments"], [{"slot": 1, "type": "PLA", "color": "FFFFFFFF", "usedG": 4.53}])
+
+    def test_3mf_upload_hands_no_metadata(self):
+        self._upload("good-token")
+        self.assertFalse({"printer_model", "est_grams", "required_filaments"} & set(self.calls[-1]))
+
+    def test_unreadable_metadata_never_fails_the_upload(self):
+        with mock.patch("makeros_hub.ingest.read_gcode_meta", side_effect=ValueError("garbled")):
+            status, _ = self._upload("good-token", data=b"G28\n", file_name="cube.gcode")
+        self.assertEqual(status, 201)
+        self.assertNotIn("printer_model", self.calls[-1])
 
     def test_missing_api_key_is_403(self):
         boundary = "----b"
