@@ -451,6 +451,19 @@ class TestManagerKlipper(KlipperCase):
         self.assertIsNot(m._adapters["k1"], first)
         self.assertEqual(m._adapters["k1"]._model, "Sovol SV08")
 
+    def test_a_model_edit_rebuild_reports_an_unacked_finished_print_once(self):
+        # the old adapter's unacked job is rescued AND the rebuilt one reloads it from disk: one jobKey, one row
+        m = self.manager()
+        self.fake.state, self.fake.filename = "printing", "makeros/x_cube.gcode"
+        self.poll(m._adapters["k1"])
+        self.fake.state, self.fake.duration = "complete", 3600.0
+        self.poll(m._adapters["k1"])
+        (job,) = m.pending_jobs()
+        m.reconcile([{"id": "k1", "vendor": "klipper", "moonrakerUrl": self.fake.url, "model": "Sovol SV08"}], version="v2")
+        self.assertEqual([j["jobKey"] for j in m.pending_jobs()], [job["jobKey"]])
+        m.ack_jobs([job["jobKey"]])
+        self.assertEqual(m.pending_jobs(), [])
+
     def test_an_assignment_goes_uploading_then_printing(self):
         m = self.manager()
         assignment = {"queueJobId": JOB, "printerId": "k1", "submissionUid": UID, "fileName": "cube.gcode", "assignmentSeq": 3}
