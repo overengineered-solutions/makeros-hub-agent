@@ -11,6 +11,7 @@ This agent connects one Procrastination Station shop box to the sovereign pstati
 - New member codes from pstation use ten random characters, the current OrcaSlicer input limit. Earlier eight-character hashes remain valid until explicitly revoked. Online attempts are limited, but hash disclosure permits offline guessing; code hashes are sensitive, not public identifiers.
 - MQTT reports contain the destination session's own transfer state and filename. FTPS upload notifications select that member's sessions. Tests drive two members and inspect both packets. FTPS does not implement RETR; LIST is empty and SIZE refuses. Unique spool filenames and `(member_id, filename)` capture pairing prevent one member's same-named upload from replacing another's.
 - Passive FTPS binds to the virtual printer's configured address, and accepts a data connection only from the known control peer. Unknown control peers are refused.
+- Lasers (v0.68): the HA push listener answers only its configured source address and a bearer from a 0600 file, and only records readings. The agent's laser verbs are `laser_power_on` (a POST to an HA webhook whose URL is a 0600 file; HA makes the decision) and `laser_load` (a checked file handed to the gate's `/store`). There is no off verb and no path to the laser controller except the gate. The agent holds no HA token and never installs or updates the gate.
 
 ## Root access and updates
 

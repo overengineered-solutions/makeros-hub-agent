@@ -19,3 +19,12 @@ ingest_port = 8787
 
 # Cap a single sliced-file upload, in MB (guards the Pi against a runaway upload).
 max_upload_mb = 64
+
+# Lasers (v0.68). Optional; without it every laser reports "not configured". See docs/laser-ha.md.
+# [laser]
+# ha_push_listen = "0.0.0.0:8788"
+# ha_push_allowed_ip = "192.168.1.213"   # Home Assistant; every other source gets 403
+# gate_url = "http://127.0.0.1:7650"     # omit until the gate is installed; loopback or a private IPv4 only
+# cutting_amps = 2.0
+# on_amps = 0.5
+# run_gap_s = 60

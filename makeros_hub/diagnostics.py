@@ -35,6 +35,8 @@ SUBSYSTEMS = (
     # LAN discovery sweep (Moonraker HTTP probe + Bambu SSDP listener) —
     # subnet derivation failures, sweep budget timeouts, SSDP bind denies.
     "lan_scan",
+    # v0.68 lasers: the HA push listener, the gate link, laser commands.
+    "laser",
 )
 ERROR_MESSAGE_MAX = 280
 LOG_MESSAGE_MAX = 180

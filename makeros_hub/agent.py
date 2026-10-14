@@ -43,6 +43,7 @@ from .vprinter.pool_ranking import PoolRankingState
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import get_to_file, TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
+from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import PrinterManager
 from .printers.camera import CameraScheduler, collect_camera_frames, prime_camera_capabilities
@@ -101,7 +102,7 @@ def _validate_heartbeat(body: dict) -> None:
         raise TransportError("heartbeat response has invalid poll interval")
     if type(body.get("applied")) is not int or body["applied"] < 0:
         raise TransportError("heartbeat response missing applied count")
-    for k in ("assignments", "pendingProbes", "pendingCommands", "fetches"):
+    for k in ("assignments", "pendingProbes", "pendingCommands", "fetches", "laserChecks"):
         if k in body and (not isinstance(body[k], list) or any(not isinstance(x, dict) for x in body[k])):
             raise TransportError(f"heartbeat response has invalid {k}")
 
@@ -662,6 +663,8 @@ def heartbeat_payload(
     discovery_hits: list[dict] | None = None,
     vp_bindings: list[dict] | None = None,
     pi_metrics: dict | None = None,
+    lasers: list[dict] | None = None,
+    laser_file_checks: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -727,6 +730,12 @@ def heartbeat_payload(
     # virtual_printers.bind_ip. Empty/missing = no fresh allocations this tick.
     if vp_bindings:
         payload["vpBindings"] = list(vp_bindings)[:64]
+    # Lasers (v0.68): plug state, runs and gate link per laser in config-down (omitted when it lists none), and the
+    # gate's verdicts on member files the cloud offered.
+    if lasers:
+        payload["lasers"] = list(lasers)[:8]
+    if laser_file_checks:
+        payload["laserFileChecks"] = list(laser_file_checks)[:16]
     diag = collect_cheap_diagnostics(diagnostics)
     if diag:
         payload["diagnostics"] = diag
@@ -1030,6 +1039,9 @@ def _pull_config(
         # point applying config we're about to drop on the restart.
         _maybe_restart_on_nonce(resp.body.get("restartNonce"))
         manager.reconcile(printers, version)
+        laser_hub = getattr(manager, "laser", None)
+        if laser_hub is not None:
+            laser_hub.set_lasers(resp.body.get("lasers"))   # v0.68; absent = no lasers
         # Multi-VP config-down (v0.40.0+): the cloud emits a `virtualPrinters`
         # array (plural). For each VP without a bind_ip, run the IP allocator
         # to claim one + queue the allocation for the next heartbeat
@@ -1349,7 +1361,13 @@ def run(
         )
 
     interval = cfg.heartbeat_sec
-    manager = PrinterManager(diagnostics=diagnostics)
+    laser_hub = LaserHub(
+        cfg.laser,
+        fetcher=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential,
+                                               max_bytes=LASER_FILE_MAX_BYTES, max_seconds=60.0),
+        diagnostics=diagnostics,
+    )
+    manager = PrinterManager(diagnostics=diagnostics, laser=laser_hub)
     # Wire the camera-test probe so it can enumerate the same printer list
     # the heartbeat tick captures from. Filtered by cameraEnabled so the
     # probe doesn't fire ffmpeg against printers the admin has explicitly
@@ -1456,6 +1474,7 @@ def run(
     if pulled_tailscale_status:
         tailscale_status = pulled_tailscale_status
     maybe_rehydrate_vprinter_outbox()
+    laser_hub.start()   # HA's plug-reading pushes (only with a [laser] table)
 
     # Start the OrcaSlicer ingest server (inbound HTTP on the LAN). Best-effort:
     # if the port is taken we log + continue (heartbeat/telemetry still work).
@@ -1791,6 +1810,13 @@ def run(
                         f"collect failed: {redact(str(exc))}",
                     )
                     pi_metrics = None
+                # Lasers (v0.68): a finished load's result joins the command results; the report polls the gate (3 s max).
+                laser_report = None
+                try:
+                    pending_command_results.extend(laser_hub.take_command_results())
+                    laser_report = laser_hub.report()
+                except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
+                    _record_diagnostic(diagnostics, "laser", f"laser report failed: {redact(str(exc))}")
                 resp = post_json(
                     cfg.heartbeat_url,
                     heartbeat_payload(
@@ -1808,6 +1834,8 @@ def run(
                         discovery_hits=discovery_hits,
                         vp_bindings=pending_vp_bindings,
                         pi_metrics=pi_metrics,
+                        lasers=laser_report.lasers if laser_report else None,
+                        laser_file_checks=laser_report.file_checks if laser_report else None,
                     ),
                     bearer=credential,
                     retries=3,
@@ -1827,6 +1855,13 @@ def run(
                         log.info("reported %d command result(s) to the cloud", reported_command_count)
                     reported_binding_count = len(pending_vp_bindings)
                     pending_vp_bindings = []
+                    try:
+                        if laser_report is not None:
+                            laser_hub.ack(laser_report)   # closed runs and file verdicts delivered
+                        if laser_hub.offer_checks(resp.body.get("laserChecks")):
+                            log.info("laser: queued file check(s) for the gate")
+                    except Exception as exc:  # noqa: BLE001 - a bad laser field never stops the loop
+                        _record_diagnostic(diagnostics, "laser", f"laser ack/offers failed: {redact(str(exc))}")
                     if reported_binding_count:
                         log.info("reported %d VP binding(s) to the cloud", reported_binding_count)
                     assignments = resp.body.get("assignments")
@@ -1987,6 +2022,7 @@ def run(
         except Exception as exc:  # noqa: BLE001 - best-effort shutdown
             log.warning("virtual printer shutdown failed: %s", redact(str(exc)))
         manager.stop_all()
+        laser_hub.stop()
         if ingest is not None:
             ingest.stop()
         _restore_shutdown_signal_handlers(previous_signal_handlers)
