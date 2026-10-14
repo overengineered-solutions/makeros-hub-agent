@@ -33,7 +33,7 @@ import paho.mqtt.client as mqtt
 
 from . import bambu_parse, bambu_send, tray_translate
 from .jobs import JobTracker
-from .queue_progress import QueueProgressTracker
+from .queue_progress import QueueProgressTracker, _fsync_dir, _safe_file_component
 from ..vprinter.capture import parse_printer_model_id
 from ..vprinter.report import MODEL_PRODUCT_NAMES
 
@@ -46,25 +46,6 @@ def _sliced_model_matches(path, model: str | None) -> bool:
     actual = MODEL_PRODUCT_NAMES.get(parse_printer_model_id(Path(path)))
     return expected is not None and actual == expected
 
-
-def _fsync_dir(path: Path) -> bool:
-    """fsync the directory so an os.replace survives a power cut. Returns False when it could NOT be made durable —
-    the pre-publish dispatch save treats that as "not persisted" (codex v0.54 round 3)."""
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return False
-    try:
-        os.fsync(fd)
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-
-
-def _safe_file_component(value: str) -> str:
-    return "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(value))[:80] or "printer"
 
 log = logging.getLogger("makeros-hub.bambu")
 

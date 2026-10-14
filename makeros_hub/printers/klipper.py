@@ -12,6 +12,11 @@ Scope (PR-1 + PR-2 combined):
   tracker that emits terminal print_jobs from observed print_stats.state
   transitions — same wire shape as the Bambu adapter's JobTracker so the
   cloud ingest is vendor-agnostic.
+- Queue dispatch: start_print uploads a cloud-assigned G-code
+  (POST /server/files/upload) and starts it (POST /printer/print/start);
+  collect_queue_progress turns observed print_stats into queue reports through
+  the same QueueProgressTracker as Bambu. Dispatch state and unacked terminal
+  jobs are persisted (owner rule: nothing that matters lives only in RAM).
 
 Auth: trusted LAN — Moonraker is typically wide open on the makerspace LAN.
 A future PR can add the standard `X-Api-Key` header (operator pastes the
@@ -24,14 +29,25 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import re
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
+from .gcode_meta import read_gcode_meta
+from .queue_progress import QueueProgressTracker, _safe_file_component, write_json_durably
+
 log = logging.getLogger(__name__)
+
+# Same env vars + defaults as bambu.py (one directory per kind of state, one file per printer). Defined here, not
+# imported: bambu.py needs paho.
+QUEUE_PROGRESS_DIR = Path(os.environ.get("MAKEROS_HUB_QUEUE_PROGRESS_DIR", "/var/lib/makeros-hub/queue-progress"))
+TERMINAL_JOBS_DIR = Path(os.environ.get("MAKEROS_HUB_TERMINAL_JOBS_DIR", "/var/lib/makeros-hub/terminal-jobs"))
 
 # Job-buffer cap (mirror of the Bambu JobTracker). If somehow the cloud is
 # offline for >MAX_PENDING completed prints we drop the OLDEST so we never
@@ -61,6 +77,11 @@ HTTP_CONTROL_TIMEOUT_SEC = 15.0
 # Backwards-compat — older direct references still resolve, but new code
 # should pick the per-call constant above.
 HTTP_TIMEOUT_SEC = HTTP_GET_TIMEOUT_SEC
+# A large-format G-code over the shop LAN; Moonraker also parses its metadata before it answers.
+HTTP_UPLOAD_TIMEOUT_SEC = 120.0
+# Where dispatched files land under Moonraker's gcodes root, and the cap on the whole relative path.
+REMOTE_DIR = "makeros"
+REMOTE_PATH_MAX_CHARS = 200
 # Backoff caps on consecutive poll failures so a long-unreachable printer
 # stops hammering the network at 5s intervals.
 POLL_BACKOFF_MAX_SEC = 30.0
@@ -96,14 +117,31 @@ _STATE_MAP = {
     "error": "error",
 }
 
+# print_stats.state → the Bambu gcode_state vocabulary QueueProgressTracker speaks.
+_GCODE_STATE_MAP = {
+    "printing": "RUNNING",
+    "paused": "PAUSE",
+    "standby": "IDLE",
+    "complete": "FINISH",
+    "cancelled": "FAILED",
+    "error": "FAILED",
+}
+# start_print's live check: is klippy up, and is the printer between prints?
+_LIVE_QUERY = "webhooks=state&print_stats=state,filename"
+_STARTABLE_STATES = frozenset({"standby", "complete", "cancelled"})
+_UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
 
 class KlipperAdapter:
     """Owns one Klipper printer's Moonraker connection. Thread-safe reads via
     `status()`; a background polling thread keeps the cached state fresh."""
 
-    def __init__(self, printer_id: str, moonraker_url: str, diagnostics=None):
+    def __init__(self, printer_id: str, moonraker_url: str, diagnostics=None, *, model: Optional[str] = None):
         self.printer_id = printer_id
         self.moonraker_url = _normalize_base(moonraker_url)
+        # The cloud's machines.model. start_print refuses a G-code whose printer_model is not exactly this; the
+        # status DTO never carries it (the `model` property below stays None).
+        self._model = model
         self._lock = threading.Lock()
         self._data: dict[str, Any] = {}
         self._last_poll_ok_at: Optional[float] = None
@@ -122,7 +160,18 @@ class KlipperAdapter:
         # each successful tick; drained via pending_jobs() and cleared via
         # ack_jobs() — same shape as the Bambu adapter so the cloud ingest
         # is vendor-agnostic.
-        self._job_tracker = KlipperJobTracker(printer_id)
+        safe_id = _safe_file_component(printer_id)
+        self._job_tracker = KlipperJobTracker(printer_id, state_path=TERMINAL_JOBS_DIR / f"{safe_id}.json")
+        # Queue assignment ↔ print correlation, driven by OBSERVED print_stats
+        # (same tracker as Bambu), persisted so an update / power cut never
+        # loses which queue job the printer is running.
+        self._queue_progress = QueueProgressTracker()
+        self._queue_progress_path = QUEUE_PROGRESS_DIR / f"{safe_id}.json"
+        self._queue_progress_saved = ""
+        try:
+            self._queue_progress.load_state(json.loads(self._queue_progress_path.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
+            pass
 
     # Bambu compat — every adapter exposes these. The model field is only
     # set by Bambu so the agent's status pipeline can omit it.
@@ -214,6 +263,248 @@ class KlipperAdapter:
         """Drop jobs the cloud confirmed receiving (after a heartbeat 200)."""
         with self._lock:
             self._job_tracker.ack(job_keys)
+
+    # --- queue dispatch (cloud assignment → Moonraker) --------------------
+    def pending_queue_job_ids(self) -> list[str]:
+        with self._lock:
+            return self._queue_progress.pending_queue_job_ids()
+
+    def pending_queue_jobs(self) -> list[dict]:
+        with self._lock:
+            return self._queue_progress.pending_queue_jobs()
+
+    def start_print(
+        self,
+        local_path,
+        file_name: str,
+        *,
+        plate: int = 1,
+        use_ams: bool = False,
+        ams_mapping=None,
+        queue_job_id: str | None = None,
+        raw_print: dict | None = None,
+        required_filaments: list | None = None,
+        assignment_seq: int | None = None,
+    ) -> dict:
+        """Upload a cloud-assigned G-code to Moonraker and start it. Same keywords as BambuAdapter.start_print; plate,
+        use_ams, ams_mapping, raw_print and required_filaments are Bambu-only and ignored (Klipper has no AMS mirror —
+        the cloud checks the staff-set loaded filament before it assigns).
+
+        Order: idempotency → model gate → live idle check → record + persist the dispatch → upload → start. Nothing is
+        uploaded before the dispatch is durable; a step that certainly failed forgets the dispatch again."""
+        if not isinstance(queue_job_id, str) or not queue_job_id:
+            return {"ok": False, "reason": "bad_assignment"}
+        with self._lock:
+            pending = self._queue_progress.pending_queue_jobs()
+            mine = [p for p in pending if p["queueJobId"] == queue_job_id]
+            if mine:
+                old_seq = mine[0].get("assignmentSeq")
+                if old_seq is None or assignment_seq is None or old_seq == assignment_seq:
+                    # the durable dispatch state already holds THIS assignment: nothing is uploaded or started twice
+                    log.info("klipper %s: %s already dispatched here — not starting it again", self.printer_id, queue_job_id)
+                    return {"ok": True, "already_dispatched": True}
+                log.warning("klipper %s: %s re-assigned (seq %s → %s) — superseding the stale dispatch record",
+                            self.printer_id, queue_job_id, old_seq, assignment_seq)
+                self._queue_progress.discard_dispatch(queue_job_id)
+                self._save_queue_progress()
+                pending = [p for p in pending if p["queueJobId"] != queue_job_id]
+            if pending:
+                # another job's outcome on this printer is still unknown: never stack a second start on it
+                return {"ok": False, "reason": "printer_busy: dispatch_pending"}
+
+        # The cloud matched the job to this printer by model; the file itself must agree (G-code for another machine
+        # must never reach a printer — the same rule as Bambu's _sliced_model_matches).
+        try:
+            meta = read_gcode_meta(local_path)
+        except OSError:
+            meta = None
+        sliced = (meta or {}).get("printerModel")
+        if not (self._model and sliced and sliced.strip() == self._model.strip()):
+            log.warning("klipper %s: refusing %s — sliced for %r, this printer is %r", self.printer_id, queue_job_id, sliced, self._model)
+            return {"ok": False, "reason": "model_mismatch"}
+
+        refusal = self._live_refusal()
+        if refusal:
+            log.info("klipper %s: not starting %s — %s", self.printer_id, queue_job_id, refusal)
+            return {"ok": False, "reason": refusal}
+
+        remote = _remote_path(queue_job_id, file_name)
+        if not self._record_dispatch(queue_job_id, remote, assignment_seq):
+            return {"ok": False, "reason": "state_persist_failed"}
+        try:
+            uploaded = self._upload(Path(local_path), remote)
+        except Exception as exc:  # noqa: BLE001 — any failure: the file is not (provably) there
+            detail = _http_detail(exc)
+            log.warning("klipper %s: upload of %s failed: %s", self.printer_id, remote, detail)
+            self._diag("klipper", f"upload for {queue_job_id[:8]} failed: {detail}")
+            self._discard_dispatch(queue_job_id)
+            return {"ok": False, "reason": "upload_failed"}
+        if uploaded != remote:
+            # Moonraker names the file it stored; print_stats.filename will be that name, so the dispatch must be too.
+            self._discard_dispatch(queue_job_id)
+            if not self._record_dispatch(queue_job_id, uploaded, assignment_seq):
+                return {"ok": False, "reason": "state_persist_failed"}
+
+        url = f"{self.moonraker_url}/printer/print/start?{urllib.parse.urlencode({'filename': uploaded})}"
+        req = urllib.request.Request(
+            url, method="POST", data=b"",
+            headers={"Content-Length": "0", "Accept": "application/json", "User-Agent": "makeros-hub-agent"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=HTTP_CONTROL_TIMEOUT_SEC) as resp:  # noqa: S310 - operator LAN URL
+                body = resp.read(8 * 1024)
+        except urllib.error.HTTPError as exc:
+            detail = _http_detail(exc)
+            log.warning("klipper %s: start of %s refused: %s", self.printer_id, uploaded, detail)
+            self._diag("klipper", f"print start for {queue_job_id[:8]} refused: {detail}")
+            self._discard_dispatch(queue_job_id)
+            return {"ok": False, "reason": "start_command_failed"}
+        except (urllib.error.URLError, OSError) as exc:
+            # The command may have reached klippy: keep the dispatch and let telemetry decide (RUNNING → printing;
+            # nothing within the start timeout → start_not_observed). Never a second start on top of a maybe-first.
+            log.warning("klipper %s: start of %s unconfirmed (%s) — waiting on telemetry", self.printer_id, uploaded, _classify_error(exc))
+            return {"ok": True}
+        try:
+            parsed = json.loads(body.decode("utf-8", errors="replace"))
+        except ValueError:
+            parsed = None
+        if not (isinstance(parsed, dict) and parsed.get("result") == "ok"):
+            self._diag("klipper", f"print start for {queue_job_id[:8]} answered without ok")
+            self._discard_dispatch(queue_job_id)
+            return {"ok": False, "reason": "start_command_failed"}
+        log.info("klipper %s: started %s for %s", self.printer_id, uploaded, queue_job_id)
+        return {"ok": True}
+
+    def _live_refusal(self) -> Optional[str]:
+        """None when klippy is ready and the printer is between prints; else the held reason. A fresh query, not the
+        poll cache — the cache may be seconds old and a member may just have started something at the screen."""
+        try:
+            status = self._fetch_once(_LIVE_QUERY)
+        except Exception as exc:  # noqa: BLE001
+            return f"printer_stale: {_classify_error(exc)}"
+        hooks = status.get("webhooks")
+        stats = status.get("print_stats")
+        klippy = hooks.get("state") if isinstance(hooks, dict) else None
+        state = stats.get("state") if isinstance(stats, dict) else None
+        if not isinstance(klippy, str) or not isinstance(state, str):
+            return "printer_stale: shape_mismatch"
+        if klippy != "ready":
+            return f"printer_busy: klippy_{_UNSAFE_NAME.sub('_', klippy)[:24]}"
+        if state in ("printing", "paused"):
+            return "printer_busy: printing"
+        if state == "error":
+            return "printer_busy: klipper_error"
+        if state not in _STARTABLE_STATES:
+            return f"printer_busy: {_UNSAFE_NAME.sub('_', state)[:24]}"
+        return None
+
+    def _record_dispatch(self, queue_job_id: str, task_name: str, assignment_seq) -> bool:
+        with self._lock:
+            self._queue_progress.record_dispatch(
+                queue_job_id, self._job_tracker.pending(), task_name=task_name,
+                active_key=self._job_tracker.active_key(), assignment_seq=assignment_seq,
+            )
+            if self._save_queue_progress():
+                return True
+            # a print we cannot track across a restart is a print we do not start
+            self._queue_progress.discard_dispatch(queue_job_id)
+            log.error("klipper %s: refusing to start %s — dispatch state could not be persisted", self.printer_id, queue_job_id)
+            return False
+
+    def _discard_dispatch(self, queue_job_id: str) -> None:
+        with self._lock:
+            self._queue_progress.discard_dispatch(queue_job_id)
+            self._save_queue_progress()
+
+    def _upload(self, local: Path, remote: str) -> str:
+        """POST /server/files/upload, streamed (the file is never read into memory whole). Returns the stored path
+        relative to the gcodes root (item.path). `print` is deliberately NOT sent: with it Moonraker swallows a failed
+        start, or silently job-queues the file to start later (file_manager._finish_gcode_upload)."""
+        directory, _, name = remote.rpartition("/")
+        digest = hashlib.sha256()
+        with local.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        boundary = "makeros" + os.urandom(12).hex()
+        fields = {"root": "gcodes", "path": directory, "checksum": digest.hexdigest()}
+        head = "".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n' for k, v in fields.items())
+        head += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+                 "Content-Type: application/octet-stream\r\n\r\n")
+        head_bytes = head.encode("utf-8")
+        tail_bytes = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        size = local.stat().st_size
+
+        def body():
+            yield head_bytes
+            with local.open("rb") as src:
+                yield from iter(lambda: src.read(1 << 20), b"")
+            yield tail_bytes
+
+        req = urllib.request.Request(
+            f"{self.moonraker_url}/server/files/upload",
+            data=body(),
+            method="POST",
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Content-Length": str(len(head_bytes) + size + len(tail_bytes)),
+                "Accept": "application/json",
+                "User-Agent": "makeros-hub-agent",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=HTTP_UPLOAD_TIMEOUT_SEC) as resp:  # noqa: S310 - operator LAN URL
+            status = resp.status
+            raw = resp.read(64 * 1024)
+        if status != 201:
+            raise ValueError(f"upload answered http_{status}, expected 201")
+        parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        # The upload body is NOT wrapped in "result" (application.py FileUploadHandler); accept a wrapped one anyway.
+        result = parsed.get("result", parsed) if isinstance(parsed, dict) else None
+        item = result.get("item") if isinstance(result, dict) else None
+        path = item.get("path") if isinstance(item, dict) else None
+        if not isinstance(path, str) or not path:
+            raise ValueError("upload answered without item.path")
+        return path
+
+    def collect_queue_progress(self, on_report=None) -> list[dict]:
+        """Drain queue-status reports inferred from observed print_stats. `on_report` receives each report BEFORE the
+        popped dispatch state is persisted (the agent writes it to the durable outbox there); a report that could not be
+        made durable rolls the tracker back and hands out nothing — the same reports come again next beat."""
+        with self._lock:
+            last = self._last_poll_ok_at
+            stats = self._data.get("print_stats") if isinstance(self._data, dict) else None
+            raw_state = stats.get("state") if isinstance(stats, dict) else None
+            # None = no FRESH observation: silence is not idle, so no timeouts run on it
+            fresh = last is not None and (time.monotonic() - last) <= STALE_SEC
+            gcode_state = _GCODE_STATE_MAP.get(raw_state) if fresh and isinstance(raw_state, str) else None
+            before = self._queue_progress.to_state()
+            task_names = {d["queueJobId"]: d.get("taskName") for d in before["dispatches"]}
+            reports = self._queue_progress.collect(self._job_tracker.pending(), gcode_state)
+            for report in reports:
+                task = task_names.get(report.get("queueJobId"))
+                key = self._job_tracker.active_key(task) if report.get("state") == "printing" and task else None
+                if key:
+                    report["printerJobKey"] = key   # the cloud stamps hub_job_ref from it, so the terminal job links
+            if callable(on_report):
+                for report in reports:
+                    try:
+                        on_report(report)
+                    except Exception as exc:  # noqa: BLE001
+                        log.error("progress report not durable (%s) — keeping the dispatch state, retrying next beat", exc)
+                        self._queue_progress.load_state(before, now=time.monotonic(), now_wall=time.time())
+                        return []
+            self._save_queue_progress()
+            return reports
+
+    def _save_queue_progress(self) -> bool:
+        """Write only when the state changed (SD-card friendly). False = not durable."""
+        encoded = json.dumps(self._queue_progress.to_state(), sort_keys=True)
+        if encoded == self._queue_progress_saved:
+            return True
+        if not write_json_durably(self._queue_progress_path, encoded):
+            log.error("klipper %s: queue progress could not be made durable", self.printer_id)
+            return False
+        self._queue_progress_saved = encoded
+        return True
 
     def send_command(self, command: str, params: dict | None = None) -> dict:
         """Pause / resume / stop the active print over Moonraker's standard
@@ -390,19 +681,7 @@ class KlipperAdapter:
                     POLL_BACKOFF_MAX_SEC,
                 )
             else:
-                with self._lock:
-                    was_first = self._last_poll_ok_at is None
-                    self._data = data
-                    self._last_poll_ok_at = time.monotonic()
-                    self._last_error_reason = None
-                    self._consecutive_failures = 0
-                    # Feed the job tracker every successful poll. Pure helper —
-                    # converts the Moonraker status dict to the (state, filename,
-                    # print_duration) it needs and accumulates terminal-state
-                    # transitions into pending_jobs. Lock held throughout so a
-                    # concurrent `pending_jobs()` / `ack_jobs()` call sees a
-                    # consistent buffer.
-                    self._job_tracker.observe(data, time.monotonic())
+                was_first = self._record_poll(data)
                 # Adversarial review MED #14: explicit "connected" log on
                 # the first-poll-success transition so the cloud admin diag
                 # gets a clear event (mirrors the Bambu adapter's
@@ -418,8 +697,25 @@ class KlipperAdapter:
             if self._stop.wait(wait):
                 return
 
-    def _fetch_once(self) -> dict[str, Any]:
-        url = f"{self.moonraker_url}/printer/objects/query?{_QUERY_OBJECTS}"
+    def _record_poll(self, data: dict[str, Any]) -> bool:
+        """Apply one successful poll; True on the first one since start."""
+        with self._lock:
+            was_first = self._last_poll_ok_at is None
+            self._data = data
+            self._last_poll_ok_at = time.monotonic()
+            self._last_error_reason = None
+            self._consecutive_failures = 0
+            # Feed the job tracker every successful poll. Pure helper —
+            # converts the Moonraker status dict to the (state, filename,
+            # print_duration) it needs and accumulates terminal-state
+            # transitions into pending_jobs. Lock held throughout so a
+            # concurrent `pending_jobs()` / `ack_jobs()` call sees a
+            # consistent buffer.
+            self._job_tracker.observe(data, time.monotonic())
+        return was_first
+
+    def _fetch_once(self, query: str = _QUERY_OBJECTS) -> dict[str, Any]:
+        url = f"{self.moonraker_url}/printer/objects/query?{query}"
         req = urllib.request.Request(
             url, headers={"Accept": "application/json", "User-Agent": "makeros-hub-agent"}
         )
@@ -427,7 +723,7 @@ class KlipperAdapter:
             body = resp.read(64 * 1024)
         parsed = json.loads(body.decode("utf-8", errors="replace"))
         # Moonraker shape: { result: { status: { print_stats: {...}, ... } } }
-        result = parsed.get("result")
+        result = parsed.get("result") if isinstance(parsed, dict) else None
         if not isinstance(result, dict):
             raise ValueError("missing result")
         status = result.get("status")
@@ -466,6 +762,27 @@ def _classify_error(err: BaseException) -> str:
     if isinstance(err, (ValueError, json.JSONDecodeError)):
         return "shape_mismatch"
     return "unknown"
+
+
+def _remote_path(queue_job_id: str, file_name: str) -> str:
+    """makeros/<job8>_<file>, at most REMOTE_PATH_MAX_CHARS, the extension kept (Moonraker only treats .gcode/.gco/.g
+    as printable). Names are reduced to [A-Za-z0-9._-] so they are safe in a multipart header and a query string."""
+    name = _UNSAFE_NAME.sub("_", PurePosixPath(file_name).name) or "print.gcode"
+    suffix = PurePosixPath(name).suffix
+    stem = name[: len(name) - len(suffix)] if suffix else name
+    prefix = f"{REMOTE_DIR}/{_UNSAFE_NAME.sub('_', queue_job_id[:8])}_"
+    return prefix + stem[: max(1, REMOTE_PATH_MAX_CHARS - len(prefix) - len(suffix))] + suffix
+
+
+def _http_detail(err: BaseException) -> str:
+    """A short, log-safe description of a failed Moonraker call (HTTP code + Moonraker's own message)."""
+    if isinstance(err, urllib.error.HTTPError):
+        try:
+            message = _extract_moonraker_error_message(err.read(8 * 1024).decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            message = ""
+        return f"HTTP {err.code} {message}".strip()[:200]
+    return f"{_classify_error(err)}: {err}"[:200]
 
 
 def _num(v: Any) -> Optional[float]:
@@ -629,7 +946,8 @@ class KlipperJobTracker:
     cancelled / error / standby (Moonraker's terminal states).
 
     Stateful but lock-managed externally (the KlipperAdapter holds its own
-    lock around observe + pending + ack). Pure dict / list ops here.
+    lock around observe + pending + ack). Dict / list ops, plus a durable
+    save (state_path) whenever the terminal buffer changes.
 
     Job key is a sha256 of (printer_id, filename, started_ts_ms). Klipper
     doesn't expose a stable per-print task id like Bambu's MQTT task_id,
@@ -637,11 +955,18 @@ class KlipperJobTracker:
     same-second collisions on cancel→restart-of-same-file.
     """
 
-    def __init__(self, printer_id: str):
+    def __init__(self, printer_id: str, state_path: Optional[Path] = None):
         self.printer_id = printer_id
         self._active: Optional[dict] = None
         self._pending: list[dict] = []
         self._last_state: str = ""
+        # Durability (owner rule: not RAM-only): unacked terminal jobs, plus the last print this tracker reported
+        # ({filename, printDuration}) — without it every restart onto a printer still showing that print as complete
+        # re-reports it under a NEW key (the key is built from monotonic time) and the cloud books it twice.
+        self._state_path = state_path
+        self._last_terminal: Optional[dict] = None
+        self._seen_duration: Optional[float] = None
+        self._load()
         # Track print_duration across polls so a printing→complete→printing
         # cycle that fits inside one 5s poll window is detected via the
         # reset (new print_duration < prior). Adversarial-review HIGH #2:
@@ -669,6 +994,7 @@ class KlipperJobTracker:
         # printing→complete→printing cycle that lands inside one 5s poll
         # window is detected via the reset edge.
         print_duration = _num(print_stats.get("print_duration"))
+        self._seen_duration = print_duration
 
         if self._active is None:
             if state in _ACTIVE_STATES:
@@ -686,7 +1012,9 @@ class KlipperJobTracker:
             if state in _TERMINAL_DONE_STATES:
                 self._close("done", now)
             elif state in _TERMINAL_FAILED_STATES:
-                self._close("failed", now)
+                # Moonraker, unlike Bambu, says which: 'cancelled' is a person stopping it (the cloud's evidence-only
+                # cancelled lane, member text "cancelled at the printer"); 'error' is a failure.
+                self._close("cancelled" if state == "cancelled" else "failed", now)
             elif state in _ACTIVE_STATES:
                 # Hidden-cycle detection (adversarial review HIGH #2): a
                 # full print→complete→printing or printing→cancelled→printing
@@ -741,11 +1069,42 @@ class KlipperJobTracker:
     def pending(self) -> list[dict]:
         return list(self._pending)
 
+    def active_key(self, filename: Optional[str] = None) -> Optional[str]:
+        """The print running now (its jobKey), or None. With `filename`: only when the running print is that file."""
+        if self._active is None or (filename is not None and self._active.get("name") != filename):
+            return None
+        return self._active["key"]
+
     def ack(self, job_keys: list[str]) -> None:
         keys = set(job_keys)
+        before = len(self._pending)
         self._pending = [j for j in self._pending if j["jobKey"] not in keys]
+        if len(self._pending) != before:
+            self._save()
 
     # --- internals --------------------------------------------------------
+    def _load(self) -> None:
+        if self._state_path is None:
+            return
+        try:
+            raw = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        pending = raw.get("pending") if isinstance(raw.get("pending"), list) else []
+        self._pending = [j for j in pending if isinstance(j, dict) and isinstance(j.get("jobKey"), str)][-MAX_PENDING_JOBS:]
+        last = raw.get("lastTerminal")
+        if isinstance(last, dict) and isinstance(last.get("filename"), str):
+            self._last_terminal = {"filename": last["filename"], "printDuration": _num(last.get("printDuration"))}
+
+    def _save(self) -> None:
+        if self._state_path is None:
+            return
+        state = json.dumps({"pending": self._pending, "lastTerminal": self._last_terminal}, sort_keys=True)
+        if not write_json_durably(self._state_path, state):
+            # A terminal cannot be refused (the print already ended); loud so the journal shows it.
+            log.error("klipper %s: terminal jobs not durable (RAM-only until acked)", self.printer_id)
 
     def _open(self, filename: Optional[str], now: float) -> None:
         self._active = {
@@ -767,6 +1126,7 @@ class KlipperJobTracker:
         }
         if self._active.get("name"):
             job["filename"] = self._active["name"]
+            self._last_terminal = {"filename": self._active["name"], "printDuration": self._seen_duration}
         self._buffer(job)
         self._active = None
 
@@ -792,8 +1152,13 @@ class KlipperJobTracker:
                 self.printer_id,
             )
             return
-        status_out = "done" if state in _TERMINAL_DONE_STATES else "failed"
+        status_out = "done" if state in _TERMINAL_DONE_STATES else ("cancelled" if state == "cancelled" else "failed")
         print_dur = _num(print_stats.get("print_duration"))
+        last = self._last_terminal
+        if last is not None and last["filename"] == filename and _same_duration(last["printDuration"], print_dur):
+            log.info("klipper %s: %s was already reported before the restart — not again", self.printer_id, filename)
+            return
+        self._last_terminal = {"filename": filename, "printDuration": print_dur}
         if print_dur is not None and print_dur > 0:
             print_time_seconds = int(print_dur)
             started_at = now - print_dur
@@ -821,6 +1186,14 @@ class KlipperJobTracker:
                 self.printer_id,
                 len(dropped),
             )
+        self._save()
+
+
+def _same_duration(a: Optional[float], b: Optional[float]) -> bool:
+    """print_duration freezes when a print ends, so the same print reads the same after a restart (1 s of slack)."""
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(a - b) < 1.0
 
 
 def _job_filename(print_stats: dict[str, Any]) -> Optional[str]:

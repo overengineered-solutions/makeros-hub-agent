@@ -478,7 +478,9 @@ class TestKlipperJobTracker(unittest.TestCase):
         self.assertRegex(job["startedAt"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
         self.assertRegex(job["endedAt"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
-    def test_close_on_cancelled_emits_failed_job(self):
+    def test_close_on_cancelled_emits_cancelled_job(self):
+        # Moonraker says 'cancelled' only when a person stopped the print — the cloud's evidence-only cancelled lane,
+        # not a failure (an 'error' state below still reports failed).
         Track = self._import()
         t = Track("p1")
         t.observe(
@@ -489,7 +491,7 @@ class TestKlipperJobTracker(unittest.TestCase):
         )
         pending = t.pending()
         self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["status"], "failed")
+        self.assertEqual(pending[0]["status"], "cancelled")
 
     def test_close_on_error_emits_failed_job(self):
         Track = self._import()

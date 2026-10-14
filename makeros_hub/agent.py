@@ -110,17 +110,26 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
     """Closure the ingest server calls to register an OrcaSlicer upload with the
     cloud. Maps the /api/print/hub/submit response to an ingest outcome dict."""
 
-    def submit(*, member_token, submission_uid, file_name, file_sha256, file_size, print_now):
+    def submit(*, member_token, submission_uid, file_name, file_sha256, file_size, print_now,
+               printer_model=None, est_grams=None, required_filaments=None):
+        body = {
+            "memberToken": member_token,
+            "hubSubmissionUid": submission_uid,
+            "fileName": file_name,
+            "fileSha256": file_sha256,
+            "fileSizeBytes": file_size,
+        }
+        # What the G-code says it was sliced for (gcode_meta) — additive, omitted when absent, so an older cloud is unaffected.
+        if isinstance(printer_model, str) and printer_model:
+            body["printerModel"] = printer_model
+        if isinstance(est_grams, int) and not isinstance(est_grams, bool):
+            body["estGrams"] = est_grams
+        if isinstance(required_filaments, list) and required_filaments:
+            body["requiredFilaments"] = required_filaments
         try:
             resp = post_json(
                 cfg.submit_url,
-                {
-                    "memberToken": member_token,
-                    "hubSubmissionUid": submission_uid,
-                    "fileName": file_name,
-                    "fileSha256": file_sha256,
-                    "fileSizeBytes": file_size,
-                },
+                body,
                 bearer=credential,
                 retries=2,
                 backoff_base=1.0,

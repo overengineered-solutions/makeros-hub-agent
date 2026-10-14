@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Callable
 
 from .multipart import boundary_from_content_type, parse_multipart
+from .printers.gcode_meta import read_gcode_meta
 
 log = logging.getLogger("makeros-hub.ingest")
 
@@ -184,6 +185,21 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(507, {"error": "spool_write_failed"})
             return
 
+        # A G-code names the printer and filaments it was sliced for; the cloud routes on them (a .3mf → None, today's
+        # path). A parse miss never fails the upload — the job just falls back to staff review.
+        meta_kwargs: dict = {}
+        try:
+            meta = read_gcode_meta(dest_dir / file_name)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("gcode metadata unreadable for %s: %s", file_name, exc)
+            meta = None
+        if meta is not None:
+            meta_kwargs = {
+                "printer_model": meta["printerModel"],
+                "est_grams": meta["estGrams"],
+                "required_filaments": meta["requiredFilaments"],
+            }
+
         try:
             outcome = self.submit_fn(
                 member_token=member_token,
@@ -192,6 +208,7 @@ class _Handler(BaseHTTPRequestHandler):
                 file_sha256=sha,
                 file_size=size,
                 print_now=print_now,
+                **meta_kwargs,
             )
         except Exception as exc:  # noqa: BLE001
             log.error("cloud submit raised: %s", exc)

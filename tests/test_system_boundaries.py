@@ -157,6 +157,22 @@ class SystemBoundaries(unittest.TestCase):
                                 file_size=1, print_now=False)
                 self.assertEqual(result["status"], expected)
 
+    def test_upload_body_carries_sliced_metadata_only_when_present(self):
+        submit = agent.make_cloud_submit(Config(cloud_url="https://cloud.invalid"), "test-only")
+        base = dict(member_token="fake", submission_uid="uid", file_name="cube.gcode", file_sha256="a" * 64, file_size=1, print_now=False)
+        filaments = [{"slot": 1, "type": "PLA", "color": "FFFFFFFF", "usedG": 4.53}]
+        with mock.patch.object(agent, "post_json", return_value=http.Response(200, {"ok": True, "jobId": "j"})) as post:
+            submit(**base)
+            submit(**base, printer_model=None, est_grams=None, required_filaments=[])
+            submit(**base, printer_model="Sovol SV08 MAX", est_grams=5, required_filaments=filaments)
+        bodies = [c.args[1] for c in post.call_args_list]
+        legacy = {"memberToken", "hubSubmissionUid", "fileName", "fileSha256", "fileSizeBytes"}
+        self.assertEqual(set(bodies[0]), legacy)
+        self.assertEqual(set(bodies[1]), legacy)
+        self.assertEqual(bodies[2]["printerModel"], "Sovol SV08 MAX")
+        self.assertEqual(bodies[2]["estGrams"], 5)
+        self.assertEqual(bodies[2]["requiredFilaments"], filaments)
+
     def test_config_requires_https_and_preserves_existing_file_on_replace_failure(self):
         for url in ['http://cloud.example', 'https://user:secret@cloud.example', 'https://cloud.example/path?token=secret', 'https://cloud.example\n']:
             with self.assertRaises(ValueError):

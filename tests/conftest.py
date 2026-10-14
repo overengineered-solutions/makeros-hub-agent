@@ -7,6 +7,8 @@ from an env var with a real system default:
     report_outbox.PATH             -> /var/lib/makeros-hub/queue-reports.json
     bambu.QUEUE_PROGRESS_DIR       -> /var/lib/makeros-hub/queue-progress
     bambu.TERMINAL_JOBS_DIR        -> /var/lib/makeros-hub/terminal-jobs
+    klipper.QUEUE_PROGRESS_DIR     -> /var/lib/makeros-hub/queue-progress   (same dirs, one file per printer)
+    klipper.TERMINAL_JOBS_DIR      -> /var/lib/makeros-hub/terminal-jobs
     update.STATE_PATH              -> /var/lib/makeros-hub/last_update.json
 
 That is right for the agent and wrong for a test suite. A fresh PrinterManager() calls _load_dispatched(),
@@ -26,7 +28,7 @@ Reads happen through the module global at call time, so rebinding the attribute 
 import pytest
 
 from makeros_hub import report_outbox, update
-from makeros_hub.printers import bambu, manager
+from makeros_hub.printers import bambu, klipper, manager
 
 # (module, attribute, is_dir) — a directory is created so code that lists it finds an empty dir, not a missing one.
 _STATE_PATHS = [
@@ -34,6 +36,8 @@ _STATE_PATHS = [
     (report_outbox, "PATH", False),
     (bambu, "QUEUE_PROGRESS_DIR", True),
     (bambu, "TERMINAL_JOBS_DIR", True),
+    (klipper, "QUEUE_PROGRESS_DIR", True),
+    (klipper, "TERMINAL_JOBS_DIR", True),
     (update, "STATE_PATH", False),
 ]
 
