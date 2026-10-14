@@ -105,6 +105,8 @@ installer and is never installed or updated by this agent.
 **The laser gate (`laser_gate/`, its own 0.1.0).** A stdlib-only service in front of the OMTech's Ruida controller:
 `POST /check` (never contacts the controller), `POST /store` (checks again, then stores the file in the controller's
 memory, refusing while the head moves) and `GET /status`, and nothing else; members start a job at the laser's panel.
+Among its checks, a file is refused unless every command is on its allowlist, every power is within the member's material cap, and
+every cut's layer has its power and speed set before it.
 It runs as its own `laser-gate` user under `laser_gate/install.sh`, with nftables rules in their own boot unit.
 The agent never imports it, and this repo's `install.sh` and `update.sh` never mention it (G13), so a hub OTA cannot
 install or change it. The agent waits 60 s for `/check` and 120 s for `/store`. The command table and the store
