@@ -240,7 +240,8 @@ class JobTracker:
                 and a["key"] not in {j["jobKey"] for j in self._pending}):
             self._restored = {"key": a["key"], "name": a.get("name"), "startedAt": float(a["startedAt"]),
                               "material": a.get("material"), "etaAt": float(a["etaAt"]) if num(a.get("etaAt")) else None,
-                              **({"notDispatched": True} if a.get("notDispatched") is True else {})}
+                              **({"notDispatched": True} if a.get("notDispatched") is True else {}),
+                              **({"taskKey": a["taskKey"]} if isinstance(a.get("taskKey"), str) else {})}
         self._active_saved = json.dumps(self._state(), sort_keys=True)
 
     def _save_active(self) -> bool:
@@ -268,7 +269,8 @@ class JobTracker:
             and not (task_id and str(saved["key"]).startswith("task_") and self._task_key(task_id) != saved["key"])
         ))
         if same:
-            self._active = saved
+            # adopted by name only: a task id that turns up later and differs means it was another print (observe)
+            self._active = saved if exact else {**saved, "adopted": True}
         else:
             # IDLE after a restart = the printer was reset; another name = another print. The outcome is unknown, so
             # nothing is invented (the queue's outcome_unknown_after_restart covers a dispatched job).
@@ -332,7 +334,9 @@ class JobTracker:
             job["materialKey"] = a["material"]
         if a.get("notDispatched"):
             job["notDispatched"] = True   # queue progress never links it (the site ignores the key)
-        self._last_key = job["jobKey"]
+        # _emit_recovered dedupes on the printer's task key: a print keyed by fingerprint whose task id showed up later
+        # must not come back under that task key on a restart onto its FINISH (codex review of 3b59933)
+        self._last_key = a.get("taskKey") or job["jobKey"]
         self._buffer(job)
 
     def _buffer(self, job: dict) -> None:
@@ -401,6 +405,24 @@ class JobTracker:
             return  # no signal yet (pre-pushall)
         if self._restored is not None:
             self._adopt_or_drop(merged, state, now)
+        task_id = _printer_task_id(merged)
+        if self._active is not None and task_id:
+            key = str(self._active["key"])
+            known = key if key.startswith("task_") else self._active.get("taskKey")
+            if known and known != self._task_key(task_id):
+                # The printer's own id says this is ANOTHER print (codex review of 3b59933: Alice's task 77 adopted by name
+                # from a report without an id, then Bob's task 78 showed up and finished under Alice's key).
+                if self._active.get("adopted"):
+                    # restored after a restart and never confirmed: its outcome is unknown, nothing is invented, and the
+                    # print in its place is handled as if first seen now (opened or recovered, and marked)
+                    log.info("%s: the printer's task id %s is not the adopted print's — its key is dropped", self.printer_id, task_id)
+                    self._active, self._mark_next, self._last_state = None, True, ""
+                else:
+                    self._close("cancelled", now)   # the gap between two prints was missed while the hub watched
+            elif known:
+                self._active.pop("adopted", None)   # confirmed by the printer's own id
+            elif not key.startswith("task_"):
+                self._active["taskKey"] = self._task_key(task_id)   # a dedupe alias; the key the site holds is kept
 
         if self._active is None:
             if state == _ACTIVE:

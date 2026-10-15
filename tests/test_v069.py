@@ -267,6 +267,41 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
                          {"ok": True})                       # the disk is back: the cloud's re-send starts it
         self.assertFalse(b._jobs._mark_next)
 
+    def test_a_task_id_that_turns_up_after_a_name_only_adoption_and_differs_drops_it(self):
+        # codex review of 3b59933: Alice's task 77 adopted by name from a report without an id; Bob's task 78 then showed
+        # up (as a later delta, or straight on its FINISH) and completed Alice's job under her key
+        for later in ("RUNNING", "FINISH"):
+            with self.subTest(later=later):
+                key, _ = self.printing(task_id="77")
+                b = boot()
+                report(b, gcode_state="RUNNING", subtask_name="cube")
+                self.assertEqual(b._jobs.active_key(), key)  # adopted by name (no id in this report)
+                report(b, gcode_state=later, subtask_name="cube", task_id="78")
+                if later == "RUNNING":
+                    self.assertEqual(b._jobs.active_key(), "task_S1_78")
+                    report(b, gcode_state="FINISH", subtask_name="cube", task_id="78")
+                (job,) = b.pending_jobs()
+                self.assertEqual((job["jobKey"], job.get("notDispatched")), ("task_S1_78", True))
+                b._queue_progress._start_timeout_sec = 0
+                self.assertEqual(b.collect_queue_progress(), [{"queueJobId": "q1", "state": "held",
+                                                               "reason": "outcome_unknown_after_restart", "assignmentSeq": 7}])
+                for f in bambu_module.TERMINAL_JOBS_DIR.glob("*"):
+                    f.unlink()
+                for f in bambu_module.QUEUE_PROGRESS_DIR.glob("*"):
+                    f.unlink()
+
+    def test_a_fingerprinted_print_whose_task_id_shows_up_after_the_restart_is_reported_once(self):
+        # codex review of 3b59933: closed under its fingerprint, acked, then re-emitted under task_S1_77 on the next
+        # restart onto the same FINISH: one physical print, two terminal rows
+        key, _ = self.printing(task_id="0")
+        b = boot()
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual([j["jobKey"] for j in b.pending_jobs()], [key])
+        b.ack_jobs([key])
+        c = boot()
+        report(c, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual(c.pending_jobs(), [])
+
     def test_the_task_id_beats_a_partial_reports_fallback_file_name(self):
         # codex review of 135cb83: the first report after the restart carried task 77 and gcode_file only; the name
         # mismatch dropped the real dispatch's print, reopened it with a new start and marked it notDispatched
