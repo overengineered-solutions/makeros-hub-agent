@@ -422,6 +422,53 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
         self.assertEqual(len(a.pending_jobs()), 1)
 
+    def reconnect(self, a):
+        a._on_disconnect(None, None, 0)
+        a._on_connect(a._client, None, None, 0)
+
+    def test_after_a_reconnect_another_name_is_never_aliased_to_the_print_just_closed(self):
+        # codex review of 95d4abe: the late-id alias ran before the reconnect judgement and took Bob's task 78 as the id
+        # of Alice's fingerprinted cube, so Bob's print was never reported
+        key, _ = self.printing(task_id="0")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="0")
+        a.ack_jobs([key])
+        self.reconnect(a)
+        report(a, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        self.assertEqual([j["jobKey"] for j in a.pending_jobs()], ["task_S1_78"])
+
+    def test_a_name_before_the_task_id_never_spends_the_reconnect_judgement(self):
+        # codex review of 95d4abe: FINISH/bob/task "0" first, then a delta with task 78: the first report used up the
+        # judgement although nothing could be recovered without the id
+        key, _ = self.printing(task_id="77")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        a.ack_jobs([key])
+        self.reconnect(a)
+        report(a, gcode_state="FINISH", subtask_name="bob", task_id="0")
+        report(a, gcode_state="FINISH", task_id="78")
+        self.assertEqual([j["jobKey"] for j in a.pending_jobs()], ["task_S1_78"])
+
+    def test_the_next_dispatch_never_inherits_the_finished_prints_cached_identity(self):
+        # codex review of 95d4abe: Bob's first delta (gcode_state only) opened under Alice's cached task 77; his real name
+        # and task 78 then read as a contradiction, fenced his own dispatch and held q2
+        key, _ = self.printing(task_id="77")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["completed"])
+        a.ack_jobs([key])
+        (self.spool / UID / "bob.3mf").write_bytes(b"3mf")
+        self.assertEqual(a.start_print(self.spool / UID / "bob.3mf", "bob.3mf", queue_job_id="q2", assignment_seq=8), {"ok": True})
+        report(a, gcode_state="RUNNING")
+        report(a, gcode_state="RUNNING", subtask_name="bob", task_id="78")
+        report(a, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        self.assertEqual([(j["jobKey"], j["status"], j.get("notDispatched")) for j in a.pending_jobs()],
+                         [("task_S1_78", "done", None)])
+        self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["printing", "completed"])
+
     def test_a_same_file_finish_without_the_saved_prints_id_waits_for_the_id(self):
         # codex review of 1e116ed: Alice's cube (task 77) saved; Bob's cube (task 78) finished during the outage; the first
         # fresh report (FINISH, cube, no id) completed Alice's job, and task 78 was ignored
@@ -991,6 +1038,12 @@ class TestCameraFairnessAtCapacity(unittest.TestCase):
         s.attempted("p", 120.0)
         s.accepted("p", 120.0, None)
         self.assertEqual(s.plan(t, st("idle", 3), 160.0), [])             # a healthy camera's reconnect costs no capture
+        for now in (200.0, 240.0):                                        # failing again (streak 2, breaker 60 s)
+            s.plan(t, st("idle", 3), now)
+            s.attempted("p", now)
+            s.failed("p", now)
+        s.plan(t, st("idle", 4), 280.0)                                   # reconnect; its retry loses the race...
+        self.assertEqual(len(s.plan(t, st("idle", 5), 320.0)), 1)         # ...and a second reconnect keeps it armed
 
     def test_a_state_change_still_goes_first(self):
         s = CameraScheduler()

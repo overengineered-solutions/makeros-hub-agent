@@ -296,7 +296,7 @@ class CameraScheduler:
                 if changed and state == c.state:
                     # a reconnect (power-cycle): a failing camera is retried at once, ranked from now (codex reviews of
                     # 02dc878 and 213d644: the streak reset below must not take its retry away)
-                    c.reset_at, c.reconnect = now, c.streak > 0
+                    c.reset_at, c.reconnect = now, c.reconnect or c.streak > 0   # a retry already armed stays armed
                 elif changed:
                     c.change = True    # a state change: kept until answered, so one lost race does not hide it
                 c.state, c.link = state, link

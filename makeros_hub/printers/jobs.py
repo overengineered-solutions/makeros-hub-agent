@@ -460,7 +460,10 @@ class JobTracker:
                 if task_id and not known:
                     self._active["taskKey"] = self._task_key(task_id)   # a dedupe alias; the key the site holds is kept
         elif (task_id and state in (_TERMINAL_DONE, _TERMINAL_FAILED) and self._last_state in (_TERMINAL_DONE, _TERMINAL_FAILED)
-              and self._last_key and not self._last_key.startswith("task_")):
+              and self._last_key and not self._last_key.startswith("task_") and not self._recover_next
+              and (not real or not self._last_name or real == self._last_name)):
+            # (after a reconnect the recovery judgement below decides instead; a real name that differs is another print:
+            # codex review of 95d4abe)
             # the print just closed under its fingerprint is still on screen and names its task id only now: dedupe on that
             # id too, or a restart onto this FINISH re-emits it (codex review of 921c14a). ponytail: an id first seen after
             # a restart cannot be tied to the fingerprint; Bambu's pushall on connect carries it, so that needs a printer
@@ -469,14 +472,14 @@ class JobTracker:
 
         if self._active is None:
             if self._recover_next and state in (_TERMINAL_DONE, _TERMINAL_FAILED):
-                if not task_id and not real:
-                    return   # judged on the first report that names the print (nothing decided, nothing advanced)
-                self._recover_next = False
-                if (task_id and real and real == self._last_name and self._last_key
-                        and not self._last_key.startswith("task_")):
-                    self._last_key = self._task_key(task_id)   # the same print, its id learned late: an alias, no row
-                else:
-                    self._emit_recovered(merged, state, now)   # dedupes on the last reported task key
+                # judged on the first report giving the task id that a recovered row needs; a name alone (task "0") never
+                # spends the judgement (codex review of 95d4abe)
+                if task_id:
+                    self._recover_next = False
+                    if real and real == self._last_name and self._last_key and not self._last_key.startswith("task_"):
+                        self._last_key = self._task_key(task_id)   # the same print, its id learned late: an alias, no row
+                    else:
+                        self._emit_recovered(merged, state, now)   # dedupes on the last reported task key
             elif self._recover_next:
                 self._recover_next = False   # running or idle: nothing finished unseen to judge
             if state == _ACTIVE:

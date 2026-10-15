@@ -34,6 +34,7 @@ import paho.mqtt.client as mqtt
 from . import bambu_parse, bambu_send, tray_translate
 from .jobs import JobTracker
 from .manager import BUSY_GCODE_STATES   # manager imports this module lazily, so no import cycle
+_IDENTITY_KEYS = ("subtask_name", "gcode_file", "task_id", "subtask_id")   # which print the merged report describes
 from .queue_progress import QueueProgressTracker, _fsync_dir, _safe_file_component
 from ..vprinter.capture import parse_printer_model_id
 from ..vprinter.report import MODEL_PRODUCT_NAMES
@@ -172,7 +173,7 @@ class BambuAdapter:
             # v0.69: which print the printer is on must come from THIS connection's reports, never the cached ones
             cached = self._data.get("print")
             if isinstance(cached, dict):
-                for k in ("subtask_name", "gcode_file", "task_id", "subtask_id"):
+                for k in _IDENTITY_KEYS:
                     cached.pop(k, None)
             self._jobs.reconnected()
         client.subscribe(self._report_topic, qos=0)
@@ -429,6 +430,12 @@ class BambuAdapter:
                     self._queue_progress.discard_dispatch(queue_job_id)
                     log.error("bambu %s: refusing to start %s — dispatch state could not be persisted", self.printer_id, queue_job_id)
                     return {"ok": False, "reason": "state_persist_failed"}
+                # v0.69: the next print's first delta may carry only gcode_state; the finished print's cached name and task id
+                # must not become its identity (they fenced the dispatch's own print; codex review of 95d4abe)
+                cached = self._data.get("print")
+                if isinstance(cached, dict):
+                    for k in _IDENTITY_KEYS:
+                        cached.pop(k, None)
                 if not self._jobs.dispatch_recorded():   # v0.69: this dispatch's print must never inherit a post-drop mark
                     self._queue_progress.discard_dispatch(queue_job_id)
                     self._save_queue_progress()
