@@ -79,8 +79,11 @@ Built on v0.68.0, following pstation `docs/camera-pipeline-plan-2026-10-15.md`.
 - **Lanes.** Socket cameras each get their own thread, up to 16 at once: the A1s on :6000, Pi webcams, Moonraker.
   ffmpeg (RTSPS) cameras keep the 4 slots v0.68 had for everything. An ffmpeg capture starts only while the beat still
   has its full 5.5 s deadline left. Dead A1s can no longer hold the slots that the X1C, P2S, H2D and SV08 need.
-- **Not started is not failed.** A capture that never started is not posted as a failure. It is counted, and it goes
-  first next beat.
+- **Not started is not failed.** A capture that never started is not posted as a failure. It is counted, and it stays
+  overdue, so it moves up next beat.
+- **Most overdue first.** Inside a lane, captures start in order of how long each camera has been due: a state change
+  or a camera with no photo yet first, then the rest by when their tier ran out. A camera that loses the race only gets
+  more overdue, so wanted or first-layer cameras over the lane's capacity can no longer starve the mid-print ones.
 - **The A1 deadline.** An A1 capture has one 5 s deadline for connect, TLS and a frame. Before, it was 4 s per step with
   no total. Its timeout is split by phase: `unreachable` (connect), `tls-error` (handshake), `timeout` (authed, then no
   picture).
@@ -100,17 +103,20 @@ Built on v0.68.0, following pstation `docs/camera-pipeline-plan-2026-10-15.md`.
 
 **Forced update.**
 - With `MAKEROS_HUB_OTA_WAIT_IDLE=1`, an update target waits while a printer is preparing, printing or paused. The
-  site can now send `targetForceSha256` in the heartbeat response, and when it equals `targetVersionSha256` the hub
-  skips that wait for that one target.
+  site (pstation 0141) now sends `targetVersionForce: true` beside the target once the operator presses **Update now,
+  even while printing**, and only while the forced sha equals the armed one. The hub then skips that wait for that one
+  target. `targetForceSha256` equal to `targetVersionSha256` is accepted too, the stricter form either side can move to.
 - Nothing else is skipped: the version gate, the cooldown, the attempt cap and content trust all still apply. A force
-  naming any other sha is ignored.
+  naming any other sha, or a flag that is not a literal `true`, is ignored.
 - Since v0.54 the wait itself is opt-in. Without the variable, an update already applies mid-print.
 
 **Nothing lost on a mid-print restart.**
-- **The running Bambu print.** Its key, name, start and material are saved in
-  `terminal-jobs/<printer>.active.json`, together with the last reported key. The v0.68 terminal file keeps its list
-  format, so a rollback still reads it. A print that finished while the hub was down is now closed under the key the
-  site already holds, and its queue job is completed. A LAN print has no task id, so before this it was never reported
+- **The running Bambu print.** Its key, name, start, material and the printer's ETA are saved in
+  `terminal-jobs/<printer>.json`, together with the last reported key, as one list entry that is not a job. The file
+  keeps v0.68's list format: a rollback reads exactly the jobs, and its next save drops the entry, so a print the
+  rollback went on to report never comes back after a later upgrade. A print that finished while the hub was down is
+  now closed under the key the site already holds, ending at the printer's last ETA (no duration is sent when the
+  printer gave none), and its queue job is completed. A LAN print has no task id, so before this it was never reported
   and its job was held as `outcome_unknown_after_restart`. A print already reported is not re-sent after a restart.
 - **Commands.** The command guard (`dispatched-commands.json`) and undelivered command results
   (`command-results.json`) are durable. The site re-sends a command after 10 minutes without a result, and that re-send
@@ -129,14 +135,17 @@ The whole state audit, the force procedure and how to confirm a clean return are
 | `POST /api/print/hub/camera?…&failed=1&reason=<r>` | hub → site |
 | `printers[].mqttConnectedAtMs`, `piMetrics.tickWallMs`, `piMetrics.cpuCount`, `cameraStats` | hub → site, heartbeat |
 | `cameraWant: string[]` (≤ 64 printer ids) | site → hub, heartbeat response |
-| `targetForceSha256` (40-hex, equal to `targetVersionSha256` to force) | site → hub, heartbeat response |
+| `targetVersionForce: true` (pstation 0141), or `targetForceSha256` equal to `targetVersionSha256` | site → hub, heartbeat response |
 
 **Capacity: tens of printers and Pi webcams on one shop box.** These figures are estimates. `cameraStats` and
 `tickWallMs` measure them from the first 0.69 beat.
 - **ffmpeg, the CPU cost.** At most 4 run at once, the same peak as v0.68. A slot starts a capture only while 5.5 s of
   the 8 s beat are left, so the lane delivers about 8 RTSP frames per beat at roughly 2 s per capture. That covers
   about 18 RTSP printers mid-print (one frame per 90 s each), or 8 on the 20 s tier at the same time. Beyond that,
-  `notStarted` rises and RTSP photos get older in turn, oldest first. They never show "Capture failed". To relieve CPU,
+  `notStarted` rises and every RTSP photo gets older in proportion, most overdue first, so none starves: with N RTSP
+  cameras due every beat, each gets a frame about every N/8 to N/4 beats (12 due: every 1.5 to 3 beats). A capture that
+  never started is never posted as a failure. A camera whose last post was a failure keeps showing "Capture failed"
+  on the site until its next turn, which comes within those few beats, far inside the site's 15-minute hint. To relieve CPU,
   lower `FF_SLOTS` in `printers/camera.py` (when `ffMs` max nears 5.5 s, or `childCpuMs` climbs during builds). To get
   more frames, raise it only once `cpuCount` and `loadAvg1m` show headroom.
 - **Socket cameras.** These are almost free on CPU: the threads wait in `recv`. Up to 16 run at once, and the rest queue

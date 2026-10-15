@@ -225,7 +225,7 @@ def capture_printer_frame_with_reason(printer: dict[str, Any]) -> tuple[Optional
 SITE_MAX_FRAME_BYTES = 1_500_000   # = pstation camera/route.ts MAX_BYTES; bigger is "too-large", never pushed
 BEAT_BUDGET_S = 8.0                # = the v0.68 overall_timeout
 FF_SLOTS = 4                       # ponytail: = v0.68's whole pool, so no new ffmpeg peak; lower it if cameraStats.childCpuMs/ffMs or loadAvg1m say the box chokes during builds
-IO_MAX = 16                        # concurrent socket captures; more due cameras queue inside the beat (oldest first)
+IO_MAX = 16                        # concurrent socket captures; more due cameras queue inside the beat (most overdue first)
 BACKOFF_BASE_S, BACKOFF_CAP_S, BACKOFF_CAP_PRINTING_S = 60.0, 600.0, 120.0
 
 
@@ -235,7 +235,7 @@ class _Cam:
     state: str
     link: Any                       # status["mqttConnectedAtMs"]: moves on every MQTT (re)connect = a power-cycle
     last_ok: Optional[float] = None  # the SITE answered 200
-    last_try: float = -1.0          # a camera that was not started keeps an old last_try, so it goes first next beat
+    last_try: float = -1.0          # not started: it stays overdue, and an old last_try wins a tie next beat
     streak: int = 0                 # real failures in a row
     retry_at: float = 0.0           # breaker
     sha: Optional[bytes] = None     # digest of the last accepted frame (frozen check)
@@ -260,7 +260,7 @@ class CameraScheduler:
                                       "ioMs": [0, 0, 0], "ffMs": [0, 0, 0]}   # [count, sum, max]
 
     def plan(self, targets, status_by_id, now: float, want: Optional[set] = None) -> list[dict]:
-        """The targets due this beat, urgent first, then oldest last attempt (start order inside a lane)."""
+        """The targets due this beat, most overdue first, then oldest last attempt (start order inside a lane)."""
         due = []
         for t in targets:
             pid = t.get("printerId")
@@ -282,8 +282,11 @@ class CameraScheduler:
             wanted = pid in want if want is not None else bool(t.get("cameraDense"))   # older site: config-down flag
             interval = self.FIRST_OR_LAST_LAYER_S if wanted else self._interval(state, st.get("progressPct"))
             if changed or c.last_ok is None or now - c.last_ok >= interval:
-                urgent = changed or interval == self.FIRST_OR_LAST_LAYER_S
-                due.append(((not urgent, c.last_try), t))
+                # Earliest deadline first: a state change or no accepted photo yet is due since forever, anything else
+                # since last_ok + its tier. A camera that loses the race only grows more overdue, so it reaches the front:
+                # wanted / first-layer cameras over the lane's capacity can no longer starve the mid-print ones.
+                due_since = float("-inf") if changed or c.last_ok is None else c.last_ok + interval
+                due.append(((due_since, c.last_try), t))
         due.sort(key=lambda d: d[0])
         return [t for _, t in due]
 
@@ -363,7 +366,7 @@ def collect_camera_frames(
     io lane: one thread per due socket camera (A1 :6000, Pi webcams, Moonraker), up to IO_MAX at once, so a dead A1
     can no longer hold a slot a healthy camera needs. ff lane: `ff_slots` ffmpeg (RTSPS) captures, and one starts only
     when the beat still has its full 5.5 s deadline left. A capture that never started is NOT a failure: it is counted
-    in stats.notStarted, never posted, and sorts first next beat. A started capture that outlives the beat is
+    in stats.notStarted, never posted, and stays overdue, so it moves up next beat. A started capture that outlives the beat is
     'timeout'. A frame over the site's 1.5 MB cap is 'too-large'; the same bytes as the last accepted frame are
     'frozen' (a replayed picture must never read as current). Frames carry {printerId, jpegBase64, sourceId, sha256};
     failures {printerId, reason, stderrTail, sourceId}. The caller marks a frame accepted after the site's 200.

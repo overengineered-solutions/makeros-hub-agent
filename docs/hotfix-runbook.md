@@ -13,7 +13,8 @@ queue job, after the restart.
 1. **Forcing skips only one rule.** That rule is "wait while a printer is preparing, printing or paused", and the force
    skips it for one target only. Everything else still applies. The version must be newer. The tag must resolve to the
    commit sha set on `/admin/hub`. The 15-minute cooldown and the 3-attempt cap still hold. A force left over from an
-   earlier target is ignored, because the hub honours it only when it names the target's own sha.
+   earlier target is ignored: the site sends the force only while the forced sha equals the armed one, and saving a
+   target clears it.
 2. **The waiting rule is opt-in on the hub.** Since v0.54 the agent waits for idle only when its service environment
    sets `MAKEROS_HUB_OTA_WAIT_IDLE=1`. Without that setting it already updates mid-print, and the force changes
    nothing. Whether the shop box sets it can be seen only on the box (`systemctl show makeros-hub -p Environment`),
@@ -52,7 +53,7 @@ Every check below is read-only. SQL runs through `read sql pstation "<one select
 
 1. On `/admin/hub`, confirm the target tag and sha, press **Update now, even while printing**, and confirm. The site
    records who forced which target in its events.
-2. On its next heartbeat (within about 30 s) the hub receives `targetForceSha256` equal to the target's sha. It logs
+2. On its next heartbeat (within about 30 s) the hub receives `targetVersionForce: true` beside the target. It logs
    `OTA: target vX.Y.Z @ <sha> FORCED while a printer is busy`, records the same line in its diagnostics, and runs
    the root update script.
 3. The service stops, installs and starts again. Expect no heartbeat for 30 to 90 seconds. That shows up as one
@@ -91,7 +92,7 @@ Every check below is read-only. SQL runs through `read sql pstation "<one select
 | Queue jobs already sent (the manager's guard) | `dispatched.json` | Same as above, one level up. |
 | Queue status reports not yet delivered | `queue-reports.json` | Sent on the next beat. The site ignores a repeat. |
 | Finished prints not yet acknowledged | `terminal-jobs/<printer>.json` | Sent on the next heartbeat. |
-| **The print running now, and the last one reported (Bambu, v0.69)** | `terminal-jobs/<printer>.active.json` | A print that finished during the gap closes under the key the site already holds. Without this, a LAN print, which carries no task id, was never reported. A print that was already reported is not re-sent. |
+| **The print running now, and the last one reported (Bambu, v0.69)** | inside `terminal-jobs/<printer>.json`, one entry that is not a job | A print that finished during the gap closes under the key the site already holds, ending at the printer's last ETA. Without this, a LAN print, which carries no task id, was never reported. A print that was already reported is not re-sent. |
 | The print running now (Klipper) | inside `terminal-jobs/<printer>.json` | Same, since v0.68. |
 | **Commands already run (v0.69)** | `dispatched-commands.json` | The site re-sends a command after 10 minutes without a result. It is answered `ok` without running it again, so a pause is not repeated and a dryer cycle is not restarted. |
 | **Command results not yet delivered (v0.69)** | `command-results.json` | Sent on the next beat. Before this, the site's row stayed `sent`. |
@@ -126,5 +127,8 @@ mid-print. The site re-queues that refusal without counting it.
   crash-looping. The box's journal (`journalctl -u makeros-hub -n 200`) is on Marshall's root console. Hand him that
   exact command, and nothing more.
 - **A wrong release:** cut a fixed release (a rollback is v0.68.0's tree with the version bumped), set its tag and sha,
-  and force it the same way.
+  and force it the same way. A rollback is safe for the saved prints: v0.68 reads the terminal file's jobs and drops the
+  saved running print the first time it saves, so a print it then reports cannot be reported again after a later
+  upgrade. Across the rollback's own restart, v0.68 behaves as v0.68 always did: a print still running is reported
+  under a new key, and one that finished during the restart with no task id is held for staff.
 - **Never delete state files to clear an alarm.** They are what keeps a print reported and billed once.

@@ -713,15 +713,18 @@ def _camera_stats(scheduler: CameraScheduler) -> dict:
 
 def _ota_step(body: dict, statuses, *, diagnostics=None, wait_idle: bool | None = None, updater=maybe_update) -> str:
     """One beat of the over-the-air update. With MAKEROS_HUB_OTA_WAIT_IDLE=1 a target waits while any printer is
-    preparing, printing or paused — unless the cloud sent `targetForceSha256` equal to THIS target's sha (v0.69: the
-    operator's "Update now, even while printing" on /admin/hub). The force skips that one rule for that one target and
-    nothing else: the version gate, the cooldown, the attempt cap and the content-trust sha all still apply, and a
-    force naming any other sha (a stale one from an earlier target) is ignored. Returns what happened, for tests/logs."""
+    preparing, printing or paused — unless the cloud forced THIS target (v0.69: the operator's "Update now, even while
+    printing" on /admin/hub). pstation 0141 sends `targetVersionForce: true` beside the target, and only while the forced
+    sha equals the armed one; `targetForceSha256` equal to the target's sha is accepted too, so either side can move to
+    the stricter form alone. The force skips that one rule for that one target and nothing else: the version gate, the
+    cooldown, the attempt cap and the content-trust sha all still apply, and a force naming any other sha (a stale one
+    from an earlier target) or anything but a literal true is ignored. Returns what happened, for tests/logs."""
     target, target_sha = body.get("targetVersion"), body.get("targetVersionSha256")
     if not (isinstance(target, str) and target and should_update(__version__, target)):
         return "none"
     busy = (OTA_WAIT_IDLE if wait_idle is None else wait_idle) and should_defer_update(statuses)
-    forced = busy and is_commit_sha(target_sha) and body.get("targetForceSha256") == target_sha
+    forced = busy and is_commit_sha(target_sha) and (
+        body.get("targetVersionForce") is True or body.get("targetForceSha256") == target_sha)
     if busy and not forced:
         log.info("OTA: target %s deferred — a printer is preparing/printing/paused; will retry next beat", target)
         return "deferred"
