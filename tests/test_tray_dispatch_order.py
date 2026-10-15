@@ -100,6 +100,39 @@ class TestDispatchOrder(unittest.TestCase):
             self.assertEqual(r, {"ok": False, "reason": "printer_stale: printer has not reported its trays recently"})
             up.assert_not_called()
 
+    def test_rechecks_spools_after_upload_before_recording_or_starting(self):
+        import copy
+        import json
+        for change in ("wrong_material", "moved", "stale"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as d, \
+                    mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
+                    mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), \
+                    mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True):
+                a = self._adapter(d)
+                a._data = copy.deepcopy(RAW_STATE)
+
+                def during_upload(*args):
+                    trays = a._data["print"]["ams"]["ams"][0]["tray"]
+                    if change == "wrong_material":
+                        trays[1]["tray_type"] = "ABS"
+                    elif change == "moved":
+                        trays[0], trays[1] = dict(trays[1], id="0"), dict(trays[0], id="1")
+                    else:
+                        a._last_report_at = time.monotonic() - 3600
+
+                with mock.patch.object(bambu_send, "upload_3mf", side_effect=during_upload) as upload:
+                    result = a.start_print("/tmp/x.3mf", "x.3mf", use_ams=True, ams_mapping=[5], queue_job_id="q1",
+                        required_filaments=[{"slot": 1, "type": "PLA", "color": "FFFFFF", "idx": "GFL99"}])
+                upload.assert_called_once()
+                if change == "moved":
+                    self.assertEqual(result, {"ok": True})
+                    self.assertEqual(json.loads(a._client.published[0])["print"]["ams_mapping"], [0])
+                else:
+                    self.assertFalse(result["ok"])
+                    self.assertTrue(result["reason"].startswith("printer_stale:" if change == "stale" else "spool_mismatch:"))
+                    self.assertEqual(a._client.published, [])
+                    self.assertEqual(a._queue_progress.to_state()["dispatches"], [])
+
     def test_h2d_unknown_hardware_or_nozzle_command_refuses_before_upload(self):
         import copy
         import json

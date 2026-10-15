@@ -396,26 +396,35 @@ class BambuAdapter:
         # trays from its live AMS state, or refuse before anything is uploaded (a wrong tray = the wrong material).
         # Only when the cloud sent the job's requirements (older clouds / web uploads without them keep the replay).
         h2d = str(self.model or "").strip().upper() in {"H2D", "O1D"}
-        if h2d or "ams_mapping2" in payload["print"] or payload["print"].get("use_ams") is True or isinstance(required_filaments, list):
+        original_command = payload["print"]
+
+        def refresh_trays() -> str | None:
+            if not (h2d or "ams_mapping2" in original_command or original_command.get("use_ams") is True or isinstance(required_filaments, list)):
+                return None
             st = self.status()
             if st.get("connectionState") != "connected":
                 # the AMS mirror rides only on a FRESH report (bambu_parse.normalize_status); stale trays are no basis.
                 # Its own reason: the cloud re-queues WITHOUT counting it as a spool refusal (codex v0.56 r1).
                 log.warning("bambu %s: refusing %s — no fresh printer report to translate trays from", self.printer_id, queue_job_id)
-                return {"ok": False, "reason": "printer_stale: printer has not reported its trays recently"}
+                return "printer_stale: printer has not reported its trays recently"
             if h2d and st.get("extruderCount") != 2:
-                return {"ok": False, "reason": "unsupported_nozzle_mapping: H2D has not reported its dual-extruder hardware"}
+                return "unsupported_nozzle_mapping: H2D has not reported its dual-extruder hardware"
             try:
-                before = (payload["print"].get("ams_mapping"), payload["print"].get("ams_mapping2"))
+                before = (original_command.get("ams_mapping"), original_command.get("ams_mapping2"))
                 payload["print"] = tray_translate.translate_print_trays(
-                    payload["print"], required_filaments if isinstance(required_filaments, list) else None, st.get("ams"), st.get("vtTray"),
+                    original_command, required_filaments if isinstance(required_filaments, list) else None, st.get("ams"), st.get("vtTray"),
                     extruder_count=st.get("extruderCount"), nozzles=st.get("nozzles"),
                 )
             except tray_translate.TrayTranslationError as exc:
                 log.warning("bambu %s: refusing %s — %s", self.printer_id, queue_job_id, exc)
-                return {"ok": False, "reason": f"{exc.reason}: {exc.detail}"[:200]}
+                return f"{exc.reason}: {exc.detail}"[:200]
             log.info("bambu %s: trays for %s — virtual %s → physical %s / %s", self.printer_id, queue_job_id,
                      before, payload["print"].get("ams_mapping"), payload["print"].get("ams_mapping2"))
+            return None
+
+        refusal = refresh_trays()
+        if refusal:
+            return {"ok": False, "reason": refusal}
 
         # Every submission path converges here. The chosen virtual pool is not proof of the file's model.
         if not _sliced_model_matches(local_path, self.model):
@@ -427,6 +436,10 @@ class BambuAdapter:
         except bambu_send.BambuSendError as exc:
             log.warning("bambu %s upload failed: %s", self.printer_id, exc)
             return {"ok": False, "reason": "upload_failed"}
+        # A spool can move during FTPS upload; translate the original selection again before recording a start.
+        refusal = refresh_trays()
+        if refusal:
+            return {"ok": False, "reason": refusal}
         # v0.54: record + persist the dispatch BEFORE the command leaves the box (codex #4) — a crash in between can only
         # leave a dispatch that never started (it times out as start_not_observed), never a running print the cloud
         # can't correlate. A failed publish discards it again.
