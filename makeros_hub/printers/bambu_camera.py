@@ -24,6 +24,7 @@ from __future__ import annotations
 import socket
 import ssl
 import struct
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -37,7 +38,9 @@ _AUTH_HEADER = struct.pack("<IIII", 0x40, 0x3000, 0, 0)
 # isn't silently dropped.
 _SOI = b"\xff\xd8\xff"
 _EOI = b"\xff\xd9"  # JPEG end-of-image
-_DEFAULT_TIMEOUT = 4.0
+# v0.69: the WHOLE capture (connect + TLS + one frame). It was 4 s per blocking step with no total, so a peer that
+# trickled bytes held a capture thread for as long as it liked.
+_DEFAULT_TIMEOUT = 5.0
 # A single 1280x720 MJPEG frame is ~100 KB; cap the read so a misbehaving/non-Bambu
 # peer on :6000 can't stream unboundedly into agent memory.
 _MAX_FRAME_BYTES = 2 * 1024 * 1024
@@ -80,16 +83,26 @@ def capture_frame_with_reason(
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
+    deadline = time.monotonic() + timeout
+
+    def left() -> float:
+        return max(0.05, deadline - time.monotonic())
+
+    phase = "connect"
     try:
-        with socket.create_connection((host, CAMERA_PORT), timeout=timeout) as raw:
-            raw.settimeout(timeout)
+        with socket.create_connection((host, CAMERA_PORT), timeout=left()) as raw:
+            phase = "tls"
+            raw.settimeout(left())
             with ctx.wrap_socket(raw, server_hostname=host) as tls:
+                phase = "stream"
                 tls.sendall(_auth_packet(access_code))
-                jpeg = _read_one_jpeg(tls, max_bytes)
+                jpeg = _read_one_jpeg(tls, max_bytes, deadline)
     except ssl.SSLError as exc:
         return CaptureResult(None, "tls-error", str(exc)[:_DETAIL_TAIL])
     except socket.timeout:
-        return CaptureResult(None, "timeout", "")
+        # connect -> the port is not answering; tls -> the handshake is stuck; stream -> authed, then no picture (the
+        # signature an A1 shows after a power blip: the camera wedges while MQTT keeps reporting)
+        return CaptureResult(None, {"connect": "unreachable", "tls": "tls-error"}.get(phase, "timeout"), f"timed out in {phase}")
     except ConnectionRefusedError:
         return CaptureResult(None, "unreachable", "connection refused")
     except (OSError, ValueError) as exc:
@@ -122,15 +135,22 @@ def capture_frame(
     ).jpeg
 
 
-def _read_one_jpeg(sock: ssl.SSLSocket, max_bytes: int) -> Optional[bytes]:
+def _read_one_jpeg(sock: ssl.SSLSocket, max_bytes: int, deadline: Optional[float] = None) -> Optional[bytes]:
     """Accumulate 4 KB chunks until one complete SOI..EOI JPEG is buffered.
     Bounded by TOTAL bytes read — not just current buffer size — so a peer that
     never sends an SOI (or never an EOI) and just trickles bytes can't keep a
-    capture thread alive indefinitely; it's cut off once it has sent max_bytes."""
+    capture thread alive indefinitely; it's cut off once it has sent max_bytes.
+    With `deadline` (monotonic, v0.69) it is also cut off at that instant: each recv waits only for the time left, so a
+    1-byte-a-second peer can no longer stretch a capture past the overall budget."""
     keep = len(_SOI) - 1
     buf = bytearray()
     total = 0
     while total < max_bytes:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socket.timeout("capture deadline")
+            sock.settimeout(remaining)
         try:
             chunk = sock.recv(4096)
         except socket.timeout:

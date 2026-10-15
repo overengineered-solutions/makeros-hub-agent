@@ -27,7 +27,7 @@ class FakeClient:
         return _Info()
 
 
-RAW_STATE = {"print": {"ams": {"ams": [{"id": "0", "tray": [
+RAW_STATE = {"print": {"gcode_state": "IDLE", "ams": {"ams": [{"id": "0", "tray": [
     {"id": "0", "tray_type": "PETG", "tray_color": "000000FF", "tray_info_idx": "GFG00", "remain": 50},
     {"id": "1", "tray_type": "PLA", "tray_color": "FFFFFFFF", "tray_info_idx": "GFL99", "remain": 50},
 ]}]}}}

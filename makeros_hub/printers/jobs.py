@@ -21,11 +21,14 @@ State machine (driven by print.gcode_state):
 Job identity (`jobKey` — the cloud's native idempotency key, opaque to it):
   prefer the printer's own task/subtask id from the report (stable across agent
   restarts), else a fingerprint of serial + job name + observed start time.
-  Caveat (documented): with no printer-supplied id, an agent restart MID-print
-  re-fingerprints with a new start time — the terminal job may then appear
-  under a new key (a duplicate observe-only row, admin-visible) rather than
-  being silently merged with a different print of the same file. We bias
-  toward duplicates over silent merges.
+  v0.69: the running print (key, name, start, material) and the last closed key
+  are saved beside the terminal buffer (<printer>.active.json), so a restart
+  mid-print keeps ONE key for one print, and a print that FINISHED while the hub
+  was down is closed under that key — LAN prints carry no task id ("0"), and
+  before this such a print was never reported at all (its queue job was held
+  as outcome_unknown_after_restart). The saved print is adopted only when the
+  printer still shows it (same name / task id, active or terminal); otherwise
+  it is dropped, never invented as an outcome.
 
 Grams: Bambu LAN telemetry does not reliably report consumed filament, so we
 OMIT grams — the cloud's zero-gram path flags the row needs_review instead of
@@ -46,6 +49,8 @@ import os
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
+
+from .queue_progress import write_json_durably
 
 log = logging.getLogger("makeros-hub.jobs")
 
@@ -161,6 +166,13 @@ class JobTracker:
         # print that ended just before a restart still reaches the cloud, so the machine never stays "occupied".
         self._state_path = state_path
         self._load_pending()
+        # v0.69: the running print + the last closed key, in a sidecar so the terminal file keeps v0.68's list format
+        # (a rollback still reads it). Written after the terminal buffer: a crash between the two leaves a saved print
+        # whose key is already pending, which _load_active drops.
+        self._restored: dict | None = None
+        self._last_key: str | None = None
+        self._active_saved = ""
+        self._load_active()
 
     def active_key(self) -> str | None:
         """The job the printer is running right now (its dedupe key), or None."""
@@ -192,6 +204,62 @@ class JobTracker:
             # A terminal cannot be refused (the print already ended); loud so the ops digest/journal shows the box is
             # failing to make state durable. The printer-task-id recovery path still covers most restarts.
             log.error("could not persist terminal jobs for %s (RAM-only until acked): %s", self.printer_id, e)
+
+    def _active_path(self) -> "Path | None":
+        return self._state_path.with_suffix(".active.json") if self._state_path is not None else None
+
+    def _load_active(self) -> None:
+        path = self._active_path()
+        if path is None:
+            return
+        try:
+            text = path.read_text(encoding="utf-8")
+            raw = json.loads(text)
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        self._active_saved = text
+        last = raw.get("lastKey")
+        self._last_key = last if isinstance(last, str) else None
+        a = raw.get("active")
+        if (isinstance(a, dict) and isinstance(a.get("key"), str) and isinstance(a.get("startedAt"), (int, float))
+                and not isinstance(a.get("startedAt"), bool)
+                and all(a.get(k) is None or isinstance(a.get(k), str) for k in ("name", "material"))
+                and a["key"] not in {j["jobKey"] for j in self._pending}):
+            self._restored = {"key": a["key"], "name": a.get("name"), "startedAt": float(a["startedAt"]),
+                              "material": a.get("material")}
+
+    def _save_active(self) -> None:
+        path = self._active_path()
+        if path is None:
+            return
+        running = self._active if self._active is not None else self._restored
+        encoded = json.dumps({"active": running, "lastKey": self._last_key}, sort_keys=True)
+        if encoded != self._active_saved:
+            # ponytail: one attempt per change — a failed write (logged by write_json_durably) is retried at the next
+            # change, not on every MQTT message; the terminal buffer stays the loud, retried record of a finished print
+            write_json_durably(path, encoded)
+            self._active_saved = encoded
+
+    def _adopt_or_drop(self, merged: dict, state: str) -> None:
+        """First observation after a load: the saved running print is this tracker's active job again only if the
+        printer still shows it. ponytail: a re-print of the SAME file with no task id, started and still running while
+        the hub was down, is taken for the saved print (Bambu reports no start time to tell them apart)."""
+        saved, self._restored = self._restored, None
+        name, task_id = _job_name(merged), _printer_task_id(merged)
+        same = (
+            (state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED))
+            and not (name and saved["name"] and name != saved["name"])
+            and not (task_id and str(saved["key"]).startswith("task_") and self._task_key(task_id) != saved["key"])
+        )
+        if same:
+            self._active = saved
+        else:
+            # IDLE after a restart = the printer was reset; another name = another print. The outcome is unknown, so
+            # nothing is invented (the queue's outcome_unknown_after_restart covers a dispatched job).
+            log.info("%s: %s is no longer the running print after the restart (%s) — its key is dropped",
+                     self.printer_id, saved["name"] or saved["key"], state)
 
     # -- internals ----------------------------------------------------------
     def _fingerprint(self, name: str | None, started_ts: float) -> str:
@@ -233,6 +301,7 @@ class JobTracker:
             job["filename"] = self._active["name"]
         if self._active["material"]:
             job["materialKey"] = self._active["material"]
+        self._last_key = job["jobKey"]
         self._buffer(job)
         self._active = None
 
@@ -270,6 +339,9 @@ class JobTracker:
             )
             return
         key = self._task_key(task_id)
+        if key == self._last_key:
+            # v0.69: already reported (and acked) before this restart — the printer keeps showing FINISH for hours.
+            return
         if any(j["jobKey"] == key for j in self._pending):
             # A reloaded tracker (restart or adapter rebuild) already holds this print, observed in full (codex review
             # of release-0.68.0): a second, poorer row under the same key made queue progress see two candidates for
@@ -287,6 +359,7 @@ class JobTracker:
         material = decode_active_material(merged)
         if material:
             job["materialKey"] = material
+        self._last_key = key
         self._buffer(job)
 
     # -- public -------------------------------------------------------------
@@ -294,6 +367,8 @@ class JobTracker:
         state = _gcode_state(merged)
         if not state:
             return  # no signal yet (pre-pushall)
+        if self._restored is not None:
+            self._adopt_or_drop(merged, state)
 
         if self._active is None:
             if state == _ACTIVE:
@@ -334,6 +409,7 @@ class JobTracker:
                 self._close("cancelled", now)
 
         self._last_state = state
+        self._save_active()
 
     def pending(self) -> list[dict]:
         """Unacked terminal jobs (oldest first). Safe to send repeatedly —

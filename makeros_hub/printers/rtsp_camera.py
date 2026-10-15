@@ -52,10 +52,9 @@ from urllib.parse import quote
 log = logging.getLogger("makeros-hub.printers")
 
 RTSP_PORT = 322
-# Per-capture wall-clock deadline. MUST stay below collect_camera_frames'
-# overall_timeout (8s) so a single wedged capture is bounded by ITS OWN
-# categorizable deadline rather than being abandoned (uncategorized) by the
-# pool. Layering: socket flag (4s) < per-capture deadline (5.5s) < pool (8s).
+# Per-capture wall-clock deadline. MUST stay below camera.BEAT_BUDGET_S (8s) so a single wedged capture is bounded by
+# ITS OWN categorizable deadline rather than being abandoned by the beat. Layering: socket flag (4s) < per-capture
+# deadline (5.5s) < beat (8s). v0.69: camera.collect_camera_frames starts an ffmpeg only while this much beat is left.
 _DEFAULT_TIMEOUT = 5.5
 # ffmpeg socket I/O timeout (µs) spliced before -i when the build supports a
 # socket-timeout flag. 4s < the 5.5s python deadline so ffmpeg self-exits

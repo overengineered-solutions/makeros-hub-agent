@@ -4,6 +4,9 @@
 between a start and a successful flush lost them, while the persisted dispatch guard kept the job from being
 re-dispatched — the cloud never learned the file went up. The list is now written (atomic replace + fsync) on every
 change and rehydrated on boot; the cloud dedupes re-sends.
+
+v0.69: printer/laser command results ride the same outbox in their own file (COMMAND_RESULTS_PATH): a result queued for
+the next heartbeat used to die with the process, leaving the cloud row 'sent' until it re-delivered the command.
 """
 
 from __future__ import annotations
@@ -16,10 +19,14 @@ from pathlib import Path
 log = logging.getLogger("makeros-hub.report-outbox")
 
 PATH = Path(os.environ.get("MAKEROS_HUB_REPORT_OUTBOX", "/var/lib/makeros-hub/queue-reports.json"))
+COMMAND_RESULTS_PATH = Path(os.environ.get("MAKEROS_HUB_COMMAND_RESULTS", "/var/lib/makeros-hub/command-results.json"))
+QUEUE_KEYS = ("queueJobId", "state")
+COMMAND_KEYS = ("requestId", "command", "status")
 MAX_REPORTS = 2000   # bounded: a hub cut off for days keeps the newest, never grows without limit
 
 
-def load(path: Path | None = None) -> list[dict]:
+def load(path: Path | None = None, required: tuple[str, ...] = QUEUE_KEYS) -> list[dict]:
+    """Rows of `path` that carry every `required` key as a string; anything else is dropped (never raises)."""
     p = path or PATH
     try:
         data = json.loads(p.read_text())
@@ -30,9 +37,9 @@ def load(path: Path | None = None) -> list[dict]:
         return []
     if not isinstance(data, list):
         return []
-    out = [r for r in data if isinstance(r, dict) and isinstance(r.get("queueJobId"), str) and isinstance(r.get("state"), str)]
+    out = [r for r in data if isinstance(r, dict) and all(isinstance(r.get(k), str) for k in required)]
     if out:
-        log.info("report outbox: %d queued report(s) rehydrated", len(out))
+        log.info("report outbox %s: %d queued report(s) rehydrated", p.name, len(out))
     return out
 
 

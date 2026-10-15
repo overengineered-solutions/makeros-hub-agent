@@ -85,6 +85,9 @@ class _FakeTLS:
     def __init__(self, chunks):
         self._chunks = list(chunks)
 
+    def settimeout(self, _t):
+        pass
+
     def sendall(self, _b):
         pass
 
@@ -163,10 +166,32 @@ class TestCaptureFrameWithReason(unittest.TestCase):
         r = bambu_camera.capture_frame_with_reason("1.2.3.4", "code")
         self.assertEqual(r.reason, "unreachable")
 
-    def test_timeout(self):
+    def test_a_connect_timeout_is_unreachable(self):
+        # v0.69: the port not answering is not the "authed, then no picture" timeout the Floor calls a stuck camera
         self._patch(connect=socket.timeout())
         r = bambu_camera.capture_frame_with_reason("1.2.3.4", "code")
-        self.assertEqual(r.reason, "timeout")
+        self.assertEqual((r.reason, r.detail), ("unreachable", "timed out in connect"))
+
+    def test_a_handshake_timeout_is_a_tls_error(self):
+        self._patch(ctx=_FakeCtx(socket.timeout("_ssl.c: The handshake operation timed out")))
+        r = bambu_camera.capture_frame_with_reason("1.2.3.4", "code")
+        self.assertEqual((r.reason, r.detail), ("tls-error", "timed out in tls"))
+
+    def test_a_trickling_peer_is_cut_off_at_the_overall_deadline(self):
+        # one byte every 50 ms never trips a per-recv timeout; the whole-capture deadline must (5 s in production)
+        import time
+
+        class _Trickle(_FakeTLS):
+            def recv(self, _n):
+                time.sleep(0.05)
+                return b"\x00"
+
+        self._patch(ctx=_FakeCtx(_Trickle([])))
+        t0 = time.monotonic()
+        r = bambu_camera.capture_frame_with_reason("1.2.3.4", "code", timeout=0.3)
+        self.assertEqual((r.reason, r.detail), ("timeout", "timed out in stream"))
+        self.assertLess(time.monotonic() - t0, 0.3 + 0.1)
+        self.assertEqual(bambu_camera._DEFAULT_TIMEOUT, 5.0)
 
     def test_recv_timeout_is_timeout_not_liveview_off(self):
         # A stalled :6000 stream (recv timeout mid-frame) must surface as

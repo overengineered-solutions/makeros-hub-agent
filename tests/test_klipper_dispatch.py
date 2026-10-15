@@ -416,6 +416,25 @@ class TestDurability(KlipperCase):
         self.poll(reborn)
         self.assertEqual([(j["jobKey"], j["status"]) for j in reborn.pending_jobs()], [(key, "done")])
 
+    def test_a_print_that_finished_while_the_hub_was_down_completes_its_queue_job_exactly_once(self):
+        # v0.69 audit: the whole chain after a mid-print restart — one terminal under the key the site already holds, one
+        # 'completed' for the right queue job, and nothing on any later restart onto the still-complete printer
+        self.start()
+        self.poll()
+        (printing,) = self.adapter.collect_queue_progress()
+        key = printing["printerJobKey"]
+        self.fake.state, self.fake.duration = "complete", 3600.0
+        reborn = self.make()
+        self.poll(reborn)
+        self.assertEqual([(j["jobKey"], j["status"]) for j in reborn.pending_jobs()], [(key, "done")])
+        self.assertEqual(reborn.collect_queue_progress(),
+                         [{"queueJobId": JOB, "state": "completed", "printerJobKey": key, "assignmentSeq": 3}])
+        reborn.ack_jobs([key])
+        for _ in range(2):
+            again = self.make()
+            self.poll(again)
+            self.assertEqual((again.pending_jobs(), again.collect_queue_progress()), ([], []))
+
     def test_a_print_that_ended_while_the_hub_was_down_ends_when_the_printer_says(self):
         # saved an hour ago as running (started then); it ran 10 minutes; the hub comes back now
         now = time.time()

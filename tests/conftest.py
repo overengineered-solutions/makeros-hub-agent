@@ -11,6 +11,8 @@ from an env var with a real system default:
     klipper.TERMINAL_JOBS_DIR      -> /var/lib/makeros-hub/terminal-jobs
     update.STATE_PATH              -> /var/lib/makeros-hub/last_update.json
     laser.RUNS_STATE_PATH          -> /var/lib/makeros-hub/laser-runs.json
+    manager.DISPATCHED_COMMANDS_PATH     -> /var/lib/makeros-hub/dispatched-commands.json   (v0.69)
+    report_outbox.COMMAND_RESULTS_PATH   -> /var/lib/makeros-hub/command-results.json       (v0.69)
 
 That is right for the agent and wrong for a test suite. A fresh PrinterManager() calls _load_dispatched(),
 so state written by one test is loaded by the next: the dispatch guards then correctly refuse to re-start a
@@ -34,7 +36,9 @@ from makeros_hub.printers import bambu, klipper, manager
 # (module, attribute, is_dir) — a directory is created so code that lists it finds an empty dir, not a missing one.
 _STATE_PATHS = [
     (manager, "DISPATCHED_STATE_PATH", False),
+    (manager, "DISPATCHED_COMMANDS_PATH", False),
     (report_outbox, "PATH", False),
+    (report_outbox, "COMMAND_RESULTS_PATH", False),
     (bambu, "QUEUE_PROGRESS_DIR", True),
     (bambu, "TERMINAL_JOBS_DIR", True),
     (klipper, "QUEUE_PROGRESS_DIR", True),

@@ -21,6 +21,7 @@ import logging
 import os
 import platform
 import queue
+import resource
 import signal
 import shutil
 import socket
@@ -46,7 +47,7 @@ from .ingest import IngestServer
 from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import PrinterManager
-from .printers.camera import CameraScheduler, collect_camera_frames, prime_camera_capabilities
+from .printers.camera import FF_SLOTS, CameraScheduler, collect_camera_frames, prime_camera_capabilities
 from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples, stub_detector
 from .printers.onnx_detector import (
     DetectorHolder,
@@ -54,7 +55,7 @@ from .printers.onnx_detector import (
     build_detector_async,
 )
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
-from .update import OTA_WAIT_IDLE, maybe_update, should_defer_update, should_update
+from .update import OTA_WAIT_IDLE, is_commit_sha, maybe_update, should_defer_update, should_update
 from .vprinter.capture import CapturedJob, build_vp_submit_body
 from .vprinter.manager import VirtualPrinterManager
 from .vprinter.outbox import VPrinterOutbox, validate_submission_uid
@@ -564,6 +565,7 @@ def _collect_pi_metrics(tick_wall_ms: int | None = None) -> dict:
       memUsedPct  : int   — (1 - MemAvailable/MemTotal) × 100 from /proc/meminfo
       cpuTempC    : int   — /sys/class/thermal/thermal_zone0/temp / 1000
       tickWallMs  : int   — caller-provided self-timing for the heartbeat tick
+      cpuCount    : int   — os.cpu_count() (v0.69), so loadAvg1m reads against the box's real width
     """
     metrics: dict = {}
     try:
@@ -598,6 +600,9 @@ def _collect_pi_metrics(tick_wall_ms: int | None = None) -> dict:
         pass
     if isinstance(tick_wall_ms, int) and tick_wall_ms >= 0:
         metrics["tickWallMs"] = tick_wall_ms
+    cpus = os.cpu_count()
+    if cpus:
+        metrics["cpuCount"] = cpus
     return metrics
 
 
@@ -623,38 +628,111 @@ def push_camera_frames(
     camera_frames: list[dict] | None,
     camera_failures: list[dict] | list[str] | None,
     log,
-) -> None:
-    """POST each collected camera frame to the cloud's dedicated camera endpoint as raw JPEG bytes — out-of-band from
-    the heartbeat (whose body is size-capped on the cloud, so a base64 frame won't fit). Best-effort: a frame that
-    fails to push is logged and skipped, never raised into the heartbeat loop. A capture failure this beat is signaled
-    with ?failed=1 + an empty body so the board can show 'reconnecting'. Frames carry {printerId, jpegBase64}."""
+) -> dict[str, int | str]:
+    """POST each collected frame to the cloud's camera endpoint as raw JPEG bytes, out-of-band from the heartbeat (whose
+    body the cloud caps at 512 KB), then signal each capture failure with ?failed=1&reason=<r> and an empty body.
+
+    Returns printerId -> the HTTP status the site answered for its frame, or "net" (v0.69: only a 200 marks a frame
+    captured — the caller applies it). Stops at the first 5xx or network error: the site is down, and 15 s per remaining
+    frame would only stretch the beat; failures are not posted after an abort (same site, same outage). Any other error
+    on one frame is logged and skipped, never raised into the heartbeat loop."""
     import base64
     from urllib.parse import urlencode
 
+    out: dict[str, int | str] = {}
     for f in camera_frames or []:
         pid = f.get("printerId")
         b64 = f.get("jpegBase64")
         if not pid or not b64:
             continue
+        query = {"printerId": pid}
+        if f.get("sourceId"):
+            query["sourceId"] = f["sourceId"]
         try:
-            raw = base64.b64decode(b64)
-            query = {"printerId": pid}
-            if f.get("sourceId"):
-                query["sourceId"] = f["sourceId"]
-            post_bytes(f"{camera_url}?{urlencode(query)}", raw, content_type="image/jpeg", bearer=credential, timeout=15.0)
+            st = post_bytes(f"{camera_url}?{urlencode(query)}", base64.b64decode(b64), content_type="image/jpeg",
+                            bearer=credential, timeout=15.0)
+        except TransportError as exc:
+            out[pid] = "net"
+            log.warning("camera push failed for %s: %s", pid, str(exc)[:200])
+            return out
         except Exception as exc:  # noqa: BLE001 — best-effort; a bad frame must never sink the heartbeat
             log.warning("camera push failed for %s: %s", pid, str(exc)[:200])
+            continue
+        out[pid] = st
+        if st >= 500:
+            return out
     for fail in camera_failures or []:
         pid = fail.get("printerId") if isinstance(fail, dict) else fail
         if not pid:
             continue
-        try:
-            query = {"printerId": pid, "failed": "1"}
-            if isinstance(fail, dict) and fail.get("sourceId"):
+        query = {"printerId": pid, "failed": "1"}
+        if isinstance(fail, dict):
+            if fail.get("sourceId"):
                 query["sourceId"] = fail["sourceId"]
-            post_bytes(f"{camera_url}?{urlencode(query)}", b"", content_type="image/jpeg", bearer=credential, timeout=10.0)
+            if fail.get("reason"):
+                query["reason"] = fail["reason"]   # v0.69; an older site ignores it
+        try:
+            st = post_bytes(f"{camera_url}?{urlencode(query)}", b"", content_type="image/jpeg", bearer=credential, timeout=10.0)
+        except TransportError as exc:
+            log.warning("camera failure report push failed for %s: %s", pid, str(exc)[:200])
+            return out
         except Exception as exc:  # noqa: BLE001
             log.warning("camera failure report push failed for %s: %s", pid, str(exc)[:200])
+            continue
+        if st >= 500:
+            return out
+    return out
+
+
+def _apply_camera_push(scheduler: CameraScheduler, camera_frames: list[dict], pushed: dict, now: float) -> None:
+    """A frame is captured only when the site took it (200). 413/415/422 = the site refused the picture itself, a real
+    failure for the breaker; 404/409/5xx/network/unsent are neutral (409: the source changed and configVersion follows)."""
+    for f in camera_frames:
+        pid = f["printerId"]
+        st = pushed.get(pid)
+        k = "unsent" if st is None else str(st)
+        scheduler.stats["push"][k] = scheduler.stats["push"].get(k, 0) + 1
+        if st == 200:
+            scheduler.accepted(pid, now, bytes.fromhex(f["sha256"]) if f.get("sha256") else None)
+        elif st in (413, 415, 422):
+            scheduler.failed(pid, now)
+
+
+def _camera_want(body: dict) -> set[str] | None:
+    """The heartbeat response's cameraWant (v0.69, at most 64 ids); None when absent or not a list = an older site."""
+    w = body.get("cameraWant")
+    return {x for x in w[:64] if isinstance(x, str)} if isinstance(w, list) else None
+
+
+def _camera_stats(scheduler: CameraScheduler) -> dict:
+    """Cumulative since this agent started (diff two reads); well under 1 KB against the site's 2 KB cap."""
+    r = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return {**scheduler.stats, "breakerOpen": scheduler.breaker_open(time.monotonic()), "ffSlots": FF_SLOTS,
+            "childCpuMs": int((r.ru_utime + r.ru_stime) * 1000)}
+
+
+def _ota_step(body: dict, statuses, *, diagnostics=None, wait_idle: bool | None = None, updater=maybe_update) -> str:
+    """One beat of the over-the-air update. With MAKEROS_HUB_OTA_WAIT_IDLE=1 a target waits while any printer is
+    preparing, printing or paused — unless the cloud sent `targetForceSha256` equal to THIS target's sha (v0.69: the
+    operator's "Update now, even while printing" on /admin/hub). The force skips that one rule for that one target and
+    nothing else: the version gate, the cooldown, the attempt cap and the content-trust sha all still apply, and a
+    force naming any other sha (a stale one from an earlier target) is ignored. Returns what happened, for tests/logs."""
+    target, target_sha = body.get("targetVersion"), body.get("targetVersionSha256")
+    if not (isinstance(target, str) and target and should_update(__version__, target)):
+        return "none"
+    busy = (OTA_WAIT_IDLE if wait_idle is None else wait_idle) and should_defer_update(statuses)
+    forced = busy and is_commit_sha(target_sha) and body.get("targetForceSha256") == target_sha
+    if busy and not forced:
+        log.info("OTA: target %s deferred — a printer is preparing/printing/paused; will retry next beat", target)
+        return "deferred"
+    if forced:
+        log.warning("OTA: target %s @ %s FORCED while a printer is busy (operator: update now, even while printing)",
+                    target, target_sha[:12])
+        _record_diagnostic(diagnostics, "update", f"forced update to {target} while a printer is busy")
+    if updater(__version__, target, target_sha):
+        log.info("OTA: update to %s launched; the service will restart", target)
+        return "forced" if forced else "launched"
+    return "skipped"
 
 
 def heartbeat_payload(
@@ -674,6 +752,7 @@ def heartbeat_payload(
     pi_metrics: dict | None = None,
     lasers: list[dict] | None = None,
     laser_file_checks: list[dict] | None = None,
+    camera_stats: dict | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -714,6 +793,8 @@ def heartbeat_payload(
         # _collect_pi_metrics — all four are best-effort; any missing or
         # unreadable source is silently omitted.
         payload["piMetrics"] = pi_metrics
+    if isinstance(camera_stats, dict) and camera_stats:
+        payload["cameraStats"] = camera_stats   # v0.69: the site stores it in hubs.last_metrics (capped at 2 KB there)
     if failure_samples:
         payload["failureSamples"] = list(failure_samples)[:64]
     # V4 Slice 2 — managed CA delivery. When the agent has an enabled VP
@@ -1398,7 +1479,13 @@ def run(
     fetch_lock = threading.Lock()   # v0.57: one web-upload fetch worker at a time
     pending_queue_reports: list[dict] = report_outbox.load()   # v0.58: durable across restarts
     pending_probe_results: list[dict] = []
-    pending_command_results: list[dict] = []
+    # v0.69: durable like the queue reports — a result queued for the next beat survives a restart mid-print
+    pending_command_results: list[dict] = report_outbox.load(report_outbox.COMMAND_RESULTS_PATH, report_outbox.COMMAND_KEYS)
+
+    def _keep_command_results(new: list[dict]) -> None:
+        if new:
+            pending_command_results.extend(new)
+            report_outbox.save(pending_command_results, report_outbox.COMMAND_RESULTS_PATH)
     # Per-model VP-binding queue (Option A) — the IP allocator pushes onto this
     # when it claims an IP; the next heartbeat ships it as `vpBindings` and the
     # cloud writes virtual_printers.bind_ip. Reset on successful POST.
@@ -1420,6 +1507,7 @@ def run(
     # override that force-enables capture on every camera-capable printer (handy
     # for a one-off test); unset, only admin-enabled printers are captured.
     camera_scheduler = CameraScheduler()
+    camera_want: set[str] | None = None   # v0.69: the site's cameraWant from the last heartbeat; None = an older site
     # Warm the ffmpeg socket-timeout capability probe now (at boot) so the first
     # camera beat doesn't pay the probe inside its capture deadline.
     prime_camera_capabilities()
@@ -1592,6 +1680,7 @@ def run(
                 # the heartbeat (a failure just sends no frame this beat).
                 camera_frames: list[dict] | None = None
                 camera_failures: list[dict] | None = None
+                camera_stats: dict | None = None
                 try:
                     all_targets = manager.camera_targets()
                     eligible = [
@@ -1607,17 +1696,20 @@ def run(
                         status_by_id = {
                             s.get("printerId"): s for s in statuses if s.get("printerId")
                         }
+                        beat_now = time.monotonic()
                         camera_frames, camera_failures = collect_camera_frames(
                             eligible,
                             status_by_id,
                             camera_scheduler,
-                            time.monotonic(),
+                            beat_now,
+                            want=camera_want,
                         )
                         # Ship frames OUT-OF-BAND to the dedicated camera endpoint (raw JPEG bytes) — never in the
                         # heartbeat, whose body the cloud caps at 512KB (a base64 frame would 413 the whole beat).
                         # Best-effort; never raises into the loop. camera_frames/_failures are then dropped from the
-                        # heartbeat payload below (send None).
-                        push_camera_frames(cfg.camera_url, credential, camera_frames, camera_failures, log)
+                        # heartbeat payload below (send None). v0.69: only the site's 200 marks a frame captured.
+                        pushed = push_camera_frames(cfg.camera_url, credential, camera_frames, camera_failures, log)
+                        _apply_camera_push(camera_scheduler, camera_frames, pushed, beat_now)
                         # R4.5 agent-side loudness — when failures > 0, mirror
                         # the cloud's loud signal to the Pi-local diagnostics
                         # board so an offline operator can triage without a
@@ -1639,6 +1731,7 @@ def run(
                                 f"no frame from {len(camera_failures)}/{len(eligible)} eligible: "
                                 + reason_summary,
                             )
+                    camera_stats = _camera_stats(camera_scheduler)
                 except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
                     _record_diagnostic(
                         diagnostics, "camera", f"frame collection failed: {redact(str(exc))}"
@@ -1811,7 +1904,8 @@ def run(
                 # to read, never raises, missing keys silently dropped.
                 # Wrapped: a /proc read regression must not sink the heartbeat.
                 try:
-                    pi_metrics = _collect_pi_metrics()
+                    # v0.69: the tick's own wall time (this beat so far) — v0.68 called it bare, so it was never sent
+                    pi_metrics = _collect_pi_metrics(int((time.monotonic() - now) * 1000))
                 except Exception as exc:  # noqa: BLE001
                     _record_diagnostic(
                         diagnostics,
@@ -1822,7 +1916,7 @@ def run(
                 # Lasers (v0.68): a finished load's result joins the command results; the report polls the gate (3 s max).
                 laser_report = None
                 try:
-                    pending_command_results.extend(laser_hub.take_command_results())
+                    _keep_command_results(laser_hub.take_command_results())
                     laser_report = laser_hub.report()
                 except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
                     _record_diagnostic(diagnostics, "laser", f"laser report failed: {redact(str(exc))}")
@@ -1845,6 +1939,7 @@ def run(
                         pi_metrics=pi_metrics,
                         lasers=laser_report.lasers if laser_report else None,
                         laser_file_checks=laser_report.file_checks if laser_report else None,
+                        camera_stats=camera_stats,
                     ),
                     bearer=credential,
                     retries=3,
@@ -1858,9 +1953,10 @@ def run(
                     pending_probe_results = []
                     if reported_probe_count:
                         log.info("reported %d probe result(s) to the cloud", reported_probe_count)
-                    reported_command_count = len(pending_command_results)
-                    pending_command_results = []
+                    reported_command_count = min(len(pending_command_results), 64)   # = heartbeat_payload's cap
                     if reported_command_count:
+                        del pending_command_results[:reported_command_count]
+                        report_outbox.save(pending_command_results, report_outbox.COMMAND_RESULTS_PATH)
                         log.info("reported %d command result(s) to the cloud", reported_command_count)
                     reported_binding_count = len(pending_vp_bindings)
                     pending_vp_bindings = []
@@ -1936,6 +2032,9 @@ def run(
                     next_ms = resp.body.get("nextPollMs")
                     if isinstance(next_ms, (int, float)) and next_ms > 0:
                         interval = max(5, int(next_ms / 1000))
+                    # v0.69: printers the site wants on the 20 s tier (dirty idle plate, a plate tap, no photo); absent =
+                    # an older site, and the scheduler falls back to config-down's cameraDense
+                    camera_want = _camera_want(resp.body)
                     # Re-pull the printer config when the cloud says it changed
                     # (a printer was added/edited/removed in the admin UI).
                     new_version = resp.body.get("configVersion")
@@ -1960,13 +2059,8 @@ def run(
                     # resolve to. No-op unless it's a strictly-newer release tag and
                     # the cooldown has passed; on apply, the root script verifies the
                     # SHA before installing, then restarts the service (systemd mode).
-                    target = resp.body.get("targetVersion")
-                    target_sha = resp.body.get("targetVersionSha256")
-                    if isinstance(target, str) and target and should_update(__version__, target):
-                        if OTA_WAIT_IDLE and should_defer_update(manager.statuses()):
-                            log.info("OTA: target %s deferred — a printer is preparing/printing/paused; will retry next beat", target)
-                        elif maybe_update(__version__, target, target_sha):
-                            log.info("OTA: update to %s launched; the service will restart", target)
+                    if should_update(__version__, resp.body.get("targetVersion")):
+                        _ota_step(resp.body, manager.statuses(), diagnostics=diagnostics)
                     probe_results = _run_pending_probes(
                         resp.body.get("pendingProbes"),
                         diagnostics=diagnostics,
@@ -1978,7 +2072,7 @@ def run(
                     # resume/stop) and queue their results for the next heartbeat.
                     command_reports = manager.dispatch_commands(resp.body.get("pendingCommands"))
                     if command_reports:
-                        pending_command_results.extend(command_reports)
+                        _keep_command_results(command_reports)
                         log.info(
                             "executed %d printer command(s) from the heartbeat", len(command_reports)
                         )

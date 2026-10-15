@@ -29,9 +29,11 @@ import base64
 import concurrent.futures
 import hashlib
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from .bambu_camera import capture_frame as _bambu_capture_frame
@@ -40,6 +42,7 @@ from .rtsp_camera import CaptureResult as _RtspResult
 from .rtsp_camera import capture_frame as _rtsp_capture_frame
 from .rtsp_camera import capture_frame_with_reason as _rtsp_capture_with_reason
 from .rtsp_camera import _supported_timeout_flag as _rtsp_supported_timeout_flag
+from .rtsp_camera import _DEFAULT_TIMEOUT as _RTSP_DEADLINE_S
 
 
 def prime_camera_capabilities() -> None:
@@ -217,90 +220,127 @@ def capture_printer_frame_with_reason(printer: dict[str, Any]) -> tuple[Optional
     return (None, "no-camera-source", "")
 
 
+# v0.69 (camera pipeline plan 2026-10-15). Shop box CPU is the budget: ffmpeg is the only heavy capture, so it keeps
+# today's 4 slots; socket cameras (A1 :6000, HTTP snapshots) block in recv and each get a thread.
+SITE_MAX_FRAME_BYTES = 1_500_000   # = pstation camera/route.ts MAX_BYTES; bigger is "too-large", never pushed
+BEAT_BUDGET_S = 8.0                # = the v0.68 overall_timeout
+FF_SLOTS = 4                       # ponytail: = v0.68's whole pool, so no new ffmpeg peak; lower it if cameraStats.childCpuMs/ffMs or loadAvg1m say the box chokes during builds
+IO_MAX = 16                        # concurrent socket captures; more due cameras queue inside the beat (oldest first)
+BACKOFF_BASE_S, BACKOFF_CAP_S, BACKOFF_CAP_PRINTING_S = 60.0, 600.0, 120.0
+
+
+@dataclass
+class _Cam:
+    source: str
+    state: str
+    link: Any                       # status["mqttConnectedAtMs"]: moves on every MQTT (re)connect = a power-cycle
+    last_ok: Optional[float] = None  # the SITE answered 200
+    last_try: float = -1.0          # a camera that was not started keeps an old last_try, so it goes first next beat
+    streak: int = 0                 # real failures in a row
+    retry_at: float = 0.0           # breaker
+    sha: Optional[bytes] = None     # digest of the last accepted frame (frozen check)
+
+
 class CameraScheduler:
-    """Phase-adaptive capture cadence, per printer. Captures densely at a state
-    change + during the first/last few % of a print (where things go wrong),
-    sparsely mid-print, and rarely while idle — so the board feels live without
-    hammering the printer or the heartbeat. Pure given an injected monotonic
-    `now` (seconds). Stateful across beats (last-capture time + last state).
+    """Per-printer capture cadence + a breaker for dead cameras (v0.69). Pure given an injected monotonic `now`.
 
-    Mark-on-success contract (v0.41.0): `should_capture` ONLY reads/updates the
-    state-tracking dict; `mark_captured` stamps `last_capture` and is called by
-    the caller AFTER the capture actually returns a frame. A persistently-failing
-    printer therefore stays "due" every beat (the heartbeat is the natural
-    backoff: ~30-40s) instead of going dark for IDLE_S=600s. The agent's
-    overall_timeout=8s + max_workers=4 already bound the worst-case CPU spend
-    on a broken printer, so the more-aggressive retry is safe. Pre-v0.41.0 the
-    scheduler stamped on every attempt, which produced 10-minute blackouts on
-    Liveview-off printers (2026-06-17 PS Moya P2S regression)."""
+    Cadence tiers (unchanged since v0.41): dense on a state change and in the first/last 5% of a print, sparse
+    mid-print, rare while idle; a printer the site lists in `cameraWant` (or, from an older site, flagged cameraDense)
+    gets the dense tier. A frame counts as captured only when the SITE accepted it (`accepted`, after the push), so a
+    starved or refused frame stays due. A real failure (`failed`) is retried next beat once; from the second in a row
+    the camera backs off 60 -> 120 -> 240 -> 480 -> 600 s (120 s cap while printing). A state change, a new MQTT
+    connection (`mqttConnectedAtMs`: how a power-cycle shows up to the hub), a source change or a disable/enable
+    (`forget`) resets it. Only the heartbeat thread touches this object; capture workers never do."""
 
-    FIRST_OR_LAST_LAYER_S = 20.0  # dense: first ~5% / last ~5% of a print
-    MID_PRINT_S = 90.0  # sparse: steady-state printing
-    IDLE_S = 600.0  # rare: idle/paused/offline keepalive
+    FIRST_OR_LAST_LAYER_S, MID_PRINT_S, IDLE_S = 20.0, 90.0, 600.0
 
     def __init__(self) -> None:
-        self._last_capture: dict[str, float] = {}
-        self._last_state: dict[str, str] = {}
-        self._last_source: dict[str, str] = {}
+        self._cams: dict[str, _Cam] = {}
+        self.stats: dict[str, Any] = {"beats": 0, "attempts": 0, "ok": 0, "notStarted": 0, "fail": {}, "push": {},
+                                      "ioMs": [0, 0, 0], "ffMs": [0, 0, 0]}   # [count, sum, max]
 
-    def should_capture(
-        self, printer_id: str, state: Optional[str], progress_pct: Any, now: float, dense: bool = False,
-        source_id: Optional[str] = None,
-    ) -> bool:
-        """Decide whether to attempt a capture this beat. Side-effects ONLY the
-        last-state tracking — does NOT stamp last_capture. Callers must call
-        `mark_captured` AFTER a successful frame is in hand.
+    def plan(self, targets, status_by_id, now: float, want: Optional[set] = None) -> list[dict]:
+        """The targets due this beat, urgent first, then oldest last attempt (start order inside a lane)."""
+        due = []
+        for t in targets:
+            pid = t.get("printerId")
+            if not isinstance(pid, str) or camera_source_kind(t) is None:
+                continue   # ponytail: no camera path (e.g. a Bambu without its access code) is a config gap, not a camera failure
+            st = status_by_id.get(pid) or {}
+            src, state, link = camera_source_id(t), st.get("state") or "", st.get("mqttConnectedAtMs")
+            c = self._cams.get(pid)
+            if c is None or c.source != src:                    # new printer or new source: fresh and due
+                c, changed = _Cam(src, state, link), False
+                self._cams[pid] = c
+            else:
+                changed = state != c.state or link != c.link     # a cycle under 150 s is idle->idle; only `link` moves
+                c.state, c.link = state, link
+            if changed:
+                c.streak, c.retry_at = 0, 0.0
+            if now < c.retry_at:
+                continue                                         # an open breaker wins over want
+            wanted = pid in want if want is not None else bool(t.get("cameraDense"))   # older site: config-down flag
+            interval = self.FIRST_OR_LAST_LAYER_S if wanted else self._interval(state, st.get("progressPct"))
+            if changed or c.last_ok is None or now - c.last_ok >= interval:
+                urgent = changed or interval == self.FIRST_OR_LAST_LAYER_S
+                due.append(((not urgent, c.last_try), t))
+        due.sort(key=lambda d: d[0])
+        return [t for _, t in due]
 
-        `dense` (cameraDense, config-down): the cloud is asking a HUMAN to judge
-        this printer from its picture — today, "is the build plate clear?" for a
-        plate-gated printer. Such a printer is by definition idle, which is this
-        scheduler's slowest tier (IDLE_S = 600s), so the honest answer would be
-        based on a ten-minute-old frame. While the flag is set the printer gets
-        the dense cadence instead. It clears itself the moment the plate is
-        confirmed, so this costs nothing on a shop where nothing is waiting."""
-        state = state or ""
-        if source_id is not None:
-            if printer_id in self._last_source and self._last_source[printer_id] != source_id:
-                self._last_capture.pop(printer_id, None)
-            self._last_source[printer_id] = source_id
-        prev_state = self._last_state.get(printer_id)
-        last = self._last_capture.get(printer_id)
-        self._last_state[printer_id] = state
-        if last is None:  # first sighting — always due
-            return True
-        if state != prev_state:  # state change is high-signal — grab one now
-            return True
-        return now - last >= (self.FIRST_OR_LAST_LAYER_S if dense else self._interval(state, progress_pct))
+    def attempted(self, pid: str, now: float) -> None:
+        if pid in self._cams:
+            self._cams[pid].last_try = now
 
-    def mark_captured(self, printer_id: str, now: float) -> None:
-        """Stamp last_capture so the next beat respects the cadence interval.
-        Call only after a SUCCESSFUL capture; failures stay due next beat.
+    def accepted(self, pid: str, now: float, sha: Optional[bytes]) -> None:
+        c = self._cams.get(pid)
+        if c is None:
+            return
+        c.last_ok, c.streak, c.retry_at, c.sha = now, 0, 0.0, sha
+        self.stats["ok"] += 1
 
-        Threading note: mark_captured is called by the COLLECTOR thread (the one
-        driving collect_camera_frames' as_completed loop) after a future
-        resolves — NOT by the capture worker threads. should_capture also runs on
-        that same collector/heartbeat thread on the next beat, so these scheduler
-        dicts are only ever touched by one thread. (shutdown(wait=False) abandons
-        straggler workers, but they never call mark_captured, so they can't race
-        these dicts.) A future "stream frames as they finish from the workers"
-        refactor would need a lock here."""
-        self._last_capture[printer_id] = now
+    def failed(self, pid: str, now: float) -> None:
+        c = self._cams.get(pid)
+        if c is None:
+            return
+        c.streak += 1
+        if c.streak >= 2:   # one miss retries next beat (a camera waking after a reboot); two opens the breaker
+            cap = BACKOFF_CAP_PRINTING_S if c.state == "printing" else BACKOFF_CAP_S
+            c.retry_at = now + min(BACKOFF_BASE_S * 2 ** (c.streak - 2), cap)
+
+    def is_repeat(self, pid: str, sha: Optional[bytes]) -> bool:
+        c = self._cams.get(pid)
+        return c is not None and c.sha is not None and c.sha == sha
+
+    def breaker_open(self, now: float) -> int:
+        return sum(now < c.retry_at for c in self._cams.values())
 
     def _interval(self, state: str, progress_pct: Any) -> float:
         if state == "printing":
             p = progress_pct if isinstance(progress_pct, (int, float)) else None
-            # Inclusive boundaries: exactly 5% / 95% count as first/last-layer
-            # (dense) — matches the "first ~5% / last ~5%" intent.
+            # Inclusive boundaries: exactly 5% / 95% count as first/last-layer (dense).
             if p is None or p <= 5 or p >= 95:
                 return self.FIRST_OR_LAST_LAYER_S
             return self.MID_PRINT_S
         return self.IDLE_S
 
     def forget(self, keep_ids: set[str]) -> None:
-        """Drop tracking for printers no longer present (called on reconcile)."""
-        for d in (self._last_capture, self._last_state, self._last_source):
-            for pid in [p for p in d if p not in keep_ids]:
-                d.pop(pid, None)
+        """Drop tracking for printers no longer eligible (removed or camera disabled): a re-enable captures at once."""
+        for pid in [p for p in self._cams if p not in keep_ids]:
+            self._cams.pop(pid, None)
+
+
+_NOT_STARTED = object()
+
+
+def _lane(t: dict[str, Any]) -> str:
+    return "ff" if camera_source_kind(t) == "bambu-rtsp" else "io"
+
+
+def _add_ms(stat: list, dur_s: float) -> None:
+    ms = int(dur_s * 1000)
+    stat[0] += 1
+    stat[1] += ms
+    stat[2] = max(stat[2], ms)
 
 
 def collect_camera_frames(
@@ -309,59 +349,31 @@ def collect_camera_frames(
     scheduler: CameraScheduler,
     now: float,
     *,
+    want: Optional[set] = None,
     capture: Callable[[dict[str, Any]], Optional[bytes]] = capture_printer_frame,
     capture_with_reason: Callable[
         [dict[str, Any]], tuple[Optional[bytes], Optional[str], str]
     ] = capture_printer_frame_with_reason,
-    max_workers: int = 4,
-    overall_timeout: float = 8.0,
+    budget: float = BEAT_BUDGET_S,
+    ff_slots: int = FF_SLOTS,
+    clock: Callable[[], float] = time.monotonic,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """For every printer DUE for a frame (per the scheduler + its live state),
-    capture in PARALLEL and return `([{printerId, jpegBase64}], failures)`.
-    Bounded by `overall_timeout` so a slow/unreachable camera never stalls the
-    heartbeat — whatever finishes in time ships this beat, the rest are retried
-    next beat. `failures` is a list of per-printer dicts
-    `{printerId, reason, stderrTail}` so the cloud can surface the silent-drop
-    with a categorized cause ('liveview-off' / 'auth-fail' / 'unreachable' /
-    'timeout' / 'no-ffmpeg' / 'bad-jpeg' / 'unknown') instead of just a list of
-    printerIds vanishing (R4.5). Never raises; capturedAt is omitted (the cloud
-    stamps receipt time, avoiding agent/server clock skew).
+    """Capture every DUE camera in two lanes and return `(frames, failures)` within `budget` seconds.
 
-    Mark-on-success contract (v0.41.0): only successful captures stamp the
-    scheduler's last_capture, so flaky printers retry every beat instead of
-    going dark for IDLE_S=600s. The `capture` arg is preserved for tests that
-    only need the boolean success path; production wiring uses
-    `capture_with_reason` to surface categorized failures.
-
-    BACK-COMPAT: callers receiving the legacy `list[str]` shape (printerIds
-    only) can map(.get('printerId')) over the new failures list. The cloud
-    heartbeat route v0.41.0+ parses the dict shape; pre-v0.41.0 cloud builds
-    fall back gracefully if both shapes ever cross.
-    """
-    due = [
-        t
-        for t in targets
-        if isinstance(t.get("printerId"), str)
-        and scheduler.should_capture(
-            t["printerId"],
-            (status_by_id.get(t["printerId"]) or {}).get("state"),
-            (status_by_id.get(t["printerId"]) or {}).get("progressPct"),
-            now,
-            dense=bool(t.get("cameraDense")),
-            source_id=camera_source_id(t),
-        )
-    ]
+    io lane: one thread per due socket camera (A1 :6000, Pi webcams, Moonraker), up to IO_MAX at once, so a dead A1
+    can no longer hold a slot a healthy camera needs. ff lane: `ff_slots` ffmpeg (RTSPS) captures, and one starts only
+    when the beat still has its full 5.5 s deadline left. A capture that never started is NOT a failure: it is counted
+    in stats.notStarted, never posted, and sorts first next beat. A started capture that outlives the beat is
+    'timeout'. A frame over the site's 1.5 MB cap is 'too-large'; the same bytes as the last accepted frame are
+    'frozen' (a replayed picture must never read as current). Frames carry {printerId, jpegBase64, sourceId, sha256};
+    failures {printerId, reason, stderrTail, sourceId}. The caller marks a frame accepted after the site's 200.
+    Never raises; never blocks the beat on a straggler."""
+    scheduler.stats["beats"] += 1
+    due = scheduler.plan(targets, status_by_id, now, want)
     if not due:
         return [], []
-
-    # Back-compat: if the caller passed only the legacy bytes-returning
-    # `capture` lambda (no `capture_with_reason`), wrap it. Tests that
-    # provide just `capture=` keep working unchanged; the heartbeat path
-    # in agent.py uses the default (capture_printer_frame_with_reason).
-    if (
-        capture is not capture_printer_frame
-        and capture_with_reason is capture_printer_frame_with_reason
-    ):
+    # Back-compat: a caller passing only the legacy bytes-returning `capture` gets it wrapped.
+    if capture is not capture_printer_frame and capture_with_reason is capture_printer_frame_with_reason:
         _legacy = capture
 
         def _wrap_legacy(t: dict[str, Any]) -> tuple[Optional[bytes], Optional[str], str]:
@@ -370,56 +382,59 @@ def collect_camera_frames(
 
         capture_with_reason = _wrap_legacy
 
-    frames: list[dict[str, str]] = []
-    captured: set[str] = set()
-    failure_by_pid: dict[str, dict[str, str]] = {}
-    ex = concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(due)))
+    end = clock() + budget
+    n_io = sum(_lane(t) == "io" for t in due)
+    pools = {"io": concurrent.futures.ThreadPoolExecutor(max(1, min(IO_MAX, n_io))),
+             "ff": concurrent.futures.ThreadPoolExecutor(max(1, ff_slots))}
+    started: set[str] = set()   # set by a worker only once it passed its start gate
+
+    def run(t: dict[str, Any], lane: str):
+        left = end - clock()
+        if left <= 0 or (lane == "ff" and left < _RTSP_DEADLINE_S):
+            return _NOT_STARTED   # a start that cannot finish inside the beat is not a start
+        started.add(t["printerId"])
+        t0 = clock()
+        jpeg, reason, tail = capture_with_reason(t)
+        return jpeg, reason, tail, clock() - t0
+
+    futs = {pools[_lane(t)].submit(run, t, _lane(t)): t for t in due}   # plan order = start order inside a lane
     try:
-        fut_to_pid = {ex.submit(capture_with_reason, t): t["printerId"] for t in due}
-        try:
-            for fut in concurrent.futures.as_completed(fut_to_pid, timeout=overall_timeout):
-                pid = fut_to_pid[fut]
-                try:
-                    jpeg, reason, stderr_tail = fut.result()
-                except Exception:  # noqa: BLE001 - a bad capture never sinks the beat
-                    jpeg, reason, stderr_tail = (None, "unknown", "")
-                if jpeg:
-                    captured.add(pid)
-                    scheduler.mark_captured(pid, now)
-                    frames.append(
-                        {
-                            "printerId": pid,
-                            "jpegBase64": base64.b64encode(jpeg).decode("ascii"),
-                        }
-                    )
-                else:
-                    failure_by_pid[pid] = {
-                        "printerId": pid,
-                        "reason": reason or "unknown",
-                        "stderrTail": stderr_tail or "",
-                    }
-        except concurrent.futures.TimeoutError:
-            pass  # keep whatever finished; the slow ones retry next beat
+        for _ in concurrent.futures.as_completed(futs, timeout=max(0.0, end - clock())):
+            pass
+    except concurrent.futures.TimeoutError:
+        pass   # keep whatever finished; stragglers are judged below
     finally:
-        # Do NOT block the heartbeat waiting on stragglers — each capture is
-        # self-bounded (socket/HTTP timeout + total-byte cap). cancel_futures
-        # drops any not-yet-started captures (when due > max_workers); a running
-        # one finishes on its own and its result is discarded. (A `with` block
-        # would wait=True here and could add seconds to the beat.)
-        ex.shutdown(wait=False, cancel_futures=True)
-    # DUE printers that produced no frame this beat — include a categorized
-    # reason 'timeout' for those still pending when overall_timeout hit, so
-    # the cloud's no_frame event always names a cause per printer.
+        for pool in pools.values():
+            pool.shutdown(wait=False, cancel_futures=True)   # never block the beat on a straggler
+
+    frames: list[dict[str, str]] = []
     failures: list[dict[str, str]] = []
-    for t in due:
-        pid = t["printerId"]
-        if pid in captured:
-            continue
-        f = failure_by_pid.get(pid)
-        if f is None:
-            f = {"printerId": pid, "reason": "timeout", "stderrTail": ""}
-        failures.append(f)
-    sources = {t["printerId"]: camera_source_id(t) for t in due}
-    for result in frames + failures:
-        result["sourceId"] = sources[result["printerId"]]
+    for fut, t in futs.items():
+        pid, lane = t["printerId"], _lane(t)
+        if pid not in started:
+            scheduler.stats["notStarted"] += 1
+            continue   # silent: still due, and its old last_try sorts it first next beat
+        scheduler.attempted(pid, now)
+        scheduler.stats["attempts"] += 1
+        if not fut.done():
+            jpeg, reason, tail, dur = None, "timeout", "outlived the beat", budget
+        elif fut.exception() is not None:
+            jpeg, reason, tail, dur = None, "unknown", "", 0.0
+        else:
+            jpeg, reason, tail, dur = fut.result()
+        _add_ms(scheduler.stats[lane + "Ms"], dur)
+        sha = hashlib.sha256(jpeg).digest() if jpeg else None
+        if jpeg and len(jpeg) > SITE_MAX_FRAME_BYTES:
+            jpeg, reason, tail = None, "too-large", f"{len(jpeg)} bytes"
+        elif jpeg and scheduler.is_repeat(pid, sha):
+            jpeg, reason, tail = None, "frozen", "same bytes as the last accepted frame"
+        src = camera_source_id(t)
+        if jpeg:
+            frames.append({"printerId": pid, "jpegBase64": base64.b64encode(jpeg).decode("ascii"),
+                           "sourceId": src, "sha256": sha.hex()})
+        else:
+            reason = reason or "unknown"
+            scheduler.failed(pid, now)
+            scheduler.stats["fail"][reason] = scheduler.stats["fail"].get(reason, 0) + 1
+            failures.append({"printerId": pid, "reason": reason, "stderrTail": tail or "", "sourceId": src})
     return frames, failures

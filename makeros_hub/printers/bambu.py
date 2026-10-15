@@ -92,6 +92,9 @@ class BambuAdapter:
         self._lock = threading.Lock()
         self._data: dict[str, Any] = {}
         self._connack: str | None = None  # None | 'ok' | 'fail'
+        # v0.69: wall ms of the last successful MQTT connect. A power-cycled printer reconnects, so a new stamp is how the
+        # camera scheduler learns to retry a camera it had backed off (a cycle under STALE_SEC never leaves 'idle').
+        self._connected_at_ms: int | None = None
         self._error_reason: str | None = None
         self._last_report_at: float | None = None
         self._started = 0.0
@@ -160,6 +163,7 @@ class BambuAdapter:
         with self._lock:
             self._connack = "ok"
             self._error_reason = None
+            self._connected_at_ms = int(time.time() * 1000)
         client.subscribe(self._report_topic, qos=0)
         client.publish(self._request_topic, PUSHALL)
         client.publish(self._request_topic, GET_VERSION)
@@ -259,6 +263,7 @@ class BambuAdapter:
             last = self._last_report_at
             started = self._started
             data = self._data
+            connected_at_ms = self._connected_at_ms
 
         if connack == "fail":
             conn_state, reason = "error", err
@@ -272,9 +277,12 @@ class BambuAdapter:
         else:
             conn_state, reason = "connecting", None
 
-        return bambu_parse.normalize_status(
+        out = bambu_parse.normalize_status(
             self.printer_id, data, connection_state=conn_state, error_reason=reason, model=self.model
         )
+        if connected_at_ms is not None:
+            out["mqttConnectedAtMs"] = connected_at_ms   # omitted until the first connect (the DTO's absent-key rule)
+        return out
 
     def pending_queue_job_ids(self) -> list[str]:
         """Queue jobs dispatched here whose outcome is not yet known (v0.58: the manager asks before its busy check)."""
@@ -340,6 +348,16 @@ class BambuAdapter:
             if pending:
                 # another job's outcome on this printer is still unknown: never stack a second start on it
                 return {"ok": False, "reason": "printer_busy"}
+
+        with self._lock:
+            print_obj = self._data.get("print")
+            gcode_state = print_obj.get("gcode_state") if isinstance(print_obj, dict) else None
+        if not isinstance(gcode_state, str) or not gcode_state.strip():
+            # v0.69: right after a (re)connect paho says "connected" before the printer's first full report, so the busy
+            # checks see no state and a printer mid-print reads as idle. No start until it has said what it is doing; the
+            # cloud re-queues printer_stale without counting it (queue-status route).
+            log.warning("bambu %s: refusing %s — no printer state reported since the hub connected", self.printer_id, queue_job_id)
+            return {"ok": False, "reason": "printer_stale: no printer state reported since the hub connected"}
 
         sequence_id = os.urandom(4).hex()
         payload = bambu_send.build_print_start_payload(

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from ..diagnostics import get_default, redact
+from .queue_progress import write_json_durably
 from .threemf_objects import parse_plate_objects
 
 log = logging.getLogger("makeros-hub.printers")
@@ -37,6 +38,11 @@ BUSY_ACTIVITY_STATES = frozenset({"printing", "paused"})
 DISPATCHED_STATE_PATH = Path(os.environ.get("MAKEROS_HUB_DISPATCHED_STATE", "/var/lib/makeros-hub/dispatched.json"))
 DISPATCHED_TTL_SEC = 24 * 3600
 MAX_DISPATCHED_COMMANDS = 1000
+# v0.69: the command guard below persists too. pstation puts a 'sent' command back to pending after 10 minutes without a
+# result (hub-commands.ts takePendingCommands) and fails it after an hour; a restart that lost both the result and an
+# in-RAM guard re-ran a pause or a dryer cycle ten minutes later. Entries older than the cloud's hour are dropped.
+DISPATCHED_COMMANDS_PATH = Path(os.environ.get("MAKEROS_HUB_DISPATCHED_COMMANDS", "/var/lib/makeros-hub/dispatched-commands.json"))
+DISPATCHED_COMMANDS_TTL_SEC = 2 * 3600
 # Fallback rebuild for adapters that remain in error. Paho normally retries
 # network/authentication failures itself (observed in the shop on 2026-09-09),
 # but an adapter whose start() failed needs the manager to try again. This
@@ -101,7 +107,8 @@ class PrinterManager:
         # redelivered — a second ams_dry mode=1 would restart the heater cycle.
         # A successfully-dispatched requestId here makes a redelivery re-report
         # ok without republishing. Bounded like _dispatched_queue_jobs.
-        self._dispatched_commands: OrderedDict[str, float] = OrderedDict()
+        self._dispatched_commands: OrderedDict[str, float] = OrderedDict()   # requestId -> wall stamp (v0.69: persisted)
+        self._load_dispatched_commands()
         # Per-printer camera-routing facts (vendor/model/host/accessCode/urls),
         # rebuilt every reconcile. Lets the camera capturer pick the right source
         # (Bambu :6000 / HTTP snapshot / …) without re-plumbing config-down.
@@ -497,6 +504,30 @@ class PrinterManager:
         except OSError as e:
             log.warning("could not persist the dispatched-job guard: %s", e)
 
+    def _remember_command(self, request_id: str) -> None:
+        """Guard a command that ran, durably before its result is even queued. ponytail: the publish and this write are
+        not atomic — a crash in the milliseconds between them can still re-run a command the cloud redelivers."""
+        self._dispatched_commands[request_id] = time.time()
+        self._dispatched_commands.move_to_end(request_id)
+        while len(self._dispatched_commands) > MAX_DISPATCHED_COMMANDS:
+            self._dispatched_commands.popitem(last=False)
+        if not write_json_durably(DISPATCHED_COMMANDS_PATH, json.dumps(dict(self._dispatched_commands))):
+            log.warning("command guard not durable: a restart could re-run %s if the cloud redelivers it", request_id)
+
+    def _load_dispatched_commands(self) -> None:
+        try:
+            raw = json.loads(DISPATCHED_COMMANDS_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(raw, dict):
+            return
+        now = time.time()
+        # a stamp from the future (the clock stepped back across the restart) is kept, like the dispatch guard
+        fresh = {rid: float(t) for rid, t in raw.items()
+                 if isinstance(rid, str) and isinstance(t, (int, float)) and not isinstance(t, bool) and now - t < DISPATCHED_COMMANDS_TTL_SEC}
+        for rid in sorted(fresh, key=fresh.get):   # oldest first, so the cap evicts the oldest
+            self._dispatched_commands[rid] = fresh[rid]
+
     def busy_printers(self) -> list[str]:
         """Printers currently preparing/printing/paused per their own live status (the hub is the truth for physical
         state). Used to refuse a second dispatch and to defer an OTA restart."""
@@ -683,10 +714,7 @@ class PrinterManager:
                 report = self.laser.dispatch(request_id, printer_id, command, params)
                 if report is not None:
                     if report.get("status") == "ok":
-                        self._dispatched_commands[request_id] = time.monotonic()
-                        self._dispatched_commands.move_to_end(request_id)
-                        while len(self._dispatched_commands) > MAX_DISPATCHED_COMMANDS:
-                            self._dispatched_commands.popitem(last=False)
+                        self._remember_command(request_id)
                     reports.append(report)
                 continue
             adapter = self._adapters.get(printer_id)
@@ -718,10 +746,7 @@ class PrinterManager:
                 # Record only successful dispatches so a failed one (e.g. a
                 # transient printer_unavailable) can still be retried if the cloud
                 # ever redelivers; bound it like the queue-job guard.
-                self._dispatched_commands[request_id] = time.monotonic()
-                self._dispatched_commands.move_to_end(request_id)
-                while len(self._dispatched_commands) > MAX_DISPATCHED_COMMANDS:
-                    self._dispatched_commands.popitem(last=False)
+                self._remember_command(request_id)
                 reports.append({"requestId": request_id, "command": command, "status": "ok"})
             else:
                 reason = result.get("reason") if isinstance(result, dict) else "unknown"
