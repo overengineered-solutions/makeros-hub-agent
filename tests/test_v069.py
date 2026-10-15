@@ -409,6 +409,30 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         b._queue_progress._start_timeout_sec = 0
         self.assertEqual([r.get("reason") for r in b.collect_queue_progress()], ["outcome_unknown_after_restart"])
 
+    def test_a_lan_re_print_saying_zero_is_never_waited_on_as_the_saved_task(self):
+        # codex review of bc8aa63: Alice's saved cube had task 77; Bob's LAN re-print said "0" on return, and the tracker
+        # waited for Alice's id through Bob's whole print, which was never reported
+        self.printing(task_id="77")
+        b = boot()
+        report(b, gcode_state="RUNNING", subtask_name="cube", task_id="0", subtask_id="0")
+        report(b, gcode_state="FINISH")
+        self.assertEqual([(j["filename"], j["status"], j.get("notDispatched")) for j in b.pending_jobs()],
+                         [("cube", "done", True)])
+        b._queue_progress._start_timeout_sec = 0
+        self.assertEqual([r.get("reason") for r in b.collect_queue_progress()], ["outcome_unknown_after_restart"])
+
+    def test_a_short_lan_print_is_never_aliased_to_a_later_id_either(self):
+        # codex review of bc8aa63: a 120 s LAN cube never reached the 5-minute rule, so after a drop another member's
+        # cube (task 78) was aliased to it and suppressed for good
+        key, _ = self.printing(task_id="0")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report_later(a, 120, gcode_state="FINISH", subtask_name="cube", task_id="0")
+        a.ack_jobs([key])
+        self.reconnect(a)
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        self.assertEqual([j["jobKey"] for j in a.pending_jobs()], ["task_S1_78"])
+
     def test_a_lan_re_dispatch_keeps_its_no_id_so_a_later_id_is_another_print(self):
         # codex review of 708dff1: the second LAN dispatch's seed dropped the "0" ids its deltas never resend, so another
         # cube (task 78) finished during a later drop was aliased to it and never reported
@@ -1273,6 +1297,14 @@ class TestRestartMidDispatchNeverStartsTwice(_Dispatch):
         report(c, gcode_state="FINISH", subtask_name="cube", task_id="77")
         self.assertEqual([r["state"] for r in third.dispatch_assignments([ASSIGNMENT], self.spool)], ["uploading"])
         self.assertEqual((c._client.published, self.upload.call_count), ([], 1))
+
+    def test_a_guard_whose_directory_fsync_fails_is_not_durable(self):
+        # codex review of bc8aa63: the directory-fsync failure was swallowed and the save reported success, so the adapter
+        # could persist its popped dispatch with no durable guard behind it
+        m = PrinterManager()
+        with mock.patch("makeros_hub.printers.queue_progress._fsync_dir", return_value=False):
+            self.assertFalse(m._remember_dispatched_queue_job("q9", 1))
+        self.assertTrue(m._remember_dispatched_queue_job("q9", 1))
 
     def test_died_after_the_outbox_before_the_manager_guard(self):
         m = PrinterManager()

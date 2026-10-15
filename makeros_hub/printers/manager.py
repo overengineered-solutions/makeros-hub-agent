@@ -499,26 +499,14 @@ class PrinterManager:
                 self._dispatched_wall[job_id] = float(stamp)
 
     def _save_dispatched(self) -> bool:
-        try:
-            DISPATCHED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            tmp = DISPATCHED_STATE_PATH.with_suffix(".json.tmp")
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps({"v": 2, "jobs": {j: {"t": t, **({"seq": self._dispatched_seq[j]} if j in self._dispatched_seq else {})} for j, t in self._dispatched_wall.items()}}))
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, DISPATCHED_STATE_PATH)
-            try:
-                fd = os.open(str(DISPATCHED_STATE_PATH.parent), os.O_RDONLY)
-                try:
-                    os.fsync(fd)
-                finally:
-                    os.close(fd)
-            except OSError:
-                pass
-        except OSError as e:
-            log.warning("could not persist the dispatched-job guard: %s", e)
-            return False
-        return True
+        """True only once durable, directory entry included (v0.69: a resolved dispatch is popped on the strength of it;
+        a swallowed directory-fsync failure reported success, codex review of bc8aa63)."""
+        encoded = json.dumps({"v": 2, "jobs": {j: {"t": t, **({"seq": self._dispatched_seq[j]} if j in self._dispatched_seq else {})}
+                                                for j, t in self._dispatched_wall.items()}})
+        if write_json_durably(DISPATCHED_STATE_PATH, encoded):
+            return True
+        log.warning("could not persist the dispatched-job guard")
+        return False
 
     def _remember_command(self, request_id: str) -> None:
         """Guard a command that ran, durably before its result is even queued. ponytail: the publish and this write are

@@ -289,8 +289,11 @@ class JobTracker:
         eta = saved.get("etaAt")
         # the printer's own id (the key, or the alias a fingerprinted print learned): no ambiguity to judge
         exact = bool(task_id) and self._task_key(task_id) in (saved["key"], saved.get("taskKey"))
-        # a print that said it had no id ("0") and now shows one is another print (codex review of 708dff1)
-        id_contradicts = bool(task_id) and not exact and saved.get("noId") is True
+        # a print that said it had no id ("0") and now shows one, or one with an id that now says "0", is another print
+        # (codex reviews of 708dff1 and bc8aa63)
+        saved_id = str(saved["key"]).startswith("task_") or bool(saved.get("taskKey"))
+        id_contradicts = ((bool(task_id) and not exact and saved.get("noId") is True)
+                          or (saved_id and _explicit_no_id(merged)))
         overran = (state in _STILL_ACTIVE and not exact and eta is not None and eta > saved["startedAt"]
                    and now > eta + ADOPT_PAST_ETA_S)
         same = (state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED)) and (exact or (
@@ -375,7 +378,8 @@ class JobTracker:
         # must not come back under that task key on a restart onto its FINISH (codex review of 3b59933)
         self._last_key = a.get("taskKey") or job["jobKey"]
         self._last_name = a["name"] if a.get("named", True) else None
-        self._last_alias_ok = not a.get("noId")
+        # still saying "0" at its close, however short the print: a later id is another print's (codex review of bc8aa63)
+        self._last_alias_ok = not (a.get("noId") or a.get("saidZero"))
         self._buffer(job)
 
     def _buffer(self, job: dict) -> None:
@@ -448,8 +452,11 @@ class JobTracker:
             real_now = _subtask_name(merged)
             # a real name that differs from the saved one decides at once: no id to wait for will turn it into the saved
             # print (codex review of b715c89: a local LAN print, task "0", stayed untracked to its end)
-            contradicts = (bool(real_now) and self._restored.get("named", True) and bool(self._restored["name"])
-                           and real_now != self._restored["name"])
+            contradicts = ((bool(real_now) and self._restored.get("named", True) and bool(self._restored["name"])
+                            and real_now != self._restored["name"])
+                           # the fresh report SAYS no id ("0") and the saved print had one: a LAN re-print in its place,
+                           # whose id will never come (codex review of bc8aa63)
+                           or (has_id and _explicit_no_id(merged)))
             if ((state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED)) and not _printer_task_id(merged)
                     and not contradicts and (has_id or not real_now)):
                 # A bare delta ({"gcode_state": "FINISH"}), or one naming only the generic gcode_file, says nothing about
@@ -460,9 +467,12 @@ class JobTracker:
                 return
             self._adopt_or_drop(merged, state, now)
         task_id, real = _printer_task_id(merged), _subtask_name(merged)
-        if self._active is not None and _explicit_no_id(merged) and now - self._active["startedAt"] >= NO_ID_AFTER_S:
-            # a LAN print: an id seen after a gap is another print's (codex reviews of a599650 and 708dff1)
-            self._active["noId"] = True
+        if self._active is not None:
+            said_zero = _explicit_no_id(merged)
+            self._active["saidZero"] = said_zero   # the latest report's word; an id seen after the close is not its own
+            if said_zero and now - self._active["startedAt"] >= NO_ID_AFTER_S:
+                # a LAN print: an id seen after a gap is another print's (codex reviews of a599650 and 708dff1)
+                self._active["noId"] = True
         if self._active is not None:
             key = str(self._active["key"])
             known = key if key.startswith("task_") else self._active.get("taskKey")
