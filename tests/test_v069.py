@@ -275,7 +275,7 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
                 key, _ = self.printing(task_id="77")
                 b = boot()
                 report(b, gcode_state="RUNNING", subtask_name="cube")
-                self.assertEqual(b._jobs.active_key(), key)  # adopted by name (no id in this report)
+                self.assertIsNone(b._jobs.active_key())      # a saved print with an id waits for the id, not the name
                 report(b, gcode_state=later, subtask_name="cube", task_id="78")
                 if later == "RUNNING":
                     self.assertEqual(b._jobs.active_key(), "task_S1_78")
@@ -376,6 +376,42 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         report(b, gcode_state="FINISH", subtask_name="cube", task_id="77")
         self.assertEqual([(j["jobKey"], j["status"]) for j in b.pending_jobs()], [(key, "done")])
         self.assertEqual(b.collect_queue_progress()[-1]["state"], "completed")
+
+    def test_a_reconnect_with_nothing_running_never_re_emits_an_acked_print(self):
+        # codex review of 1e116ed: closed under its fingerprint, acked, then the reconnect's pushall named task 77 and the
+        # re-armed recovery emitted the same print again under task_S1_77
+        key, _ = self.printing(task_id="0")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="0")
+        a.ack_jobs([key])
+        a._on_disconnect(None, None, 0)
+        a._on_connect(a._client, None, None, 0)
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual(a.pending_jobs(), [])
+
+    def test_a_same_file_finish_without_the_saved_prints_id_waits_for_the_id(self):
+        # codex review of 1e116ed: Alice's cube (task 77) saved; Bob's cube (task 78) finished during the outage; the first
+        # fresh report (FINISH, cube, no id) completed Alice's job, and task 78 was ignored
+        self.printing(task_id="77")
+        b = boot()
+        report(b, gcode_state="FINISH", subtask_name="cube")
+        self.assertEqual(b.pending_jobs(), [])
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        self.assertEqual([(j["jobKey"], j.get("notDispatched")) for j in b.pending_jobs()], [("task_S1_78", True)])
+        b._queue_progress._start_timeout_sec = 0
+        self.assertEqual([r.get("reason") for r in b.collect_queue_progress()], ["outcome_unknown_after_restart"])
+
+    def test_another_prints_name_on_a_finish_frame_splits_it_off(self):
+        # codex review of 1e116ed: the name split ran only on RUNNING, so FINISH/bob/78 closed Alice's fingerprinted cube as
+        # done with Bob's ending and completed her job
+        key, _ = self.printing(task_id="0")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report(a, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        self.assertEqual([(j["jobKey"], j["status"], j.get("notDispatched")) for j in a.pending_jobs()],
+                         [(key, "cancelled", None), ("task_S1_78", "done", True)])
+        self.assertEqual([(r["state"], r.get("reason")) for r in a.collect_queue_progress()], [("held", "print_cancelled")])
 
     def test_a_generic_plate_path_never_disproves_the_saved_real_name(self):
         # codex review of e8134f8: a LAN cube finished during the restart; the first report (FINISH, task "0",
@@ -890,6 +926,23 @@ class TestCameraFairnessAtCapacity(unittest.TestCase):
                 else:
                     s.failed(pid, now)
         self.assertGreaterEqual(min(got.values()), 6, got)                 # ~ every 3 beats on the 90 s tier
+
+    def test_a_failed_transition_capture_is_retried_next_beat_whatever_the_tier(self):
+        # codex review of 1e116ed: the print ended at t=40, that capture failed once, and the 600 s idle tier hid the
+        # promised next-beat retry until t=600
+        s = CameraScheduler()
+        t = [{"printerId": "p", "vendor": "bambu", "model": "X1C", "host": "h", "accessCode": "c"}]
+        s.plan(t, {"p": {"state": "printing", "progressPct": 50}}, 0.0)
+        s.accepted("p", 0.0, None)
+        idle = {"p": {"state": "idle"}}
+        self.assertEqual(len(s.plan(t, idle, 40.0)), 1)
+        s.attempted("p", 40.0)
+        s.failed("p", 40.0)
+        self.assertEqual(len(s.plan(t, idle, 80.0)), 1)                   # the one free miss: retried next beat
+        s.attempted("p", 80.0)
+        s.failed("p", 80.0)                                               # the second opens the breaker
+        self.assertEqual(s.plan(t, idle, 120.0), [])
+        self.assertEqual(len(s.plan(t, idle, 141.0)), 1)                  # and the breaker paces it, not the tier
 
     def test_a_state_change_still_goes_first(self):
         s = CameraScheduler()

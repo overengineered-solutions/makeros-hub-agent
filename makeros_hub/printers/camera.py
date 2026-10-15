@@ -303,7 +303,9 @@ class CameraScheduler:
                 continue                                         # an open breaker wins over want
             wanted = pid in want if want is not None else bool(t.get("cameraDense"))   # older site: config-down flag
             interval = self.FIRST_OR_LAST_LAYER_S if wanted else self._interval(state, st.get("progressPct"))
-            if c.change or c.last_ok is None or now - c.last_ok >= interval:
+            # a failing camera stays due (its breaker paces it): the one free miss is retried next beat even when its
+            # tier is the 600 s idle one (codex review of 1e116ed)
+            if c.change or c.streak or c.last_ok is None or now - c.last_ok >= interval:
                 # Earliest deadline first, after unanswered state changes: a new camera is due since forever, a working
                 # one since last_ok + its tier. A camera that loses the race only grows more overdue, so it reaches the
                 # front: wanted / first-layer cameras over the lane's capacity can no longer starve the mid-print ones. A

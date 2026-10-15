@@ -99,8 +99,8 @@ Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
   picture).
 - **New reasons.** `frozen` means the same bytes as the last accepted frame. `too-large` means over the site's
   1.5 MB cap. Neither frame is pushed.
-- **The breaker.** One miss is retried next beat. From the second miss the camera backs off 60, 120, 240, 480, then
-  600 s, capped at 120 s while printing. It resets on a state change, a new MQTT connection (`mqttConnectedAtMs`: how a
+- **The breaker.** One miss is retried next beat, whatever the camera's tier. From the second miss the camera backs off
+  60, 120, 240, 480, then 600 s, capped at 120 s while printing; a failing camera stays due, paced by the breaker. It resets on a state change, a new MQTT connection (`mqttConnectedAtMs`: how a
   power-cycle shows up to the hub), a source change or a disable/enable.
 - **Acknowledgement.** A frame counts as captured only after the site answers 200. 413, 415 and 422 count as failures.
   Pushes stop at the first 5xx or network error.
@@ -136,7 +136,7 @@ Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
   old job's `held` has been delivered, because the site matches an unbound finished print to the printer's
   `printing` job by time; the site ignores the `notDispatched` key itself. A report with neither a real name (`subtask_name`; the
   generic `gcode_file` plate path counts for nothing) nor a task id never decides which print a saved one was: the hub
-  waits for the first report that names it. An MQTT reconnect handles the running print the same way: the cached
+  waits for the first report that names it, and for a saved print the printer gave a task id, for that id. An MQTT reconnect handles the running print the same way: the cached
   name and task id are dropped, and the print is confirmed again by the new connection's reports. A print whose task id matches the saved one is
   always kept, whatever name a partial report gives it. The
   ETA is kept current while a print runs or is paused, so a restart short of that never drops a print. A failed write
