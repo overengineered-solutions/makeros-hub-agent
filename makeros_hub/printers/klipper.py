@@ -731,10 +731,10 @@ class KlipperAdapter:
                     POLL_BACKOFF_MAX_SEC,
                 )
             else:
-                self._refresh_metadata(data)   # v0.70: one GET per new filename; a failure only costs the slicer ETA
                 was_first = self._record_poll(data, stop)
                 if was_first is None:
                     return   # stopped while this poll was in flight
+                self._refresh_metadata(data)   # Publish and date the reading before a metadata request can delay it.
                 # Adversarial review MED #14: explicit "connected" log on
                 # the first-poll-success transition so the cloud admin diag
                 # gets a clear event (mirrors the Bambu adapter's

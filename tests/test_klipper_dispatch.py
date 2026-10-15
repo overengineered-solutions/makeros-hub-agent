@@ -499,7 +499,9 @@ class TestManagerKlipper(KlipperCase):
         self.assertIsNot(m._adapters["k1"], first)
         self.assertEqual(m._adapters["k1"]._model, "Sovol SV08")
 
-    def test_a_model_edit_rebuild_reports_an_unacked_finished_print_once(self):
+    @mock.patch.object(KlipperAdapter, "start")
+    def test_a_model_edit_rebuild_reports_an_unacked_finished_print_once(self, _start):
+        # This case feeds samples explicitly; a background HTTP sample can otherwise replay an older state.
         # the old adapter's unacked job is rescued AND the rebuilt one reloads it from disk: one jobKey, one row
         m = self.manager()
         self.fake.state, self.fake.filename = "printing", "makeros/x_cube.gcode"

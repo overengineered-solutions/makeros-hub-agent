@@ -56,11 +56,11 @@ are 5 s.
 | `sentAt` | unix ms | when the hub built the body |
 | `full` | bool | see *Full and delta* |
 | `printers[].printerId` | string (uuid) | the site's machine id, as in the heartbeat |
-| `printers[].sampledAt` | unix ms | the newest reading used: the Bambu adapter's last MQTT report, the Klipper adapter's last successful poll |
+| `printers[].sampledAt` | unix ms | the newest reading used: the Bambu adapter's last print-status report (not a version reply or command acknowledgement), the Klipper adapter's last successful poll before any metadata lookup. Never-observed printers are omitted from telemetry; their connectivity still rides the heartbeat |
 | `connected` | bool | the heartbeat's `connectionState == "connected"` |
 | `state` | `idle` / `printing` / `paused` / `offline` / `error` | the heartbeat's activity state; `offline` or `error` when not connected |
 | `gcodeState` | string, max 32 | Bambu only, the raw `gcode_state` (`RUNNING`, `PREPARE`, `FINISH`, …); the site's plate-clear gate reads it, so Klipper never sends one |
-| `stageCode` | int | Bambu `stg_cur`. Omitted for the idle sentinels (`-1` on X1, `255` on P1/A1), and `0` ("printing") is omitted unless `gcode_state` is `RUNNING`, `PAUSE` or `PREPARE` (at boot the printer reports 0 where it means idle; after a print it keeps the last value). Unknown codes (the H2D/P2S-era 59–77) are forwarded as is: show them as working |
+| `stageCode` | int | Bambu `stg_cur`, falling back to `stage._id` on newer firmware. Omitted for the idle sentinels (`-1` on X1, `255` on P1/A1), and `0` ("printing") is omitted unless `gcode_state` is `RUNNING`, `PAUSE` or `PREPARE` (at boot the printer reports 0 where it means idle; after a print it keeps the last value). Unknown codes (the H2D/P2S-era 59–77) are forwarded as is: show them as working |
 | `stageSecondsLeft` | int ≥ 0 | Bambu `stg_cd`, the countdown of the current stage; only beside `stageCode` |
 | `displayMessage` | string, max 120 | Klipper `display_status.message` (the M117 / `SET_DISPLAY_TEXT` text the start macro sets); omitted when empty |
 | `preparing` | bool | Klipper: `print_stats.state == "printing"` and `print_stats.print_duration == 0` (the start routine: soak, home, QGL, mesh — Klipper counts print time from the first extrusion). Bambu: `gcode_state == "PREPARE"`. Present while connected (Klipper: whenever Moonraker reports `print_stats`) |
@@ -69,7 +69,7 @@ are 5 s.
 | `printDurationSec` | int | Klipper `print_stats.print_duration` |
 | `elapsedSec` | int | Klipper `print_stats.total_duration`; Bambu `now − gcode_start_time` while a print is under way |
 | `layer` | `[current, total]` | Klipper `print_stats.info.current_layer/total_layer` (filled by `SET_PRINT_STATS_INFO`; OrcaSlicer's `CURRENT_LAYER=[layer_num]` is zero-based); Bambu `layer_num/total_layer_num`. Omitted until a total is known |
-| `nozzleC`, `nozzleTargetC` | number °C | Klipper `extruder.temperature/target`. Bambu: flat `nozzle_temper/nozzle_target_temper`, each falling back to the packed `device.extruder.info[].temp` of the active extruder (low 16 bits current, high 16 target) on P2S/H2D firmware |
+| `nozzleC`, `nozzleTargetC` | number °C | Klipper `extruder.temperature/target`. Bambu: flat `nozzle_temper/nozzle_target_temper`, each falling back to the packed `device.extruder.info[].temp` of the active extruder (low 16 bits current, high 16 target) on P2S/H2D firmware; omitted when the active extruder or its reading is unknown |
 | `bedC`, `bedTargetC` | number °C | Klipper `heater_bed.temperature/target`; Bambu flat `bed_temper/bed_target_temper`, falling back to packed `device.bed.info.temp` |
 | `chamberC` | number °C | Bambu `chamber_temper`, falling back to the low word of `device.ctc.info.temp`; never Klipper, never A1/P1 (no sensor) |
 | `jobName` | string, max 300 | Klipper `print_stats.filename`; Bambu `subtask_name`, else `gcode_file` |

@@ -19,6 +19,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import math
 import threading
 import time
 from typing import Any, Callable, Optional
@@ -70,7 +71,7 @@ _ACTIVE_STATES = frozenset({"printing", "paused"})
 
 
 def _is_number(v: Any) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool)
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
 
 
 def _clamp_ms(ms: float) -> int:
@@ -86,8 +87,9 @@ def project(status: dict) -> Optional[dict]:
     connected = status.get("connectionState") == "connected"
     out: dict[str, Any] = {"printerId": pid, "connected": connected}
     sampled = status.get("sampledAt")
-    if _is_number(sampled):
-        out["sampledAt"] = int(sampled)
+    if not _is_number(sampled) or sampled <= 0:
+        return None  # Never observed: the heartbeat reports connectivity without inventing a sample time.
+    out["sampledAt"] = int(sampled)
     for key, wire in _WIRE_KEYS.items():
         if key in status:
             out[wire] = status[key]
@@ -229,12 +231,14 @@ class TelemetryPusher:
             self._note_failure(f"transport error: {exc}")
             return None
         if status == 404:
+            self._drop_connection()
             if not self._route_missing:
                 log.info("telemetry: the site has no %s route yet (404); retrying every %.0f s", self._path, NOT_FOUND_RETRY_SEC)
             self._route_missing = True
             return None
         was_missing, self._route_missing = self._route_missing, False
         if not 200 <= status < 300 or len(raw) > MAX_RESPONSE_BYTES:
+            self._drop_connection()
             self._note_failure(f"HTTP {status}")
             return None
         try:
@@ -242,6 +246,7 @@ class TelemetryPusher:
         except (ValueError, UnicodeDecodeError):
             reply = None
         if not isinstance(reply, dict) or reply.get("ok") is not True:
+            self._drop_connection()
             # An empty or broken 200 (a proxy's, say) is not the site accepting the send — the heartbeat's rule too.
             self._note_failure("reply is not {ok: true}")
             return None

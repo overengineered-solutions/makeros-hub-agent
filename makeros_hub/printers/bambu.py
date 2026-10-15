@@ -20,6 +20,7 @@ telemetry only).
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from pathlib import Path
@@ -102,6 +103,7 @@ class BambuAdapter:
         self._state_seen = False
         self._error_reason: str | None = None
         self._last_report_at: float | None = None
+        self._last_status_at: float | None = None
         self._started = 0.0
         self._shape_logged = False
         self._version_logged = False
@@ -192,6 +194,9 @@ class BambuAdapter:
         with self._lock:
             bambu_parse.merge_report(self._data, doc)
             self._last_report_at = time.monotonic()
+            report = doc.get("print")
+            if isinstance(report, dict) and report and report.get("command", "push_status") == "push_status":
+                self._last_status_at = self._last_report_at
             if isinstance(doc.get("print"), dict) and doc["print"].get("gcode_state"):
                 self._state_seen = True
             # Job lifecycle detection (wall-clock — startedAt/endedAt are real
@@ -280,8 +285,9 @@ class BambuAdapter:
             connack = self._connack
             err = self._error_reason
             last = self._last_report_at
+            sampled = self._last_status_at
             started = self._started
-            data = self._data
+            data = copy.deepcopy(self._data)  # MQTT merges in place; the reading must match the captured timestamp.
             connected_at_ms = self._connected_at_ms
 
         if connack == "fail":
@@ -301,10 +307,10 @@ class BambuAdapter:
         )
         if connected_at_ms is not None:
             out["mqttConnectedAtMs"] = connected_at_ms   # omitted until the first connect (the DTO's absent-key rule)
-        if last is not None:
+        if sampled is not None:
             # v0.70: when the newest report arrived (wall ms), for the site's "updated 4 s ago"; the staleness clock is
             # monotonic, so its age is moved onto the wall clock. Absent until the first report (the same rule).
-            out["sampledAt"] = int((time.time() - (now - last)) * 1000)
+            out["sampledAt"] = int((time.time() - (now - sampled)) * 1000)
         return out
 
     def pending_queue_job_ids(self) -> list[str]:

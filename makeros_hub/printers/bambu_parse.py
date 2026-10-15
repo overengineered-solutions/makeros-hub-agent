@@ -104,14 +104,15 @@ def _packed_device_temp(device: dict, part: str) -> tuple[float, float] | None:
 
 
 def _packed_extruder_temp(device: dict) -> tuple[float, float] | None:
-    """The active extruder's packed temp (device.extruder.state: low 4 bits the count, the next 4 the active one); the
-    first valid entry when the active one is not listed. One nozzle on the wire, as the flat nozzle_temper is."""
+    """The active extruder's packed temp (device.extruder.state: low 4 bits the count, the next 4 the active one),
+    omitted when its identity or reading is unknown. One nozzle on the wire, as the flat nozzle_temper is."""
     extruders = device.get("extruder")
     if not isinstance(extruders, dict) or not isinstance(extruders.get("info"), list):
         return None
     state = _to_int(extruders.get("state"))
-    active = (state >> 4) & 15 if state is not None and state >= 0 else 0
-    fallback: tuple[float, float] | None = None
+    if state is None or state < 0:
+        return None
+    active = (state >> 4) & 15
     for ext in extruders["info"]:
         if not isinstance(ext, dict):
             continue
@@ -120,8 +121,7 @@ def _packed_extruder_temp(device: dict) -> tuple[float, float] | None:
             continue
         if _to_int(ext.get("id")) == active:
             return packed
-        fallback = fallback or packed
-    return fallback
+    return None
 
 
 def build_temperatures(print_obj: dict) -> dict[str, Any]:
@@ -159,6 +159,8 @@ def build_stage(print_obj: dict) -> dict[str, Any]:
     preheating, 13 homing, ...) and shows unknown ones as working."""
     out: dict[str, Any] = {}
     code = _to_int(print_obj.get("stg_cur"))
+    if code is None and isinstance(print_obj.get("stage"), dict):
+        code = _to_int(print_obj["stage"].get("_id"))
     gcode_state = print_obj.get("gcode_state")
     active = isinstance(gcode_state, str) and gcode_state.upper() in _ACTIVE_GCODE_STATES
     if code is None or code in _STAGE_IDLE_SENTINELS or not 0 <= code <= _STAGE_CODE_MAX or (code == 0 and not active):

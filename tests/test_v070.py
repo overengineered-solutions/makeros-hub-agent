@@ -464,7 +464,7 @@ class TestTelemetryPush(unittest.TestCase):
         self.assertTrue(h.conns[0].closed)
         h.rows[0] = row("p1", progressPct=15.5)
         h.tick()
-        self.assertEqual(len(h.conns), 2)                          # re-created on the next send
+        self.assertEqual(len(h.conns), 3)                          # replaced after both the 500 and transport error
         self.assertIs(h.sent[5]["full"], True)
         h.rows[0] = row("p1", progressPct=16.0)
         h.tick()                                                   # {ok: false} is not acceptance
@@ -563,10 +563,11 @@ class TestTelemetryPush(unittest.TestCase):
         self.assertTrue(conns[0].closed)                                                           # closed on stop
 
     def test_project_maps_disconnected_rows_to_offline_or_error(self):
-        self.assertEqual(telemetry.project({"printerId": "p", "connectionState": "error", "errorReason": "unreachable"}),
-                         {"printerId": "p", "connected": False, "state": "error"})
-        self.assertEqual(telemetry.project({"printerId": "p", "connectionState": "connecting"}),
-                         {"printerId": "p", "connected": False, "state": "offline"})
+        self.assertEqual(telemetry.project({"printerId": "p", "connectionState": "error", "sampledAt": 1000}),
+                         {"printerId": "p", "connected": False, "state": "error", "sampledAt": 1000})
+        self.assertEqual(telemetry.project({"printerId": "p", "connectionState": "connecting", "sampledAt": 1000}),
+                         {"printerId": "p", "connected": False, "state": "offline", "sampledAt": 1000})
+        self.assertIsNone(telemetry.project({"printerId": "p", "connectionState": "error"}))
         self.assertIsNone(telemetry.project({"connectionState": "connected"}))
 
     def test_against_a_real_loopback_server(self):
