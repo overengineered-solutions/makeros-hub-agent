@@ -21,6 +21,7 @@ import dataclasses
 import logging
 import threading
 from typing import Any
+from ..printers.tray_translate import cleared_tray
 
 log = logging.getLogger("makeros-hub.vprinter")
 
@@ -241,7 +242,7 @@ def _observed_dual_nozzles(statuses: list[dict]) -> tuple[dict, ...]:
 def tray_key(tray: dict[str, Any]) -> str | None:
     """The live_pool dedupe key for one tray, or None for an empty slot — the SAME string the derivation
     uses, exposed for the ranking signals."""
-    if not isinstance(tray, dict) or not _clean_optional(tray.get("material")):
+    if not isinstance(tray, dict) or not _clean_optional(tray.get("material")) or cleared_tray(tray):
         return None
     key = "|".join(
         (

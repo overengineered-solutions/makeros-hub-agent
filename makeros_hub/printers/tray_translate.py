@@ -15,6 +15,7 @@ the cloud puts the job back in the queue with the reason. Pure functions; the ad
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 EXTERNAL_TRAY_IDS = frozenset({254, 255})
@@ -34,8 +35,16 @@ def _norm_material(value: Any) -> str:
 def _norm_color(value: Any) -> str | None:
     s = str(value or "").strip().lstrip("#").upper()
     if len(s) in (6, 8) and all(c in "0123456789ABCDEF" for c in s):
-        return s[:6]
+        return s[:6] if len(s) == 8 and s.endswith("FF") else s
     return None
+
+
+def cleared_tray(tray: dict[str, Any]) -> bool:
+    """Alpha 00 is a transparent spool only when a real RFID tag confirms it is present."""
+    color = _norm_color(tray.get("colorHex"))
+    tag = tray.get("tagUid")
+    tagged = isinstance(tag, str) and re.fullmatch(r"[0-9a-fA-F]{16}", tag) and any(c != "0" for c in tag)
+    return bool(color and len(color) == 8 and color.endswith("00") and not tagged)
 
 
 def _norm_fid(value: Any) -> str | None:
@@ -73,7 +82,7 @@ def live_trays(ams_units: Any, vt_tray: Any = None) -> list[dict[str, Any]]:
             if unit.get("amsType") == "ams_ht" and slot != 0:
                 continue
             material = _norm_material(tray.get("material"))
-            if not material:
+            if not material or cleared_tray(tray):
                 continue
             # BambuStudio DevMapping.cpp: N3S/AMS HT uses ams_id+slot in the
             # legacy flat COMMAND map; mapping2 carries the explicit pair.
@@ -89,7 +98,7 @@ def live_trays(ams_units: Any, vt_tray: Any = None) -> list[dict[str, Any]]:
             if remain is not None:        # only when the AMS reports one (RFID spool) — the dict shape is pinned by tests
                 entry["remain"] = remain
             out.append(entry)
-    if isinstance(vt_tray, dict) and _norm_material(vt_tray.get("material")):
+    if isinstance(vt_tray, dict) and _norm_material(vt_tray.get("material")) and not cleared_tray(vt_tray):
         ext = {"tray_id": 254, "ams_id": 255, "slot_id": 0, "material": _norm_material(vt_tray.get("material")),
                "color": _norm_color(vt_tray.get("colorHex")), "filament_id": _norm_fid(vt_tray.get("filamentId"))}
         remain = _norm_remain(vt_tray.get("remainPct"))
