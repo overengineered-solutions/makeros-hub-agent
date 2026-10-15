@@ -186,6 +186,44 @@ class _Dispatch(unittest.TestCase):
 
 
 class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
+    def age_saved_print(self, hours_since_start, hours_since_eta):
+        """The hub was down: move the saved running print's start and ETA into the past (wall clock)."""
+        path = bambu_module.TERMINAL_JOBS_DIR / "p1.json"
+        raw = json.loads(path.read_text())
+        (entry,) = [e for e in raw if "hubState" in e]
+        started = entry["hubState"]["active"]["startedAt"] = time.time() - hours_since_start * 3600
+        entry["hubState"]["active"]["etaAt"] = time.time() - hours_since_eta * 3600
+        path.write_text(json.dumps(raw))
+        return started
+
+    def test_a_re_print_of_the_same_file_never_completes_the_saved_prints_queue_job(self):
+        # codex re-review: dropping the saved key was not enough; queue progress matched the re-print's terminal by
+        # filename and reported q1 'completed' with ANOTHER print's key
+        self.printing(task_id="0")
+        self.age_saved_print(9, 8)                           # down 8 h; the saved print should have ended 8 h ago
+        b = boot()
+        report(b, gcode_state="RUNNING", subtask_name="cube", task_id="0")    # a re-print of the same file
+        self.assertEqual(b.collect_queue_progress(), [])
+        c = boot()                                           # and another restart before it ends
+        report(c, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report(c, gcode_state="FINISH", subtask_name="cube", task_id="0")
+        self.assertEqual(len(c.pending_jobs()), 1)           # the re-print is still reported, as its own print
+        c._queue_progress._start_timeout_sec = 0
+        self.assertEqual(c.collect_queue_progress(),
+                         [{"queueJobId": "q1", "state": "held", "reason": "outcome_unknown_after_restart", "assignmentSeq": 7}])
+
+    def test_the_printers_own_task_id_keeps_the_saved_print_however_long_the_outage(self):
+        # codex re-review: the ETA cutoff discarded a print whose task id matched (paused through the outage)
+        key, _ = self.printing(task_id="77")
+        started = self.age_saved_print(9, 8)
+        b = boot()
+        report(b, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        self.assertEqual(b._jobs.active_key(), key)
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual(b.pending_jobs()[0]["startedAt"], _iso(started))   # the saved start, not the hub's return
+        self.assertEqual(b.collect_queue_progress()[-1]["printerJobKey"], key)
+
+
     def test_reported_once_to_the_right_queue_job_for_a_lan_print_without_a_task_id(self):
         # LAN prints carry task_id "0". Before v0.69 the running print lived only in RAM: after the restart nothing was
         # reported, and the queue job was held as outcome_unknown_after_restart for a human.
@@ -593,6 +631,22 @@ class TestRestartMidDispatchNeverStartsTwice(_Dispatch):
         self.assertEqual(self.upload.call_count, 0)
         report(a, gcode_state="IDLE")
         self.assertEqual(self.start(a), {"ok": True})
+
+    def test_a_fresh_busy_report_after_the_managers_check_still_stops_the_start(self):
+        # codex re-review: the manager passed the cached IDLE, then the first fresh report (RUNNING, started at the screen
+        # during the drop) set the freshness flag before start_print checked it
+        a = boot()
+        report(a, gcode_state="IDLE")
+        a._on_disconnect(None, None, 0)
+        a._on_connect(a._client, None, None, 0)
+        report(a, gcode_state="RUNNING", subtask_name="walk-up")
+        self.assertEqual(self.start(a), {"ok": False, "reason": "printer_busy"})
+        self.assertEqual(self.upload.call_count, 0)
+        b = boot()                                             # and a report landing DURING the upload
+        report(b, gcode_state="IDLE")
+        self.upload.side_effect = lambda *_a, **_k: report(b, gcode_state="PREPARE", subtask_name="walk-up")
+        self.assertEqual(self.start(b), {"ok": False, "reason": "printer_busy"})
+        self.assertEqual((b._client.published, b.pending_queue_jobs()), ([], []))   # nothing sent, no dispatch left behind
 
     def test_a_freshly_connected_printer_that_has_not_reported_is_never_started(self):
         a = boot()                                           # paho says connected; the printer's first report is not in

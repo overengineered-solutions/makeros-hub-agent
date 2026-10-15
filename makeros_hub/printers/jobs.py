@@ -183,6 +183,9 @@ class JobTracker:
         self._last_key: str | None = None
         self._active_saved = ""
         self._unsaved = False   # the last write failed: every observation retries until one lands
+        # set when the saved running print was dropped after a restart; the adapter then makes every queue dispatch from
+        # before the restart unlinkable, so no other print (a re-print of the same file) can complete that job
+        self.lost_saved_print = False
         self._load_pending()
 
     def active_key(self) -> str | None:
@@ -257,7 +260,9 @@ class JobTracker:
         saved, self._restored = self._restored, None
         name, task_id = _job_name(merged), _printer_task_id(merged)
         eta = saved.get("etaAt")
-        overran = state in _STILL_ACTIVE and eta is not None and eta > saved["startedAt"] and now > eta + ADOPT_PAST_ETA_S
+        exact = bool(task_id) and saved["key"] == self._task_key(task_id)   # the printer's own id: no ambiguity to judge
+        overran = (state in _STILL_ACTIVE and not exact and eta is not None and eta > saved["startedAt"]
+                   and now > eta + ADOPT_PAST_ETA_S)
         same = (
             (state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED))
             and not overran
@@ -269,8 +274,9 @@ class JobTracker:
         else:
             # IDLE after a restart = the printer was reset; another name = another print. The outcome is unknown, so
             # nothing is invented (the queue's outcome_unknown_after_restart covers a dispatched job).
-            log.info("%s: %s is no longer the running print after the restart (%s) — its key is dropped",
-                     self.printer_id, saved["name"] or saved["key"], state)
+            self.lost_saved_print = True
+            log.info("%s: %s is no longer the running print after the restart (%s%s) — its key is dropped",
+                     self.printer_id, saved["name"] or saved["key"], state, ", long past its ETA" if overran else "")
 
     # -- internals ----------------------------------------------------------
     def _fingerprint(self, name: str | None, started_ts: float) -> str:

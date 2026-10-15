@@ -33,6 +33,7 @@ import paho.mqtt.client as mqtt
 
 from . import bambu_parse, bambu_send, tray_translate
 from .jobs import JobTracker
+from .manager import BUSY_GCODE_STATES   # manager imports this module lazily, so no import cycle
 from .queue_progress import QueueProgressTracker, _fsync_dir, _safe_file_component
 from ..vprinter.capture import parse_printer_model_id
 from ..vprinter.report import MODEL_PRODUCT_NAMES
@@ -189,6 +190,10 @@ class BambuAdapter:
             # Job lifecycle detection (wall-clock — startedAt/endedAt are real
             # timestamps on the wire, unlike the monotonic staleness clock).
             self._jobs.observe(self._data, time.time())
+            if self._jobs.lost_saved_print:
+                self._jobs.lost_saved_print = False
+                if self._queue_progress.unlink_rehydrated():
+                    self._save_queue_progress()   # durable: another restart must not make the job linkable again
             if not self._shape_logged:
                 self._shape_logged = True
                 # First-parse shape observability (redacted) — see CLAUDE doctrine.
@@ -357,15 +362,10 @@ class BambuAdapter:
                 # another job's outcome on this printer is still unknown: never stack a second start on it
                 return {"ok": False, "reason": "printer_busy"}
 
-        with self._lock:
-            seen = self._state_seen
-        if not seen:
-            # v0.69: right after a (re)connect paho says "connected" before the printer's first report on that connection,
-            # so the busy checks see no state, or the state cached from before the drop, and a printer mid-print reads as
-            # idle. No start until it has said what it is doing on this connection; the cloud re-queues printer_stale
-            # without counting it (queue-status route).
-            log.warning("bambu %s: refusing %s — no printer state reported since the hub connected", self.printer_id, queue_job_id)
-            return {"ok": False, "reason": "printer_stale: no printer state reported since the hub connected"}
+        refusal = self._not_startable()
+        if refusal:
+            log.warning("bambu %s: refusing %s — %s", self.printer_id, queue_job_id, refusal)
+            return {"ok": False, "reason": refusal}
 
         sequence_id = os.urandom(4).hex()
         payload = bambu_send.build_print_start_payload(
@@ -427,6 +427,11 @@ class BambuAdapter:
                     self._queue_progress.discard_dispatch(queue_job_id)
                     log.error("bambu %s: refusing to start %s — dispatch state could not be persisted", self.printer_id, queue_job_id)
                     return {"ok": False, "reason": "state_persist_failed"}
+        refusal = self._not_startable()   # again: the upload took seconds, and a report may have landed meanwhile
+        if refusal:
+            log.warning("bambu %s: not starting %s after its upload — %s", self.printer_id, queue_job_id, refusal)
+            self._discard_dispatch(queue_job_id)
+            return {"ok": False, "reason": refusal}
         try:
             info = client.publish(self._request_topic, json.dumps(payload))
         except Exception as exc:  # noqa: BLE001
@@ -442,6 +447,24 @@ class BambuAdapter:
             self._discard_dispatch(queue_job_id)
             return {"ok": False, "reason": "start_command_failed"}
         return {"ok": True}
+
+    def _not_startable(self) -> str | None:
+        """Why a start must not go out now, from the printer's OWN report on THIS connection, or None.
+
+        v0.69: right after a (re)connect paho says "connected" before the printer's first report on that connection, and
+        _data still holds the state from before the drop: a printer someone started at its screen meanwhile reads as idle.
+        So: no start until it has reported its state on this connection (the cloud re-queues printer_stale without
+        counting it), and none while that report says it is busy — checked here, not only by the manager, because the
+        first fresh report can land between the manager's busy check and this call (codex review)."""
+        with self._lock:
+            seen = self._state_seen
+            print_obj = self._data.get("print")
+            gcode_state = print_obj.get("gcode_state") if isinstance(print_obj, dict) else None
+        if not seen:
+            return "printer_stale: no printer state reported since the hub connected"
+        if isinstance(gcode_state, str) and gcode_state.upper() in BUSY_GCODE_STATES:
+            return "printer_busy"
+        return None
 
     def _discard_dispatch(self, queue_job_id: str | None) -> None:
         if not queue_job_id:

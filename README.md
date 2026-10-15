@@ -89,8 +89,9 @@ Built on v0.68.0, following pstation `docs/camera-pipeline-plan-2026-10-15.md`.
   or the capture really fails, so losing one race does not hide it until its next tier.
 - **One capture per camera at a time.** A camera whose capture from an earlier beat is still running is skipped
   (counted in `cameraStats.stillRunning`), so stuck cameras can never stack threads. An HTTP snapshot has one 4 s
-  deadline for the whole transfer (a camera trickling bytes no longer outlives it), and the A1's 5 s deadline covers
-  every address its host resolves to.
+  deadline for its body (a camera trickling bytes no longer outlives it), and the A1's 5 s deadline covers every
+  address its host resolves to. Limit: a camera trickling its HTTP headers or chunk framing can still hold its one
+  worker past the deadline; it shows as failing, and it never takes a second thread.
 - **The A1 deadline.** An A1 capture has one 5 s deadline for connect, TLS and a frame. Before, it was 4 s per step with
   no total. Its timeout is split by phase: `unreachable` (connect), `tls-error` (handshake), `timeout` (authed, then no
   picture).
@@ -126,16 +127,18 @@ Built on v0.68.0, following pstation `docs/camera-pipeline-plan-2026-10-15.md`.
   printer gave none), and its queue job is completed. A LAN print has no task id, so before this it was never reported
   and its job was held as `outcome_unknown_after_restart`. A print already reported is not re-sent after a restart.
   A same-file print still running more than 30 minutes past the saved print's ETA may be a re-print started during
-  the outage, so it is not taken for the saved print: that job is held for staff instead of being closed by the wrong
-  print. The ETA is kept current while a print runs or is paused, so a restart short of that never drops a print. A
-  failed write is retried on the next report instead of being remembered as saved.
+  the outage, so it is not taken for the saved print, and no later print can complete that queue job: it is held for
+  staff instead of being closed by the wrong print. A print whose task id matches the saved one is always kept. The
+  ETA is kept current while a print runs or is paused, so a restart short of that never drops a print. A failed write
+  is retried on the next report instead of being remembered as saved.
 - **Commands.** The command guard (`dispatched-commands.json`) and undelivered command results
   (`command-results.json`) are durable. The site re-sends a command after 10 minutes without a result, and that re-send
   no longer runs a pause or a dryer cycle twice. Undelivered results are cleared only after the heartbeat that carried
   them, and only the 64 that heartbeat carried.
 - **Fresh connections.** A Bambu printer that has not reported its state on the current MQTT connection is refused a
   start (`printer_stale`). Right after a restart or a reconnect it reads as idle, or as its state from before the drop,
-  even when it is printing.
+  even when it is printing. The adapter itself also refuses a printer whose fresh report says it is preparing,
+  printing or paused (`printer_busy`), before the upload and again just before the start goes out.
 - **Update attempts.** The cooldown and attempt record (`last_update.json`) is now fsynced with its directory, so a
   power cut cannot lose an attempt and let a broken release past the cap.
 

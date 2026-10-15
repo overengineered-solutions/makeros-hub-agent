@@ -80,7 +80,11 @@ def _http_snapshot_with_reason(
     # ftp://, etc. (local-file / scheme-confusion exfil into a "camera frame").
     if urllib.parse.urlparse(url).scheme not in ("http", "https"):
         return (None, "unknown", "non-http snapshot url")
-    deadline = time.monotonic() + timeout   # the whole transfer: a camera trickling bytes never resets it
+    # The whole body transfer: a camera trickling bytes no longer resets it. ponytail: the deadline is checked between
+    # reads, so a peer trickling its HEADERS or chunk framing faster than the socket timeout can still hold this worker
+    # longer; CameraScheduler.running keeps that to one thread per camera, and the camera reads as failing. A watchdog
+    # that shuts the socket is the upgrade if a camera is ever seen doing it.
+    deadline = time.monotonic() + timeout
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "makeros-hub-agent"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured LAN URL
