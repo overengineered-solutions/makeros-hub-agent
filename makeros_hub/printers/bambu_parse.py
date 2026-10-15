@@ -275,6 +275,10 @@ def _raw_ams_unit(unit: dict) -> dict | None:
 
 
 def _add_tray_identity_fields(tray_out: dict[str, Any], tray: dict) -> None:
+    state = _to_int(tray.get("state"))
+    # Only steady reports establish presence; missing state and RFID scan transients stay unknown.
+    if state is not None and 0 <= state <= 0xFFFFFFFF and (state in (0, 3) or state & 0x08):
+        tray_out["spoolPresent"] = _tray_present(tray)
     material = tray.get("tray_type")
     if isinstance(material, str) and material.strip():
         tray_out["material"] = material.strip()[:64]
@@ -344,7 +348,7 @@ def build_vt_tray(print_obj: dict) -> dict | None:
     # same Generic PLA on an AMS and on an external holder must key identically.
     return {
         k: tray_out[k]
-        for k in ("material", "productName", "filamentId", "colorHex", "remainPct", "tagUid")
+        for k in ("material", "productName", "filamentId", "colorHex", "remainPct", "tagUid", "spoolPresent")
         if k in tray_out
     } or None
 

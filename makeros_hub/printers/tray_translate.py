@@ -40,7 +40,11 @@ def _norm_color(value: Any) -> str | None:
 
 
 def cleared_tray(tray: dict[str, Any]) -> bool:
-    """Alpha 00 is a transparent spool only when a real RFID tag confirms it is present."""
+    """Exclude absent spools; alpha 00 needs presence or legacy RFID evidence to be dispatchable."""
+    if tray.get("spoolPresent") is False:
+        return True
+    if tray.get("spoolPresent") is True:
+        return False
     color = _norm_color(tray.get("colorHex"))
     tag = tray.get("tagUid")
     tagged = isinstance(tag, str) and re.fullmatch(r"[0-9a-fA-F]{16}", tag) and any(c != "0" for c in tag)
