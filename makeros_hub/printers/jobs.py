@@ -54,6 +54,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
+from .queue_progress import _fsync_dir   # True only once the directory entry is durable
+
 log = logging.getLogger("makeros-hub.jobs")
 
 # Unacked-terminal-job buffer cap per printer. Each entry is a tiny dict, so
@@ -71,20 +73,6 @@ ETA_SLACK_S = 300   # the saved ETA is rewritten only when the printer's estimat
 # A same-name print still running this long after the saved print's ETA may be a re-print started during the outage:
 # with no task id nothing tells them apart, so it is dropped (held for staff), never booked under the old key.
 ADOPT_PAST_ETA_S = 1800
-
-
-def _fsync_dir(path: "Path") -> None:
-    """Make an os.replace durable across a power cut (the directory entry, not just the file)."""
-    try:
-        fd = os.open(str(path), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(fd)
-    except OSError:
-        pass
-    finally:
-        os.close(fd)
 
 
 def _iso(ts: float) -> str:
@@ -213,9 +201,10 @@ class JobTracker:
         return {"active": self._active if self._active is not None else self._restored, "lastKey": self._last_key,
                 **({"notDispatchedNext": True} if self._mark_next else {})}
 
-    def _save_pending(self) -> None:
+    def _save_pending(self) -> bool:
+        """Write the jobs + the running-print state atomically. True only once it is durable (file AND directory)."""
         if self._state_path is None:
-            return
+            return True
         state = self._state()
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,7 +215,8 @@ class JobTracker:
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self._state_path)
-            _fsync_dir(self._state_path.parent)
+            if not _fsync_dir(self._state_path.parent):
+                raise OSError("directory fsync failed")
         except OSError as e:
             # A terminal cannot be refused (the print already ended); loud (once per failing run) so the ops digest/journal
             # shows the box is failing to make state durable. Not marked saved, so the next observation writes again.
@@ -234,9 +224,10 @@ class JobTracker:
             if not self._unsaved:
                 log.error("could not persist terminal jobs for %s (RAM-only until a save lands): %s", self.printer_id, e)
             self._unsaved = True
-            return
+            return False
         self._active_saved = json.dumps(state, sort_keys=True)
         self._unsaved = False
+        return True
 
     def _load_active(self, raw: dict) -> None:
         last = raw.get("lastKey")
@@ -252,10 +243,11 @@ class JobTracker:
                               **({"notDispatched": True} if a.get("notDispatched") is True else {})}
         self._active_saved = json.dumps(self._state(), sort_keys=True)
 
-    def _save_active(self) -> None:
+    def _save_active(self) -> bool:
         # one write per change; a failed write left _active_saved empty, so this retries it
         if self._state_path is not None and json.dumps(self._state(), sort_keys=True) != self._active_saved:
-            self._save_pending()
+            return self._save_pending()
+        return True
 
     def _adopt_or_drop(self, merged: dict, state: str, now: float) -> None:
         """First observation after a load: the saved running print is this tracker's active job again only if the
@@ -397,6 +389,8 @@ class JobTracker:
         material = decode_active_material(merged)
         if material:
             job["materialKey"] = material
+        if self._mark_next:
+            job["notDispatched"] = True   # found finished in place of a dropped saved print (another task id)
         self._last_key = key
         self._buffer(job)
 
@@ -454,13 +448,18 @@ class JobTracker:
         self._last_state = state
         self._save_active()
 
-    def dispatch_recorded(self) -> None:
+    def dispatch_recorded(self) -> bool:
         """The adapter durably recorded a new dispatch: from here a print can be ours again, so stop marking. Saved now,
-        before the start is published, so a crash cannot leave the mark to land on that dispatch's print. (A new dispatch
-        is recorded only once every older one is resolved, so nothing the mark protected is still open.)"""
-        if self._mark_next:
-            self._mark_next = False
-            self._save_active()
+        before the start is published, so a crash cannot leave the mark to land on that dispatch's print; False when that
+        save did not land (the mark stays, and the adapter does not start). A new dispatch is recorded only once every
+        older one is resolved, so nothing the mark protected is still open."""
+        if not self._mark_next:
+            return True
+        self._mark_next = False
+        if self._save_active():
+            return True
+        self._mark_next = True
+        return False
 
     def pending(self) -> list[dict]:
         """Unacked terminal jobs (oldest first). Safe to send repeatedly —

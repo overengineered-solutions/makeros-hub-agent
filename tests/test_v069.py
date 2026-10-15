@@ -238,6 +238,35 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         report(c, gcode_state="FINISH", subtask_name="next", task_id="0")
         self.assertEqual([r["state"] for r in c.collect_queue_progress()], ["printing", "completed"])
 
+    def test_another_members_finished_reprint_found_on_return_is_never_the_old_jobs_completion(self):
+        # codex review of e69e4b1: Alice's cube (task 77) was saved; Bob re-printed cube as task 78 during the outage; the
+        # hub came back onto FINISH/78 and the recovered record completed Alice's job with Bob's print
+        self.printing(task_id="77")
+        b = boot()
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        (job,) = b.pending_jobs()
+        self.assertEqual((job["jobKey"], job.get("notDispatched")), ("task_S1_78", True))
+        b._queue_progress._start_timeout_sec = 0
+        self.assertEqual(b.collect_queue_progress(),
+                         [{"queueJobId": "q1", "state": "held", "reason": "outcome_unknown_after_restart", "assignmentSeq": 7}])
+
+    def test_a_new_dispatch_whose_mark_clear_cannot_be_saved_is_not_started(self):
+        # codex review of e69e4b1: the clear failed silently, the start went out, and after a restart the dispatched print
+        # inherited the mark and its job was held
+        self.printing(task_id="0")
+        b = boot()
+        report(b, gcode_state="IDLE")                        # reset during the outage: dropped, marking on
+        b._queue_progress._start_timeout_sec = 0
+        b.collect_queue_progress()                           # q1 held
+        (self.spool / UID / "next.3mf").write_bytes(b"3mf")
+        with mock.patch.object(JobTracker, "_save_pending", return_value=False):
+            got = b.start_print(self.spool / UID / "next.3mf", "next.3mf", queue_job_id="q2", assignment_seq=8)
+        self.assertEqual(got, {"ok": False, "reason": "state_persist_failed"})
+        self.assertEqual((b._client.published, b.pending_queue_jobs(), b._jobs._mark_next), ([], [], True))
+        self.assertEqual(b.start_print(self.spool / UID / "next.3mf", "next.3mf", queue_job_id="q2", assignment_seq=8),
+                         {"ok": True})                       # the disk is back: the cloud's re-send starts it
+        self.assertFalse(b._jobs._mark_next)
+
     def test_the_task_id_beats_a_partial_reports_fallback_file_name(self):
         # codex review of 135cb83: the first report after the restart carried task 77 and gcode_file only; the name
         # mismatch dropped the real dispatch's print, reopened it with a new start and marked it notDispatched

@@ -128,8 +128,9 @@ Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
   printer gave none), and its queue job is completed. A LAN print has no task id, so before this it was never reported
   and its job was held as `outcome_unknown_after_restart`. A print already reported is not re-sent after a restart.
   A same-file print still running more than 30 minutes past the saved print's ETA may be a re-print started during
-  the outage, so it is not taken for the saved print. After any such drop, every print that opens is marked
-  `notDispatched` until the hub records its next dispatch, so no walk-up or re-print can complete the old queue job:
+  the outage, so it is not taken for the saved print. After any such drop, every print that opens, or is found
+  already finished, is marked `notDispatched` until the hub durably records its next dispatch (a start whose clear
+  cannot be saved is refused), so no walk-up or re-print can complete the old queue job:
   it is held for staff instead of being closed by the wrong print. A print whose task id matches the saved one is
   always kept, whatever name a partial report gives it. The
   ETA is kept current while a print runs or is paused, so a restart short of that never drops a print. A failed write
