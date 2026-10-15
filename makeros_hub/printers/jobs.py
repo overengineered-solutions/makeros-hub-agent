@@ -260,7 +260,8 @@ class JobTracker:
         saved, self._restored = self._restored, None
         name, task_id = _job_name(merged), _printer_task_id(merged)
         eta = saved.get("etaAt")
-        exact = bool(task_id) and saved["key"] == self._task_key(task_id)   # the printer's own id: no ambiguity to judge
+        # the printer's own id (the key, or the alias a fingerprinted print learned): no ambiguity to judge
+        exact = bool(task_id) and self._task_key(task_id) in (saved["key"], saved.get("taskKey"))
         overran = (state in _STILL_ACTIVE and not exact and eta is not None and eta > saved["startedAt"]
                    and now > eta + ADOPT_PAST_ETA_S)
         same = (state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED)) and (exact or (
@@ -423,6 +424,13 @@ class JobTracker:
                 self._active.pop("adopted", None)   # confirmed by the printer's own id
             elif not key.startswith("task_"):
                 self._active["taskKey"] = self._task_key(task_id)   # a dedupe alias; the key the site holds is kept
+        elif (task_id and state in (_TERMINAL_DONE, _TERMINAL_FAILED) and self._last_state in (_TERMINAL_DONE, _TERMINAL_FAILED)
+              and self._last_key and not self._last_key.startswith("task_")):
+            # the print just closed under its fingerprint is still on screen and names its task id only now: dedupe on that
+            # id too, or a restart onto this FINISH re-emits it (codex review of 921c14a). ponytail: an id first seen after
+            # a restart cannot be tied to the fingerprint; Bambu's pushall on connect carries it, so that needs a printer
+            # that left task_id out of every report of the whole print.
+            self._last_key = self._task_key(task_id)
 
         if self._active is None:
             if state == _ACTIVE:

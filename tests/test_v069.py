@@ -302,6 +302,34 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         report(c, gcode_state="FINISH", subtask_name="cube", task_id="77")
         self.assertEqual(c.pending_jobs(), [])
 
+    def test_a_task_id_that_arrives_after_a_fingerprint_close_dedupes_the_next_restart(self):
+        # codex review of 921c14a: closed under its fingerprint on a FINISH without an id, then a delta named task 77; the
+        # next restart onto that FINISH emitted task_S1_77 as a second print
+        key, _ = self.printing(task_id="0")
+        b = boot()
+        report(b, gcode_state="FINISH", subtask_name="cube")
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual([j["jobKey"] for j in b.pending_jobs()], [key])
+        b.ack_jobs([key])
+        c = boot()
+        report(c, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual(c.pending_jobs(), [])
+
+    def test_a_learned_task_id_is_an_exact_identity_past_the_eta_cutoff(self):
+        # codex review of 921c14a: fingerprinted print, its task id learned while paused, then an outage past the ETA cutoff:
+        # the matching id must keep it (and its start), not drop it as a possible re-print
+        key, _ = self.printing(task_id="0")
+        b = boot()
+        report(b, gcode_state="PAUSE", subtask_name="cube", task_id="77")
+        self.assertEqual(b._jobs.active_key(), key)
+        started = self.age_saved_print(9, 8)
+        c = boot()
+        report(c, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        report(c, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        (job,) = c.pending_jobs()
+        self.assertEqual((job["startedAt"], job.get("notDispatched")), (_iso(started), None))
+        self.assertEqual(c.collect_queue_progress()[-1]["state"], "completed")
+
     def test_the_task_id_beats_a_partial_reports_fallback_file_name(self):
         # codex review of 135cb83: the first report after the restart carried task 77 and gcode_file only; the name
         # mismatch dropped the real dispatch's print, reopened it with a new start and marked it notDispatched
