@@ -473,7 +473,8 @@ class JobTracker:
                 # RUNNING means we missed the gap between two prints: close the
                 # old one (unconfirmed end → cancelled) and open the new.
                 name, task_id = _job_name(merged), _printer_task_id(merged)
-                same_id = bool(task_id) and self._active["key"] == self._task_key(task_id)   # the id beats a fallback name
+                # the id (the key, or the alias a fingerprinted print learned) beats a fallback name
+                same_id = bool(task_id) and self._task_key(task_id) in (self._active["key"], self._active.get("taskKey"))
                 if name and self._active["name"] and name != self._active["name"] and not same_id:
                     self._close("cancelled", now)
                     self._open(merged, now)

@@ -86,8 +86,9 @@ Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
   or a camera with no photo yet first, then the rest by when their tier ran out. A camera that loses the race only gets
   more overdue, so wanted or first-layer cameras over the lane's capacity can no longer starve the mid-print ones. A
   failing camera counts as due only from its failed try or its breaker closing, so dead cameras take their breaker's
-  share of the lane and never sit at its front. A state change or a reconnect stays first until a frame is accepted
-  or the capture really fails, so losing one race does not hide it until its next tier.
+  share of the lane and never sit at its front. A state change stays first until a frame is accepted or the capture
+  really fails, so losing one race does not hide it until its next tier. A reconnect resets the breaker and makes a
+  failing camera due at once, ranked from the reconnect: a printer whose Wi-Fi flaps every beat cannot take the lane.
 - **One capture per camera at a time.** A camera whose capture from an earlier beat is still running is skipped
   (counted in `cameraStats.stillRunning`), so stuck cameras can never stack threads. An HTTP snapshot has one 4 s
   deadline for its body (a camera trickling bytes no longer outlives it), and the A1's 5 s deadline covers every

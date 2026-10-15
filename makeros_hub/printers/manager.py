@@ -355,6 +355,11 @@ class PrinterManager:
                 # Rebuilt adapters reload these same durable jobs. Keying them
                 # avoids duplicate growth without discarding unacked evidence.
                 for j in rescued:
+                    if j.get("notDispatched"):
+                        # v0.69: never unfenced. It stays in the printer's terminal file, and the rebuilt adapter reloads
+                        # it behind the same wait for the old dispatch (codex review of 02dc878). ponytail: a printer
+                        # removed for good keeps it on disk unsent, like any file nothing reads any more.
+                        continue
                     self._orphan_jobs.setdefault(j["jobKey"], j)
                 if rescued:
                     log.info("rescued jobs from %s: processed=%d, expected=%d", pid, len(rescued), len(rescued))

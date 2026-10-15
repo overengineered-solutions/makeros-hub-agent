@@ -402,6 +402,24 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
                                                                      return_value=b.pending_jobs()))
         self.assertEqual(sent[0], [])
 
+    def test_a_torn_down_adapter_never_releases_a_held_back_print_unfenced(self):
+        # codex review of 02dc878: a config pull without the access code tore the adapter down, the rescue moved Bob's
+        # held-back print into the orphans, and the next heartbeat sent it while Alice's job was still 'printing'
+        self.printing(task_id="77")
+        b = boot()
+        m = PrinterManager()
+        m._adapters["p1"] = b
+        report(b, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        m._stop("p1")
+        self.assertEqual(m.pending_jobs(), [])
+        c = boot()                                           # the access code is back: rebuilt from the same files
+        m._adapters["p1"] = c
+        report(c, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        self.assertEqual(m.pending_jobs(), [])               # still fenced behind q1
+        c._queue_progress._start_timeout_sec = 0
+        self.assertEqual([r["state"] for r in m.collect_queue_progress()], ["held"])
+        self.assertEqual([j["jobKey"] for j in m.pending_jobs()], ["task_S1_78"])
+
     def test_a_new_dispatch_settles_a_saved_print_no_report_has_named(self):
         self.printing(task_id="77")
         b = boot()
@@ -414,6 +432,18 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         report(b, gcode_state="FINISH", subtask_name="next", task_id="90")
         self.assertEqual([(j["jobKey"], j.get("notDispatched")) for j in b.pending_jobs()], [("task_S1_90", None)])
         self.assertEqual([r["state"] for r in b.collect_queue_progress()], ["printing", "completed"])
+
+    def test_a_learned_task_id_beats_a_fallback_name_while_the_hub_watches(self):
+        # codex review of 02dc878: the in-session same-id check looked at the key only, not the learned alias
+        self.printing(task_id="0")
+        b = boot()
+        report(b, gcode_state="PAUSE", subtask_name="cube", task_id="77")   # learns the alias
+        c = boot()                                           # its first report: the id, and only the fallback name
+        report(c, gcode_state="RUNNING", task_id="77", gcode_file="Metadata/plate_1.gcode")
+        report(c, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        # one print, done (RUNNING upgrades a fingerprint key to the task key, as since v0.4x), never cancelled + a new one
+        self.assertEqual([(j["jobKey"], j["status"], j["filename"]) for j in c.pending_jobs()], [("task_S1_77", "done", "cube")])
+        self.assertEqual(c.collect_queue_progress()[-1]["state"], "completed")
 
     def test_the_task_id_beats_a_partial_reports_fallback_file_name(self):
         # codex review of 135cb83: the first report after the restart carried task 77 and gcode_file only; the name
@@ -782,6 +812,27 @@ class TestCameraFairnessAtCapacity(unittest.TestCase):
             r = bambu_camera.capture_frame_with_reason("printer.local", "code", timeout=0.3)
         self.assertEqual(r.reason, "unreachable")
         self.assertLess(time.monotonic() - t0, 0.45)
+
+    def test_cameras_that_reconnect_every_beat_never_starve_the_healthy_ones(self):
+        # codex review of 02dc878: four flapping RTSP printers reset their breaker and took the top rank every beat
+        cam = lambda pid: {"printerId": pid, "vendor": "bambu", "model": "X1C", "host": "h", "accessCode": "c"}   # noqa: E731
+        flap, healthy = [f"flap{i}" for i in range(4)], ["ok0", "ok1"]
+        targets = [cam(p) for p in flap + healthy]
+        s = CameraScheduler()
+        got = {p: 0 for p in healthy}
+        for beat in range(20):
+            now = beat * 40.0
+            status = {p: {"state": "printing", "progressPct": 50, "mqttConnectedAtMs": beat} for p in flap}
+            status |= {p: {"state": "printing", "progressPct": 50, "mqttConnectedAtMs": 1} for p in healthy}
+            for t in s.plan(targets, status, now, set())[:4]:
+                pid = t["printerId"]
+                s.attempted(pid, now)
+                if pid in got:
+                    s.accepted(pid, now, None)
+                    got[pid] += 1
+                else:
+                    s.failed(pid, now)
+        self.assertGreaterEqual(min(got.values()), 6, got)                 # ~ every 3 beats on the 90 s tier
 
     def test_a_state_change_still_goes_first(self):
         s = CameraScheduler()

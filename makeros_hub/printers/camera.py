@@ -252,7 +252,8 @@ class _Cam:
     streak: int = 0                 # real failures in a row
     retry_at: float = 0.0           # breaker
     sha: Optional[bytes] = None     # digest of the last accepted frame (frozen check)
-    change: bool = False            # a state change / reconnect not yet answered by an accepted frame or a real failure
+    change: bool = False            # a state change not yet answered by an accepted frame or a real failure
+    reset_at: float = float("-inf")  # last reconnect: due from then on, so a camera that reconnects every beat never jumps the queue
 
 
 class CameraScheduler:
@@ -291,9 +292,13 @@ class CameraScheduler:
                 self._cams[pid] = c
             else:
                 changed = state != c.state or link != c.link     # a cycle under 150 s is idle->idle; only `link` moves
+                if changed and state == c.state:
+                    c.reset_at = now   # a reconnect (power-cycle): retried at once, but ranked from now (codex review of 02dc878)
+                elif changed:
+                    c.change = True    # a state change: kept until answered, so one lost race does not hide it
                 c.state, c.link = state, link
             if changed:
-                c.streak, c.retry_at, c.change = 0, 0.0, True   # kept until answered: a change that loses the race stays due
+                c.streak, c.retry_at = 0, 0.0
             if now < c.retry_at:
                 continue                                         # an open breaker wins over want
             wanted = pid in want if want is not None else bool(t.get("cameraDense"))   # older site: config-down flag
@@ -305,7 +310,7 @@ class CameraScheduler:
                 # failing camera is due only from its failed try (one miss) or its breaker closing, never from its last
                 # photo, so a dozen dead cameras cannot sit at the front of the lane forever.
                 due_since = max(c.last_ok + interval if c.last_ok is not None else float("-inf"),
-                                (c.retry_at or c.last_try) if c.streak else float("-inf"))
+                                (c.retry_at or c.last_try) if c.streak else float("-inf"), c.reset_at)
                 due.append(((not c.change, due_since, c.last_try), t))
         due.sort(key=lambda d: d[0])
         return [t for _, t in due]
