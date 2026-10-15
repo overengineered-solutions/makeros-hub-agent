@@ -245,6 +245,9 @@ class RunTracker:
     def sample(self, state: str, t: float) -> None:
         if state == "cutting":
             if self.open is None:
+                # the open run rides too, so keep 31 closed: report() never cuts the newest closed run, which the site
+                # would close at its last cutting reading and then keep that way (codex re-review of 97f1dfd)
+                del self.closed[:-(MAX_RUNS - 1)]
                 self.open = {"runKey": uuid.uuid4().hex, "startedAt": t, "lastCuttingAt": t}
             else:
                 self.open["lastCuttingAt"] = max(self.open["lastCuttingAt"], t)

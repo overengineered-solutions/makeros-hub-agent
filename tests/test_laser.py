@@ -284,6 +284,18 @@ class H2Runs(Base):
         reborn.ack(after)
         self.assertEqual(LaserHub(hub.cfg, secrets_dir=self.secrets)._unclaimed_runs[LASER_ID]["closed"], [])
 
+    def test_a_new_run_never_pushes_the_newest_closed_run_out_of_the_report(self):
+        # 31 unacked closed runs and B open at a restart: B comes back closed, and cutting opens C before any report
+        closed = [{"runKey": f"{i:032x}", "startedAt": i * 10, "lastCuttingAt": i * 10, "endedAt": i * 10,
+                   "endReason": "idle"} for i in range(31)]
+        r = RunTracker(60)
+        r.load({"open": {"runKey": "b" * 32, "startedAt": 1000, "lastCuttingAt": 4600}, "closed": closed})
+        r.sample("cutting", 9000)
+        rep = r.report()
+        self.assertEqual((len(rep), rep[0]["endedAt"]), (32, None))
+        self.assertEqual(rep[-1], {"runKey": "b" * 32, "startedAt": laser.iso_z(1000), "lastCuttingAt": laser.iso_z(4600),
+                                   "endedAt": laser.iso_z(4600), "endReason": "telemetry_lost"})
+
     def test_at_most_32_kept_oldest_dropped(self):
         r = RunTracker(60)
         for i in range(40):
