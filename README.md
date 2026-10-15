@@ -1,6 +1,6 @@
 # Procrastination Station shop-box agent
 
-The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.68.0 review candidate**, not evidence that the installed shop box has been updated.
+The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.68.1 review candidate**, not evidence that the installed shop box has been updated.
 
 The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Read [SECURITY.md](SECURITY.md) for the boundaries and limitations.
 
@@ -70,6 +70,16 @@ sh -n update.sh
 ```
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
+
+## 0.68.1 candidate: laser runs and file verdicts kept until the website names them
+
+A hotfix to 0.68.0 (codex release review of pstation `aa9433b`). 0.68.0 dropped every closed cutting run and file
+verdict a heartbeat carried as soon as that heartbeat got a 200, so a run or verdict the website failed to write was
+lost for good. The agent now drops only what the response's `laserAck` (`runKeys`, `fileIds`) names, and keeps the
+rest for the next beat. A website that sends no `laserAck` at all (one from before it) has nothing dropped: everything
+is re-sent, and the website stores it by key, so nothing doubles. What a website that never acknowledges can hold the
+agent to is bounded by the existing caps: 32 closed runs per laser (31 while one is open) and 32 file verdicts, oldest
+dropped first. Nothing else changed.
 
 ## 0.68.0 candidate: Klipper/SV08 dispatch, laser status and runs, Turn on and Load, the laser gate
 

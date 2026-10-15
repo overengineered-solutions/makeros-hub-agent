@@ -1866,7 +1866,7 @@ def run(
                     pending_vp_bindings = []
                     try:
                         if laser_report is not None:
-                            laser_hub.ack(laser_report)   # closed runs and file verdicts delivered
+                            laser_hub.ack(laser_report, resp.body.get("laserAck"))   # only what the site stored
                         if laser_hub.offer_checks(resp.body.get("laserChecks")):
                             log.info("laser: queued file check(s) for the gate")
                     except Exception as exc:  # noqa: BLE001 - a bad laser field never stops the loop
