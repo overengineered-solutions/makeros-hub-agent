@@ -185,6 +185,10 @@ class JobTracker:
         # completion; the old job is held when the printer is idle. Terminal records already pending at the drop stay
         # linkable (codex reviews of af50a73, 9ac3ff7 and 135cb83).
         self._mark_next = False
+        # in memory only (a restart re-arms recovery anyway): the last closed print's real name, and whether the first
+        # terminal report after an MQTT reconnect with nothing running still has to be judged
+        self._last_name: str | None = None
+        self._recover_next = False
         self._load_pending()
 
     def active_key(self) -> str | None:
@@ -308,6 +312,7 @@ class JobTracker:
         name = _job_name(merged)
         task_id = _printer_task_id(merged)
         eta = _eta(merged, now)
+        self._recover_next = False
         self._active = {
             "key": self._task_key(task_id) if task_id else self._fingerprint(name, now),
             "name": name,
@@ -324,6 +329,7 @@ class JobTracker:
         if self._active is None:
             return
         a, self._active = self._active, None   # cleared first: the one save below holds the job AND no running print
+        self._recover_next = False             # the hub saw this print end: nothing unseen left to judge
         end = now
         # The first state since a restart is already terminal: it ended while the hub was down, so `now` would book the
         # whole outage as print time. Its end is the printer's last ETA (never past now); with no ETA the end is unknown,
@@ -351,6 +357,7 @@ class JobTracker:
         # _emit_recovered dedupes on the printer's task key: a print keyed by fingerprint whose task id showed up later
         # must not come back under that task key on a restart onto its FINISH (codex review of 3b59933)
         self._last_key = a.get("taskKey") or job["jobKey"]
+        self._last_name = a["name"] if a.get("named", True) else None
         self._buffer(job)
 
     def _buffer(self, job: dict) -> None:
@@ -409,7 +416,7 @@ class JobTracker:
             job["materialKey"] = material
         if self._mark_next:
             job["notDispatched"] = True   # found finished in place of a dropped saved print (another task id)
-        self._last_key = key
+        self._last_key, self._last_name = key, name if _subtask_name(merged) else None
         self._buffer(job)
 
     # -- public -------------------------------------------------------------
@@ -444,8 +451,9 @@ class JobTracker:
                 # hub watched Alice since her last (re)connect, so the gap between the two was missed: cancelled, as for
                 # any missed ending. Bob is handled as if first seen now: opened, or recovered if he already finished,
                 # and marked notDispatched (no dispatch starts while a print runs or while the printer is silent).
+                self._mark_next = True   # first: the cancellation's one save carries the fence (codex review of 213d644)
                 self._close("cancelled", now)
-                self._mark_next, self._last_state = True, ""
+                self._last_state = ""
             else:
                 if real and (same_id or not self._active.get("named", True)):
                     self._active.update(name=real, named=True)   # the real name replaces a fallback (codex review of c3ccb8b)
@@ -460,6 +468,17 @@ class JobTracker:
             self._last_key = self._task_key(task_id)
 
         if self._active is None:
+            if self._recover_next and state in (_TERMINAL_DONE, _TERMINAL_FAILED):
+                if not task_id and not real:
+                    return   # judged on the first report that names the print (nothing decided, nothing advanced)
+                self._recover_next = False
+                if (task_id and real and real == self._last_name and self._last_key
+                        and not self._last_key.startswith("task_")):
+                    self._last_key = self._task_key(task_id)   # the same print, its id learned late: an alias, no row
+                else:
+                    self._emit_recovered(merged, state, now)   # dedupes on the last reported task key
+            elif self._recover_next:
+                self._recover_next = False   # running or idle: nothing finished unseen to judge
             if state == _ACTIVE:
                 self._open(merged, now)
             elif self._last_state == "" and state in (_TERMINAL_DONE, _TERMINAL_FAILED):
@@ -503,8 +522,11 @@ class JobTracker:
         identity closed Alice's print while Bob's had finished during the gap (codex review of e8134f8)."""
         if self._active is not None:
             self._restored, self._active, self._last_state = self._active, None, ""
-        # with nothing running, _last_state stays: re-arming _emit_recovered here re-emitted an acked fingerprinted print
-        # under the task id the new connection's pushall supplied (codex review of 1e116ed)
+        elif self._restored is None:
+            # Nothing running: a print may have run and finished during the gap, so the first terminal report that names
+            # one is judged (codex review of 213d644) — but the print just closed under its fingerprint, still on screen
+            # and only now giving its task id, is that same print, not a new one (codex review of 1e116ed).
+            self._recover_next = True
 
     def dispatch_recorded(self) -> bool:
         """The adapter durably recorded a new dispatch: from here a print can be ours again, so stop marking. Saved now,

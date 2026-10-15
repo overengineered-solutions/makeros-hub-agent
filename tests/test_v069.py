@@ -390,6 +390,38 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         report(a, gcode_state="FINISH", subtask_name="cube", task_id="77")
         self.assertEqual(a.pending_jobs(), [])
 
+    def test_a_crash_right_after_the_cancellation_keeps_the_replacements_fence(self):
+        # codex review of 213d644: the cancellation's save landed before the fence was set; a power cut between the two
+        # recovered task 78 unmarked, ahead of Alice's 'held', and the site's time fallback billed Alice with it
+        key, _ = self.printing(task_id="77")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        with mock.patch.object(JobTracker, "_save_active", side_effect=_Crash()), self.assertRaises(_Crash):
+            report(a, gcode_state="RUNNING", subtask_name="bob", task_id="78")
+        b = boot()
+        report(b, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        self.assertEqual([(j["jobKey"], j["status"], j.get("notDispatched")) for j in b.pending_jobs()],
+                         [(key, "cancelled", None), ("task_S1_78", "done", True)])
+
+    def test_a_distinct_print_that_finished_during_a_reconnect_gap_is_recovered(self):
+        # codex review of 213d644: 77 finished and was acked; 78 ran and finished while MQTT was down; after the reconnect
+        # nothing reported it
+        key, _ = self.printing(task_id="77")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        a.ack_jobs([key])
+        a._on_disconnect(None, None, 0)
+        a._on_connect(a._client, None, None, 0)
+        report(a, gcode_state="FINISH")                      # a bare delta first: judged on the report that names it
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        self.assertEqual([(j["jobKey"], j["status"], j.get("notDispatched")) for j in a.pending_jobs()],
+                         [("task_S1_78", "done", None)])
+        a._on_disconnect(None, None, 0)                      # and the same print on screen across another drop: nothing
+        a._on_connect(a._client, None, None, 0)
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        self.assertEqual(len(a.pending_jobs()), 1)
+
     def test_a_same_file_finish_without_the_saved_prints_id_waits_for_the_id(self):
         # codex review of 1e116ed: Alice's cube (task 77) saved; Bob's cube (task 78) finished during the outage; the first
         # fresh report (FINISH, cube, no id) completed Alice's job, and task 78 was ignored
@@ -943,6 +975,22 @@ class TestCameraFairnessAtCapacity(unittest.TestCase):
         s.failed("p", 80.0)                                               # the second opens the breaker
         self.assertEqual(s.plan(t, idle, 120.0), [])
         self.assertEqual(len(s.plan(t, idle, 141.0)), 1)                  # and the breaker paces it, not the tier
+
+    def test_a_reconnect_keeps_a_failing_cameras_retry(self):
+        # codex review of 213d644: the reconnect reset the streak, and with it the failing camera's due-ness, until t=600
+        s = CameraScheduler()
+        t = [{"printerId": "p", "vendor": "bambu", "model": "X1C", "host": "h", "accessCode": "c"}]
+        st = lambda state, link: {"p": {"state": state, "progressPct": 50, "mqttConnectedAtMs": link}}   # noqa: E731
+        s.plan(t, st("printing", 1), 0.0)
+        s.accepted("p", 0.0, None)
+        for now in (40.0, 80.0):
+            self.assertEqual(len(s.plan(t, st("idle", 1), now)), 1)
+            s.attempted("p", now)
+            s.failed("p", now)
+        self.assertEqual(len(s.plan(t, st("idle", 2), 120.0)), 1)         # the power-cycle: retried at once
+        s.attempted("p", 120.0)
+        s.accepted("p", 120.0, None)
+        self.assertEqual(s.plan(t, st("idle", 3), 160.0), [])             # a healthy camera's reconnect costs no capture
 
     def test_a_state_change_still_goes_first(self):
         s = CameraScheduler()

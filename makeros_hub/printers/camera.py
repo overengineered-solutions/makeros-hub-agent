@@ -254,6 +254,7 @@ class _Cam:
     sha: Optional[bytes] = None     # digest of the last accepted frame (frozen check)
     change: bool = False            # a state change not yet answered by an accepted frame or a real failure
     reset_at: float = float("-inf")  # last reconnect: due from then on, so a camera that reconnects every beat never jumps the queue
+    reconnect: bool = False         # a failing camera reconnected: due until answered, ranked from reset_at
 
 
 class CameraScheduler:
@@ -293,7 +294,9 @@ class CameraScheduler:
             else:
                 changed = state != c.state or link != c.link     # a cycle under 150 s is idle->idle; only `link` moves
                 if changed and state == c.state:
-                    c.reset_at = now   # a reconnect (power-cycle): retried at once, but ranked from now (codex review of 02dc878)
+                    # a reconnect (power-cycle): a failing camera is retried at once, ranked from now (codex reviews of
+                    # 02dc878 and 213d644: the streak reset below must not take its retry away)
+                    c.reset_at, c.reconnect = now, c.streak > 0
                 elif changed:
                     c.change = True    # a state change: kept until answered, so one lost race does not hide it
                 c.state, c.link = state, link
@@ -305,7 +308,7 @@ class CameraScheduler:
             interval = self.FIRST_OR_LAST_LAYER_S if wanted else self._interval(state, st.get("progressPct"))
             # a failing camera stays due (its breaker paces it): the one free miss is retried next beat even when its
             # tier is the 600 s idle one (codex review of 1e116ed)
-            if c.change or c.streak or c.last_ok is None or now - c.last_ok >= interval:
+            if c.change or c.reconnect or c.streak or c.last_ok is None or now - c.last_ok >= interval:
                 # Earliest deadline first, after unanswered state changes: a new camera is due since forever, a working
                 # one since last_ok + its tier. A camera that loses the race only grows more overdue, so it reaches the
                 # front: wanted / first-layer cameras over the lane's capacity can no longer starve the mid-print ones. A
@@ -325,7 +328,7 @@ class CameraScheduler:
         c = self._cams.get(pid)
         if c is None:
             return
-        c.last_ok, c.streak, c.retry_at, c.sha, c.change = now, 0, 0.0, sha, False
+        c.last_ok, c.streak, c.retry_at, c.sha, c.change, c.reconnect = now, 0, 0.0, sha, False, False
         self.stats["ok"] += 1
 
     def failed(self, pid: str, now: float) -> None:
@@ -333,7 +336,7 @@ class CameraScheduler:
         if c is None:
             return
         c.streak += 1
-        c.change = False    # the change got its try; from here the breaker ranks it
+        c.change = c.reconnect = False   # the change / reconnect got its try; from here the breaker ranks it
         if c.streak >= 2:   # one miss retries next beat (a camera waking after a reboot); two opens the breaker
             cap = BACKOFF_CAP_PRINTING_S if c.state == "printing" else BACKOFF_CAP_S
             c.retry_at = now + min(BACKOFF_BASE_S * 2 ** min(c.streak - 2, 10), cap)   # exponent capped: no float overflow
