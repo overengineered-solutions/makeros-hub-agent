@@ -183,9 +183,11 @@ class JobTracker:
         self._last_key: str | None = None
         self._active_saved = ""
         self._unsaved = False   # the last write failed: every observation retries until one lands
-        # set when the saved running print was dropped after a restart; the adapter then makes every queue dispatch from
-        # before the restart unlinkable, so no other print (a re-print of the same file) can complete that job
-        self.lost_saved_print = False
+        # The saved running print was dropped while the printer shows ANOTHER print active (another file, or the same file
+        # long past its ETA): that print started while the hub was down, so no dispatch of this hub started it. It is
+        # marked `notDispatched` when it opens, in the same atomic write as the print itself, and queue progress never
+        # takes its ending as a queue job's completion (codex re-reviews of af50a73 and 9ac3ff7).
+        self._mark_next = False
         self._load_pending()
 
     def active_key(self) -> str | None:
@@ -206,7 +208,8 @@ class JobTracker:
                 self._load_active(states[-1])
 
     def _state(self) -> dict:
-        return {"active": self._active if self._active is not None else self._restored, "lastKey": self._last_key}
+        return {"active": self._active if self._active is not None else self._restored, "lastKey": self._last_key,
+                **({"notDispatchedNext": True} if self._mark_next else {})}
 
     def _save_pending(self) -> None:
         if self._state_path is None:
@@ -236,13 +239,15 @@ class JobTracker:
     def _load_active(self, raw: dict) -> None:
         last = raw.get("lastKey")
         self._last_key = last if isinstance(last, str) else None
+        self._mark_next = raw.get("notDispatchedNext") is True
         a = raw.get("active")
         num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)   # noqa: E731
         if (isinstance(a, dict) and isinstance(a.get("key"), str) and num(a.get("startedAt"))
                 and all(a.get(k) is None or isinstance(a.get(k), str) for k in ("name", "material"))
                 and a["key"] not in {j["jobKey"] for j in self._pending}):
             self._restored = {"key": a["key"], "name": a.get("name"), "startedAt": float(a["startedAt"]),
-                              "material": a.get("material"), "etaAt": float(a["etaAt"]) if num(a.get("etaAt")) else None}
+                              "material": a.get("material"), "etaAt": float(a["etaAt"]) if num(a.get("etaAt")) else None,
+                              **({"notDispatched": True} if a.get("notDispatched") is True else {})}
         self._active_saved = json.dumps(self._state(), sort_keys=True)
 
     def _save_active(self) -> None:
@@ -274,7 +279,8 @@ class JobTracker:
         else:
             # IDLE after a restart = the printer was reset; another name = another print. The outcome is unknown, so
             # nothing is invented (the queue's outcome_unknown_after_restart covers a dispatched job).
-            self.lost_saved_print = True
+            if state in _STILL_ACTIVE:
+                self._mark_next = True
             log.info("%s: %s is no longer the running print after the restart (%s%s) — its key is dropped",
                      self.printer_id, saved["name"] or saved["key"], state, ", long past its ETA" if overran else "")
 
@@ -303,7 +309,9 @@ class JobTracker:
             "startedAt": now,
             "material": decode_active_material(merged),
             "etaAt": round(eta) if eta is not None else None,
+            **({"notDispatched": True} if self._mark_next else {}),
         }
+        self._mark_next = False
 
     def _close(self, status: str, now: float) -> None:
         if self._active is None:
@@ -331,6 +339,8 @@ class JobTracker:
             job["filename"] = a["name"]
         if a["material"]:
             job["materialKey"] = a["material"]
+        if a.get("notDispatched"):
+            job["notDispatched"] = True   # queue progress never links it (the site ignores the key)
         self._last_key = job["jobKey"]
         self._buffer(job)
 
@@ -400,6 +410,8 @@ class JobTracker:
             self._adopt_or_drop(merged, state, now)
 
         if self._active is None:
+            if self._mark_next and state not in _STILL_ACTIVE:
+                self._mark_next = False   # the replacement ended before it ever ran under the hub's eyes
             if state == _ACTIVE:
                 self._open(merged, now)
             elif self._last_state == "" and state in (_TERMINAL_DONE, _TERMINAL_FAILED):

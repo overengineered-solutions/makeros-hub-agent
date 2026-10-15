@@ -201,8 +201,13 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         # filename and reported q1 'completed' with ANOTHER print's key
         self.printing(task_id="0")
         self.age_saved_print(9, 8)                           # down 8 h; the saved print should have ended 8 h ago
+        queue_file = next(bambu_module.QUEUE_PROGRESS_DIR.glob("*.json"))
+        before = queue_file.read_text()
         b = boot()
         report(b, gcode_state="RUNNING", subtask_name="cube", task_id="0")    # a re-print of the same file
+        # the re-print carries its own mark in the terminal file's one atomic write: no second file has to land with it
+        # (codex re-review of 9ac3ff7: a crash between two writes left the old job linkable)
+        self.assertEqual(queue_file.read_text(), before)
         self.assertEqual(b.collect_queue_progress(), [])
         c = boot()                                           # and another restart before it ends
         report(c, gcode_state="RUNNING", subtask_name="cube", task_id="0")
@@ -211,6 +216,19 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         c._queue_progress._start_timeout_sec = 0
         self.assertEqual(c.collect_queue_progress(),
                          [{"queueJobId": "q1", "state": "held", "reason": "outcome_unknown_after_restart", "assignmentSeq": 7}])
+
+    def test_a_dropped_walk_up_print_never_costs_the_finished_dispatch_its_completion(self):
+        # codex re-review of 9ac3ff7: q1 finished (its record on disk), a walk-up print started at the screen, the hub
+        # restarted onto IDLE; invalidating every pre-restart dispatch held q1 although its own ending was right there
+        key, _ = self.printing(task_id="0")
+        a = boot()                                           # (the same process as printing() in effect: state is on disk)
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="0")
+        report(a, gcode_state="RUNNING", subtask_name="walk-up", task_id="0")
+        b = boot()                                           # down before the next beat; the walk-up was cancelled
+        report(b, gcode_state="IDLE")
+        self.assertEqual(b.collect_queue_progress(),
+                         [{"queueJobId": "q1", "state": "completed", "printerJobKey": key, "assignmentSeq": 7}])
 
     def test_the_printers_own_task_id_keeps_the_saved_print_however_long_the_outage(self):
         # codex re-review: the ETA cutoff discarded a print whose task id matched (paused through the outage)

@@ -190,10 +190,6 @@ class BambuAdapter:
             # Job lifecycle detection (wall-clock — startedAt/endedAt are real
             # timestamps on the wire, unlike the monotonic staleness clock).
             self._jobs.observe(self._data, time.time())
-            if self._jobs.lost_saved_print:
-                self._jobs.lost_saved_print = False
-                if self._queue_progress.unlink_rehydrated():
-                    self._save_queue_progress()   # durable: another restart must not make the job linkable again
             if not self._shape_logged:
                 self._shape_logged = True
                 # First-parse shape observability (redacted) — see CLAUDE doctrine.

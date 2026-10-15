@@ -118,7 +118,6 @@ class QueueProgressTracker:
                     "reported_printing": bool(d["reported_printing"]),
                     "baselineKeys": sorted(d["baselineKeys"]),
                     "taskName": d.get("taskName"),
-                    **({"unlinkable": True} if d.get("unlinkable") else {}),
                 }
                 for d in self._dispatches
             ],
@@ -147,7 +146,6 @@ class QueueProgressTracker:
                     "baselineKeys": {k for k in _list(d.get("baselineKeys")) if isinstance(k, str)},
                     "taskName": d.get("taskName") if isinstance(d.get("taskName"), str) else None,
                     **({"assignmentSeq": d["assignmentSeq"]} if isinstance(d.get("assignmentSeq"), int) and not isinstance(d.get("assignmentSeq"), bool) else {}),
-                    **({"unlinkable": True} if d.get("unlinkable") is True else {}),
                     "rehydrated_monotonic": now,
                 }
             )
@@ -188,17 +186,6 @@ class QueueProgressTracker:
         """[{queueJobId, assignmentSeq}] for the unresolved dispatches (v0.58 r5: idempotency is keyed by BOTH)."""
         return [{"queueJobId": str(d["queueJobId"]), **_seq_of(d)} for d in self._dispatches if d.get("queueJobId")]
 
-    def unlink_rehydrated(self) -> bool:
-        """v0.69: the print a dispatch from before the restart was running is gone (the JobTracker dropped its saved print:
-        reset, another file, or the same file long past its ETA). No terminal record can be proven to be that print any
-        more, so none completes it; it is held when the printer is idle (outcome_unknown_after_restart). Returns whether
-        anything changed (the caller persists)."""
-        changed = False
-        for d in self._dispatches:
-            if "rehydrated_monotonic" in d and not d.get("unlinkable"):
-                d["unlinkable"] = changed = True
-        return changed
-
     def discard_dispatch(self, queue_job_id: str) -> None:
         """The start command never left the box (publish failed): forget the dispatch we recorded ahead of it."""
         self._dispatches = [d for d in self._dispatches if d["queueJobId"] != queue_job_id]
@@ -223,10 +210,12 @@ class QueueProgressTracker:
 
         dispatch = self._dispatches[0]
         task_name = dispatch.get("taskName")
-        candidates = [] if dispatch.get("unlinkable") else [
+        candidates = [
             job
             for job in pending_jobs
             if isinstance(job, dict)
+            # v0.69: a print found running in place of a dropped saved print started while the hub was down (jobs.py)
+            and not job.get("notDispatched")
             and (key := _job_key(job))
             and key not in dispatch["baselineKeys"]
             and key not in self._linked_job_keys
