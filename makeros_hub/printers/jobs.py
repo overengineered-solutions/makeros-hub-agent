@@ -93,6 +93,13 @@ def _job_name(merged: dict) -> str | None:
     return name.strip()[:300] if isinstance(name, str) and name.strip() else None
 
 
+def _subtask_name(merged: dict) -> str | None:
+    """The print's real name, when this report carries one (not the gcode_file fallback _job_name may return)."""
+    p = merged.get("print")
+    n = p.get("subtask_name") if isinstance(p, dict) else None
+    return n.strip()[:300] if isinstance(n, str) and n.strip() else None
+
+
 def _printer_task_id(merged: dict) -> str | None:
     """The printer's own job id when it gives us one (task_id/subtask_id on the
     report). '0'/''/absent → None (some local prints don't carry one)."""
@@ -414,14 +421,20 @@ class JobTracker:
                 # The printer's own id says this is ANOTHER print (codex review of 3b59933: Alice's task 77 adopted by name
                 # from a report without an id, then Bob's task 78 showed up and finished under Alice's key).
                 if self._active.get("adopted"):
-                    # restored after a restart and never confirmed: its outcome is unknown, nothing is invented, and the
-                    # print in its place is handled as if first seen now (opened or recovered, and marked)
+                    # restored after a restart and never confirmed: its outcome is unknown, nothing is invented
                     log.info("%s: the printer's task id %s is not the adopted print's — its key is dropped", self.printer_id, task_id)
-                    self._active, self._mark_next, self._last_state = None, True, ""
+                    self._active = None
                 else:
                     self._close("cancelled", now)   # the gap between two prints was missed while the hub watched
+                # Either way the print in its place is handled as if first seen now: opened, or recovered if it already
+                # finished (codex review of c3ccb8b: a finished task 78 found after a drop was never reported), and marked
+                # notDispatched: no dispatch can start while a print runs or while the printer is not reporting.
+                self._mark_next, self._last_state = True, ""
             elif known:
                 self._active.pop("adopted", None)   # confirmed by the printer's own id
+                real = _subtask_name(merged)
+                if real:
+                    self._active["name"] = real   # the real name replaces a gcode_file fallback (codex review of c3ccb8b)
             elif not key.startswith("task_"):
                 self._active["taskKey"] = self._task_key(task_id)   # a dedupe alias; the key the site holds is kept
         elif (task_id and state in (_TERMINAL_DONE, _TERMINAL_FAILED) and self._last_state in (_TERMINAL_DONE, _TERMINAL_FAILED)

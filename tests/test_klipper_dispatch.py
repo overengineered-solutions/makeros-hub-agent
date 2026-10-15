@@ -460,6 +460,7 @@ class TestDurability(KlipperCase):
                     self.fake.print_started_at = time.time() - 60
                 else:                       # reset after it ended: outcome unknown, nothing invented
                     self.fake.state, self.fake.filename = "standby", ""
+                time.sleep(0.002)   # keys carry the observation's millisecond: a fast box observed both in one (codex review)
                 reborn = self.make(pid="k1")
                 self.poll(reborn)
                 self.assertNotEqual(reborn._job_tracker.active_key(), key)

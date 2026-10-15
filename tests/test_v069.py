@@ -330,6 +330,33 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         self.assertEqual((job["startedAt"], job.get("notDispatched")), (_iso(started), None))
         self.assertEqual(c.collect_queue_progress()[-1]["state"], "completed")
 
+    def test_a_print_found_finished_after_a_watched_task_id_change_is_reported_as_its_own(self):
+        # codex review of c3ccb8b: the hub watched task 77, MQTT dropped while another print (78) ran and finished, and the
+        # reconnect's FINISH/78 closed 77 as cancelled but never reported 78
+        key, _ = self.printing(task_id="77")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77", mc_percent=40)
+        a._on_disconnect(None, None, 0)
+        a._on_connect(a._client, None, None, 0)
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        self.assertEqual([(j["jobKey"], j["status"], j.get("notDispatched")) for j in a.pending_jobs()],
+                         [(key, "cancelled", None), ("task_S1_78", "done", True)])
+        self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["held"])   # 77's own record: print_cancelled
+
+    def test_the_real_name_replaces_a_fallback_name_under_the_same_task_id(self):
+        # codex review of c3ccb8b: opened from a report with task 77 and gcode_file only; the later subtask_name was kept
+        # out, so FINISH carried the wrong filename and the queue job was held instead of completed
+        a = boot()
+        report(a, gcode_state="IDLE")
+        self.assertEqual(self.start(a), {"ok": True})
+        report(a, gcode_state="RUNNING", task_id="77", gcode_file="Metadata/plate_1.gcode")
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        (job,) = a.pending_jobs()
+        self.assertEqual((job["jobKey"], job["filename"]), ("task_S1_77", "cube"))
+        self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["printing", "completed"])
+
     def test_the_task_id_beats_a_partial_reports_fallback_file_name(self):
         # codex review of 135cb83: the first report after the restart carried task 77 and gcode_file only; the name
         # mismatch dropped the real dispatch's print, reopened it with a new start and marked it notDispatched
