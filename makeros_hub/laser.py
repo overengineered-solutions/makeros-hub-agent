@@ -582,10 +582,10 @@ class LaserHub:
         carried, so a run or verdict the site failed to write was lost). No laserAck, from a site before it or malformed,
         drops nothing. Whatever is kept rides the next beat; the caps bound a site that never acks: 32 closed runs per
         laser (31 while one is open) and 32 check results, the oldest dropped first."""
-        if not isinstance(laser_ack, dict):
-            return
-        run_keys, file_ids = ({v for v in laser_ack.get(k) if isinstance(v, str)} if isinstance(laser_ack.get(k), list)
-                              else set() for k in ("runKeys", "fileIds"))
+        lists = [laser_ack.get(k) for k in ("runKeys", "fileIds")] if isinstance(laser_ack, dict) else []
+        if len(lists) != 2 or not all(isinstance(v, list) for v in lists):
+            return   # malformed in any part: the site always sends both lists (codex review of e4eb9e7)
+        run_keys, file_ids = ({v for v in vs if isinstance(v, str)} for vs in lists)
         with self._lock:
             for lid, keys in report.run_keys.items():
                 if lid in self._lasers:

@@ -349,7 +349,9 @@ class H2Ack(Base):
 
     def test_no_laser_ack_from_an_older_site_keeps_everything(self):
         hub, rep = self.two_of_each()
-        for ack in (None, "ok", [], {"runKeys": "abc", "fileIds": {}}):
+        first = rep.run_keys[LASER_ID][0]
+        for ack in (None, "ok", [], {"runKeys": "abc", "fileIds": {}}, {"runKeys": [first]},
+                    {"runKeys": [first], "fileIds": "bad"}, {"runKeys": "bad", "fileIds": [self.F1]}):
             with self.subTest(ack=ack):
                 hub.ack(rep, ack)
                 self.assertEqual(self.left(hub), (rep.run_keys[LASER_ID], [self.F1, self.F2]))

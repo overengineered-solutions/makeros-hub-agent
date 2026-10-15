@@ -76,7 +76,7 @@ Tests use fake equipment and local sockets; NumPy enables the real YOLO preproce
 A hotfix to 0.68.0 (codex release review of pstation `aa9433b`). 0.68.0 dropped every closed cutting run and file
 verdict a heartbeat carried as soon as that heartbeat got a 200, so a run or verdict the website failed to write was
 lost for good. The agent now drops only what the response's `laserAck` (`runKeys`, `fileIds`) names, and keeps the
-rest for the next beat. A website that sends no `laserAck` at all (one from before it) has nothing dropped: everything
+rest for the next beat. A website that sends no `laserAck` at all (one from before it), or one malformed in any part, has nothing dropped: everything
 is re-sent, and the website stores it by key, so nothing doubles. What a website that never acknowledges can hold the
 agent to is bounded by the existing caps: 32 closed runs per laser (31 while one is open) and 32 file verdicts, oldest
 dropped first. Nothing else changed.
