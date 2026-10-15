@@ -576,15 +576,24 @@ class LaserHub:
             self._save_runs()   # tick() may have closed a run
         return LaserReport(lasers=entries or None, file_checks=list(checks), run_keys=run_keys, check_items=checks)
 
-    def ack(self, report: LaserReport) -> None:
-        """The heartbeat that carried `report` got a 200: drop the closed runs and check results it delivered."""
+    def ack(self, report: LaserReport, laser_ack) -> None:
+        """The heartbeat that carried `report` got a 200 with `laser_ack` (its laserAck): drop only the closed runs and
+        check results it carried that laserAck names (v0.68.1, codex release review: 0.68.0 dropped everything it
+        carried, so a run or verdict the site failed to write was lost). No laserAck, from a site before it or malformed,
+        drops nothing. Whatever is kept rides the next beat; the caps bound a site that never acks: 32 closed runs per
+        laser (31 while one is open) and 32 check results, the oldest dropped first."""
+        lists = [laser_ack.get(k) for k in ("runKeys", "fileIds")] if isinstance(laser_ack, dict) else []
+        if len(lists) != 2 or not all(isinstance(v, list) for v in lists):
+            return   # malformed in any part: the site always sends both lists (codex review of e4eb9e7)
+        run_keys, file_ids = ({v for v in vs if isinstance(v, str)} for vs in lists)
         with self._lock:
             for lid, keys in report.run_keys.items():
                 if lid in self._lasers:
-                    self._lasers[lid].runs.ack(keys)
+                    # only runs this report carried closed: an open run's key the site stored must not drop it once closed
+                    self._lasers[lid].runs.ack(run_keys.intersection(keys))
             self._save_runs()
-            carried = {id(c) for c in report.check_items}
-            self._check_results = [c for c in self._check_results if id(c) not in carried]
+            done = {id(c) for c in report.check_items if c.get("fileId") in file_ids}
+            self._check_results = [c for c in self._check_results if id(c) not in done]
 
     # file checks (heartbeat response laserChecks), off the heartbeat thread
     def offer_checks(self, offers) -> int:

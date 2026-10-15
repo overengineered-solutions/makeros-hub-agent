@@ -73,7 +73,8 @@ Tests use fake equipment and local sockets; NumPy enables the real YOLO preproce
 
 ## 0.69.0 candidate: fair camera capture, a forced update, nothing lost on a mid-print restart
 
-Built on v0.68.0, following pstation `docs/camera-pipeline-plan-2026-10-15.md`.
+Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
+`docs/camera-pipeline-plan-2026-10-15.md`.
 
 **Cameras.**
 - **Lanes.** Socket cameras each get their own thread, up to 16 at once: the A1s on :6000, Pi webcams, Moonraker.
@@ -174,6 +175,16 @@ The whole state audit, the force procedure and how to confirm a clean return are
   needed, are keep-alive and raw bytes instead of base64.
 - **Memory.** Each frame is held in base64 (about 270 KB for a 200 KB JPEG) until the beat ends: about 10 MB at 30
   frames, against the service's 600 MB cap.
+
+## 0.68.1 candidate: laser runs and file verdicts kept until the website names them
+
+A hotfix to 0.68.0 (codex release review of pstation `aa9433b`). 0.68.0 dropped every closed cutting run and file
+verdict a heartbeat carried as soon as that heartbeat got a 200, so a run or verdict the website failed to write was
+lost for good. The agent now drops only what the response's `laserAck` (`runKeys`, `fileIds`) names, and keeps the
+rest for the next beat. A website that sends no `laserAck` at all (one from before it), or one malformed in any part, has nothing dropped: everything
+is re-sent, and the website stores it by key, so nothing doubles. What a website that never acknowledges can hold the
+agent to is bounded by the existing caps: 32 closed runs per laser (31 while one is open) and 32 file verdicts, oldest
+dropped first. Nothing else changed.
 
 ## 0.68.0 candidate: Klipper/SV08 dispatch, laser status and runs, Turn on and Load, the laser gate
 

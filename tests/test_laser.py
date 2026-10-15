@@ -37,6 +37,11 @@ LASER_KEYS = {"machineId", "state", "stateSince", "switch", "currentA", "powerW"
               "gateDetail", "gate", "runs"}
 
 
+def acked(rep):
+    """The laserAck of a site that stored everything `rep` carried."""
+    return {"runKeys": [k for keys in rep.run_keys.values() for k in keys], "fileIds": [c["fileId"] for c in rep.check_items]}
+
+
 def iso_in(seconds):
     return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -242,7 +247,7 @@ class H2Runs(Base):
             self.assertEqual(rep.lasers[0]["runs"], [{"runKey": open_key, "startedAt": laser.iso_z(1000),
                                                       "lastCuttingAt": laser.iso_z(1000),
                                                       "endedAt": laser.iso_z(1000), "endReason": "switch_off"}])
-        hub.ack(second)
+        hub.ack(second, acked(second))
         self.assertEqual(hub.report(now=1071, mono=61, poll=False).lasers[0]["runs"], [])
 
     def test_an_ack_keeps_runs_closed_after_that_beat_was_built(self):
@@ -251,7 +256,7 @@ class H2Runs(Base):
         hub.push({"laser": SLUG, "switch": "on", "currentA": 3}, now=1000, mono=10)
         rep = hub.report(now=1001, mono=11, poll=False)   # carries only the open run
         hub.push({"laser": SLUG, "switch": "off", "currentA": 0}, now=1010, mono=20)
-        hub.ack(rep)
+        hub.ack(rep, {"runKeys": [r["runKey"] for r in rep.lasers[0]["runs"]], "fileIds": []})   # the site acks open runs too
         self.assertEqual(len(hub.report(now=1011, mono=21, poll=False).lasers[0]["runs"]), 1)
 
     def test_runs_the_cloud_has_not_acked_survive_a_restart(self):
@@ -281,7 +286,7 @@ class H2Runs(Base):
         self.assertEqual((b["startedAt"], b["endedAt"], b["endReason"]),
                          (laser.iso_z(1020), laser.iso_z(1020), "telemetry_lost"))
         self.assertEqual(after.lasers[1]["runs"], [])
-        reborn.ack(after)
+        reborn.ack(after, acked(after))
         self.assertEqual(LaserHub(hub.cfg, secrets_dir=self.secrets)._unclaimed_runs[LASER_ID]["closed"], [])
 
     def test_a_new_run_never_pushes_the_newest_closed_run_out_of_the_report(self):
@@ -307,6 +312,71 @@ class H2Runs(Base):
         rep = r.report()
         self.assertEqual(len(rep), 32)
         self.assertIsNone(rep[0]["endedAt"])   # the open run always rides
+
+
+class H2Ack(Base):
+    """v0.68.1 (codex release review of pstation aa9433b): a 200 drops only what its laserAck names."""
+    F1, F2 = FILE_ID, "aaaaaaaa-bbbb-4ccc-8ddd-ffffffffffff"
+
+    def two_of_each(self):
+        self.secret(laser.PUSH_TOKEN_FILE, PUSH_TOKEN)
+        hub = self.hub()
+        for t in (1000, 1020):
+            hub.push({"laser": SLUG, "switch": "on", "currentA": 3}, now=t, mono=t)
+            hub.push({"laser": SLUG, "switch": "off", "currentA": 0}, now=t + 5, mono=t + 5)
+        hub._check_results = [{"fileId": f, "sha256": SHA, "verdict": "retry", "detail": "gate_unreachable"}
+                              for f in (self.F1, self.F2)]
+        rep = hub.report(now=1100, mono=1100, poll=False)
+        self.assertEqual((len(rep.run_keys[LASER_ID]), len(rep.check_items)), (2, 2))
+        return hub, rep
+
+    def left(self, hub):
+        rep = hub.report(now=1200, mono=1200, poll=False)
+        saved = LaserHub(hub.cfg, secrets_dir=self.secrets)._unclaimed_runs[LASER_ID]["closed"]
+        self.assertEqual([r["runKey"] for r in saved], rep.run_keys[LASER_ID])   # what is kept is kept on disk too
+        return rep.run_keys[LASER_ID], [c["fileId"] for c in rep.check_items]
+
+    def test_an_empty_ack_keeps_both(self):
+        hub, rep = self.two_of_each()
+        hub.ack(rep, {"runKeys": [], "fileIds": []})
+        self.assertEqual(self.left(hub), (rep.run_keys[LASER_ID], [self.F1, self.F2]))
+
+    def test_a_partial_ack_drops_only_what_it_names(self):
+        hub, rep = self.two_of_each()
+        first, second = rep.run_keys[LASER_ID]
+        hub.ack(rep, {"runKeys": [first, "f" * 32, 7], "fileIds": [self.F2, None]})
+        self.assertEqual(self.left(hub), ([second], [self.F1]))
+
+    def test_no_laser_ack_from_an_older_site_keeps_everything(self):
+        hub, rep = self.two_of_each()
+        first = rep.run_keys[LASER_ID][0]
+        for ack in (None, "ok", [], {"runKeys": "abc", "fileIds": {}}, {"runKeys": [first]},
+                    {"runKeys": [first], "fileIds": "bad"}, {"runKeys": "bad", "fileIds": [self.F1]}):
+            with self.subTest(ack=ack):
+                hub.ack(rep, ack)
+                self.assertEqual(self.left(hub), (rep.run_keys[LASER_ID], [self.F1, self.F2]))
+
+    def test_a_verdict_that_arrived_after_the_beat_stays(self):
+        hub, rep = self.two_of_each()
+        late = {"fileId": self.F1, "sha256": SHA, "verdict": "checked", "result": {}}
+        hub._check_results.append(late)
+        hub.ack(rep, acked(rep))
+        self.assertEqual(hub._check_results, [late])
+
+    def test_a_site_that_never_acks_holds_at_most_32_runs_and_32_verdicts(self):
+        self.secret(laser.PUSH_TOKEN_FILE, PUSH_TOKEN)
+        hub = self.hub()
+        hub.check_one = lambda o: {"fileId": o["fileId"], "sha256": SHA, "verdict": "retry", "detail": "x"}
+        for i in range(40):
+            hub.push({"laser": SLUG, "switch": "on", "currentA": 3}, now=1000 + i * 10, mono=1 + i * 10)
+            hub.push({"laser": SLUG, "switch": "off", "currentA": 0}, now=1001 + i * 10, mono=2 + i * 10)
+            hub._check_queue = [offer(fileId=f"{i:08d}-bbbb-4ccc-8ddd-eeeeeeeeeeee")]
+            hub._check_worker()
+            rep = hub.report(now=1005 + i * 10, mono=6 + i * 10, poll=False)
+            hub.ack(rep, {"runKeys": [], "fileIds": []})
+        self.assertEqual((len(hub._lasers[LASER_ID].runs.closed), len(hub._check_results)), (32, 32))
+        self.assertEqual(len(rep.lasers[0]["runs"]), 32)
+        self.assertEqual(len(rep.file_checks), 16)
 
 
 # --- H3 -------------------------------------------------------------------------------------------------------------
@@ -686,7 +756,8 @@ class H7Checks(Base):
                                 "result": {k: CHECKED[k] for k in ("sizeBytes", "maxPowerPct", "widthMm", "heightMm", "layers")}}])
         self.assertEqual(gate.calls[0]["path"], "/check?maxPowerPct=40")
         self.assertEqual(gate.calls[0]["body"], BODY)
-        hub.ack(hub.report(poll=False))
+        rep = hub.report(poll=False)
+        hub.ack(rep, acked(rep))
         self.assertEqual(hub.report(poll=False).file_checks, [])
 
         refused = {"verdict": "refused", "code": "power_over_cap", "reason": "layer 0 power 90.0% is over the 40.0% cap",
@@ -805,7 +876,7 @@ class H9RunLoop(Base):
 
     def test_one_beat(self):
         stop = threading.Event()
-        sent, offered = [], []
+        sent, offered, acks = [], [], []
 
         class Nothing:
             def __init__(self, *a, **k):
@@ -827,13 +898,14 @@ class H9RunLoop(Base):
             manager.laser.set_lasers([{"id": LASER_ID, "slug": SLUG, "name": "OMTech"}])
             manager.laser._command_results.append({"requestId": "L1", "command": "laser_load", "status": "ok"})
             manager.laser.offer_checks = lambda offers: offered.append(offers) or 0
+            manager.laser.ack = lambda rep, laser_ack: acks.append((rep, laser_ack))
             return None
 
         def post(url, body, **_k):
             sent.append(body)
             stop.set()
             return hub_http.Response(200, {"hubId": "h", "configVersion": "v", "nextPollMs": 30000, "applied": 0,
-                                           "laserChecks": [offer()]})
+                                           "laserChecks": [offer()], "laserAck": {"runKeys": [], "fileIds": []}})
 
         with mock.patch("makeros_hub.agent.read_credential", return_value="cred"), \
                 mock.patch("makeros_hub.agent._pull_config", side_effect=pull), \
@@ -848,6 +920,8 @@ class H9RunLoop(Base):
         self.assertEqual((body["lasers"][0]["haLink"], body["lasers"][0]["gateLink"]), ("not_configured", "not_configured"))
         self.assertIn({"requestId": "L1", "command": "laser_load", "status": "ok"}, body["commandResults"])
         self.assertEqual(offered, [[offer()]])
+        [(rep, laser_ack)] = acks
+        self.assertEqual((rep.lasers, laser_ack), (body["lasers"], {"runKeys": [], "fileIds": []}))
 
 
 # --- H10 ------------------------------------------------------------------------------------------------------------
