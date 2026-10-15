@@ -31,6 +31,9 @@ CREDENTIAL_PATH = Path(
 )
 SPOOL_DIR = Path(os.environ.get("MAKEROS_HUB_SPOOL_DIR", "/var/lib/makeros-hub/spool"))
 DEFAULT_HEARTBEAT_SEC = 30
+# v0.70: how often the telemetry push sends coalesced status deltas (docs/telemetry-v1.md); 0 turns the push off and the
+# 30 s heartbeat carries status alone, as before. The site can move a running hub between 2 and 60 s with `nextMs`.
+DEFAULT_TELEMETRY_SEC = 5
 # Non-privileged port the OrcaSlicer ingest HTTP server binds on the LAN. The
 # member points OrcaSlicer's Print Host at http://<hub>.local:<port>.
 DEFAULT_INGEST_PORT = 8787
@@ -60,6 +63,8 @@ class Config:
     max_upload_mb: int = DEFAULT_MAX_UPLOAD_MB
     # v0.68: the optional [laser] table (makeros_hub.laser.LaserConfig); None = every laser reports not_configured.
     laser: Any = None
+    # v0.70: telemetry push cadence in seconds, 0 = off (last so positional construction of older callers is unchanged).
+    telemetry_sec: int = DEFAULT_TELEMETRY_SEC
 
     def __post_init__(self):
         self.cloud_url = validate_cloud_url(self.cloud_url)
@@ -71,6 +76,11 @@ class Config:
     @property
     def heartbeat_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/heartbeat"
+
+    @property
+    def telemetry_url(self) -> str:
+        # v0.70: coalesced status deltas, beside the heartbeat (docs/telemetry-v1.md).
+        return self.cloud_url.rstrip("/") + "/api/print/hub/telemetry"
 
     @property
     def config_url(self) -> str:
@@ -347,6 +357,11 @@ def load_config(cloud_url_override: str | None = None) -> Config:
         or data.get("max_upload_mb")
         or DEFAULT_MAX_UPLOAD_MB
     )
+    # v0.70: not the `or` chain above — "0" is the off switch and must survive the parse (env, then config.toml).
+    raw_telemetry = os.environ.get("MAKEROS_HUB_TELEMETRY_SEC")
+    if raw_telemetry is None or not raw_telemetry.strip():
+        raw_telemetry = data.get("telemetry_sec", DEFAULT_TELEMETRY_SEC)
+    telemetry_sec = max(0, int(raw_telemetry))
     try:
         laser = parse_laser_config(data.get("laser"))
     except ValueError as exc:
@@ -359,6 +374,7 @@ def load_config(cloud_url_override: str | None = None) -> Config:
         ingest_port=ingest_port,
         max_upload_mb=max_upload_mb,
         laser=laser,
+        telemetry_sec=telemetry_sec,
     )
 
 

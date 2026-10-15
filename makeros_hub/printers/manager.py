@@ -398,6 +398,20 @@ class PrinterManager:
         out.extend(self._static.values())
         return out
 
+    def live_statuses(self) -> list[dict]:
+        """v0.70: the telemetry push's read, every second on its own thread. Only each adapter's status(), which takes
+        the adapter's own lock: no stuck-adapter retry, no get_version re-ask and no static error rows (those belong to
+        the heartbeat beat, and none of them is ever connected). list() snapshots the adapter dict, so a reconcile on
+        the heartbeat thread cannot change it under this iteration. Never raises: a bad adapter is skipped this second."""
+        out: list[dict] = []
+        for pid, adapter in list(self._adapters.items()):
+            try:
+                out.append(adapter.status())
+            except Exception as e:  # noqa: BLE001 — the heartbeat's statuses() records it; here it is just skipped
+                log.debug("telemetry status read failed for %s: %s", pid,
+                          self._redact_printer_exception(e, self._access_code_for(pid)))
+        return out
+
     def camera_targets(self) -> list[dict]:
         """Per-printer camera-routing facts (vendor/model/host/accessCode/urls)
         for the camera capturer. One entry per configured printer; the capturer

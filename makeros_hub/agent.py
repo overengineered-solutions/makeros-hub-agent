@@ -55,6 +55,7 @@ from .printers.onnx_detector import (
     build_detector_async,
 )
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
+from .telemetry import start_telemetry
 from .update import OTA_WAIT_IDLE, is_commit_sha, maybe_update, should_defer_update, should_update
 from .vprinter.capture import CapturedJob, build_vp_submit_body
 from .vprinter.manager import VirtualPrinterManager
@@ -1578,6 +1579,9 @@ def run(
         tailscale_status = pulled_tailscale_status
     maybe_rehydrate_vprinter_outbox()
     laser_hub.start()   # HA's plug-reading pushes (only with a [laser] table)
+    # v0.70: status deltas every few seconds on their own daemon thread (docs/telemetry-v1.md), read from the adapters
+    # directly; the heartbeat below keeps its cadence and content. Stops with the same stop_event; never raises.
+    start_telemetry(cfg, credential, manager.live_statuses, stop_event)
 
     # Start the OrcaSlicer ingest server (inbound HTTP on the LAN). Best-effort:
     # if the port is taken we log + continue (heartbeat/telemetry still work).

@@ -1,6 +1,6 @@
 # Procrastination Station shop-box agent
 
-The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.69.0 review candidate**, not evidence that the installed shop box has been updated.
+The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.70.0 review candidate**, not evidence that the installed shop box has been updated.
 
 The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Read [SECURITY.md](SECURITY.md) for the boundaries and limitations.
 
@@ -70,6 +70,53 @@ sh -n update.sh
 ```
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
+
+## 0.70.0 candidate: the phase, not the word "Printing", and status that does not wait for the heartbeat
+
+Built on v0.69.0, following pstation `reports/Live printer status design.md` (the operator, 2026-10-15: "it says
+printing but... it also looks like its been sitting there for a long time ... Maybe we show current temp vs target
+temp"; "these waits are killer ... so we dont have to wait on hub heart beats").
+
+**What each printer now reports (heartbeat and telemetry alike; every key additive, omitted when unknown).**
+- **Klipper (the SV08 MAX).** `nozzleTargetC` / `bedTargetC` beside the temperatures, so 140 / 140 (held for
+  calibration) reads differently from 140 / 215 (heating). `displayMessage`: the M117 text the start macro sets
+  ("Bed soak 20 min before calibration" was there the whole time on 2026-10-15). `preparing`: `print_stats.state`
+  is `printing` but `print_duration` is 0, i.e. the start routine (Klipper counts print time from the first extrusion).
+  Progress is the slicer's M73 value (`display_status.progress`), which OrcaSlicer holds at 0 through the start routine,
+  instead of the byte position that read 8 % while the file sat on its heat-wait; the byte position is used only when
+  `display_status` is absent. **No ETA before the first extrusion**, then the slicer's `estimated_time` minus the time
+  printed (one `GET /server/files/metadata` per new filename, cached, 32 entries; a failed fetch is retried once a
+  minute and costs only the slicer ETA), else the old extrapolation. `printDurationSec`, `elapsedSec`
+  (`total_duration`) and `layer` `[current, total]` from `print_stats.info` (filled by `SET_PRINT_STATS_INFO`; Orca's
+  layer number is zero-based). The poll now also asks for `print_stats.info/message`, `toolhead.homed_axes` and
+  `idle_timeout.state` (Moonraker omits what a printer lacks). Still no Klipper `gcodeState`: the site feeds that key
+  into its plate-clear gate.
+- **Bambu.** `stageCode` (`stg_cur`: 7 heating nozzle, 2 heatbed preheating, 13 homing, …; the idle sentinels −1/255
+  and the boot-time 0 are omitted) with `stageSecondsLeft` (`stg_cd`), `layer` `[layer_num, total_layer_num]`,
+  `nozzleTargetC` / `bedTargetC` / `chamberC` read from the flat floats (`nozzle_target_temper`, …) or, when a model
+  lacks them, from the packed `device.extruder.info[].temp` / `device.bed.info.temp` / `device.ctc.info.temp` words
+  of P2S/H2D firmware (current in the low 16 bits, target in the high 16), `preparing` (`gcode_state` `PREPARE`, which
+  `state` still maps to idle), and `elapsedSec` from `gcode_start_time`. Fixed: progress, temperatures, `jobName` and
+  the ETA were sent while the printer was offline, so stale cached values went out as if fresh.
+- **Both.** `sampledAt` (unix ms): when the reading was taken, the Bambu adapter's last MQTT report or the Klipper
+  adapter's last successful poll, so the site can say "updated 4 s ago" instead of dating everything by the heartbeat.
+
+**Telemetry push.** A new thread POSTs coalesced per-printer deltas to `/api/print/hub/telemetry` every 5 s
+(`MAKEROS_HUB_TELEMETRY_SEC`, or `telemetry_sec` in `config.toml`; `0` disables it, and the heartbeat then carries
+status alone, as before). Values are rounded first (0.5 °C, 0.1 %, whole minutes), an unchanged printer is absent, an
+idle printer is silent until its state moves, and a full snapshot of every connected printer goes out at start, after
+any failure, when the site asks and every 60 s. One persistent HTTPS connection, the hub's bearer, 5 s timeouts; a 404
+(a site without the route yet) is logged once and retried every minute. Nothing about cameras, commands or OTA rides
+here, and the heartbeat's cadence, content and `nextPollMs` handling are untouched. The contract the site is built
+against is [docs/telemetry-v1.md](docs/telemetry-v1.md).
+
+**Wire contract (every field is additive; each side tolerates the other side at an older version).**
+
+| Field | Direction |
+| --- | --- |
+| `printers[].sampledAt`, `preparing`, `nozzleTargetC`, `bedTargetC`, `chamberC`, `displayMessage`, `printDurationSec`, `elapsedSec`, `layer`, `stageCode`, `stageSecondsLeft` | hub → site, heartbeat |
+| `POST /api/print/hub/telemetry` (docs/telemetry-v1.md) | hub → site, every 2–60 s |
+| `{ ok, wantFull?, nextMs? }` | site → hub, telemetry reply |
 
 ## 0.69.0 candidate: fair camera capture, a forced update, nothing lost on a mid-print restart
 
