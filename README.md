@@ -134,8 +134,10 @@ Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
   cannot be saved is refused), so no walk-up or re-print can complete the old queue job:
   it is held for staff instead of being closed by the wrong print. A marked print's report is held back until that
   old job's `held` has been delivered, because the site matches an unbound finished print to the printer's
-  `printing` job by time; the site ignores the `notDispatched` key itself. A bare delta with no name or task id never
-  decides which print a saved one was: the hub waits for the first report that names it. A print whose task id matches the saved one is
+  `printing` job by time; the site ignores the `notDispatched` key itself. A report with neither a real name (`subtask_name`; the
+  generic `gcode_file` plate path counts for nothing) nor a task id never decides which print a saved one was: the hub
+  waits for the first report that names it. An MQTT reconnect handles the running print the same way: the cached
+  name and task id are dropped, and the print is confirmed again by the new connection's reports. A print whose task id matches the saved one is
   always kept, whatever name a partial report gives it. The
   ETA is kept current while a print runs or is paused, so a restart short of that never drops a print. A failed write
   is retried on the next report instead of being remembered as saved.

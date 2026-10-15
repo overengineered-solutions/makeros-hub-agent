@@ -331,18 +331,75 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         self.assertEqual(c.collect_queue_progress()[-1]["state"], "completed")
 
     def test_a_print_found_finished_after_a_watched_task_id_change_is_reported_as_its_own(self):
-        # codex review of c3ccb8b: the hub watched task 77, MQTT dropped while another print (78) ran and finished, and the
-        # reconnect's FINISH/78 closed 77 as cancelled but never reported 78
-        key, _ = self.printing(task_id="77")
+        # codex review of c3ccb8b: the hub watched task 77, another print (78) ran and finished unseen, and FINISH/78
+        # closed 77 but never reported 78
+        for reconnect in (True, False):
+            with self.subTest(reconnect=reconnect):
+                key, _ = self.printing(task_id="77")
+                a = boot()
+                report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+                report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77", mc_percent=40)
+                if reconnect:                                # MQTT dropped: 77 must be confirmed again, like after a restart
+                    a._on_disconnect(None, None, 0)
+                    a._on_connect(a._client, None, None, 0)
+                report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
+                expected = [] if reconnect else [(key, "cancelled", None)]   # unknown is not invented; a watched gap is
+                self.assertEqual([(j["jobKey"], j["status"], j.get("notDispatched")) for j in a.pending_jobs()],
+                                 expected + [("task_S1_78", "done", True)])
+                a._queue_progress._start_timeout_sec = 0
+                self.assertEqual([(r["state"], r.get("reason")) for r in a.collect_queue_progress()],
+                                 [("held", "outcome_unknown_after_restart" if reconnect else "print_cancelled")])
+                for f in list(bambu_module.TERMINAL_JOBS_DIR.glob("*")) + list(bambu_module.QUEUE_PROGRESS_DIR.glob("*")):
+                    f.unlink()
+
+    def test_a_reconnect_needs_a_fresh_identity_before_it_settles_the_running_print(self):
+        # codex review of e8134f8: Alice's task 77 cached, Bob's 78 ran and finished during the drop, and a bare FINISH
+        # delta merged with the cached identity closed Alice's print as done and completed her job
+        self.printing(task_id="77")
         a = boot()
         report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77")
-        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="77", mc_percent=40)
         a._on_disconnect(None, None, 0)
         a._on_connect(a._client, None, None, 0)
-        report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        report(a, gcode_state="FINISH")
+        self.assertEqual(a.pending_jobs(), [])               # undecided
+        report(a, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        self.assertEqual([(j["jobKey"], j.get("notDispatched")) for j in a.pending_jobs()], [("task_S1_78", True)])
+        # a short blip on the same print just carries on, and completes its job
+        for f in list(bambu_module.TERMINAL_JOBS_DIR.glob("*")) + list(bambu_module.QUEUE_PROGRESS_DIR.glob("*")):
+            f.unlink()
+        key, _ = self.printing(task_id="77")
+        b = boot()
+        report(b, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        b._on_disconnect(None, None, 0)
+        b._on_connect(b._client, None, None, 0)
+        report(b, gcode_state="RUNNING", subtask_name="cube", task_id="77")
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual([(j["jobKey"], j["status"]) for j in b.pending_jobs()], [(key, "done")])
+        self.assertEqual(b.collect_queue_progress()[-1]["state"], "completed")
+
+    def test_a_generic_plate_path_never_disproves_the_saved_real_name(self):
+        # codex review of e8134f8: a LAN cube finished during the restart; the first report (FINISH, task "0",
+        # gcode_file only) mismatched the saved name and dropped the print, so it was never reported
+        key, _ = self.printing(task_id="0")
+        b = boot()
+        report(b, gcode_state="FINISH", task_id="0", gcode_file="Metadata/plate_1.gcode")
+        self.assertEqual(b.pending_jobs(), [])               # undecided
+        report(b, gcode_state="FINISH", task_id="0", gcode_file="Metadata/plate_1.gcode", subtask_name="cube")
+        self.assertEqual([(j["jobKey"], j["status"]) for j in b.pending_jobs()], [(key, "done")])
+        self.assertEqual(b.collect_queue_progress()[-1]["state"], "completed")
+
+    def test_a_real_name_change_with_a_new_task_id_is_another_print_even_on_a_fingerprint(self):
+        # codex review of e8134f8: the alias learned from Bob's report (task 78) hid the name change, so Bob was taken for
+        # Alice's fingerprinted cube
+        key, _ = self.printing(task_id="0")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report(a, gcode_state="RUNNING", subtask_name="bob", task_id="78")
+        self.assertEqual(a._jobs.active_key(), "task_S1_78")
+        report(a, gcode_state="FINISH", subtask_name="bob", task_id="78")
         self.assertEqual([(j["jobKey"], j["status"], j.get("notDispatched")) for j in a.pending_jobs()],
                          [(key, "cancelled", None), ("task_S1_78", "done", True)])
-        self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["held"])   # 77's own record: print_cancelled
+        self.assertEqual([(r["state"], r.get("reason")) for r in a.collect_queue_progress()], [("held", "print_cancelled")])
 
     def test_the_real_name_replaces_a_fallback_name_under_the_same_task_id(self):
         # codex review of c3ccb8b: opened from a report with task 77 and gcode_file only; the later subtask_name was kept

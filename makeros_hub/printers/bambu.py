@@ -169,6 +169,12 @@ class BambuAdapter:
             self._error_reason = None
             self._connected_at_ms = int(time.time() * 1000)
             self._state_seen = False
+            # v0.69: which print the printer is on must come from THIS connection's reports, never the cached ones
+            cached = self._data.get("print")
+            if isinstance(cached, dict):
+                for k in ("subtask_name", "gcode_file", "task_id", "subtask_id"):
+                    cached.pop(k, None)
+            self._jobs.reconnected()
         client.subscribe(self._report_topic, qos=0)
         client.publish(self._request_topic, PUSHALL)
         client.publish(self._request_topic, GET_VERSION)

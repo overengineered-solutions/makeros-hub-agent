@@ -248,7 +248,8 @@ class JobTracker:
             self._restored = {"key": a["key"], "name": a.get("name"), "startedAt": float(a["startedAt"]),
                               "material": a.get("material"), "etaAt": float(a["etaAt"]) if num(a.get("etaAt")) else None,
                               **({"notDispatched": True} if a.get("notDispatched") is True else {}),
-                              **({"taskKey": a["taskKey"]} if isinstance(a.get("taskKey"), str) else {})}
+                              **({"taskKey": a["taskKey"]} if isinstance(a.get("taskKey"), str) else {}),
+                              "named": a.get("named") is not False}
         self._active_saved = json.dumps(self._state(), sort_keys=True)
 
     def _save_active(self) -> bool:
@@ -265,7 +266,7 @@ class JobTracker:
         ponytail: with no saved ETA a same-name running print is still adopted, and a same-file re-print that ALSO
         finished while the hub was down is booked under the saved key (Bambu reports no start time to tell them apart)."""
         saved, self._restored = self._restored, None
-        name, task_id = _job_name(merged), _printer_task_id(merged)
+        name, task_id = _subtask_name(merged), _printer_task_id(merged)   # real names only: a fallback proves nothing
         eta = saved.get("etaAt")
         # the printer's own id (the key, or the alias a fingerprinted print learned): no ambiguity to judge
         exact = bool(task_id) and self._task_key(task_id) in (saved["key"], saved.get("taskKey"))
@@ -273,12 +274,14 @@ class JobTracker:
                    and now > eta + ADOPT_PAST_ETA_S)
         same = (state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED)) and (exact or (
             not overran
-            and not (name and saved["name"] and name != saved["name"])   # a partial report's gcode_file never beats the id
+            and not (name and saved.get("named", True) and saved["name"] and name != saved["name"])
             and not (task_id and str(saved["key"]).startswith("task_") and self._task_key(task_id) != saved["key"])
         ))
         if same:
             # adopted by name only: a task id that turns up later and differs means it was another print (observe)
             self._active = saved if exact else {**saved, "adopted": True}
+            if name and not saved.get("named", True):
+                self._active.update(name=name, named=True)
         else:
             # IDLE after a restart = the printer was reset; another name = another print. The outcome is unknown, so
             # nothing is invented (the queue's outcome_unknown_after_restart covers a dispatched job).
@@ -311,6 +314,9 @@ class JobTracker:
             "startedAt": now,
             "material": decode_active_material(merged),
             "etaAt": round(eta) if eta is not None else None,
+            # named = the name came from subtask_name. A gcode_file fallback ("Metadata/plate_1.gcode" for every 3mf) is
+            # no identity: it never proves or disproves which print this is (codex review of e8134f8)
+            "named": _subtask_name(merged) is not None,
             **({"notDispatched": True} if self._mark_next else {}),
         }
 
@@ -413,13 +419,13 @@ class JobTracker:
             return  # no signal yet (pre-pushall)
         if self._restored is not None:
             if ((state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED))
-                    and not _job_name(merged) and not _printer_task_id(merged)):
-                # A bare delta ({"gcode_state": "FINISH"}) says nothing about WHICH print: missing identity never makes a
-                # match (codex review of 26528c0: it closed Alice's saved print as done before the full report named
-                # Bob's task 78). Decided, as the first observation, on the first report that names the print.
+                    and not _subtask_name(merged) and not _printer_task_id(merged)):
+                # A bare delta ({"gcode_state": "FINISH"}), or one naming only the generic gcode_file, says nothing about
+                # WHICH print: missing identity never makes or breaks a match (codex reviews of 26528c0 and e8134f8).
+                # Decided, as the first observation, on the first report that names the print or gives its task id.
                 return
             self._adopt_or_drop(merged, state, now)
-        task_id = _printer_task_id(merged)
+        task_id, real = _printer_task_id(merged), _subtask_name(merged)
         if self._active is not None and task_id:
             key = str(self._active["key"])
             known = key if key.startswith("task_") else self._active.get("taskKey")
@@ -438,11 +444,12 @@ class JobTracker:
                 self._mark_next, self._last_state = True, ""
             elif known:
                 self._active.pop("adopted", None)   # confirmed by the printer's own id
-                real = _subtask_name(merged)
                 if real:
-                    self._active["name"] = real   # the real name replaces a gcode_file fallback (codex review of c3ccb8b)
-            elif not key.startswith("task_"):
-                self._active["taskKey"] = self._task_key(task_id)   # a dedupe alias; the key the site holds is kept
+                    self._active.update(name=real, named=True)   # the real name replaces a fallback (codex review of c3ccb8b)
+            elif not key.startswith("task_") and not (real and self._active.get("named", True) and real != self._active["name"]):
+                # a dedupe alias; the key the site holds is kept. Never learned from a report whose real name says it is
+                # another print: that is a name change for the state machine below (codex review of e8134f8)
+                self._active["taskKey"] = self._task_key(task_id)
         elif (task_id and state in (_TERMINAL_DONE, _TERMINAL_FAILED) and self._last_state in (_TERMINAL_DONE, _TERMINAL_FAILED)
               and self._last_key and not self._last_key.startswith("task_")):
             # the print just closed under its fingerprint is still on screen and names its task id only now: dedupe on that
@@ -472,14 +479,18 @@ class JobTracker:
                 # frame), but never reopen/re-time it. A NAME change while
                 # RUNNING means we missed the gap between two prints: close the
                 # old one (unconfirmed end → cancelled) and open the new.
-                name, task_id = _job_name(merged), _printer_task_id(merged)
-                # the id (the key, or the alias a fingerprinted print learned) beats a fallback name
+                name = _job_name(merged)
+                # the id (the key, or the alias a fingerprinted print learned) beats a name; only REAL names differ
                 same_id = bool(task_id) and self._task_key(task_id) in (self._active["key"], self._active.get("taskKey"))
-                if name and self._active["name"] and name != self._active["name"] and not same_id:
+                if real and self._active.get("named", True) and self._active["name"] and real != self._active["name"] and not same_id:
                     self._close("cancelled", now)
+                    # the print in its place cannot be a dispatch (none starts while a print runs): fenced
+                    self._mark_next = True
                     self._open(merged, now)
                 else:
-                    if name and not self._active["name"]:
+                    if real and not self._active.get("named", True):
+                        self._active.update(name=real, named=True)   # a fallback name gives way to the real one
+                    elif name and not self._active["name"]:
                         self._active["name"] = name
                     if task_id and not str(self._active["key"]).startswith("task_"):
                         self._active["key"] = self._task_key(task_id)
@@ -497,6 +508,14 @@ class JobTracker:
 
         self._last_state = state
         self._save_active()
+
+    def reconnected(self) -> None:
+        """MQTT (re)connected. The adapter dropped the merged report's identity fields, so the running print must be
+        confirmed again by a fresh report, exactly like a restart's saved print: a bare FINISH merged with the cached
+        identity closed Alice's print while Bob's had finished during the gap (codex review of e8134f8)."""
+        if self._active is not None:
+            self._restored, self._active = self._active, None
+        self._last_state = ""
 
     def dispatch_recorded(self) -> bool:
         """The adapter durably recorded a new dispatch: from here a print can be ours again, so stop marking. Saved now,
