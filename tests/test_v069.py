@@ -469,6 +469,32 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
                          [("task_S1_78", "done", None)])
         self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["printing", "completed"])
 
+    def test_a_message_without_a_state_after_a_reconnect_never_spends_the_judgement(self):
+        # codex review of 61c12f8: a get_version answer ahead of the pushall fed the cached IDLE to the tracker, which
+        # disarmed the reconnect judgement; Bob's finished task 78 in the pushall was then never reported
+        a = boot()
+        report(a, gcode_state="IDLE")
+        self.reconnect(a)
+        a._on_message(None, None, _Msg({"info": {"command": "get_version", "module": []}}))
+        report(a, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        self.assertEqual([j["jobKey"] for j in a.pending_jobs()], ["task_S1_78"])
+
+    def test_a_same_file_lan_re_dispatch_keeps_its_name_through_identity_less_deltas(self):
+        # codex review of 61c12f8: clearing the cached identity at the dispatch also cleared the name, and a LAN re-print of
+        # the same file never resends an unchanged subtask_name, so its ending had no filename and q2 was held
+        key, _ = self.printing(task_id="0")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="0")
+        self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["completed"])
+        a.ack_jobs([key])
+        self.assertEqual(a.start_print(self.spool / UID / "cube.3mf", "cube.3mf", queue_job_id="q2", assignment_seq=8), {"ok": True})
+        report(a, gcode_state="RUNNING")
+        report(a, gcode_state="FINISH")
+        (job,) = a.pending_jobs()
+        self.assertEqual((job["filename"], job.get("notDispatched")), ("cube", None))
+        self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["printing", "completed"])
+
     def test_a_same_file_finish_without_the_saved_prints_id_waits_for_the_id(self):
         # codex review of 1e116ed: Alice's cube (task 77) saved; Bob's cube (task 78) finished during the outage; the first
         # fresh report (FINISH, cube, no id) completed Alice's job, and task 78 was ignored

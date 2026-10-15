@@ -195,8 +195,11 @@ class BambuAdapter:
             if isinstance(doc.get("print"), dict) and doc["print"].get("gcode_state"):
                 self._state_seen = True
             # Job lifecycle detection (wall-clock — startedAt/endedAt are real
-            # timestamps on the wire, unlike the monotonic staleness clock).
-            self._jobs.observe(self._data, time.time())
+            # timestamps on the wire, unlike the monotonic staleness clock). v0.69: only once this connection has reported
+            # a gcode_state: a get_version answer ahead of the pushall must not feed the cached state to the tracker
+            # (codex review of 61c12f8: it spent the reconnect judgement on a stale IDLE).
+            if self._state_seen:
+                self._jobs.observe(self._data, time.time())
             if not self._shape_logged:
                 self._shape_logged = True
                 # First-parse shape observability (redacted) — see CLAUDE doctrine.
@@ -430,12 +433,16 @@ class BambuAdapter:
                     self._queue_progress.discard_dispatch(queue_job_id)
                     log.error("bambu %s: refusing to start %s — dispatch state could not be persisted", self.printer_id, queue_job_id)
                     return {"ok": False, "reason": "state_persist_failed"}
-                # v0.69: the next print's first delta may carry only gcode_state; the finished print's cached name and task id
-                # must not become its identity (they fenced the dispatch's own print; codex review of 95d4abe)
+                # v0.69: the next print's first delta may carry only gcode_state; the finished print's cached task ids must not
+                # become its identity (they fenced the dispatch's own print; codex review of 95d4abe). Its name is the one
+                # this start sends: deltas never resend an unchanged field, so a same-file re-print would otherwise have
+                # none (codex review of 61c12f8).
                 cached = self._data.get("print")
                 if isinstance(cached, dict):
                     for k in _IDENTITY_KEYS:
                         cached.pop(k, None)
+                    if task_name:
+                        cached["subtask_name"] = task_name
                 if not self._jobs.dispatch_recorded():   # v0.69: this dispatch's print must never inherit a post-drop mark
                     self._queue_progress.discard_dispatch(queue_job_id)
                     self._save_queue_progress()
