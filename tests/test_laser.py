@@ -267,8 +267,13 @@ class H2Runs(Base):
         self.assertIsNone(reborn.report(now=1030, poll=False).lasers)
         reborn.set_lasers([{"id": LASER_ID, "slug": SLUG, "name": "X"}, {"id": "11111111-1111-4111-8111-111111111111",
                                                                         "slug": "other", "name": "Y"}])
-        after = reborn.report(now=1031, mono=5, poll=False)   # no push yet: B closes on the hub's own rule
-        runs = {r["runKey"]: r for r in after.lasers[0]["runs"]}
+        # cutting before the first report is a new run, never B continued (it may be another member's session)
+        reborn.push({"laser": SLUG, "switch": "on", "currentA": 3}, now=5000, mono=4)
+        after = reborn.report(now=5001, mono=5, poll=False)
+        (fresh,) = [r for r in after.lasers[0]["runs"] if r["endedAt"] is None]
+        self.assertNotIn(fresh["runKey"], before)
+        self.assertEqual(fresh["startedAt"], laser.iso_z(5000))
+        runs = {r["runKey"]: r for r in after.lasers[0]["runs"] if r["endedAt"] is not None}
         self.assertEqual(set(runs), set(before))
         (a,) = [r for k, r in runs.items() if before[k]["endedAt"] is not None]
         self.assertEqual(a, next(r for r in before.values() if r["endedAt"] is not None))

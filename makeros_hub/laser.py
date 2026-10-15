@@ -232,8 +232,8 @@ def _saved_run(r, closed: bool) -> dict | None:
 
 class RunTracker:
     """Cutting runs for one laser. LaserHub saves to_state() whenever it changes (codex review of release-0.68.0: a
-    closed run the cloud had not acked was lost to a restart), so an open run comes back and closes on the hub's own
-    rules, and a closed one is re-sent until acked.
+    closed run the cloud had not acked was lost to a restart), so every run is re-sent until acked; one that was open
+    at the restart comes back closed (load()).
     sample() takes a pushed reading at its receipt time; tick() runs every heartbeat and only ever closes a run, so a
     stale "cutting" reading can never open a second, overlapping run."""
 
@@ -280,12 +280,18 @@ class RunTracker:
         return {"open": self.open, "closed": self.closed}
 
     def load(self, state) -> None:
-        """A saved to_state(); anything malformed is skipped."""
+        """A saved to_state(); anything malformed is skipped. A run open at the restart closes at its last cutting
+        reading: the hub saw nothing while it was down, and cutting after the restart may be another member's session
+        (codex re-review of release-0.68.0)."""
         if not isinstance(state, dict):
             return
-        self.open = _saved_run(state.get("open"), False)
         closed = state.get("closed") if isinstance(state.get("closed"), list) else []
-        self.closed = [r for r in (_saved_run(c, True) for c in closed) if r][-MAX_RUNS:]
+        self.closed = [r for r in (_saved_run(c, True) for c in closed) if r]
+        run = _saved_run(state.get("open"), False)
+        if run:
+            self.closed.append({**run, "endedAt": run["lastCuttingAt"], "endReason": "telemetry_lost"})
+        del self.closed[:-MAX_RUNS]
+        self.open = None
 
 
 # --- HTTP to the gate and to HA --------------------------------------------------------------------------------------
