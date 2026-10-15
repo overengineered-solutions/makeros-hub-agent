@@ -145,6 +145,9 @@ Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
   printing or paused (`printer_busy`), before the upload and again just before the start goes out.
 - **Update attempts.** The cooldown and attempt record (`last_update.json`) is now fsynced with its directory, so a
   power cut cannot lose an attempt and let a broken release past the cap.
+- **A backlog of finished prints.** A heartbeat carries at most 256 terminal reports, and its 200 now acknowledges
+  only those 256. Before, a backlog past 256 after a long outage (tens of printers) was acknowledged in full and the
+  rest deleted unsent.
 
 The whole state audit, the force procedure and how to confirm a clean return are in
 [docs/hotfix-runbook.md](docs/hotfix-runbook.md).

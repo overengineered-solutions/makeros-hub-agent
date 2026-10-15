@@ -826,16 +826,10 @@ class TestCommandsSurviveARestart(unittest.TestCase):
         manager_module.DISPATCHED_COMMANDS_PATH.write_text(json.dumps(stale))
         self.assertEqual(PrinterManager()._dispatched_commands, {})
 
-    def test_results_waiting_for_a_heartbeat_are_sent_after_a_restart_and_cleared_on_its_200(self):
-        report_outbox.save([{"requestId": "r9", "command": "ams_dry", "status": "ok"}], report_outbox.COMMAND_RESULTS_PATH)
-        self.assertEqual(report_outbox.load(report_outbox.COMMAND_RESULTS_PATH), [])   # a command row is not a queue report
-        bodies = []
+    @staticmethod
+    def one_beat(post, *extra):
+        """agent.run for one heartbeat: `post` answers it and sets the stop event it is given."""
         stop = threading.Event()
-
-        def post(url, body, **_kw):
-            bodies.append(body)
-            stop.set()
-            return http.Response(status=200, body={"hubId": "h", "configVersion": "v", "nextPollMs": 30000, "applied": 0})
 
         class Ingest:
             def __init__(self, *a, **k):
@@ -863,12 +857,47 @@ class TestCommandsSurviveARestart(unittest.TestCase):
                 mock.patch.object(agent, "tailscale_binary_exists", return_value=False), \
                 mock.patch("makeros_hub.discovery.maybe_run_periodic_scan", return_value=False), \
                 mock.patch("makeros_hub.discovery.get_cached_hits", return_value=[]), \
-                mock.patch.object(agent, "post_json", side_effect=post):
-            agent.run(Config(cloud_url="https://host.example", heartbeat_sec=1), _stop_event=stop, _install_signals=False,
-                      _outbox=mock.Mock(load_all=lambda: []))
+                mock.patch.object(agent, "post_json", side_effect=lambda url, body, **kw: post(url, body, stop)):
+            for p in extra:
+                p.start()
+            try:
+                agent.run(Config(cloud_url="https://host.example", heartbeat_sec=1), _stop_event=stop, _install_signals=False,
+                          _outbox=mock.Mock(load_all=lambda: []))
+            finally:
+                for p in extra:
+                    p.stop()
+
+    OK = {"hubId": "h", "configVersion": "v", "nextPollMs": 30000, "applied": 0}
+
+    def test_results_waiting_for_a_heartbeat_are_sent_after_a_restart_and_cleared_on_its_200(self):
+        report_outbox.save([{"requestId": "r9", "command": "ams_dry", "status": "ok"}], report_outbox.COMMAND_RESULTS_PATH)
+        self.assertEqual(report_outbox.load(report_outbox.COMMAND_RESULTS_PATH), [])   # a command row is not a queue report
+        bodies = []
+
+        def post(url, body, stop):
+            bodies.append(body)
+            stop.set()
+            return http.Response(status=200, body=self.OK)
+
+        self.one_beat(post)
         self.assertEqual(bodies[0]["commandResults"], [{"requestId": "r9", "command": "ams_dry", "status": "ok"}])
         self.assertEqual(report_outbox.load(report_outbox.COMMAND_RESULTS_PATH, report_outbox.COMMAND_KEYS), [])
 
+    def test_a_backlog_past_one_heartbeat_keeps_what_was_not_sent(self):
+        # codex review (present at v0.68.0 too): 257 terminal reports after an outage, 256 posted, all 257 acked -> the
+        # 257th deleted unsent, a print never billed
+        backlog = [{"jobKey": f"k{i}", "printerId": "p1", "status": "done", "endedAt": "2026-10-15T00:00:00+00:00"} for i in range(257)]
+        acked, sent = [], []
+
+        def post(url, body, stop):
+            sent.extend(j["jobKey"] for j in body.get("jobs", []))
+            stop.set()
+            return http.Response(status=200, body=self.OK)
+
+        self.one_beat(post, mock.patch.object(PrinterManager, "pending_jobs", return_value=backlog),
+                      mock.patch.object(PrinterManager, "ack_jobs", side_effect=acked.extend))
+        self.assertEqual(len(sent), 256)
+        self.assertEqual(acked, sent)                                       # k256 stays buffered for the next beat
 
 if __name__ == "__main__":
     unittest.main()

@@ -551,6 +551,9 @@ def _uptime_sec() -> int | None:
         return None
 
 
+HEARTBEAT_JOBS_MAX = 256   # terminal reports per heartbeat; the run loop acks only the batch it sent
+
+
 def _collect_pi_metrics(tick_wall_ms: int | None = None) -> dict:
     """Cheap psutil-free resource snapshot for the cloud's hub-health tile.
 
@@ -768,7 +771,7 @@ def heartbeat_payload(
         # Terminal jobs observed since the last confirmed send — the cloud
         # ingests them into print_jobs (observe-only until a printer is
         # billing-authoritative) and dedupes on jobKey, so re-sends are safe.
-        "jobs": (jobs or [])[:256],
+        "jobs": (jobs or [])[:HEARTBEAT_JOBS_MAX],
     }
     if isinstance(tailscale_status, dict):
         for key in TAILSCALE_HEARTBEAT_FIELDS:
@@ -1675,7 +1678,9 @@ def run(
                             "vprinter",
                             f"live AMS apply failed: {redact(str(exc))}",
                         )
-                jobs = manager.pending_jobs()
+                # v0.69: one batch, sent AND acked (codex review: the payload kept 256 but the 200 acked every buffered
+                # report, so a backlog past 256 after an outage was deleted unsent); the rest go next beat, oldest first
+                jobs = manager.pending_jobs()[:HEARTBEAT_JOBS_MAX]
                 # Camera frames (opt-in). A printer is captured when EITHER the
                 # admin enabled it (cameraEnabled, via config-down) OR the global
                 # env override is set. Default-off: neither → no capture. Phase-
