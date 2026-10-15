@@ -423,6 +423,7 @@ class BambuAdapter:
                     self._queue_progress.discard_dispatch(queue_job_id)
                     log.error("bambu %s: refusing to start %s — dispatch state could not be persisted", self.printer_id, queue_job_id)
                     return {"ok": False, "reason": "state_persist_failed"}
+                self._jobs.dispatch_recorded()   # v0.69: this dispatch's print must never inherit a post-drop mark
         refusal = self._not_startable()   # again: the upload took seconds, and a report may have landed meanwhile
         if refusal:
             log.warning("bambu %s: not starting %s after its upload — %s", self.printer_id, queue_job_id, refusal)

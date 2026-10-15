@@ -217,6 +217,46 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         self.assertEqual(c.collect_queue_progress(),
                          [{"queueJobId": "q1", "state": "held", "reason": "outcome_unknown_after_restart", "assignmentSeq": 7}])
 
+    def test_no_print_after_a_drop_completes_the_old_job_until_the_hub_dispatches_again(self):
+        # codex review of 135cb83: only the first replacement was marked, so a second walk-up of the same file, started
+        # before the queue saw the printer idle, completed the old job with its own key
+        self.printing(task_id="0")
+        self.age_saved_print(9, 8)
+        b = boot()
+        for name in ("cube", "cube"):                        # the re-print, then another walk-up of the same file
+            report(b, gcode_state="RUNNING", subtask_name=name, task_id="0")
+            report(b, gcode_state="FINISH", subtask_name=name, task_id="0")
+        self.assertEqual([j.get("notDispatched") for j in b.pending_jobs()], [True, True])
+        b._queue_progress._start_timeout_sec = 0
+        self.assertEqual(b.collect_queue_progress(),
+                         [{"queueJobId": "q1", "state": "held", "reason": "outcome_unknown_after_restart", "assignmentSeq": 7}])
+        # the hub's next dispatch ends the marking: its own print completes it
+        (self.spool / UID / "next.3mf").write_bytes(b"3mf")
+        self.assertEqual(b.start_print(self.spool / UID / "next.3mf", "next.3mf", queue_job_id="q2", assignment_seq=8), {"ok": True})
+        c = boot()                                           # even across a restart right after the dispatch
+        report(c, gcode_state="RUNNING", subtask_name="next", task_id="0")
+        report(c, gcode_state="FINISH", subtask_name="next", task_id="0")
+        self.assertEqual([r["state"] for r in c.collect_queue_progress()], ["printing", "completed"])
+
+    def test_the_task_id_beats_a_partial_reports_fallback_file_name(self):
+        # codex review of 135cb83: the first report after the restart carried task 77 and gcode_file only; the name
+        # mismatch dropped the real dispatch's print, reopened it with a new start and marked it notDispatched
+        key, started = self.printing(task_id="77")
+        b = boot()
+        report(b, gcode_state="RUNNING", task_id="77", gcode_file="Metadata/plate_1.gcode")
+        self.assertEqual(b._jobs.active_key(), key)
+        report(b, gcode_state="RUNNING", subtask_name="cube", task_id="77", gcode_file="Metadata/plate_1.gcode")
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        (job,) = b.pending_jobs()
+        self.assertEqual((job["jobKey"], job["startedAt"], job.get("notDispatched")), (key, _iso(started), None))
+        self.assertEqual(b.collect_queue_progress()[-1], {"queueJobId": "q1", "state": "completed", "printerJobKey": key,
+                                                          "assignmentSeq": 7})
+        # and while the hub watches: a name flip under the same task id is not a second print
+        t = JobTracker("p9", "S9")
+        t.observe({"print": {"gcode_state": "RUNNING", "subtask_name": "cube", "task_id": "5"}}, 1000.0)
+        t.observe({"print": {"gcode_state": "RUNNING", "gcode_file": "Metadata/plate_1.gcode", "task_id": "5"}}, 1001.0)
+        self.assertEqual((t.pending(), t.active_key()), ([], "task_S9_5"))
+
     def test_a_dropped_walk_up_print_never_costs_the_finished_dispatch_its_completion(self):
         # codex re-review of 9ac3ff7: q1 finished (its record on disk), a walk-up print started at the screen, the hub
         # restarted onto IDLE; invalidating every pre-restart dispatch held q1 although its own ending was right there

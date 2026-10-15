@@ -183,10 +183,12 @@ class JobTracker:
         self._last_key: str | None = None
         self._active_saved = ""
         self._unsaved = False   # the last write failed: every observation retries until one lands
-        # The saved running print was dropped while the printer shows ANOTHER print active (another file, or the same file
-        # long past its ETA): that print started while the hub was down, so no dispatch of this hub started it. It is
-        # marked `notDispatched` when it opens, in the same atomic write as the print itself, and queue progress never
-        # takes its ending as a queue job's completion (codex re-reviews of af50a73 and 9ac3ff7).
+        # The saved running print was dropped after a restart (reset, another file, or the same file long past its ETA).
+        # Its dispatch, if it had one, is now an outcome nobody can prove: until the hub records its NEXT dispatch, every
+        # print that opens here is marked `notDispatched` (the walk-up or re-print that replaced it, and any after it), in
+        # the same atomic write as the print itself, and queue progress never takes such an ending as a queue job's
+        # completion; the old job is held when the printer is idle. Terminal records already pending at the drop stay
+        # linkable (codex reviews of af50a73, 9ac3ff7 and 135cb83).
         self._mark_next = False
         self._load_pending()
 
@@ -268,19 +270,17 @@ class JobTracker:
         exact = bool(task_id) and saved["key"] == self._task_key(task_id)   # the printer's own id: no ambiguity to judge
         overran = (state in _STILL_ACTIVE and not exact and eta is not None and eta > saved["startedAt"]
                    and now > eta + ADOPT_PAST_ETA_S)
-        same = (
-            (state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED))
-            and not overran
-            and not (name and saved["name"] and name != saved["name"])
+        same = (state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED)) and (exact or (
+            not overran
+            and not (name and saved["name"] and name != saved["name"])   # a partial report's gcode_file never beats the id
             and not (task_id and str(saved["key"]).startswith("task_") and self._task_key(task_id) != saved["key"])
-        )
+        ))
         if same:
             self._active = saved
         else:
             # IDLE after a restart = the printer was reset; another name = another print. The outcome is unknown, so
             # nothing is invented (the queue's outcome_unknown_after_restart covers a dispatched job).
-            if state in _STILL_ACTIVE:
-                self._mark_next = True
+            self._mark_next = True
             log.info("%s: %s is no longer the running print after the restart (%s%s) — its key is dropped",
                      self.printer_id, saved["name"] or saved["key"], state, ", long past its ETA" if overran else "")
 
@@ -311,7 +311,6 @@ class JobTracker:
             "etaAt": round(eta) if eta is not None else None,
             **({"notDispatched": True} if self._mark_next else {}),
         }
-        self._mark_next = False
 
     def _close(self, status: str, now: float) -> None:
         if self._active is None:
@@ -410,8 +409,6 @@ class JobTracker:
             self._adopt_or_drop(merged, state, now)
 
         if self._active is None:
-            if self._mark_next and state not in _STILL_ACTIVE:
-                self._mark_next = False   # the replacement ended before it ever ran under the hub's eyes
             if state == _ACTIVE:
                 self._open(merged, now)
             elif self._last_state == "" and state in (_TERMINAL_DONE, _TERMINAL_FAILED):
@@ -432,14 +429,14 @@ class JobTracker:
                 # frame), but never reopen/re-time it. A NAME change while
                 # RUNNING means we missed the gap between two prints: close the
                 # old one (unconfirmed end → cancelled) and open the new.
-                name = _job_name(merged)
-                if name and self._active["name"] and name != self._active["name"]:
+                name, task_id = _job_name(merged), _printer_task_id(merged)
+                same_id = bool(task_id) and self._active["key"] == self._task_key(task_id)   # the id beats a fallback name
+                if name and self._active["name"] and name != self._active["name"] and not same_id:
                     self._close("cancelled", now)
                     self._open(merged, now)
                 else:
                     if name and not self._active["name"]:
                         self._active["name"] = name
-                    task_id = _printer_task_id(merged)
                     if task_id and not str(self._active["key"]).startswith("task_"):
                         self._active["key"] = self._task_key(task_id)
                     if not self._active["material"]:
@@ -456,6 +453,14 @@ class JobTracker:
 
         self._last_state = state
         self._save_active()
+
+    def dispatch_recorded(self) -> None:
+        """The adapter durably recorded a new dispatch: from here a print can be ours again, so stop marking. Saved now,
+        before the start is published, so a crash cannot leave the mark to land on that dispatch's print. (A new dispatch
+        is recorded only once every older one is resolved, so nothing the mark protected is still open.)"""
+        if self._mark_next:
+            self._mark_next = False
+            self._save_active()
 
     def pending(self) -> list[dict]:
         """Unacked terminal jobs (oldest first). Safe to send repeatedly —
