@@ -1680,7 +1680,11 @@ def run(
                         )
                 # v0.69: one batch, sent AND acked (codex review: the payload kept 256 but the 200 acked every buffered
                 # report, so a backlog past 256 after an outage was deleted unsent); the rest go next beat, oldest first
-                jobs = manager.pending_jobs()[:HEARTBEAT_JOBS_MAX]
+                jobs = manager.pending_jobs()
+                if pending_queue_reports:
+                    # ...and until the old job's 'held' has been DELIVERED: queue reports flush after this heartbeat
+                    jobs = [j for j in jobs if not j.get("notDispatched")]
+                jobs = jobs[:HEARTBEAT_JOBS_MAX]
                 # Camera frames (opt-in). A printer is captured when EITHER the
                 # admin enabled it (cameraEnabled, via config-down) OR the global
                 # env override is set. Default-off: neither → no capture. Phase-

@@ -405,16 +405,25 @@ class PrinterManager:
         same durable rows; codex review of release-0.68.0: deduping an adapter's
         own rows dropped a real same-key print). The cloud dedupes on jobKey."""
         rows: list[dict] = []
+        waiting: set = set()
         for pid, adapter in self._adapters.items():
             try:
-                rows.extend(adapter.pending_jobs())
+                mine = adapter.pending_jobs()
+                marked = {j["jobKey"] for j in mine if j.get("notDispatched")}
+                pend = getattr(adapter, "pending_queue_jobs", None)
+                if marked and callable(pend) and pend():
+                    # v0.69: a print that replaced a dropped saved print waits until that printer's older dispatch is
+                    # resolved. The site's heartbeat matches an unbound terminal to the printer's 'printing' job by time,
+                    # so it must arrive after the old job is held, never before (codex review of 26528c0).
+                    waiting |= marked
+                rows.extend(mine)
             except Exception as e:  # noqa: BLE001 — one adapter can't sink the loop
                 code = self._access_code_for(pid)
                 safe = self._redact_printer_exception(e, code)
                 log.warning("pending_jobs failed for %s: %s", pid, safe)
                 self._record_failure(f"pending_jobs failed for {pid}: {safe}", extra_secrets=[code])
         held = {j.get("jobKey") for j in rows}
-        return [j for k, j in self._orphan_jobs.items() if k not in held] + rows
+        return [j for k, j in self._orphan_jobs.items() if k not in held] + [j for j in rows if j["jobKey"] not in waiting]
 
     def ack_jobs(self, job_keys: list[str]) -> None:
         """Fan a confirmed-send ack out to every adapter + the orphan buffer."""

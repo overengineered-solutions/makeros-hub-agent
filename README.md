@@ -131,7 +131,10 @@ Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
   the outage, so it is not taken for the saved print. After any such drop, every print that opens, or is found
   already finished, is marked `notDispatched` until the hub durably records its next dispatch (a start whose clear
   cannot be saved is refused), so no walk-up or re-print can complete the old queue job:
-  it is held for staff instead of being closed by the wrong print. A print whose task id matches the saved one is
+  it is held for staff instead of being closed by the wrong print. A marked print's report is held back until that
+  old job's `held` has been delivered, because the site matches an unbound finished print to the printer's
+  `printing` job by time; the site ignores the `notDispatched` key itself. A bare delta with no name or task id never
+  decides which print a saved one was: the hub waits for the first report that names it. A print whose task id matches the saved one is
   always kept, whatever name a partial report gives it. The
   ETA is kept current while a print runs or is paused, so a restart short of that never drops a print. A failed write
   is retried on the next report instead of being remembered as saved.

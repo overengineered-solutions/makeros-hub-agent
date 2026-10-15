@@ -412,6 +412,12 @@ class JobTracker:
         if not state:
             return  # no signal yet (pre-pushall)
         if self._restored is not None:
+            if ((state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED))
+                    and not _job_name(merged) and not _printer_task_id(merged)):
+                # A bare delta ({"gcode_state": "FINISH"}) says nothing about WHICH print: missing identity never makes a
+                # match (codex review of 26528c0: it closed Alice's saved print as done before the full report named
+                # Bob's task 78). Decided, as the first observation, on the first report that names the print.
+                return
             self._adopt_or_drop(merged, state, now)
         task_id = _printer_task_id(merged)
         if self._active is not None and task_id:
@@ -496,12 +502,15 @@ class JobTracker:
         before the start is published, so a crash cannot leave the mark to land on that dispatch's print; False when that
         save did not land (the mark stays, and the adapter does not start). A new dispatch is recorded only once every
         older one is resolved, so nothing the mark protected is still open."""
-        if not self._mark_next:
+        if not self._mark_next and self._restored is None:
             return True
-        self._mark_next = False
+        # a saved print still undecided (no report has named a print yet) cannot be this dispatch's: the dispatch it had
+        # is resolved, or this one could not have been recorded
+        before = (self._mark_next, self._restored)
+        self._mark_next, self._restored = False, None
         if self._save_active():
             return True
-        self._mark_next = True
+        self._mark_next, self._restored = before
         return False
 
     def pending(self) -> list[dict]:

@@ -357,6 +357,64 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         self.assertEqual((job["jobKey"], job["filename"]), ("task_S1_77", "cube"))
         self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["printing", "completed"])
 
+    def test_a_bare_finish_delta_never_decides_which_print_finished(self):
+        # codex review of 26528c0: {"gcode_state": "FINISH"} alone adopted and closed Alice's saved task 77 as done; the
+        # full report naming Bob's task 78 that followed was ignored, and Alice's job completed under her key
+        key, _ = self.printing(task_id="77")
+        b = boot()
+        report(b, gcode_state="FINISH")
+        self.assertEqual(b.pending_jobs(), [])               # undecided: nothing closed, nothing invented
+        report(b, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        self.assertEqual([(j["jobKey"], j.get("notDispatched")) for j in b.pending_jobs()], [("task_S1_78", True)])
+        b._queue_progress._start_timeout_sec = 0
+        self.assertEqual(b.collect_queue_progress(),
+                         [{"queueJobId": "q1", "state": "held", "reason": "outcome_unknown_after_restart", "assignmentSeq": 7}])
+        c = JobTracker("p5", "S5", state_path=self.PATH.with_name("p5.json"))   # and when the full report IS the print
+        c.observe({"print": {"gcode_state": "RUNNING", "subtask_name": "cube", "task_id": "77"}}, 1000.0)
+        d = JobTracker("p5", "S5", state_path=self.PATH.with_name("p5.json"))
+        d.observe({"print": {"gcode_state": "FINISH"}}, 2000.0)
+        d.observe({"print": {"gcode_state": "FINISH", "subtask_name": "cube", "task_id": "77"}}, 2001.0)
+        self.assertEqual([(j["jobKey"], j["status"]) for j in d.pending()], [("task_S5_77", "done")])
+
+    def test_a_replacement_print_waits_until_the_old_job_is_held_and_that_report_delivered(self):
+        # codex review of 26528c0: the site's heartbeat matches an unbound terminal to the printer's 'printing' job by
+        # time, so Bob's marked print arriving before Alice's 'held' could still complete and bill Alice's job
+        self.printing(task_id="77")
+        b = boot()
+        m = PrinterManager()
+        m._adapters["p1"] = b
+        report(b, gcode_state="FINISH", subtask_name="bob", task_id="78")
+        self.assertEqual(m.pending_jobs(), [])                 # q1 still unresolved on this printer: held back
+        b._queue_progress._start_timeout_sec = 0
+        self.assertEqual([r["state"] for r in m.collect_queue_progress()], ["held"])
+        self.assertEqual([j["jobKey"] for j in m.pending_jobs()], ["task_S1_78"])
+        # an undelivered queue report holds it back in the run loop too
+        sent = []
+
+        def post(url, body, stop):
+            if "jobs" in body:
+                sent.append([j["jobKey"] for j in body["jobs"]])
+            stop.set()
+            return http.Response(status=200, body=TestCommandsSurviveARestart.OK)
+
+        report_outbox.save([{"queueJobId": "q1", "state": "held", "reason": "outcome_unknown_after_restart"}])
+        TestCommandsSurviveARestart.one_beat(post, mock.patch.object(PrinterManager, "pending_jobs",
+                                                                     return_value=b.pending_jobs()))
+        self.assertEqual(sent[0], [])
+
+    def test_a_new_dispatch_settles_a_saved_print_no_report_has_named(self):
+        self.printing(task_id="77")
+        b = boot()
+        report(b, gcode_state="FINISH")                      # undecided
+        b._queue_progress._start_timeout_sec = 0
+        b.collect_queue_progress()                           # q1 held after its idle timeout
+        (self.spool / UID / "next.3mf").write_bytes(b"3mf")
+        self.assertEqual(b.start_print(self.spool / UID / "next.3mf", "next.3mf", queue_job_id="q2", assignment_seq=8), {"ok": True})
+        report(b, gcode_state="RUNNING", subtask_name="next", task_id="90")
+        report(b, gcode_state="FINISH", subtask_name="next", task_id="90")
+        self.assertEqual([(j["jobKey"], j.get("notDispatched")) for j in b.pending_jobs()], [("task_S1_90", None)])
+        self.assertEqual([r["state"] for r in b.collect_queue_progress()], ["printing", "completed"])
+
     def test_the_task_id_beats_a_partial_reports_fallback_file_name(self):
         # codex review of 135cb83: the first report after the restart carried task 77 and gcode_file only; the name
         # mismatch dropped the real dispatch's print, reopened it with a new start and marked it notDispatched
