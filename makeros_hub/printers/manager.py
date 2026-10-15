@@ -445,7 +445,7 @@ class PrinterManager:
                 log.warning("ack_jobs failed for %s: %s", pid, safe)
                 self._record_failure(f"ack_jobs failed for {pid}: {safe}", extra_secrets=[code])
 
-    def _remember_dispatched_queue_job(self, queue_job_id: str, assignment_seq: int | None = None) -> None:
+    def _remember_dispatched_queue_job(self, queue_job_id: str, assignment_seq: int | None = None) -> bool:
         self._dispatched_queue_jobs[queue_job_id] = time.monotonic()
         self._dispatched_queue_jobs.move_to_end(queue_job_id)
         self._dispatched_wall[queue_job_id] = time.time()
@@ -457,7 +457,7 @@ class PrinterManager:
             evicted, _ = self._dispatched_queue_jobs.popitem(last=False)
             self._dispatched_wall.pop(evicted, None)
             self._dispatched_seq.pop(evicted, None)
-        self._save_dispatched()
+        return self._save_dispatched()
 
     def _guard_matches(self, queue_job_id: str, assignment_seq) -> bool:
         """Is the guarded dispatch THIS assignment? Unknown on either side (pre-seq cloud / legacy state) counts as yes."""
@@ -498,7 +498,7 @@ class PrinterManager:
                 self._dispatched_queue_jobs[job_id] = now_mono
                 self._dispatched_wall[job_id] = float(stamp)
 
-    def _save_dispatched(self) -> None:
+    def _save_dispatched(self) -> bool:
         try:
             DISPATCHED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp = DISPATCHED_STATE_PATH.with_suffix(".json.tmp")
@@ -517,6 +517,8 @@ class PrinterManager:
                 pass
         except OSError as e:
             log.warning("could not persist the dispatched-job guard: %s", e)
+            return False
+        return True
 
     def _remember_command(self, request_id: str) -> None:
         """Guard a command that ran, durably before its result is even queued. ponytail: the publish and this write are
@@ -932,13 +934,24 @@ class PrinterManager:
         """Drain queue-status updates observed by printer adapters. `on_report` is handed down to adapters that support it
         (v0.58 r3: the durable outbox write happens before the adapter persists the popped dispatch)."""
         reports: list[dict] = []
+
+        def durable(report: dict) -> None:
+            # v0.69: the resolved assignment's guard is made durable here, inside the adapter's pre-pop hook, so it is on
+            # disk BEFORE the adapter persists the popped dispatch: a second crash between the two can no longer leave
+            # neither, and the site's unchanged re-send start the print again (codex review of 708dff1)
+            if on_report is not None:
+                on_report(report)
+            if report.get("state") in ("completed", "held") and isinstance(report.get("queueJobId"), str):
+                if not self._remember_dispatched_queue_job(report["queueJobId"], report.get("assignmentSeq")):
+                    raise OSError("dispatch guard not durable")   # the adapter keeps its dispatch; replayed next beat
+
         for pid, adapter in self._adapters.items():
             collect_progress = getattr(adapter, "collect_queue_progress", None)
             if not callable(collect_progress):
                 continue
             try:
                 try:
-                    produced = collect_progress(on_report=on_report) if on_report is not None else collect_progress()
+                    produced = collect_progress(on_report=durable)
                 except TypeError:
                     produced = collect_progress()   # an adapter without the hook (tests / other printer kinds)
                     if callable(on_report):

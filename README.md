@@ -149,6 +149,11 @@ Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
   that assignment (job and `assignmentSeq`) for 24 hours instead of dropping it. After a crash before its
   `uploading` report, the site still holds the job `assigned` and re-sends it in the very beat that resolves it; that
   re-send used to start the print a second time (present since v0.58). A re-queued job (a new seq) still dispatches.
+  The guard is written durably before the adapter persists the resolved dispatch, so a second crash between the two
+  cannot leave neither.
+- **LAN prints and task ids.** A print counts as id-less (a LAN print) once it has reported task id "0" for 5 minutes
+  of running. Only then is a task id seen across a restart or reconnect treated as another print's. A real id that
+  lands a few frames after the start (the hub's own starts send "0") never splits the print.
 - **Fresh connections.** A Bambu printer that has not reported its state on the current MQTT connection is refused a
   start (`printer_stale`). Right after a restart or a reconnect it reads as idle, or as its state from before the drop,
   even when it is printing. The adapter itself also refuses a printer whose fresh report says it is preparing,

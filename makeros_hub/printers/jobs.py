@@ -73,6 +73,10 @@ ETA_SLACK_S = 300   # the saved ETA is rewritten only when the printer's estimat
 # A same-name print still running this long after the saved print's ETA may be a re-print started during the outage:
 # with no task id nothing tells them apart, so it is dropped (held for staff), never booked under the old key.
 ADOPT_PAST_ETA_S = 1800
+# A print counts as id-less (a LAN print) only once it has said "0" this long after its start: a real task id often
+# lands after the first RUNNING frame (and the hub's own starts send "0"), so an early "0" proves nothing. The flag
+# only judges the gaps (adoption after a restart or reconnect, an alias after the print closed), never the live print.
+NO_ID_AFTER_S = 300
 
 
 def _iso(ts: float) -> str:
@@ -263,7 +267,8 @@ class JobTracker:
                               "material": a.get("material"), "etaAt": float(a["etaAt"]) if num(a.get("etaAt")) else None,
                               **({"notDispatched": True} if a.get("notDispatched") is True else {}),
                               **({"taskKey": a["taskKey"]} if isinstance(a.get("taskKey"), str) else {}),
-                              "named": a.get("named") is not False}
+                              "named": a.get("named") is not False,
+                              **({"noId": True} if a.get("noId") is True else {})}
         self._active_saved = json.dumps(self._state(), sort_keys=True)
 
     def _save_active(self) -> bool:
@@ -284,10 +289,12 @@ class JobTracker:
         eta = saved.get("etaAt")
         # the printer's own id (the key, or the alias a fingerprinted print learned): no ambiguity to judge
         exact = bool(task_id) and self._task_key(task_id) in (saved["key"], saved.get("taskKey"))
+        # a print that said it had no id ("0") and now shows one is another print (codex review of 708dff1)
+        id_contradicts = bool(task_id) and not exact and saved.get("noId") is True
         overran = (state in _STILL_ACTIVE and not exact and eta is not None and eta > saved["startedAt"]
                    and now > eta + ADOPT_PAST_ETA_S)
         same = (state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED)) and (exact or (
-            not overran
+            not overran and not id_contradicts
             and not (name and saved.get("named", True) and saved["name"] and name != saved["name"])
             and not (task_id and str(saved["key"]).startswith("task_") and self._task_key(task_id) != saved["key"])
         ))
@@ -453,8 +460,9 @@ class JobTracker:
                 return
             self._adopt_or_drop(merged, state, now)
         task_id, real = _printer_task_id(merged), _subtask_name(merged)
-        if self._active is not None and _explicit_no_id(merged):
-            self._active["noId"] = True   # a LAN print: an id seen after its close is another print's (codex review of a599650)
+        if self._active is not None and _explicit_no_id(merged) and now - self._active["startedAt"] >= NO_ID_AFTER_S:
+            # a LAN print: an id seen after a gap is another print's (codex reviews of a599650 and 708dff1)
+            self._active["noId"] = True
         if self._active is not None:
             key = str(self._active["key"])
             known = key if key.startswith("task_") else self._active.get("taskKey")
@@ -475,7 +483,7 @@ class JobTracker:
             else:
                 if real and (same_id or not self._active.get("named", True)):
                     self._active.update(name=real, named=True)   # the real name replaces a fallback (codex review of c3ccb8b)
-                if task_id and not known:
+                if task_id and not known and not self._active.get("noId"):
                     self._active["taskKey"] = self._task_key(task_id)   # a dedupe alias; the key the site holds is kept
         elif (task_id and state in (_TERMINAL_DONE, _TERMINAL_FAILED) and self._last_state in (_TERMINAL_DONE, _TERMINAL_FAILED)
               and self._last_key and not self._last_key.startswith("task_") and not self._recover_next

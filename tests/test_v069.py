@@ -66,6 +66,12 @@ def report(a, **print_fields):
     a._on_message(None, None, _Msg({"print": print_fields}))
 
 
+def report_later(a, seconds, **print_fields):
+    """A report `seconds` after now on the wall clock the tracker reads (e.g. a LAN print still saying "0" 5 min in)."""
+    with mock.patch.object(bambu_module.time, "time", return_value=time.time() + seconds):
+        report(a, **print_fields)
+
+
 class TestHeartbeatAdditions(unittest.TestCase):
     def test_camera_want_is_capped_and_a_non_list_means_an_older_site(self):
         self.assertEqual(agent._camera_want({"cameraWant": ["a", 3, None, "b"]}), {"a", "b"})
@@ -390,17 +396,62 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         report(a, gcode_state="FINISH", subtask_name="cube", task_id="77")
         self.assertEqual(a.pending_jobs(), [])
 
+    def test_a_saved_lan_print_is_not_adopted_by_a_same_name_print_with_an_id(self):
+        # codex review of 708dff1: Alice's saved LAN cube said task "0"; Bob's cube (task 78) finished during the outage;
+        # on return the name matched, Alice's job completed under her key with Bob's ending, and 78 became her alias
+        self.printing(task_id="0")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report_later(a, 400, gcode_state="RUNNING", subtask_name="cube", task_id="0")   # 'no id' is settled now
+        b = boot()
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        self.assertEqual([(j["jobKey"], j.get("notDispatched")) for j in b.pending_jobs()], [("task_S1_78", True)])
+        b._queue_progress._start_timeout_sec = 0
+        self.assertEqual([r.get("reason") for r in b.collect_queue_progress()], ["outcome_unknown_after_restart"])
+
+    def test_a_lan_re_dispatch_keeps_its_no_id_so_a_later_id_is_another_print(self):
+        # codex review of 708dff1: the second LAN dispatch's seed dropped the "0" ids its deltas never resend, so another
+        # cube (task 78) finished during a later drop was aliased to it and never reported
+        key, _ = self.printing(task_id="0")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="0")
+        a.collect_queue_progress()
+        a.ack_jobs([key])
+        time.sleep(0.002)
+        self.assertEqual(a.start_print(self.spool / UID / "cube.3mf", "cube.3mf", queue_job_id="q2", assignment_seq=8), {"ok": True})
+        report(a, gcode_state="RUNNING")
+        report_later(a, 400, gcode_state="RUNNING", mc_percent=50)   # still the seeded "0" 5 min in: a LAN print
+        report_later(a, 401, gcode_state="FINISH")
+        (second,) = a.pending_jobs()
+        a.collect_queue_progress()
+        a.ack_jobs([second["jobKey"]])
+        self.reconnect(a)
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        self.assertEqual([j["jobKey"] for j in a.pending_jobs()], ["task_S1_78"])
+
     def test_after_a_reconnect_a_new_id_after_a_lan_print_is_another_print(self):
         # codex review of a599650: a LAN cube (task "0") closed and acked, another cube (task 78) ran and finished during the
         # drop, and the name match aliased 78 to the old fingerprint: never reported, then suppressed for good
         key, _ = self.printing(task_id="0")
         a = boot()
         report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
-        report(a, gcode_state="FINISH", subtask_name="cube", task_id="0")
+        report_later(a, 400, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report_later(a, 401, gcode_state="FINISH", subtask_name="cube", task_id="0")
         a.ack_jobs([key])
         self.reconnect(a)
         report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
         self.assertEqual([j["jobKey"] for j in a.pending_jobs()], ["task_S1_78"])
+
+    def test_a_task_id_landing_after_the_first_running_frame_never_splits_the_dispatched_print(self):
+        # the guard on the 5-minute rule: the hub's start sends "0" and the printer's real id may land a few frames later
+        key, _ = self.printing(task_id="0")
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
+        report_later(a, 20, gcode_state="RUNNING", subtask_name="cube", task_id="4242")
+        report_later(a, 3600, gcode_state="FINISH", subtask_name="cube", task_id="4242")
+        self.assertEqual([(j["status"], j.get("notDispatched")) for j in a.pending_jobs()], [("done", None)])
+        self.assertEqual(a.collect_queue_progress()[-1]["state"], "completed")
 
     def test_a_crash_right_after_the_cancellation_keeps_the_replacements_fence(self):
         # codex review of 213d644: the cancellation's save landed before the fence was set; a power cut between the two
@@ -1186,6 +1237,42 @@ class TestRestartMidDispatchNeverStartsTwice(_Dispatch):
         newer = {**ASSIGNMENT, "assignmentSeq": 8}                  # a re-queued job (a new seq) still dispatches
         self.assertEqual([r["state"] for r in again.dispatch_assignments([newer], self.spool)], ["uploading"])
         self.assertEqual(len(b._client.published), 1)
+
+    def test_a_second_crash_before_the_resolved_guard_never_restarts_the_print(self):
+        # codex review of 708dff1: the recovery's collect persisted the popped dispatch, then the hub died before the
+        # manager's guard write; on the next boot neither existed and the site's unchanged assignment started it again
+        m = PrinterManager()
+        a = boot()
+        report(a, gcode_state="IDLE")
+        m._adapters["p1"] = a
+
+        def die(_report):
+            raise _Crash()
+
+        with self.assertRaises(_Crash):
+            m.dispatch_assignments([ASSIGNMENT], self.spool, on_report=die)
+        b = boot()
+        again = PrinterManager()
+        again._adapters["p1"] = b
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        real = PrinterManager._remember_dispatched_queue_job
+        calls = []
+
+        def remember_then_die(self_, *a_, **k_):
+            calls.append(a_)
+            if len(calls) > 1:
+                raise _Crash()                                # the guard after the adapter's pop: never reached durably
+            return real(self_, *a_, **k_)
+
+        with mock.patch.object(PrinterManager, "_remember_dispatched_queue_job", remember_then_die), \
+                self.assertRaises(_Crash):
+            again.collect_queue_progress(on_report=lambda r: None)
+        c = boot()
+        third = PrinterManager()
+        third._adapters["p1"] = c
+        report(c, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual([r["state"] for r in third.dispatch_assignments([ASSIGNMENT], self.spool)], ["uploading"])
+        self.assertEqual((c._client.published, self.upload.call_count), ([], 1))
 
     def test_died_after_the_outbox_before_the_manager_guard(self):
         m = PrinterManager()
