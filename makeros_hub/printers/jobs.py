@@ -427,8 +427,13 @@ class JobTracker:
         if self._restored is not None:
             saved_key = str(self._restored["key"])
             has_id = saved_key.startswith("task_") or bool(self._restored.get("taskKey"))
+            real_now = _subtask_name(merged)
+            # a real name that differs from the saved one decides at once: no id to wait for will turn it into the saved
+            # print (codex review of b715c89: a local LAN print, task "0", stayed untracked to its end)
+            contradicts = (bool(real_now) and self._restored.get("named", True) and bool(self._restored["name"])
+                           and real_now != self._restored["name"])
             if ((state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED)) and not _printer_task_id(merged)
-                    and (has_id or not _subtask_name(merged))):
+                    and not contradicts and (has_id or not real_now)):
                 # A bare delta ({"gcode_state": "FINISH"}), or one naming only the generic gcode_file, says nothing about
                 # WHICH print: missing identity never makes or breaks a match (codex reviews of 26528c0 and e8134f8). A
                 # saved print the printer gave an id waits for the id itself: Bob's cube (task 78) is not Alice's cube

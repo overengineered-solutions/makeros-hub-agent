@@ -433,22 +433,13 @@ class BambuAdapter:
                     self._queue_progress.discard_dispatch(queue_job_id)
                     log.error("bambu %s: refusing to start %s — dispatch state could not be persisted", self.printer_id, queue_job_id)
                     return {"ok": False, "reason": "state_persist_failed"}
-                # v0.69: the next print's first delta may carry only gcode_state; the finished print's cached task ids must not
-                # become its identity (they fenced the dispatch's own print; codex review of 95d4abe). Its name is the one
-                # this start sends: deltas never resend an unchanged field, so a same-file re-print would otherwise have
-                # none (codex review of 61c12f8).
-                cached = self._data.get("print")
-                if isinstance(cached, dict):
-                    for k in _IDENTITY_KEYS:
-                        cached.pop(k, None)
-                    if task_name:
-                        cached["subtask_name"] = task_name
                 if not self._jobs.dispatch_recorded():   # v0.69: this dispatch's print must never inherit a post-drop mark
                     self._queue_progress.discard_dispatch(queue_job_id)
                     self._save_queue_progress()
                     log.error("bambu %s: refusing to start %s — the job tracker's state could not be persisted", self.printer_id, queue_job_id)
                     return {"ok": False, "reason": "state_persist_failed"}
-        refusal = self._not_startable()   # again: the upload took seconds, and a report may have landed meanwhile
+        # again: the upload took seconds, and a report may have landed meanwhile. Only a start that passes seeds the identity.
+        refusal = self._not_startable(seed_name=task_name or "")
         if refusal:
             log.warning("bambu %s: not starting %s after its upload — %s", self.printer_id, queue_job_id, refusal)
             self._discard_dispatch(queue_job_id)
@@ -469,22 +460,33 @@ class BambuAdapter:
             return {"ok": False, "reason": "start_command_failed"}
         return {"ok": True}
 
-    def _not_startable(self) -> str | None:
+    def _not_startable(self, seed_name: str | None = None) -> str | None:
         """Why a start must not go out now, from the printer's OWN report on THIS connection, or None.
 
         v0.69: right after a (re)connect paho says "connected" before the printer's first report on that connection, and
         _data still holds the state from before the drop: a printer someone started at its screen meanwhile reads as idle.
         So: no start until it has reported its state on this connection (the cloud re-queues printer_stale without
         counting it), and none while that report says it is busy — checked here, not only by the manager, because the
-        first fresh report can land between the manager's busy check and this call (codex review)."""
+        first fresh report can land between the manager's busy check and this call (codex review).
+
+        `seed_name` (the final check, just before the publish): when the start may go out, the merged report's identity
+        is reset in the same locked step, so the next print's first delta (often gcode_state alone) never opens under the
+        finished print's task ids (codex review of 95d4abe), and its name is the one this start sends, since deltas never
+        resend an unchanged field (codex review of 61c12f8). A refused start leaves the observed identity untouched
+        (codex review of b715c89)."""
         with self._lock:
             seen = self._state_seen
             print_obj = self._data.get("print")
             gcode_state = print_obj.get("gcode_state") if isinstance(print_obj, dict) else None
-        if not seen:
-            return "printer_stale: no printer state reported since the hub connected"
-        if isinstance(gcode_state, str) and gcode_state.upper() in BUSY_GCODE_STATES:
-            return "printer_busy"
+            if not seen:
+                return "printer_stale: no printer state reported since the hub connected"
+            if isinstance(gcode_state, str) and gcode_state.upper() in BUSY_GCODE_STATES:
+                return "printer_busy"
+            if seed_name is not None and isinstance(print_obj, dict):
+                for k in _IDENTITY_KEYS:
+                    print_obj.pop(k, None)
+                if seed_name:
+                    print_obj["subtask_name"] = seed_name
         return None
 
     def _discard_dispatch(self, queue_job_id: str | None) -> None:

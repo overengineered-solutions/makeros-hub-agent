@@ -495,6 +495,27 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         self.assertEqual((job["filename"], job.get("notDispatched")), ("cube", None))
         self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["printing", "completed"])
 
+    def test_a_start_refused_after_its_upload_leaves_the_observed_print_untouched(self):
+        # codex review of b715c89: the name was seeded before the final busy check; Bob's local print, started during
+        # Alice's upload, was then reported cancelled and a phantom Alice print done
+        a = boot()
+        report(a, gcode_state="IDLE")
+        self.upload.side_effect = lambda *_a, **_k: report(a, gcode_state="RUNNING", subtask_name="bob-part", task_id="0")
+        self.assertEqual(self.start(a), {"ok": False, "reason": "printer_busy"})
+        report(a, gcode_state="RUNNING", mc_percent=50)
+        report(a, gcode_state="FINISH")
+        self.assertEqual([(j["status"], j["filename"]) for j in a.pending_jobs()], [("done", "bob-part")])
+
+    def test_another_real_name_decides_a_saved_print_with_an_id_without_waiting(self):
+        # codex review of b715c89: Alice's saved task 77 waited for an id that Bob's local LAN print (task "0") never sends,
+        # so Bob went untracked to his end and no terminal was reported
+        self.printing(task_id="77")
+        b = boot()
+        report(b, gcode_state="RUNNING", subtask_name="bob-part", task_id="0", gcode_file="Metadata/plate_1.gcode")
+        report(b, gcode_state="FINISH", subtask_name="bob-part", task_id="0")
+        self.assertEqual([(j["filename"], j["status"], j.get("notDispatched")) for j in b.pending_jobs()],
+                         [("bob-part", "done", True)])
+
     def test_a_same_file_finish_without_the_saved_prints_id_waits_for_the_id(self):
         # codex review of 1e116ed: Alice's cube (task 77) saved; Bob's cube (task 78) finished during the outage; the first
         # fresh report (FINISH, cube, no id) completed Alice's job, and task 78 was ignored
