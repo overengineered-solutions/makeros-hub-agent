@@ -305,15 +305,16 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
     def test_a_task_id_that_arrives_after_a_fingerprint_close_dedupes_the_next_restart(self):
         # codex review of 921c14a: closed under its fingerprint on a FINISH without an id, then a delta named task 77; the
         # next restart onto that FINISH emitted task_S1_77 as a second print
-        key, _ = self.printing(task_id="0")
-        b = boot()
-        report(b, gcode_state="FINISH", subtask_name="cube")
-        report(b, gcode_state="FINISH", subtask_name="cube", task_id="77")
-        self.assertEqual([j["jobKey"] for j in b.pending_jobs()], [key])
-        b.ack_jobs([key])
-        c = boot()
-        report(c, gcode_state="FINISH", subtask_name="cube", task_id="77")
-        self.assertEqual(c.pending_jobs(), [])
+        # (a print whose reports left the id OUT; one that said "0" has no id, and a later id is another print's)
+        t = JobTracker("p6", "S6", state_path=self.PATH.with_name("p6.json"))
+        t.observe({"print": {"gcode_state": "RUNNING", "subtask_name": "cube"}}, 1000.0)
+        t.observe({"print": {"gcode_state": "FINISH", "subtask_name": "cube"}}, 2000.0)
+        t.observe({"print": {"gcode_state": "FINISH", "subtask_name": "cube", "task_id": "77"}}, 2001.0)
+        (job,) = t.pending()
+        t.ack([job["jobKey"]])
+        u = JobTracker("p6", "S6", state_path=self.PATH.with_name("p6.json"))
+        u.observe({"print": {"gcode_state": "FINISH", "subtask_name": "cube", "task_id": "77"}}, 3000.0)
+        self.assertEqual(u.pending(), [])
 
     def test_a_learned_task_id_is_an_exact_identity_past_the_eta_cutoff(self):
         # codex review of 921c14a: fingerprinted print, its task id learned while paused, then an outage past the ETA cutoff:
@@ -379,16 +380,27 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
 
     def test_a_reconnect_with_nothing_running_never_re_emits_an_acked_print(self):
         # codex review of 1e116ed: closed under its fingerprint, acked, then the reconnect's pushall named task 77 and the
-        # re-armed recovery emitted the same print again under task_S1_77
+        # re-armed recovery emitted the same print again under task_S1_77 (a print whose reports left the id out)
+        key, _ = self.printing(task_id=None)
+        a = boot()
+        report(a, gcode_state="RUNNING", subtask_name="cube")
+        report(a, gcode_state="FINISH", subtask_name="cube")
+        a.ack_jobs([key])
+        self.reconnect(a)
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="77")
+        self.assertEqual(a.pending_jobs(), [])
+
+    def test_after_a_reconnect_a_new_id_after_a_lan_print_is_another_print(self):
+        # codex review of a599650: a LAN cube (task "0") closed and acked, another cube (task 78) ran and finished during the
+        # drop, and the name match aliased 78 to the old fingerprint: never reported, then suppressed for good
         key, _ = self.printing(task_id="0")
         a = boot()
         report(a, gcode_state="RUNNING", subtask_name="cube", task_id="0")
         report(a, gcode_state="FINISH", subtask_name="cube", task_id="0")
         a.ack_jobs([key])
-        a._on_disconnect(None, None, 0)
-        a._on_connect(a._client, None, None, 0)
-        report(a, gcode_state="FINISH", subtask_name="cube", task_id="77")
-        self.assertEqual(a.pending_jobs(), [])
+        self.reconnect(a)
+        report(a, gcode_state="FINISH", subtask_name="cube", task_id="78")
+        self.assertEqual([j["jobKey"] for j in a.pending_jobs()], ["task_S1_78"])
 
     def test_a_crash_right_after_the_cancellation_keeps_the_replacements_fence(self):
         # codex review of 213d644: the cancellation's save landed before the fence was set; a power cut between the two
@@ -488,6 +500,7 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         report(a, gcode_state="FINISH", subtask_name="cube", task_id="0")
         self.assertEqual([r["state"] for r in a.collect_queue_progress()], ["completed"])
         a.ack_jobs([key])
+        time.sleep(0.002)   # a fingerprint carries its start's millisecond (codex review: a fast box saw both in one)
         self.assertEqual(a.start_print(self.spool / UID / "cube.3mf", "cube.3mf", queue_job_id="q2", assignment_seq=8), {"ok": True})
         report(a, gcode_state="RUNNING")
         report(a, gcode_state="FINISH")
@@ -1148,6 +1161,31 @@ class TestRestartMidDispatchNeverStartsTwice(_Dispatch):
                 self.assertEqual(self.resend(b, state=state), ["uploading"])
                 self.assertEqual(b._client.published, [])
         self.assertEqual(self.upload.call_count, 1)
+
+    def test_a_dispatch_resolved_after_the_restart_is_not_started_again_by_the_same_beats_re_send(self):
+        # codex review of a599650 (present at v0.68): the start left, the hub died before its 'uploading' report or guard,
+        # the print finished during the outage; back up, the beat's collect resolved and forgot it, and the site's re-sent
+        # assignment (still 'assigned' there) started it a second time
+        m = PrinterManager()
+        a = boot()
+        report(a, gcode_state="IDLE")
+        m._adapters["p1"] = a
+
+        def die(_report):
+            raise _Crash()
+
+        with self.assertRaises(_Crash):
+            m.dispatch_assignments([ASSIGNMENT], self.spool, on_report=die)
+        b = boot()
+        again = PrinterManager()
+        again._adapters["p1"] = b
+        report(b, gcode_state="FINISH", subtask_name="cube", task_id="77")   # it ran and finished while the hub was down
+        self.assertEqual([r["state"] for r in again.collect_queue_progress()], ["printing", "completed"])
+        self.assertEqual([r["state"] for r in again.dispatch_assignments([ASSIGNMENT], self.spool)], ["uploading"])
+        self.assertEqual((b._client.published, self.upload.call_count), ([], 1))
+        newer = {**ASSIGNMENT, "assignmentSeq": 8}                  # a re-queued job (a new seq) still dispatches
+        self.assertEqual([r["state"] for r in again.dispatch_assignments([newer], self.spool)], ["uploading"])
+        self.assertEqual(len(b._client.published), 1)
 
     def test_died_after_the_outbox_before_the_manager_guard(self):
         m = PrinterManager()

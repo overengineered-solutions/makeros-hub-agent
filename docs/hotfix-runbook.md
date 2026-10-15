@@ -117,7 +117,8 @@ command leaves the box. After a restart, the site's re-sent assignment finds tha
 is answered `uploading` with nothing sent. If the box died before the command left, the printer stays idle. Two
 minutes after its first report, the job is held as `start_not_observed` for staff to re-queue. It is never retried
 silently. From v0.69 the hub also refuses to start a printer that has not yet reported its state since the hub
-connected (`printer_stale`). Right after a restart, a printer can look idle for a few seconds while it is in fact
+connected (`printer_stale`), and a dispatch that resolves after the restart keeps its guard, so the site's re-send of
+that same assignment is answered without a second start. Right after a restart, a printer can look idle for a few seconds while it is in fact
 mid-print. The site re-queues that refusal without counting it.
 
 `tests/test_v069.py` covers these restart cases, and `tests/test_klipper_dispatch.py` covers the Klipper ones.

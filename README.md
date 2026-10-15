@@ -145,6 +145,10 @@ Built on v0.68.0 with the v0.68.1 laserAck hotfix merged in, following pstation
   (`command-results.json`) are durable. The site re-sends a command after 10 minutes without a result, and that re-send
   no longer runs a pause or a dryer cycle twice. Undelivered results are cleared only after the heartbeat that carried
   them, and only the 64 that heartbeat carried.
+- **A finished dispatch is never started again.** A queue job that completes or is held keeps the manager's guard for
+  that assignment (job and `assignmentSeq`) for 24 hours instead of dropping it. After a crash before its
+  `uploading` report, the site still holds the job `assigned` and re-sends it in the very beat that resolves it; that
+  re-send used to start the print a second time (present since v0.58). A re-queued job (a new seq) still dispatches.
 - **Fresh connections.** A Bambu printer that has not reported its state on the current MQTT connection is refused a
   start (`printer_stale`). Right after a restart or a reconnect it reads as idle, or as its state from before the drop,
   even when it is printing. The adapter itself also refuses a printer whose fresh report says it is preparing,

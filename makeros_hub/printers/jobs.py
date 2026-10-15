@@ -100,6 +100,14 @@ def _subtask_name(merged: dict) -> str | None:
     return n.strip()[:300] if isinstance(n, str) and n.strip() else None
 
 
+def _explicit_no_id(merged: dict) -> bool:
+    """The report SAYS the print has no id (task_id/subtask_id "0", a LAN print), as opposed to leaving the field out."""
+    p = merged.get("print")
+    if not isinstance(p, dict) or _printer_task_id(merged):
+        return False
+    return any(isinstance(p.get(k), (int, str)) and str(p.get(k)).strip() == "0" for k in ("task_id", "subtask_id"))
+
+
 def _printer_task_id(merged: dict) -> str | None:
     """The printer's own job id when it gives us one (task_id/subtask_id on the
     report). '0'/''/absent → None (some local prints don't carry one)."""
@@ -188,6 +196,8 @@ class JobTracker:
         # in memory only (a restart re-arms recovery anyway): the last closed print's real name, and whether the first
         # terminal report after an MQTT reconnect with nothing running still has to be judged
         self._last_name: str | None = None
+        # a task id seen after the close may be the closed print's own only if that print never said it had none
+        self._last_alias_ok = False
         self._recover_next = False
         self._load_pending()
 
@@ -358,6 +368,7 @@ class JobTracker:
         # must not come back under that task key on a restart onto its FINISH (codex review of 3b59933)
         self._last_key = a.get("taskKey") or job["jobKey"]
         self._last_name = a["name"] if a.get("named", True) else None
+        self._last_alias_ok = not a.get("noId")
         self._buffer(job)
 
     def _buffer(self, job: dict) -> None:
@@ -416,7 +427,7 @@ class JobTracker:
             job["materialKey"] = material
         if self._mark_next:
             job["notDispatched"] = True   # found finished in place of a dropped saved print (another task id)
-        self._last_key, self._last_name = key, name if _subtask_name(merged) else None
+        self._last_key, self._last_name, self._last_alias_ok = key, name if _subtask_name(merged) else None, False
         self._buffer(job)
 
     # -- public -------------------------------------------------------------
@@ -442,6 +453,8 @@ class JobTracker:
                 return
             self._adopt_or_drop(merged, state, now)
         task_id, real = _printer_task_id(merged), _subtask_name(merged)
+        if self._active is not None and _explicit_no_id(merged):
+            self._active["noId"] = True   # a LAN print: an id seen after its close is another print's (codex review of a599650)
         if self._active is not None:
             key = str(self._active["key"])
             known = key if key.startswith("task_") else self._active.get("taskKey")
@@ -466,7 +479,7 @@ class JobTracker:
                     self._active["taskKey"] = self._task_key(task_id)   # a dedupe alias; the key the site holds is kept
         elif (task_id and state in (_TERMINAL_DONE, _TERMINAL_FAILED) and self._last_state in (_TERMINAL_DONE, _TERMINAL_FAILED)
               and self._last_key and not self._last_key.startswith("task_") and not self._recover_next
-              and (not real or not self._last_name or real == self._last_name)):
+              and self._last_alias_ok and (not real or not self._last_name or real == self._last_name)):
             # (after a reconnect the recovery judgement below decides instead; a real name that differs is another print:
             # codex review of 95d4abe)
             # the print just closed under its fingerprint is still on screen and names its task id only now: dedupe on that
@@ -481,7 +494,8 @@ class JobTracker:
                 # spends the judgement (codex review of 95d4abe)
                 if task_id:
                     self._recover_next = False
-                    if real and real == self._last_name and self._last_key and not self._last_key.startswith("task_"):
+                    if (self._last_alias_ok and real and real == self._last_name and self._last_key
+                            and not self._last_key.startswith("task_")):
                         self._last_key = self._task_key(task_id)   # the same print, its id learned late: an alias, no row
                     else:
                         self._emit_recovered(merged, state, now)   # dedupes on the last reported task key

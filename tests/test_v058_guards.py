@@ -205,14 +205,15 @@ class TestProgressReportsDurableBeforeStatePop(unittest.TestCase):
             reports = a.collect_queue_progress(on_report=hook)
             self.assertEqual(reports, [{"queueJobId": "q1", "state": "printing", "assignmentSeq": 3}])
             self.assertEqual(seen, [({"queueJobId": "q1", "state": "printing", "assignmentSeq": 3}, ["q1"])])   # still on disk at hook time
-            # the manager passes the hook down and still forgets a completed/held job
+            # the manager passes the hook down; v0.69: a completed/held job keeps its guard for THAT assignment (a stale
+            # re-send must not start it again), while a re-queued one (a new seq) is free to dispatch
             m = PrinterManager(); m._adapters["p1"] = a; m._remember_dispatched_queue_job("q1")
             a._data = {"print": {**RAW_STATE["print"], "gcode_state": "IDLE"}}
             got = []
             with mock.patch.object(a._queue_progress, "collect", return_value=[{"queueJobId": "q1", "state": "completed", "assignmentSeq": 3}]):
                 out = m.collect_queue_progress(on_report=got.append)
             self.assertEqual((out, got), ([{"queueJobId": "q1", "state": "completed", "assignmentSeq": 3}], [{"queueJobId": "q1", "state": "completed", "assignmentSeq": 3}]))
-            self.assertNotIn("q1", m._dispatched_queue_jobs)
+            self.assertEqual((m._guard_matches("q1", 3), m._guard_matches("q1", 4)), (True, False))
 
 
 class TestDurabilityFailures(unittest.TestCase):

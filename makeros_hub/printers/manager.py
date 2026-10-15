@@ -949,7 +949,12 @@ class PrinterManager:
                     if report.get("state") in ("completed", "held") and isinstance(
                         report.get("queueJobId"), str
                     ):
-                        self._forget_dispatched_queue_job(report["queueJobId"])
+                        # v0.69: REMEMBER the resolved assignment instead of forgetting it. After a crash before the
+                        # 'uploading' report, the site still holds the job 'assigned' and this very beat's response re-sends
+                        # it; with the dispatch just resolved and no guard, it was started a second time (codex review of
+                        # a599650; present at v0.68). The guard is keyed by job AND assignmentSeq, so a re-queued job (a new
+                        # seq) still dispatches; a stale re-send is answered 'uploading', which the site refuses as stale.
+                        self._remember_dispatched_queue_job(report["queueJobId"], report.get("assignmentSeq"))
             except Exception as e:  # noqa: BLE001
                 code = self._access_code_for(pid)
                 safe = self._redact_printer_exception(e, code)
