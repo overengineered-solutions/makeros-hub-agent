@@ -301,6 +301,10 @@ class BambuAdapter:
         )
         if connected_at_ms is not None:
             out["mqttConnectedAtMs"] = connected_at_ms   # omitted until the first connect (the DTO's absent-key rule)
+        if last is not None:
+            # v0.70: when the newest report arrived (wall ms), for the site's "updated 4 s ago"; the staleness clock is
+            # monotonic, so its age is moved onto the wall clock. Absent until the first report (the same rule).
+            out["sampledAt"] = int((time.time() - (now - last)) * 1000)
         return out
 
     def pending_queue_job_ids(self) -> list[str]:

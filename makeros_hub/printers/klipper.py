@@ -37,6 +37,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
@@ -90,6 +91,14 @@ POLL_BACKOFF_MAX_SEC = 30.0
 STALE_SEC = 30.0
 # How long to give the FIRST poll before declaring 'unreachable'.
 CONNECT_TIMEOUT_SEC = 20.0
+# v0.70: the slicer's estimated_time comes from one GET /server/files/metadata per NEW filename, cached here (a shop
+# printer sees a handful of files a day; 32 is far above that). A failed fetch is remembered too, and asked again only
+# every METADATA_RETRY_SEC, so an unscanned or missing file costs one request a minute, never one per poll.
+METADATA_CACHE_MAX = 32
+METADATA_RETRY_SEC = 60.0
+# display_status.message is M117 text the start macro sets ("Bed soak 20 min before calibration"); the site shows it on
+# the card, so it is trimmed to a card's worth.
+DISPLAY_MESSAGE_MAX_CHARS = 120
 # A print the tracker saved as running is the same print after a restart when the printer still shows that file and its
 # start (wall now − print_stats.total_duration) agrees within this. ponytail: a cancel + re-start of the SAME file within
 # this window while the hub was down is taken for the saved print; a wall-clock step across the restart falls back to a
@@ -102,12 +111,17 @@ JOB_NAME_MAX_CHARS = 300
 # The exact Moonraker query we issue every tick. Asking for only the fields
 # we use keeps response size small (< 2 KB) and means we never have to parse
 # a giant query object.
+# v0.70: print_stats.info (SET_PRINT_STATS_INFO layers) and message, toolhead.homed_axes and idle_timeout.state join the
+# same request (Moonraker omits any object or attribute a printer does not have, so an older Klipper is unaffected). The
+# operator, 2026-10-15: "it says printing but... it also looks like its been sitting there for a long time".
 _QUERY_OBJECTS = (
-    "print_stats=state,filename,print_duration,total_duration"
+    "print_stats=state,filename,print_duration,total_duration,info,message"
     "&extruder=temperature,target"
     "&heater_bed=temperature,target"
     "&virtual_sdcard=progress"
     "&display_status=progress,message"
+    "&toolhead=homed_axes"
+    "&idle_timeout=state"
 )
 
 # Mapping from Moonraker `print_stats.state` to the wire DTO's activity state.
@@ -180,6 +194,9 @@ class KlipperAdapter:
             self._queue_progress.load_state(json.loads(self._queue_progress_path.read_text(encoding="utf-8")))
         except (OSError, ValueError):
             pass
+        # v0.70: filename -> (metadata or None after a failed fetch, monotonic fetched-at); insertion-ordered so the
+        # oldest file is evicted first. Written on the poll thread, read by status() under _lock.
+        self._metadata: OrderedDict[str, tuple[Optional[dict], float]] = OrderedDict()
 
     # Bambu compat — every adapter exposes these. The model field is only
     # set by Bambu so the agent's status pipeline can omit it.
@@ -249,11 +266,15 @@ class KlipperAdapter:
             err = self._last_error_reason
             data = self._data
             started = self._started
+            metadata = self._metadata_for(data)
 
         if last is not None:
-            if (now - last) <= STALE_SEC:
-                return _build_status(self.printer_id, data, "connected")
-            return _build_status(self.printer_id, data, "offline")
+            out = _build_status(self.printer_id, data, "connected" if (now - last) <= STALE_SEC else "offline",
+                                metadata=metadata)
+            # v0.70: when this reading was taken (wall ms), so the site can say "updated 4 s ago" instead of dating
+            # everything by the heartbeat's arrival. The poll clock is monotonic; its age is moved onto the wall clock.
+            out["sampledAt"] = int((time.time() - (now - last)) * 1000)
+            return out
 
         # No successful poll yet. If we have an error reason AND we've been
         # running for the connect timeout, surface it. Else we're still
@@ -710,6 +731,7 @@ class KlipperAdapter:
                     POLL_BACKOFF_MAX_SEC,
                 )
             else:
+                self._refresh_metadata(data)   # v0.70: one GET per new filename; a failure only costs the slicer ETA
                 was_first = self._record_poll(data, stop)
                 if was_first is None:
                     return   # stopped while this poll was in flight
@@ -764,10 +786,61 @@ class KlipperAdapter:
             raise ValueError("missing status")
         return status
 
+    # --- slicer metadata (v0.70) -----------------------------------------
+    def _refresh_metadata(self, data: dict[str, Any]) -> None:
+        """Fetch the slicer metadata of the file print_stats names, once per filename (again after METADATA_RETRY_SEC
+        when the last try failed). Runs on the poll thread; never raises."""
+        filename = _current_filename(data)
+        if filename is None:
+            return
+        now = time.monotonic()
+        with self._lock:
+            cached = self._metadata.get(filename)
+        if cached is not None and (cached[0] is not None or now - cached[1] < METADATA_RETRY_SEC):
+            return
+        try:
+            meta: Optional[dict] = self._fetch_metadata(filename)
+        except Exception as e:  # noqa: BLE001 - the ETA degrades to the progress formula, the poll goes on
+            meta = None
+            log.debug("klipper %s metadata for %r unavailable: %s", self.printer_id, filename[:80], _classify_error(e))
+        with self._lock:
+            self._metadata[filename] = (meta, now)
+            self._metadata.move_to_end(filename)
+            while len(self._metadata) > METADATA_CACHE_MAX:
+                self._metadata.popitem(last=False)
+
+    def _fetch_metadata(self, filename: str) -> Optional[dict]:
+        """GET /server/files/metadata?filename=<file>; only the fields the status uses, shape-checked. None when the
+        result has no usable slicer estimate (Moonraker answers 404 for an unscanned or unknown file, which raises)."""
+        url = f"{self.moonraker_url}/server/files/metadata?filename={urllib.parse.quote(filename, safe='')}"
+        req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "makeros-hub-agent"})
+        with urllib.request.urlopen(req, timeout=HTTP_GET_TIMEOUT_SEC) as resp:  # noqa: S310 - operator LAN URL
+            body = resp.read(256 * 1024)
+        parsed = json.loads(body.decode("utf-8", errors="replace"))
+        result = parsed.get("result") if isinstance(parsed, dict) else None
+        if not isinstance(result, dict):
+            raise ValueError("missing result")
+        estimated = _num(result.get("estimated_time"))
+        if estimated is None or estimated <= 0:
+            return None
+        return {"estimated_time": estimated}
+
+    def _metadata_for(self, data: dict[str, Any]) -> Optional[dict]:
+        """The cached metadata of the file print_stats names right now (caller holds _lock)."""
+        filename = _current_filename(data)
+        cached = self._metadata.get(filename) if filename is not None else None
+        return cached[0] if cached is not None else None
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers (testable without HTTP)
 # ---------------------------------------------------------------------------
+
+
+def _current_filename(status: dict[str, Any]) -> Optional[str]:
+    print_stats = status.get("print_stats")
+    fn = print_stats.get("filename") if isinstance(print_stats, dict) else None
+    return fn if isinstance(fn, str) and fn.strip() else None
 
 
 def _normalize_base(url: str) -> str:
@@ -824,57 +897,113 @@ def _num(v: Any) -> Optional[float]:
     return None
 
 
+def _int(v: Any) -> Optional[int]:
+    """A whole number (Klipper sends layer counts as ints, null when unset); bools and fractions are not one."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return None
+
+
 def _build_status(
     printer_id: str,
     status: dict[str, Any],
     connection_state: str,
     error_reason: Optional[str] = None,
+    *,
+    metadata: Optional[dict] = None,
 ) -> dict:
     """Pure: Moonraker status dict → the cloud's PrinterStatusDTO shape.
 
     Same key set + casing as `bambu_parse.normalize_status` so the cloud
     ingest doesn't branch on vendor. Omit-when-absent: the cloud DTO is
     strict() and rejects an explicit null for an optional number.
+
+    v0.70 (docs/telemetry-v1.md): targets, the M117 message, layers, durations and `preparing` ride along, progress is
+    the slicer's M73 value when there is one, and no ETA is given before the first extrusion. Klipper calls the whole
+    start routine "printing" (the file's first line is START_PRINT: soak, home, QGL, mesh), and virtual_sdcard.progress
+    is header + thumbnail bytes over file size, which is why the SV08 read "printing, 8 %, no ETA" for twenty minutes
+    on 2026-10-15 while M117 said "Bed soak 20 min before calibration". No Klipper `gcodeState` on purpose: the site
+    feeds that key into its plate-clear gate (_GCODE_STATE_MAP above is for the queue tracker only).
     """
     out: dict[str, Any] = {"printerId": printer_id, "connectionState": connection_state}
     if connection_state == "error" and error_reason:
         out["errorReason"] = error_reason
 
     if connection_state == "connected":
+        print_dur: Optional[float] = None
+        state_raw: Any = None
         print_stats = status.get("print_stats")
         if isinstance(print_stats, dict):
             state_raw = print_stats.get("state")
             if isinstance(state_raw, str):
-                mapped = _STATE_MAP.get(state_raw, "idle")
-                out["state"] = mapped
+                out["state"] = _STATE_MAP.get(state_raw, "idle")
             fn = print_stats.get("filename")
             if isinstance(fn, str) and fn.strip():
                 out["jobName"] = fn.strip()[:JOB_NAME_MAX_CHARS]
-            # Print duration vs total duration: we don't have an ETA from
-            # Moonraker directly, but `print_stats.print_duration` × (1/progress)
-            # − print_duration gives an estimate. Cheap to compute; null when
-            # progress is 0 or unknown.
             print_dur = _num(print_stats.get("print_duration"))
+            if print_dur is not None:
+                print_dur = max(0.0, print_dur)
+                out["printDurationSec"] = print_dur
+            total_dur = _num(print_stats.get("total_duration"))
+            if total_dur is not None:
+                out["elapsedSec"] = max(0.0, total_dur)
+            # print_duration counts from the first extrusion (Klipper's init_duration covers everything before), so a
+            # "printing" print with none is still in its start routine.
+            if print_dur is not None:
+                out["preparing"] = state_raw == "printing" and print_dur == 0
+            info = print_stats.get("info")
+            if isinstance(info, dict):
+                current, total = _int(info.get("current_layer")), _int(info.get("total_layer"))
+                if current is not None and total is not None and total > 0 and current >= 0:
+                    out["layer"] = [current, total]
+
+        # Progress: display_status.progress is the slicer's M73 value (OrcaSlicer writes M73 P0 as the file's first
+        # executable line, so it stays 0 through the start routine); Klipper itself falls back to the byte position
+        # when a file has no M73, and so do we when the object is absent.
+        progress: Optional[float] = None
+        display = status.get("display_status")
+        if isinstance(display, dict):
+            progress = _num(display.get("progress"))
+            message = display.get("message")
+            if isinstance(message, str) and message.strip():
+                out["displayMessage"] = message.strip()[:DISPLAY_MESSAGE_MAX_CHARS]
+        if progress is None:
             vs = status.get("virtual_sdcard")
             progress = _num(vs.get("progress")) if isinstance(vs, dict) else None
-            if progress is not None:
-                pct = max(0.0, min(100.0, progress * 100.0))
-                out["progressPct"] = pct
-                if print_dur and progress > 0.01:
+        if progress is not None:
+            progress = max(0.0, min(1.0, progress))
+            out["progressPct"] = progress * 100.0
+            # ETA: nothing before the first extrusion (print_duration 0 made the old formula say "1 min left" the
+            # moment extrusion began, because the header bytes already counted as done). Then the slicer's own
+            # estimate minus the time printed, the way Mainsail's "slicer" estimate works, when the file's metadata
+            # is known; the progress extrapolation otherwise, or once a print has outrun its estimate.
+            if print_dur is not None and print_dur > 0:
+                estimated = _num(metadata.get("estimated_time")) if isinstance(metadata, dict) else None
+                eta_sec: Optional[float] = None
+                if estimated is not None and estimated - print_dur > 0:
+                    eta_sec = estimated - print_dur
+                elif progress > 0.01:
                     eta_sec = print_dur * (1.0 - progress) / progress
-                    if eta_sec > 0:
-                        out["etaMinutes"] = int(eta_sec / 60)
+                if eta_sec is not None and eta_sec > 0:
+                    out["etaMinutes"] = int(eta_sec / 60)
 
-        extruder = status.get("extruder")
-        if isinstance(extruder, dict):
-            t = _num(extruder.get("temperature"))
-            if t is not None:
-                out["nozzleTempC"] = t
-        bed = status.get("heater_bed")
-        if isinstance(bed, dict):
-            t = _num(bed.get("temperature"))
-            if t is not None:
-                out["bedTempC"] = t
+        for obj, current_key, target_key in (
+            ("extruder", "nozzleTempC", "nozzleTargetC"),
+            ("heater_bed", "bedTempC", "bedTargetC"),
+        ):
+            heater = status.get(obj)
+            if isinstance(heater, dict):
+                t = _num(heater.get("temperature"))
+                if t is not None:
+                    out[current_key] = t
+                # The target tells 140/140 (held for calibration) from 140/215 (heating); today's card could not.
+                target = _num(heater.get("target"))
+                if target is not None:
+                    out[target_key] = target
 
         # If print_stats said nothing, default to idle so the cloud doesn't
         # render this connection as 'offline' (no state) by accident.

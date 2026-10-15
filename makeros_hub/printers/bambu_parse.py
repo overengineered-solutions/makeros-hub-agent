@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from typing import Any
 
 # A Bambu tray_color is 8 hex chars (RRGGBBAA), no leading '#'. Anything else is
@@ -67,6 +68,126 @@ def map_activity_state(gcode_state: Any) -> str:
     if not isinstance(gcode_state, str):
         return "idle"
     return _GCODE_STATE.get(gcode_state.upper(), "idle")
+
+
+# v0.70 (docs/telemetry-v1.md): the stage, layers, targets and elapsed time that were in the merged report all along
+# and never read; the operator, 2026-10-15: "is there a way to give more granular information, like maybe its heating
+# up etc. Maybe we show current temp vs target temp".
+# A print is under way in these gcode_states (the same set as manager.BUSY_GCODE_STATES; not imported, this module
+# stays pure). stg_cur 0 means "printing" and is only a stage while one of them holds: at boot the printer reports 0
+# where it should say idle (ha-bambulab remaps it), and after a print it keeps the last value.
+_ACTIVE_GCODE_STATES = frozenset({"RUNNING", "PAUSE", "PREPARE"})
+# X1 reports -1 when idle, P1/A1 report 255 (ha-bambulab const.py).
+_STAGE_IDLE_SENTINELS = frozenset({-1, 255})
+_STAGE_CODE_MAX = 1000
+# A packed device.*.info.temp word above this is not a temperature (65535 is the firmware's "none" in sibling fields).
+_TEMP_SANE_MAX_C = 500.0
+
+
+def _packed_temp(v: Any) -> tuple[float, float] | None:
+    """P2S/H2D firmware packs device.bed.info.temp, device.ctc.info.temp and device.extruder.info[].temp as one int:
+    current in the low 16 bits, target in the high 16 (ha-bambulab models.py: 6553700 -> 100 / 100). The H2D fixture's
+    `temp: 27` is 27 / 0 under the same rule."""
+    n = _to_int(v)
+    if n is None or n < 0 or n > 0xFFFFFFFF:
+        return None
+    current, target = float(n & 0xFFFF), float(n >> 16)
+    if current > _TEMP_SANE_MAX_C or target > _TEMP_SANE_MAX_C:
+        return None
+    return current, target
+
+
+def _packed_device_temp(device: dict, part: str) -> tuple[float, float] | None:
+    block = device.get(part)
+    info = block.get("info") if isinstance(block, dict) else None
+    return _packed_temp(info.get("temp")) if isinstance(info, dict) else None
+
+
+def _packed_extruder_temp(device: dict) -> tuple[float, float] | None:
+    """The active extruder's packed temp (device.extruder.state: low 4 bits the count, the next 4 the active one); the
+    first valid entry when the active one is not listed. One nozzle on the wire, as the flat nozzle_temper is."""
+    extruders = device.get("extruder")
+    if not isinstance(extruders, dict) or not isinstance(extruders.get("info"), list):
+        return None
+    state = _to_int(extruders.get("state"))
+    active = (state >> 4) & 15 if state is not None and state >= 0 else 0
+    fallback: tuple[float, float] | None = None
+    for ext in extruders["info"]:
+        if not isinstance(ext, dict):
+            continue
+        packed = _packed_temp(ext.get("temp"))
+        if packed is None:
+            continue
+        if _to_int(ext.get("id")) == active:
+            return packed
+        fallback = fallback or packed
+    return fallback
+
+
+def build_temperatures(print_obj: dict) -> dict[str, Any]:
+    """nozzleTempC/nozzleTargetC, bedTempC/bedTargetC, chamberC from the flat floats (nozzle_temper,
+    nozzle_target_temper, bed_temper, bed_target_temper, chamber_temper: X1C/P1/A1 and older firmware), each falling
+    back to the packed device.*.info.temp layout (P2S/H2D) when the flat field is absent. A firmware update can flip a
+    machine from one layout to the other, so both are read field by field."""
+    nozzle, nozzle_target = _num(print_obj.get("nozzle_temper")), _num(print_obj.get("nozzle_target_temper"))
+    bed, bed_target = _num(print_obj.get("bed_temper")), _num(print_obj.get("bed_target_temper"))
+    chamber = _num(print_obj.get("chamber_temper"))
+    device = print_obj.get("device")
+    if isinstance(device, dict):
+        packed_nozzle = _packed_extruder_temp(device)
+        if packed_nozzle is not None:
+            nozzle = packed_nozzle[0] if nozzle is None else nozzle
+            nozzle_target = packed_nozzle[1] if nozzle_target is None else nozzle_target
+        packed_bed = _packed_device_temp(device, "bed")
+        if packed_bed is not None:
+            bed = packed_bed[0] if bed is None else bed
+            bed_target = packed_bed[1] if bed_target is None else bed_target
+        packed_chamber = _packed_device_temp(device, "ctc")
+        if packed_chamber is not None and chamber is None:
+            chamber = packed_chamber[0]   # the high word is the chamber target; the v1 contract has no key for it
+    out: dict[str, Any] = {}
+    for key, value in (("nozzleTempC", nozzle), ("nozzleTargetC", nozzle_target), ("bedTempC", bed),
+                       ("bedTargetC", bed_target), ("chamberC", chamber)):
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def build_stage(print_obj: dict) -> dict[str, Any]:
+    """stageCode (stg_cur) and stageSecondsLeft (stg_cd, the countdown of that stage). The idle sentinels are omitted,
+    and 0 ("printing") only counts while a print is under way; the site maps codes to words (7 heating nozzle, 2 heatbed
+    preheating, 13 homing, ...) and shows unknown ones as working."""
+    out: dict[str, Any] = {}
+    code = _to_int(print_obj.get("stg_cur"))
+    gcode_state = print_obj.get("gcode_state")
+    active = isinstance(gcode_state, str) and gcode_state.upper() in _ACTIVE_GCODE_STATES
+    if code is None or code in _STAGE_IDLE_SENTINELS or not 0 <= code <= _STAGE_CODE_MAX or (code == 0 and not active):
+        return out
+    out["stageCode"] = code
+    seconds_left = _to_int(print_obj.get("stg_cd"))
+    if seconds_left is not None and seconds_left >= 0:
+        out["stageSecondsLeft"] = seconds_left
+    return out
+
+
+def build_layer(print_obj: dict) -> list[int] | None:
+    """[layer_num, total_layer_num] when both are whole numbers and a total is known (0/0 before a print has one)."""
+    current, total = _to_int(print_obj.get("layer_num")), _to_int(print_obj.get("total_layer_num"))
+    if current is None or total is None or total <= 0 or current < 0:
+        return None
+    return [current, total]
+
+
+def build_elapsed_sec(print_obj: dict, now: float) -> int | None:
+    """Seconds since gcode_start_time (unix seconds, a string on the wire) while a print is under way; None when the
+    printer gave none or a time in the future."""
+    gcode_state = print_obj.get("gcode_state")
+    if not (isinstance(gcode_state, str) and gcode_state.upper() in _ACTIVE_GCODE_STATES):
+        return None
+    start = _to_int(print_obj.get("gcode_start_time"))
+    if start is None or start <= 0 or start > now + 60:
+        return None
+    return max(0, int(now - start))
 
 
 def merge_report(state: dict, delta: dict) -> dict:
@@ -451,19 +572,20 @@ def normalize_status(
     connection_state: str,
     model: str | None,
     error_reason: str | None = None,
+    now: float | None = None,
 ) -> dict:
     """Build the wire DTO the cloud heartbeat expects (PrinterStatusDTO).
 
     `model` is the config-down machine model (e.g. "A1 Mini") — the VP live-mirror scopes each
     Virtual Printer's filament pool by it (live_pool.scoped_statuses), so it must ride EVERY status:
     a REQUIRED keyword (None only when config-down carried no model; the key is then omitted).
-    Additive keys (model, gcodeState, unidentifiedSpools) are safe for pstation, whose heartbeat
-    ingest hand-picks fields.
+    Additive keys (model, gcodeState, unidentifiedSpools, and the v0.70 stage/target/layer keys) are safe
+    for pstation, whose heartbeat ingest hand-picks fields and ignores the rest.
 
     `merged` is the deep-merged report state (telemetry under merged['print']).
-    Only set keys are included — the cloud DTO is strict() and rejects unknown
-    keys AND rejects an explicit null for an optional number, so omit-when-absent
-    is required. NEVER include the serial / IP / access code (telemetry only).
+    Only set keys are included — the cloud DTO rejects an explicit null for an optional number, so
+    omit-when-absent is required. NEVER include the serial / IP / access code (telemetry only).
+    `now` (wall seconds) is only for elapsedSec; tests pass it, the adapter leaves it to the clock.
     """
     out: dict[str, Any] = {"printerId": printer_id, "connectionState": connection_state}
     if isinstance(model, str) and model.strip():
@@ -473,7 +595,8 @@ def normalize_status(
 
     print_obj = merged.get("print") if isinstance(merged.get("print"), dict) else {}
 
-    # Activity state only meaningful once we're actually connected.
+    # Telemetry only while we're actually connected. v0.70: progress, temperatures, jobName and the ETA used to sit
+    # outside this check, so the cached values of a printer that had gone away kept going out as if fresh.
     if connection_state == "connected":
         out["state"] = map_activity_state(print_obj.get("gcode_state"))
         # The RAW state too: `state` collapses FINISH/FAILED into idle, but a plate-clear gate needs
@@ -481,27 +604,31 @@ def normalize_status(
         gcode_state = print_obj.get("gcode_state")
         if isinstance(gcode_state, str) and gcode_state.strip():
             out["gcodeState"] = gcode_state.strip()[:32]
+        # PREPARE maps to idle above (the printer is between the member's send and its first move: download, heat); the
+        # flag says so without changing what `state` has always meant to the site.
+        out["preparing"] = isinstance(gcode_state, str) and gcode_state.strip().upper() == "PREPARE"
 
-    pct = _num(print_obj.get("mc_percent"))
-    if pct is not None:
-        out["progressPct"] = max(0.0, min(100.0, pct))
+        pct = _num(print_obj.get("mc_percent"))
+        if pct is not None:
+            out["progressPct"] = max(0.0, min(100.0, pct))
 
-    nozzle = _num(print_obj.get("nozzle_temper"))
-    if nozzle is not None:
-        out["nozzleTempC"] = nozzle
-    bed = _num(print_obj.get("bed_temper"))
-    if bed is not None:
-        out["bedTempC"] = bed
+        out.update(build_temperatures(print_obj))
+        out.update(build_stage(print_obj))
+        layer = build_layer(print_obj)
+        if layer is not None:
+            out["layer"] = layer
+        elapsed = build_elapsed_sec(print_obj, time.time() if now is None else now)
+        if elapsed is not None:
+            out["elapsedSec"] = elapsed
 
-    name = print_obj.get("subtask_name") or print_obj.get("gcode_file")
-    if isinstance(name, str) and name.strip():
-        out["jobName"] = name.strip()[:300]
+        name = print_obj.get("subtask_name") or print_obj.get("gcode_file")
+        if isinstance(name, str) and name.strip():
+            out["jobName"] = name.strip()[:300]
 
-    eta = _num(print_obj.get("mc_remaining_time"))  # MINUTES
-    if eta is not None:
-        out["etaMinutes"] = int(eta)
+        eta = _num(print_obj.get("mc_remaining_time"))  # MINUTES
+        if eta is not None:
+            out["etaMinutes"] = int(eta)
 
-    if connection_state == "connected":
         out.update(build_nozzle_hardware(print_obj))
         ams = build_ams(print_obj)
         if ams:
