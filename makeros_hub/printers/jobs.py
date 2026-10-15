@@ -68,6 +68,9 @@ _ACTIVE = "RUNNING"
 # PAUSE keeps the job active (a paused print resumes into the same job).
 _STILL_ACTIVE = {_ACTIVE, "PAUSE", "PREPARE", "SLICING", "INIT"}
 ETA_SLACK_S = 300   # the saved ETA is rewritten only when the printer's estimate moves by more (one write, not one a second)
+# A same-name print still running this long after the saved print's ETA may be a re-print started during the outage:
+# with no task id nothing tells them apart, so it is dropped (held for staff), never booked under the old key.
+ADOPT_PAST_ETA_S = 1800
 
 
 def _fsync_dir(path: "Path") -> None:
@@ -179,6 +182,7 @@ class JobTracker:
         self._restored: dict | None = None
         self._last_key: str | None = None
         self._active_saved = ""
+        self._unsaved = False   # the last write failed: every observation retries until one lands
         self._load_pending()
 
     def active_key(self) -> str | None:
@@ -205,7 +209,6 @@ class JobTracker:
         if self._state_path is None:
             return
         state = self._state()
-        self._active_saved = json.dumps(state, sort_keys=True)
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._state_path.with_suffix(".json.tmp")
@@ -217,9 +220,15 @@ class JobTracker:
             os.replace(tmp, self._state_path)
             _fsync_dir(self._state_path.parent)
         except OSError as e:
-            # A terminal cannot be refused (the print already ended); loud so the ops digest/journal shows the box is
-            # failing to make state durable. The printer-task-id recovery path still covers most restarts.
-            log.error("could not persist terminal jobs for %s (RAM-only until acked): %s", self.printer_id, e)
+            # A terminal cannot be refused (the print already ended); loud (once per failing run) so the ops digest/journal
+            # shows the box is failing to make state durable. Not marked saved, so the next observation writes again.
+            self._active_saved = ""
+            if not self._unsaved:
+                log.error("could not persist terminal jobs for %s (RAM-only until a save lands): %s", self.printer_id, e)
+            self._unsaved = True
+            return
+        self._active_saved = json.dumps(state, sort_keys=True)
+        self._unsaved = False
 
     def _load_active(self, raw: dict) -> None:
         last = raw.get("lastKey")
@@ -234,19 +243,24 @@ class JobTracker:
         self._active_saved = json.dumps(self._state(), sort_keys=True)
 
     def _save_active(self) -> None:
-        # ponytail: one attempt per change — a failed write (logged loudly by _save_pending) is retried at the next
-        # change, not on every MQTT message
+        # one write per change; a failed write left _active_saved empty, so this retries it
         if self._state_path is not None and json.dumps(self._state(), sort_keys=True) != self._active_saved:
             self._save_pending()
 
-    def _adopt_or_drop(self, merged: dict, state: str) -> None:
+    def _adopt_or_drop(self, merged: dict, state: str, now: float) -> None:
         """First observation after a load: the saved running print is this tracker's active job again only if the
-        printer still shows it. ponytail: a re-print of the SAME file with no task id, started and still running while
-        the hub was down, is taken for the saved print (Bambu reports no start time to tell them apart)."""
+        printer still shows it. A same-name print still running well past the saved print's ETA (ADOPT_PAST_ETA_S) is
+        not taken for it: the outage spanned the saved print's end, so it may be a re-print. The ETA is refreshed while
+        the print runs and while it is paused, so a restart of any length short of that never drops a running print.
+        ponytail: with no saved ETA a same-name running print is still adopted, and a same-file re-print that ALSO
+        finished while the hub was down is booked under the saved key (Bambu reports no start time to tell them apart)."""
         saved, self._restored = self._restored, None
         name, task_id = _job_name(merged), _printer_task_id(merged)
+        eta = saved.get("etaAt")
+        overran = state in _STILL_ACTIVE and eta is not None and eta > saved["startedAt"] and now > eta + ADOPT_PAST_ETA_S
         same = (
             (state in _STILL_ACTIVE or state in (_TERMINAL_DONE, _TERMINAL_FAILED))
+            and not overran
             and not (name and saved["name"] and name != saved["name"])
             and not (task_id and str(saved["key"]).startswith("task_") and self._task_key(task_id) != saved["key"])
         )
@@ -291,11 +305,13 @@ class JobTracker:
         a, self._active = self._active, None   # cleared first: the one save below holds the job AND no running print
         end = now
         # The first state since a restart is already terminal: it ended while the hub was down, so `now` would book the
-        # whole outage as print time. Its end is the printer's last ETA (kept within the start and now); with no ETA the
-        # end is unknown, and like _emit_recovered no duration is sent.
+        # whole outage as print time. Its end is the printer's last ETA (never past now); with no ETA the end is unknown,
+        # and like _emit_recovered no duration is sent. An ETA at the start itself is the previous print's 0 still in the
+        # merged report on the first RUNNING frame, not an estimate.
         unseen = self._last_state == ""
-        if unseen and a.get("etaAt") is not None:
-            end = min(now, max(a["startedAt"], a["etaAt"]))
+        eta = a.get("etaAt") if a.get("etaAt") is not None and a["etaAt"] > a["startedAt"] else None
+        if unseen and eta is not None:
+            end = min(now, eta)
         job = {
             "jobKey": a["key"],
             "printerId": self.printer_id,
@@ -303,7 +319,7 @@ class JobTracker:
             "startedAt": _iso(a["startedAt"]),
             "endedAt": _iso(end),
         }
-        if not unseen or a.get("etaAt") is not None:
+        if not unseen or eta is not None:
             job["printTimeSeconds"] = max(0, int(end - a["startedAt"]))
         if a["name"]:
             job["filename"] = a["name"]
@@ -375,7 +391,7 @@ class JobTracker:
         if not state:
             return  # no signal yet (pre-pushall)
         if self._restored is not None:
-            self._adopt_or_drop(merged, state)
+            self._adopt_or_drop(merged, state, now)
 
         if self._active is None:
             if state == _ACTIVE:
@@ -410,13 +426,15 @@ class JobTracker:
                         self._active["key"] = self._task_key(task_id)
                     if not self._active["material"]:
                         self._active["material"] = decode_active_material(merged)
-                    eta = _eta(merged, now)
-                    if eta is not None and abs(eta - (self._active.get("etaAt") or 0)) > ETA_SLACK_S:
-                        self._active["etaAt"] = round(eta)
             elif state not in _STILL_ACTIVE:
                 # Missed the real ending (agent blip / printer reboot) — close
                 # unconfirmed. Never billed (cancelled), still visible.
                 self._close("cancelled", now)
+            if self._active is not None and state in _STILL_ACTIVE:
+                # running or paused: keep the saved ETA current (a pause pushes it out), within ETA_SLACK_S
+                eta = _eta(merged, now)
+                if eta is not None and abs(eta - (self._active.get("etaAt") or 0)) > ETA_SLACK_S:
+                    self._active["etaAt"] = round(eta)
 
         self._last_state = state
         self._save_active()

@@ -5,15 +5,18 @@ own), which is exactly what a hub restart is: a new process reading what the old
 no site, no network."""
 
 import json
+import os
+import socket
+import stat
 import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from makeros_hub import agent, http, report_outbox
+from makeros_hub import agent, http, report_outbox, update
 from makeros_hub.config import Config
-from makeros_hub.printers import bambu as bambu_module, bambu_send, manager as manager_module
+from makeros_hub.printers import bambu as bambu_module, bambu_camera, bambu_send, camera, manager as manager_module
 from makeros_hub.printers.camera import CameraScheduler
 from makeros_hub.printers.jobs import JobTracker, _iso
 from makeros_hub.printers.manager import PrinterManager
@@ -139,6 +142,22 @@ class TestForcedUpdate(unittest.TestCase):
         self.assertEqual(self.step({"targetVersion": "v9.0.0", "targetVersionSha256": SHA}, statuses=[{"gcodeState": "IDLE"}])[0], "launched")
         self.assertEqual(self.step({"targetVersion": "v9.0.0", "targetVersionSha256": SHA}, wait_idle=False)[0], "launched")
         self.assertEqual(self.step({"targetVersion": "v0.1.0", "targetVersionSha256": SHA, "targetForceSha256": SHA}), ("none", []))
+
+
+class TestUpdateAttemptRecordIsDurable(unittest.TestCase):
+    def test_the_rename_of_the_attempt_record_is_fsynced_with_its_directory(self):
+        # codex review: without the directory fsync a power cut can lose the attempt, and the cap no longer holds
+        synced = []
+        real = os.fsync
+
+        def spy(fd):
+            synced.append(stat.S_ISDIR(os.fstat(fd).st_mode))
+            real(fd)
+
+        with mock.patch.object(update.os, "fsync", side_effect=spy):
+            update._write_state({"target": "v9.0.0", "sha": SHA, "at": 1.0, "attempts": 1})
+        self.assertEqual(synced, [False, True])
+        self.assertEqual(json.loads(update.STATE_PATH.read_text())["attempts"], 1)
 
 
 class _Dispatch(unittest.TestCase):
@@ -276,6 +295,53 @@ class TestPrintFinishedWhileTheHubWasDown(_Dispatch):
         x.observe({"print": {"gcode_state": "RUNNING", "subtask_name": "cube", "mc_remaining_time": 5}}, 1000.0)
         x.observe({"print": {"gcode_state": "FINISH", "subtask_name": "cube"}}, 1900.0)   # the hub saw it end
         self.assertEqual((x.pending()[0]["endedAt"], x.pending()[0]["printTimeSeconds"]), (_iso(1900.0), 900))
+        # the previous print's mc_remaining_time=0 still merged in on the first RUNNING frame is no ETA
+        y = JobTracker("p4", "S4", state_path=self.PATH.with_name("p4.json"))
+        y.observe({"print": {"gcode_state": "RUNNING", "subtask_name": "cube", "mc_remaining_time": 0}}, 1000.0)
+        z = JobTracker("p4", "S4", state_path=self.PATH.with_name("p4.json"))
+        z.observe({"print": {"gcode_state": "FINISH", "subtask_name": "cube"}}, 30000.0)
+        self.assertEqual(z.pending()[0]["endedAt"], _iso(30000.0))
+        self.assertNotIn("printTimeSeconds", z.pending()[0])
+
+    def test_a_same_file_print_running_long_past_the_saved_eta_is_not_taken_for_the_saved_print(self):
+        # codex review: A (LAN, task "0") was saved with an hour to go; during an 8 h outage A finished and a member
+        # started B of the same file. Booking B under A's key closed A's queue job with B and a nine-hour duration.
+        t = JobTracker("p1", "S1", state_path=self.PATH)
+        self.run_cube(t, 1000.0, mc_remaining_time=60)                    # ETA 4600
+        key_a = t.active_key()
+        u = JobTracker("p1", "S1", state_path=self.PATH)
+        self.run_cube(u, 30000.0, mc_remaining_time=40)
+        self.assertNotIn(u.active_key(), (None, key_a))                   # B is its own print
+        u.observe({"print": {"gcode_state": "FINISH", "subtask_name": "cube"}}, 32400.0)
+        self.assertNotIn(key_a, [j["jobKey"] for j in u.pending()])      # A is never closed with B's ending
+        # a hotfix restart (any length short of the saved ETA + 30 min) keeps the running print
+        v = JobTracker("p2", "S2", state_path=self.PATH.with_name("p2.json"))
+        self.run_cube(v, 1000.0, mc_remaining_time=60)
+        w = JobTracker("p2", "S2", state_path=self.PATH.with_name("p2.json"))
+        self.run_cube(w, 1090.0, mc_remaining_time=59)
+        self.assertEqual(w.active_key(), v.active_key())
+
+    def test_a_long_pause_keeps_its_eta_current_so_a_restart_during_it_keeps_the_print(self):
+        t = JobTracker("p1", "S1", state_path=self.PATH)
+        self.run_cube(t, 1000.0, mc_remaining_time=30)                    # ETA 2800
+        for at in range(1100, 20001, 100):                                # filament runout: paused for 5 h, hub up
+            t.observe({"print": {"gcode_state": "PAUSE", "subtask_name": "cube", "mc_remaining_time": 25}}, float(at))
+        u = JobTracker("p1", "S1", state_path=self.PATH)                  # the operator forces a hotfix mid-pause
+        u.observe({"print": {"gcode_state": "PAUSE", "subtask_name": "cube", "mc_remaining_time": 25}}, 20090.0)
+        self.assertEqual(u.active_key(), t.active_key())
+
+    def test_a_failed_save_is_retried_by_the_next_report_not_forgotten(self):
+        # codex review: one failed write was remembered as saved, so the unchanged reports after it never wrote again and a
+        # restart onto FINISH lost the LAN print entirely
+        t = JobTracker("p1", "S1", state_path=self.PATH)
+        with mock.patch("makeros_hub.printers.jobs.os.replace", side_effect=OSError("disk full")):
+            self.run_cube(t, 1000.0)
+        self.assertFalse(self.PATH.exists())
+        self.run_cube(t, 1001.0)                                          # the same report again: the disk is back
+        key = t.active_key()
+        u = JobTracker("p1", "S1", state_path=self.PATH)
+        u.observe({"print": {"gcode_state": "FINISH", "subtask_name": "cube"}}, 9000.0)
+        self.assertEqual([j["jobKey"] for j in u.pending()], [key])
 
     def test_after_a_rollback_reported_the_print_a_later_upgrade_never_brings_it_back(self):
         # codex review: v0.69 saves cube; the operator forces the rollback (v0.68's tree), which reports cube and a later
@@ -322,6 +388,127 @@ class TestCameraFairnessAtCapacity(unittest.TestCase):
             with self.subTest(pid=pid):
                 self.assertLessEqual(max(gaps), 4, beats)                 # never starved: a photo at least every 4 beats
         self.assertGreaterEqual(min(len(got[p]) for p in mid), 8)
+
+    def test_dead_cameras_on_printing_printers_do_not_crowd_out_live_ones(self):
+        cam = lambda pid: {"printerId": pid, "vendor": "bambu", "model": "X1C", "host": "h", "accessCode": "c"}   # noqa: E731
+        dead, live = [f"dead{i}" for i in range(12)], ["live0", "live1"]
+        targets = [cam(p) for p in dead + live]
+        status = {p: {"state": "printing", "progressPct": 50} for p in dead + live}
+        s = CameraScheduler()
+        got = {p: [] for p in live}
+        for beat in range(30):
+            now = beat * 40.0
+            for t in s.plan(targets, status, now, set())[:4]:           # every dead capture eats a slot for the beat
+                pid = t["printerId"]
+                s.attempted(pid, now)
+                if pid in got:
+                    s.accepted(pid, now, None)
+                    got[pid].append(beat)
+                else:
+                    s.failed(pid, now)
+        for pid, beats in got.items():
+            gaps = [b - a for a, b in zip([0] + beats, beats + [29])]
+            with self.subTest(pid=pid):
+                self.assertLessEqual(max(gaps[1:]), 4, beats)               # the 90 s tier, give or take a beat
+        self.assertGreater(s.breaker_open(30 * 40.0), 0)
+
+    def test_a_state_change_that_lost_the_race_stays_due_until_answered(self):
+        # codex review: a printer photographed at t=0 finishes at t=40; cameras with no photo take every start; at t=80
+        # the change was consumed and the 600 s idle tier hid it until t=600
+        s = CameraScheduler()
+        cam = lambda p: {"printerId": p, "vendor": "bambu", "model": "X1C", "host": "h", "accessCode": "c"}   # noqa: E731
+        targets = [cam("done")] + [cam(f"new{i}") for i in range(4)]
+        s.plan(targets[:1], {"done": {"state": "printing", "progressPct": 50}}, 0.0)
+        s.accepted("done", 0.0, None)
+        idle = {t["printerId"]: {"state": "idle"} for t in targets}
+        self.assertEqual(s.plan(targets, idle, 40.0)[0]["printerId"], "done")   # the change goes first...
+        s.attempted("new0", 40.0)                                         # ...but say it was not started this beat
+        self.assertEqual(s.plan(targets, idle, 80.0)[0]["printerId"], "done")   # still due, still first
+        s.accepted("done", 80.0, None)
+        self.assertNotIn("done", [t["printerId"] for t in s.plan(targets, idle, 120.0)])
+        s.plan(targets, {**idle, "done": {"state": "printing"}}, 160.0)
+        s.failed("done", 160.0)                                           # a real failure answers it: the breaker ranks it now
+        self.assertFalse(s._cams["done"].change)
+
+    def test_a_breaker_after_a_thousand_failures_does_not_overflow(self):
+        s = CameraScheduler()
+        t = {"printerId": "p", "vendor": "bambu", "model": "X1C", "host": "h", "accessCode": "c"}
+        s.plan([t], {"p": {"state": "printing"}}, 0.0)
+        for _ in range(1100):                                             # ~37 h at the 120 s printing cap
+            s.failed("p", 0.0)
+        self.assertEqual(s._cams["p"].retry_at, 120.0)
+
+    def test_a_straggling_capture_is_never_doubled_by_the_next_beat(self):
+        # codex review: workers outlive the beat, so each beat's fresh executor stacked another capture on a stuck camera
+        gate, calls = threading.Event(), []
+
+        def stuck(t):
+            calls.append(t["printerId"])
+            gate.wait(5)
+            return (None, "timeout", "")
+
+        s = CameraScheduler()
+        t = [{"printerId": "pi", "vendor": "klipper", "cameraSnapshotUrl": "http://pi/snap"}]
+        st = {"pi": {"state": "idle"}}
+        frames, fails = camera.collect_camera_frames(t, st, s, 0.0, capture_with_reason=stuck, budget=0.2)
+        self.assertEqual([f["reason"] for f in fails], ["timeout"])       # started, outlived the beat
+        s._cams["pi"].streak, s._cams["pi"].retry_at = 0, 0.0             # say the breaker let it straight back
+        self.assertEqual(camera.collect_camera_frames(t, st, s, 40.0, capture_with_reason=stuck, budget=0.2), ([], []))
+        self.assertEqual((calls, s.stats["stillRunning"]), (["pi"], 1))
+        gate.set()
+        for _ in range(100):
+            if not s.running:
+                break
+            time.sleep(0.01)
+        camera.collect_camera_frames(t, st, s, 80.0, capture_with_reason=stuck, budget=0.2)
+        self.assertEqual(calls, ["pi", "pi"])                             # free again once its worker returned
+
+    def test_a_trickling_snapshot_times_out_on_the_whole_transfer(self):
+        class Trickle:
+            headers: dict = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_a):
+                return False
+
+            def read1(self, _n=-1):
+                time.sleep(0.02)
+                return b"\xff"                                          # a byte at a time: no socket timeout ever fires
+
+        t0 = time.monotonic()
+        with mock.patch.object(camera.urllib.request, "urlopen", return_value=Trickle()):
+            got = camera._http_snapshot_with_reason("http://pi/snap", timeout=0.2)
+        self.assertEqual(got[:2], (None, "timeout"))
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+    def test_an_a1_connect_shares_one_deadline_across_addresses(self):
+        # codex review: socket.create_connection gives each resolved address the whole timeout (two dead ones: 10 s).
+        # The fakes sit under create_connection (getaddrinfo + the socket class), so its own address loop is what runs.
+        class DeadSock:
+            def __init__(self, *_a):
+                self.t = None
+
+            def settimeout(self, t):
+                self.t = t
+
+            def connect(self, _sa):
+                time.sleep(self.t)
+                raise socket.timeout()
+
+            def close(self):
+                pass
+
+        def resolve(host, port, *_a, **_k):
+            ips = ["10.0.0.1", "10.0.0.2"] if host == "printer.local" else [host]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port)) for ip in ips]
+
+        t0 = time.monotonic()
+        with mock.patch.object(socket, "getaddrinfo", side_effect=resolve), mock.patch.object(socket, "socket", DeadSock):
+            r = bambu_camera.capture_frame_with_reason("printer.local", "code", timeout=0.3)
+        self.assertEqual(r.reason, "unreachable")
+        self.assertLess(time.monotonic() - t0, 0.45)
 
     def test_a_state_change_still_goes_first(self):
         s = CameraScheduler()
@@ -392,6 +579,20 @@ class TestRestartMidDispatchNeverStartsTwice(_Dispatch):
         b = boot()
         self.assertEqual(self.resend(b), ["uploading"])
         self.assertEqual((len(a._client.published), b._client.published, self.upload.call_count), (1, [], 1))
+
+    def test_a_reconnect_forgets_the_cached_state_until_the_printer_reports_again(self):
+        # codex review: _data survives a reconnect, so a cached IDLE let a start through while the printer could have begun
+        # a print at its own screen during the drop
+        a = boot()
+        report(a, gcode_state="IDLE")
+        a._on_disconnect(None, None, 0)
+        a._on_connect(a._client, None, None, 0)
+        self.assertEqual(self.start(a), {"ok": False, "reason": "printer_stale: no printer state reported since the hub connected"})
+        report(a, mc_percent=3)                                             # a partial report without a state is not enough
+        self.assertFalse(self.start(a)["ok"])
+        self.assertEqual(self.upload.call_count, 0)
+        report(a, gcode_state="IDLE")
+        self.assertEqual(self.start(a), {"ok": True})
 
     def test_a_freshly_connected_printer_that_has_not_reported_is_never_started(self):
         a = boot()                                           # paho says connected; the printer's first report is not in

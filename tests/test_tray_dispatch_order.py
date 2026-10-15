@@ -39,6 +39,7 @@ class TestDispatchOrder(unittest.TestCase):
         a._client = FakeClient()
         a._connack = "ok"
         a._data = RAW_STATE
+        a._state_seen = True                   # the printer reported its state on this connection
         a._last_report_at = time.monotonic()   # a FRESH report: the AMS mirror rides only on connected status
         return a
 

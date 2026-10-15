@@ -108,6 +108,12 @@ def _write_state(d: dict) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(name, STATE_PATH)
+        # the rename itself must survive a power cut, or a lost attempt record lets a broken release be retried past the cap
+        dfd = os.open(STATE_PATH.parent, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
     finally:
         Path(name).unlink(missing_ok=True)
 

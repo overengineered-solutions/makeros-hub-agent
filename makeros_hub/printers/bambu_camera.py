@@ -90,7 +90,7 @@ def capture_frame_with_reason(
 
     phase = "connect"
     try:
-        with socket.create_connection((host, CAMERA_PORT), timeout=left()) as raw:
+        with _connect(host, deadline) as raw:
             phase = "tls"
             raw.settimeout(left())
             with ctx.wrap_socket(raw, server_hostname=host) as tls:
@@ -119,6 +119,22 @@ def capture_frame_with_reason(
     return CaptureResult(
         None, "liveview-off", "no frame (LAN-Mode Liveview off, or wrong access code)"
     )
+
+
+def _connect(host: str, deadline: float) -> socket.socket:
+    """socket.create_connection, but every resolved address shares the capture's one deadline (create_connection gives
+    each address the whole timeout: two dead addresses took 10 s). ponytail: the name lookup itself is not
+    deadline-bound; printers are configured by IP."""
+    err: OSError = socket.timeout("capture deadline")
+    for *_, addr in socket.getaddrinfo(host, CAMERA_PORT, type=socket.SOCK_STREAM):
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        try:
+            return socket.create_connection(addr[:2], timeout=left)
+        except OSError as exc:
+            err = exc
+    raise err
 
 
 def capture_frame(

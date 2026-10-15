@@ -77,7 +77,8 @@ Every check below is read-only. SQL runs through `read sql pstation "<one select
    ```
    - Expect no `print_double_billed`.
    - A `job_held` with reason `outcome_unknown_after_restart` means a printer was reset or showed a different print
-     after the restart. The hub never invents an outcome, so a person decides that job.
+     after the restart, or showed the same file still running more than 30 minutes past the saved print's ETA (a
+     possible re-print). The hub never invents an outcome, so a person decides that job.
    - A `job_held` with `start_not_observed` means a start never reached the printer. Staff re-queue it.
 4. **For each print that finishes after the restart:** it gets exactly one `print_recorded` and one `job_completed`
    for its own job. A print that finished *during* the gap shows them within one or two beats of the hub coming back.
@@ -98,7 +99,7 @@ Every check below is read-only. SQL runs through `read sql pstation "<one select
 | **Command results not yet delivered (v0.69)** | `command-results.json` | Sent on the next beat. Before this, the site's row stayed `sent`. |
 | Laser runs, open and closed | `laser-runs.json` | A run open at the restart closes at its last cutting reading. |
 | Captured member jobs, and the spool | `spool/vp-outbox/`, `spool/` | Re-submitted. The site deduplicates. |
-| Update attempts | `last_update.json` | The cooldown and attempt cap survive, so a broken release cannot loop. |
+| Update attempts | `last_update.json` | The cooldown and attempt cap survive, so a broken release cannot loop. From v0.69 the rename is fsynced with its directory, so a power cut cannot lose an attempt. |
 
 Not kept, on purpose:
 - **Camera timing and backoff.** After a restart every camera is due once, and a dead camera backs off again within two

@@ -95,6 +95,9 @@ class BambuAdapter:
         # v0.69: wall ms of the last successful MQTT connect. A power-cycled printer reconnects, so a new stamp is how the
         # camera scheduler learns to retry a camera it had backed off (a cycle under STALE_SEC never leaves 'idle').
         self._connected_at_ms: int | None = None
+        # v0.69: a gcode_state arrived on THIS connection. _data survives a reconnect, so a cached IDLE from before the drop
+        # must not let a start through while the printer may have begun a print at its own screen (codex review).
+        self._state_seen = False
         self._error_reason: str | None = None
         self._last_report_at: float | None = None
         self._started = 0.0
@@ -164,6 +167,7 @@ class BambuAdapter:
             self._connack = "ok"
             self._error_reason = None
             self._connected_at_ms = int(time.time() * 1000)
+            self._state_seen = False
         client.subscribe(self._report_topic, qos=0)
         client.publish(self._request_topic, PUSHALL)
         client.publish(self._request_topic, GET_VERSION)
@@ -180,6 +184,8 @@ class BambuAdapter:
         with self._lock:
             bambu_parse.merge_report(self._data, doc)
             self._last_report_at = time.monotonic()
+            if isinstance(doc.get("print"), dict) and doc["print"].get("gcode_state"):
+                self._state_seen = True
             # Job lifecycle detection (wall-clock — startedAt/endedAt are real
             # timestamps on the wire, unlike the monotonic staleness clock).
             self._jobs.observe(self._data, time.time())
@@ -226,8 +232,10 @@ class BambuAdapter:
 
     def _on_disconnect(self, *_args, **_kwargs):
         # *args: paho's on_disconnect arity shifted across 2.x (disconnect_flags
-        # was added) — stay signature-agnostic since we only log here. paho
-        # auto-reconnects; status() degrades to offline if reports go stale.
+        # was added) — stay signature-agnostic. paho auto-reconnects; status()
+        # degrades to offline if reports go stale.
+        with self._lock:
+            self._state_seen = False
         log.info("bambu %s disconnected — will reconnect", self.printer_id)
 
     def request_version_if_missing(self) -> None:
@@ -350,12 +358,12 @@ class BambuAdapter:
                 return {"ok": False, "reason": "printer_busy"}
 
         with self._lock:
-            print_obj = self._data.get("print")
-            gcode_state = print_obj.get("gcode_state") if isinstance(print_obj, dict) else None
-        if not isinstance(gcode_state, str) or not gcode_state.strip():
-            # v0.69: right after a (re)connect paho says "connected" before the printer's first full report, so the busy
-            # checks see no state and a printer mid-print reads as idle. No start until it has said what it is doing; the
-            # cloud re-queues printer_stale without counting it (queue-status route).
+            seen = self._state_seen
+        if not seen:
+            # v0.69: right after a (re)connect paho says "connected" before the printer's first report on that connection,
+            # so the busy checks see no state, or the state cached from before the drop, and a printer mid-print reads as
+            # idle. No start until it has said what it is doing on this connection; the cloud re-queues printer_stale
+            # without counting it (queue-status route).
             log.warning("bambu %s: refusing %s — no printer state reported since the hub connected", self.printer_id, queue_job_id)
             return {"ok": False, "reason": "printer_stale: no printer state reported since the hub connected"}
 

@@ -80,6 +80,7 @@ def _http_snapshot_with_reason(
     # ftp://, etc. (local-file / scheme-confusion exfil into a "camera frame").
     if urllib.parse.urlparse(url).scheme not in ("http", "https"):
         return (None, "unknown", "non-http snapshot url")
+    deadline = time.monotonic() + timeout   # the whole transfer: a camera trickling bytes never resets it
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "makeros-hub-agent"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured LAN URL
@@ -88,7 +89,15 @@ def _http_snapshot_with_reason(
             online = resp.headers.get("X-UStreamer-Online")
             if online is not None and online.strip().lower() != "true":
                 return (None, "unreachable", "camera source reports offline")
-            data = resp.read(max_bytes + 1)
+            data = bytearray()
+            while len(data) <= max_bytes:
+                if time.monotonic() > deadline:
+                    return (None, "timeout", "transfer outlived the deadline")
+                chunk = resp.read1(65536)
+                if not chunk:
+                    break
+                data += chunk
+            data = bytes(data)
     except urllib.error.HTTPError as exc:
         reason = "auth-fail" if exc.code in (401, 403) else "unreachable"
         return (None, reason, f"HTTP {exc.code}")
@@ -239,6 +248,7 @@ class _Cam:
     streak: int = 0                 # real failures in a row
     retry_at: float = 0.0           # breaker
     sha: Optional[bytes] = None     # digest of the last accepted frame (frozen check)
+    change: bool = False            # a state change / reconnect not yet answered by an accepted frame or a real failure
 
 
 class CameraScheduler:
@@ -250,14 +260,17 @@ class CameraScheduler:
     starved or refused frame stays due. A real failure (`failed`) is retried next beat once; from the second in a row
     the camera backs off 60 -> 120 -> 240 -> 480 -> 600 s (120 s cap while printing). A state change, a new MQTT
     connection (`mqttConnectedAtMs`: how a power-cycle shows up to the hub), a source change or a disable/enable
-    (`forget`) resets it. Only the heartbeat thread touches this object; capture workers never do."""
+    (`forget`) resets it. Only the heartbeat thread touches this object, except `running`: the printers whose capture
+    worker is still going (a straggler from an earlier beat), which a printer leaves only when its worker returns."""
 
     FIRST_OR_LAST_LAYER_S, MID_PRINT_S, IDLE_S = 20.0, 90.0, 600.0
 
     def __init__(self) -> None:
         self._cams: dict[str, _Cam] = {}
-        self.stats: dict[str, Any] = {"beats": 0, "attempts": 0, "ok": 0, "notStarted": 0, "fail": {}, "push": {},
-                                      "ioMs": [0, 0, 0], "ffMs": [0, 0, 0]}   # [count, sum, max]
+        # ponytail: set add/discard are atomic under the GIL; workers only add/discard their own printer id
+        self.running: set[str] = set()
+        self.stats: dict[str, Any] = {"beats": 0, "attempts": 0, "ok": 0, "notStarted": 0, "stillRunning": 0, "fail": {},
+                                      "push": {}, "ioMs": [0, 0, 0], "ffMs": [0, 0, 0]}   # [count, sum, max]
 
     def plan(self, targets, status_by_id, now: float, want: Optional[set] = None) -> list[dict]:
         """The targets due this beat, most overdue first, then oldest last attempt (start order inside a lane)."""
@@ -276,17 +289,20 @@ class CameraScheduler:
                 changed = state != c.state or link != c.link     # a cycle under 150 s is idle->idle; only `link` moves
                 c.state, c.link = state, link
             if changed:
-                c.streak, c.retry_at = 0, 0.0
+                c.streak, c.retry_at, c.change = 0, 0.0, True   # kept until answered: a change that loses the race stays due
             if now < c.retry_at:
                 continue                                         # an open breaker wins over want
             wanted = pid in want if want is not None else bool(t.get("cameraDense"))   # older site: config-down flag
             interval = self.FIRST_OR_LAST_LAYER_S if wanted else self._interval(state, st.get("progressPct"))
-            if changed or c.last_ok is None or now - c.last_ok >= interval:
-                # Earliest deadline first: a state change or no accepted photo yet is due since forever, anything else
-                # since last_ok + its tier. A camera that loses the race only grows more overdue, so it reaches the front:
-                # wanted / first-layer cameras over the lane's capacity can no longer starve the mid-print ones.
-                due_since = float("-inf") if changed or c.last_ok is None else c.last_ok + interval
-                due.append(((due_since, c.last_try), t))
+            if c.change or c.last_ok is None or now - c.last_ok >= interval:
+                # Earliest deadline first, after unanswered state changes: a new camera is due since forever, a working
+                # one since last_ok + its tier. A camera that loses the race only grows more overdue, so it reaches the
+                # front: wanted / first-layer cameras over the lane's capacity can no longer starve the mid-print ones. A
+                # failing camera is due only from its failed try (one miss) or its breaker closing, never from its last
+                # photo, so a dozen dead cameras cannot sit at the front of the lane forever.
+                due_since = max(c.last_ok + interval if c.last_ok is not None else float("-inf"),
+                                (c.retry_at or c.last_try) if c.streak else float("-inf"))
+                due.append(((not c.change, due_since, c.last_try), t))
         due.sort(key=lambda d: d[0])
         return [t for _, t in due]
 
@@ -298,7 +314,7 @@ class CameraScheduler:
         c = self._cams.get(pid)
         if c is None:
             return
-        c.last_ok, c.streak, c.retry_at, c.sha = now, 0, 0.0, sha
+        c.last_ok, c.streak, c.retry_at, c.sha, c.change = now, 0, 0.0, sha, False
         self.stats["ok"] += 1
 
     def failed(self, pid: str, now: float) -> None:
@@ -306,9 +322,10 @@ class CameraScheduler:
         if c is None:
             return
         c.streak += 1
+        c.change = False    # the change got its try; from here the breaker ranks it
         if c.streak >= 2:   # one miss retries next beat (a camera waking after a reboot); two opens the breaker
             cap = BACKOFF_CAP_PRINTING_S if c.state == "printing" else BACKOFF_CAP_S
-            c.retry_at = now + min(BACKOFF_BASE_S * 2 ** (c.streak - 2), cap)
+            c.retry_at = now + min(BACKOFF_BASE_S * 2 ** min(c.streak - 2, 10), cap)   # exponent capped: no float overflow
 
     def is_repeat(self, pid: str, sha: Optional[bytes]) -> bool:
         c = self._cams.get(pid)
@@ -373,6 +390,11 @@ def collect_camera_frames(
     Never raises; never blocks the beat on a straggler."""
     scheduler.stats["beats"] += 1
     due = scheduler.plan(targets, status_by_id, now, want)
+    busy = [t for t in due if t["printerId"] in scheduler.running]
+    if busy:
+        # its capture from an earlier beat is still going: never a second one beside it (bounds threads at one per camera)
+        scheduler.stats["stillRunning"] += len(busy)
+        due = [t for t in due if t["printerId"] not in scheduler.running]
     if not due:
         return [], []
     # Back-compat: a caller passing only the legacy bytes-returning `capture` gets it wrapped.
@@ -396,8 +418,12 @@ def collect_camera_frames(
         if left <= 0 or (lane == "ff" and left < _RTSP_DEADLINE_S):
             return _NOT_STARTED   # a start that cannot finish inside the beat is not a start
         started.add(t["printerId"])
+        scheduler.running.add(t["printerId"])
         t0 = clock()
-        jpeg, reason, tail = capture_with_reason(t)
+        try:
+            jpeg, reason, tail = capture_with_reason(t)
+        finally:
+            scheduler.running.discard(t["printerId"])
         return jpeg, reason, tail, clock() - t0
 
     futs = {pools[_lane(t)].submit(run, t, _lane(t)): t for t in due}   # plan order = start order inside a lane

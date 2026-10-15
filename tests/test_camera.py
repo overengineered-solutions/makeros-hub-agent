@@ -12,7 +12,12 @@ class FakeResp:
     def read(self, _n: int = -1) -> bytes:
         return self._data
 
+    def read1(self, _n: int = -1) -> bytes:
+        data, self._left = self._left, b""
+        return data
+
     def __enter__(self):
+        self._left = self._data   # one fake can be returned by several urlopen calls
         return self
 
     def __exit__(self, *_a):
