@@ -9,6 +9,7 @@ import unittest
 import zipfile
 from pathlib import Path
 
+from makeros_hub.agent import heartbeat_payload
 from makeros_hub.printers.manager import PrinterManager, slice_spec_of
 
 SLICED_INFO = b"""<?xml version="1.0"?><config><plate><metadata key="index" value="1"/><metadata key="printer_model_id" value="N1"/>
@@ -117,6 +118,13 @@ class TestSliceUploads(unittest.TestCase):
                                                "fixes": {"orient": True, "brim": False}, "scale": 1.0})
         self.assertEqual(slice_spec_of({"model": "P2S", "filament": "x", "fixes": [], "scale": True}),
                          {"model": "P2S", "filament": {"type": None, "colorHex": None, "trayInfoIdx": None}, "fixes": {}})
+
+
+class TestSlicerReady(unittest.TestCase):
+    def test_the_heartbeat_says_whether_this_box_can_slice(self):
+        self.assertIs(heartbeat_payload(slicer_ready=True)["slicerReady"], True)
+        self.assertIs(heartbeat_payload(slicer_ready=False)["slicerReady"], False)
+        self.assertNotIn("slicerReady", heartbeat_payload())
 
 
 if __name__ == "__main__":

@@ -46,7 +46,7 @@ from .http import get_to_file, TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
 from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
-from .printers.manager import PrinterManager
+from .printers.manager import SLICE_RUNNER, PrinterManager
 from .printers.camera import FF_SLOTS, CameraScheduler, collect_camera_frames, prime_camera_capabilities
 from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples, stub_detector
 from .printers.onnx_detector import (
@@ -762,6 +762,7 @@ def heartbeat_payload(
     laser_file_checks: list[dict] | None = None,
     camera_stats: dict | None = None,
     vp_connects: list[dict] | None = None,
+    slicer_ready: bool | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -833,6 +834,10 @@ def heartbeat_payload(
     # acknowledged after a 200 so a lost beat sends them again (vprinter/auth.py ConnectLog).
     if vp_connects:
         payload["vpConnects"] = list(vp_connects)[:64]
+    # v0.72: whether this box can slice members' checked files (the runner install-slicer.py puts in place). The site
+    # offers automatic slicing, and hands this hub slice jobs, only while this is true.
+    if slicer_ready is not None:
+        payload["slicerReady"] = bool(slicer_ready)
     # Lasers (v0.68): plug state, runs and gate link per laser in config-down (omitted when it lists none), and the
     # gate's verdicts on member files the cloud offered.
     if lasers:
@@ -1964,6 +1969,7 @@ def run(
                         laser_file_checks=laser_report.file_checks if laser_report else None,
                         camera_stats=camera_stats,
                         vp_connects=vp_connects,
+                        slicer_ready=os.path.isfile(SLICE_RUNNER) and os.access(SLICE_RUNNER, os.X_OK),
                     ),
                     bearer=credential,
                     retries=3,

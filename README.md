@@ -89,6 +89,8 @@ sliced plate.
   through their inheritance (the command line does not load the vendor bundle, and an unresolved preset loses its density
   and filament id), the textured plate, the model code Bambu writes into slice_info (the command line leaves it blank).
   A1 mini, P2S and X1C; the H2D waits for an extruder choice.
+- The heartbeat carries `slicerReady` (the runner is installed and executable); the site offers automatic slicing and
+  hands this hub slice jobs only while it is true, so an older box never receives a mesh it cannot slice.
 
 ## 0.71.0 candidate: every printer heard on every network leg, and who signs in to the virtual printers
 
