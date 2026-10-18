@@ -49,6 +49,30 @@ DISPATCHED_COMMANDS_TTL_SEC = 2 * 3600
 # bounds rebuilds; it cannot repair a wrong access code.
 STUCK_ADAPTER_RETRY_S = 120.0
 _SUBMISSION_UID_RE = re.compile(r"^[a-f0-9]{8,64}$")
+# v0.72 automatic slicing (operator, 2026-10-18): a web upload may carry a member's checked mesh and a slice spec instead
+# of a sliced plate. The hub slices it on the shop box through a root-owned runner (oes-pool-deploy
+# scripts/install-slicer.py installs it; slicer/ in this repo is the container), then treats the plate like any upload.
+SLICE_RUNNER = os.environ.get("MAKEROS_HUB_SLICE_RUNNER", "/opt/ps-slicer/run-slice")
+SLICE_TIMEOUT_SEC = 660
+_MESH_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,118}\.(stl|obj|3mf)$", re.I)
+
+
+def run_slice_job(uid: str) -> int:
+    """The runner's exit code; it writes <spool>/<uid>/.slice/out/result.json either way."""
+    import subprocess
+    return subprocess.run(["sudo", "-n", SLICE_RUNNER, uid], capture_output=True, timeout=SLICE_TIMEOUT_SEC).returncode
+
+
+def slice_spec_of(spec: dict) -> dict:
+    """Only the fields the slicer reads, so nothing else from the cloud reaches the job file (the wrapper validates them)."""
+    fil = spec.get("filament") if isinstance(spec.get("filament"), dict) else {}
+    fixes = spec.get("fixes") if isinstance(spec.get("fixes"), dict) else {}
+    out: dict = {"model": spec.get("model"),
+                 "filament": {k: fil.get(k) for k in ("type", "colorHex", "trayInfoIdx")},
+                 "fixes": {k: bool(fixes.get(k)) for k in ("orient", "brim", "supports") if k in fixes}}
+    if isinstance(spec.get("scale"), (int, float)) and not isinstance(spec.get("scale"), bool):
+        out["scale"] = float(spec["scale"])
+    return out
 
 
 def plate_of(value) -> int:
@@ -578,7 +602,7 @@ class PrinterManager:
         )
 
     def fetch_uploads(self, fetches, spool_dir, *, getter, reporter, max_per_beat: int = 1,
-                      max_bytes: int = 64 * 1024 * 1024) -> int:
+                      max_bytes: int = 64 * 1024 * 1024, slice_runner=run_slice_job) -> int:
         """Web uploads (v0.57, design B4): the cloud lists this hub's member uploads it has not fetched; download each
         into <spool>/<uid>/<file> (streaming, size-capped, wall-clock-bounded), verify the cloud's sha256, parse the sent
         plate's filaments the same way a VP capture is parsed, and report `fetched` so the job enters the scheduler. One
@@ -629,25 +653,34 @@ class PrinterManager:
             dest_dir = base / uid
             dest = dest_dir / name
             tmp = dest_dir / f".{name}.fetch.tmp"
+            spec = f.get("slice")
+            sliced: dict | None = None
             try:
                 dest_dir.mkdir(parents=True, exist_ok=True)
-                got = stream_sha(dest) if dest.exists() else None
-                if dest.exists() and got != sha:
-                    # a stale same-name file (earlier upload, over the cap, or corrupt): never reused — replaced below
-                    log.warning("web upload %s: spool file present but does not match the cloud's sha — re-fetching", job_id)
-                    dest.unlink(missing_ok=True)
-                    got = None
-                if got is None:
-                    try:
-                        got, _size = getter(path, tmp)
-                    finally:
-                        if got is None or got != sha:
-                            tmp.unlink(missing_ok=True)   # any failure or mismatch: no temp file survives
-                    if got != sha:
-                        log.error("web upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], got[:12])
-                        reporter({"queueJobId": job_id, "sha256": got})   # the cloud fails the job + tells the member
-                        continue
-                    _os.replace(tmp, dest)
+                if isinstance(spec, dict):
+                    sliced = self._slice_upload(f, spec, uid, dest_dir, dest, sha, path, getter=getter, reporter=reporter,
+                                                stream_sha=stream_sha, runner=slice_runner)
+                    if sliced is None:
+                        continue   # reported: a sha mismatch or a slice the member is told about
+                    got = sha
+                else:
+                    got = stream_sha(dest) if dest.exists() else None
+                    if dest.exists() and got != sha:
+                        # a stale same-name file (earlier upload, over the cap, or corrupt): never reused — replaced below
+                        log.warning("web upload %s: spool file present but does not match the cloud's sha — re-fetching", job_id)
+                        dest.unlink(missing_ok=True)
+                        got = None
+                    if got is None:
+                        try:
+                            got, _size = getter(path, tmp)
+                        finally:
+                            if got is None or got != sha:
+                                tmp.unlink(missing_ok=True)   # any failure or mismatch: no temp file survives
+                        if got != sha:
+                            log.error("web upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], got[:12])
+                            reporter({"queueJobId": job_id, "sha256": got})   # the cloud fails the job + tells the member
+                            continue
+                        _os.replace(tmp, dest)
                 # Also on retry with an existing file: the prior rename may
                 # have succeeded while its directory flush failed. No ACK yet.
                 for directory in (dest_dir, base):
@@ -661,6 +694,8 @@ class PrinterManager:
                 model_id = parse_printer_model_id(dest)
                 if model_id:
                     body["printerModelId"] = model_id   # the cloud refuses a file sliced for another printer (audit)
+                if sliced is not None:
+                    body["slice"] = {k: sliced.get(k) for k in ("grams", "seconds", "supportUsed", "filament", "process")}
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
                 if grams:
                     body["estGrams"] = int(math.ceil(sum(grams)))
@@ -675,6 +710,69 @@ class PrinterManager:
                 tmp.unlink(missing_ok=True)
                 log.warning("web upload %s: fetch failed: %s", job_id, exc)
         return done
+
+    def _slice_upload(self, f: dict, spec: dict, uid: str, dest_dir: Path, dest: Path, sha: str, path: str, *, getter,
+                      reporter, stream_sha, runner) -> dict | None:
+        """v0.72: download the member's mesh into <spool>/<uid>/.slice, slice it there through the runner, and move the plate
+        to the job's file name. Returns the slice summary, or None when it reported a sha mismatch or a slice error (the
+        cloud fails the job with the slicer's sentence). A plate sliced on an earlier beat whose report did not land is
+        reused, not sliced again."""
+        import shutil
+        job_id = f.get("queueJobId")
+        mesh_name = f.get("meshName")
+        if not isinstance(mesh_name, str) or not _MESH_NAME_RE.match(mesh_name):
+            reporter({"queueJobId": job_id, "sha256": sha, "sliceError": "the file name is not one the slicer accepts"})
+            return None
+        work = dest_dir / ".slice"
+        mesh = work / mesh_name
+        result_path = work / "out" / "result.json"
+        if dest.exists() and result_path.exists() and mesh.exists() and stream_sha(mesh) == sha:
+            try:
+                done = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(done, dict) and done.get("ok"):
+                    return done
+            except (OSError, ValueError):
+                pass
+        if work.is_symlink():
+            work.unlink()
+        elif work.exists():
+            shutil.rmtree(work)
+        dest.unlink(missing_ok=True)
+        work.mkdir(mode=0o700)
+        tmp = work / f".{mesh_name}.fetch.tmp"
+        got = None
+        try:
+            got, _size = getter(path, tmp)
+        finally:
+            if got != sha:
+                tmp.unlink(missing_ok=True)
+        if got != sha:
+            log.error("slice upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], str(got)[:12])
+            reporter({"queueJobId": job_id, "sha256": got})
+            return None
+        os.replace(tmp, mesh)
+        (work / "job.json").write_text(json.dumps({**slice_spec_of(spec), "mesh": mesh_name}), encoding="utf-8")
+        started = time.monotonic()
+        try:
+            rc = runner(uid)
+        except Exception as exc:  # noqa: BLE001 - a runner that cannot start is a slice error the member hears about
+            log.warning("slice upload %s: runner failed to start: %s", job_id, exc)
+            rc = -1
+        result: dict = {}
+        try:
+            result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
+        except (OSError, ValueError):
+            result = {}
+        sliced_file = work / "out" / "sliced.3mf"
+        if not (isinstance(result, dict) and result.get("ok") and sliced_file.exists()):
+            reason = result.get("error") if isinstance(result, dict) and isinstance(result.get("error"), str) else \
+                ("the shop's slicer is not available right now" if rc == -1 else "the slicer stopped before it finished")
+            log.warning("slice upload %s: not sliced (rc %s): %s", job_id, rc, reason)
+            reporter({"queueJobId": job_id, "sha256": sha, "sliceError": reason[:300]})
+            return None
+        os.replace(sliced_file, dest)
+        log.info("slice upload %s: sliced in %.1f s (%s g, %s s print)", job_id, time.monotonic() - started, result.get("grams"), result.get("seconds"))
+        return result
 
     def dispatch_commands(self, pending_commands) -> list[dict]:
         """Execute cloud-delivered control commands (pause/resume/stop) against

@@ -1,0 +1,22 @@
+#!/bin/sh
+# run-slice <job id>: one automatic slice for the hub, in the locked-down ps-slicer container (slicer/Dockerfile).
+# Installed root:root 0755 at /opt/ps-slicer/run-slice by oes-pool-deploy scripts/install-slicer.py; the hub's service
+# user may run exactly this through sudo. The id names <spool>/<id>/.slice, which must be a real directory owned by the
+# hub's user (no symlink anywhere on the way); the container sees only that directory, as that user, with no network, a
+# read-only root, 3 GB of memory, 4 CPUs, 1024 processes and ten minutes.
+set -eu
+SPOOL=/var/lib/makeros-hub/spool
+HUB_USER=makeros-hub
+IMAGE=ps-slicer:current
+id="${1:-}"
+case "$id" in ""|*[!0-9a-f]*) echo "run-slice: the job id is lowercase hex" >&2; exit 2 ;; esac
+[ "${#id}" -ge 8 ] && [ "${#id}" -le 64 ] || { echo "run-slice: the job id is 8 to 64 characters" >&2; exit 2; }
+dir="$SPOOL/$id/.slice"
+real=$(realpath -e -- "$dir" 2>/dev/null) || { echo "run-slice: no slice job at $dir" >&2; exit 2; }
+[ "$real" = "$dir" ] || { echo "run-slice: $dir is not a plain directory" >&2; exit 2; }
+[ -d "$real" ] || { echo "run-slice: $dir is not a directory" >&2; exit 2; }
+uid=$(id -u "$HUB_USER"); gid=$(id -g "$HUB_USER")
+[ "$(stat -c %u "$real")" = "$uid" ] || { echo "run-slice: $dir is not the hub's" >&2; exit 2; }
+exec timeout 600 docker run --rm --network none --read-only --tmpfs /tmp:size=1g,mode=1777 \
+  --memory 3g --memory-swap 3g --cpus 4 --pids-limit 1024 --security-opt no-new-privileges --cap-drop ALL \
+  --user "$uid:$gid" -e HOME=/tmp -v "$real":/job "$IMAGE"

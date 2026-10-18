@@ -71,6 +71,25 @@ sh -n update.sh
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
 
+## 0.72.0 candidate: the shop slices members' checked files itself
+
+Operator, 2026-10-18: "after we evaluate it we automatically slice it based on the material they want and the size and
+then send it through to the printers". A web upload may now carry a member's checked mesh (`meshName`) and a `slice`
+spec (printer model, filament type, colour and Bambu filament id, fixes: orient, brim, supports, scale) instead of a
+sliced plate.
+
+- `fetch_uploads` downloads the mesh into `<spool>/<uid>/.slice`, verifies the cloud's sha256, writes `job.json` with only
+  the slicer's fields, and runs `sudo -n /opt/ps-slicer/run-slice <uid>`. The runner (slicer/run-slice, root-owned,
+  installed by oes-pool-deploy `scripts/install-slicer.py`) starts the ps-slicer container on that folder only: no network,
+  read-only root, 3 GB, 4 CPUs, 1024 processes, ten minutes, as the hub's user.
+- The plate lands at the job's file name and goes through the same parse and report as any upload (model code, filaments,
+  grams), plus a `slice` summary. A refused slice reports `sliceError` with the slicer's sentence; a slice whose report
+  was lost is reported again next beat without slicing twice.
+- `slicer/` holds the container: OrcaSlicer 2.4.2's official Linux AppImage pinned by sha256, Bambu's own presets resolved
+  through their inheritance (the command line does not load the vendor bundle, and an unresolved preset loses its density
+  and filament id), the textured plate, the model code Bambu writes into slice_info (the command line leaves it blank).
+  A1 mini, P2S and X1C; the H2D waits for an extruder choice.
+
 ## 0.71.0 candidate: every printer heard on every network leg, and who signs in to the virtual printers
 
 - **Discovery** listens 8 s (was 3) on the broadcast port 2021 and the multicast group 239.255.255.250:1990, joined on
