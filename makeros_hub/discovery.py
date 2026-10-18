@@ -54,8 +54,8 @@ _cached_hits: list[DiscoveryHit] = []
 
 def _do_scan_locked_unsafe() -> list[DiscoveryHit]:
     """Run BOTH the HTTP sweep and SSDP listener; merge + dedup. Lock-naive —
-    callers hold the module lock. Order: SSDP first (cheap blocking 3s),
-    then HTTP sweep (~8s budget) — total ~11s worst case."""
+    callers hold the module lock. Order: SSDP first (blocking 8 s since v0.71),
+    then HTTP sweep (~8s budget) — total ~16s worst case."""
     moonraker_hits = lan_scan.run_scan()
     bambu_hits = bambu_ssdp.listen_for_bambu_announcements()
     return _merge_hits(moonraker_hits, bambu_hits)
@@ -81,7 +81,7 @@ def maybe_run_periodic_scan(now: float | None = None) -> bool:
     test/log clarity).
 
     Inline + blocking: the heartbeat loop runs single-threaded, so we're
-    sharing the loop's compute. The total sweep budget (~11s) sits inside
+    sharing the loop's compute. The total sweep budget (~16s) sits inside
     the 30s heartbeat — the cloud absorbs a slow tick on sweep ticks without
     drama. We DON'T spin up a background thread because then we'd have two
     callers racing on _cached_hits + need a more elaborate fence.

@@ -57,6 +57,7 @@ from .printers.onnx_detector import (
 from .tailscale import current_tailscale_status, reconcile_tailscale, tailscale_binary_exists
 from .telemetry import start_telemetry
 from .update import OTA_WAIT_IDLE, is_commit_sha, maybe_update, should_defer_update, should_update
+from .vprinter.auth import CONNECTS as VP_CONNECTS
 from .vprinter.capture import CapturedJob, build_vp_submit_body
 from .vprinter.manager import VirtualPrinterManager
 from .vprinter.outbox import VPrinterOutbox, validate_submission_uid
@@ -760,6 +761,7 @@ def heartbeat_payload(
     lasers: list[dict] | None = None,
     laser_file_checks: list[dict] | None = None,
     camera_stats: dict | None = None,
+    vp_connects: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -827,6 +829,10 @@ def heartbeat_payload(
     # virtual_printers.bind_ip. Empty/missing = no fresh allocations this tick.
     if vp_bindings:
         payload["vpBindings"] = list(vp_bindings)[:64]
+    # Member sign-ins on the virtual printers (v0.71): the latest per (VP serial, code sha256), with the client address;
+    # acknowledged after a 200 so a lost beat sends them again (vprinter/auth.py ConnectLog).
+    if vp_connects:
+        payload["vpConnects"] = list(vp_connects)[:64]
     # Lasers (v0.68): plug state, runs and gate link per laser in config-down (omitted when it lists none), and the
     # gate's verdicts on member files the cloud offered.
     if lasers:
@@ -1936,6 +1942,7 @@ def run(
                     laser_report = laser_hub.report()
                 except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
                     _record_diagnostic(diagnostics, "laser", f"laser report failed: {redact(str(exc))}")
+                vp_connects = VP_CONNECTS.snapshot(64)
                 resp = post_json(
                     cfg.heartbeat_url,
                     heartbeat_payload(
@@ -1956,6 +1963,7 @@ def run(
                         lasers=laser_report.lasers if laser_report else None,
                         laser_file_checks=laser_report.file_checks if laser_report else None,
                         camera_stats=camera_stats,
+                        vp_connects=vp_connects,
                     ),
                     bearer=credential,
                     retries=3,
@@ -1976,6 +1984,7 @@ def run(
                         log.info("reported %d command result(s) to the cloud", reported_command_count)
                     reported_binding_count = len(pending_vp_bindings)
                     pending_vp_bindings = []
+                    VP_CONNECTS.ack(vp_connects)
                     try:
                         if laser_report is not None:
                             laser_hub.ack(laser_report, resp.body.get("laserAck"))   # only what the site stored

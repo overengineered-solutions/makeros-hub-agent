@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import threading
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable
@@ -94,15 +95,58 @@ class AuthRateLimiter:
         return len(events)
 
 
+class ConnectLog:
+    """The latest successful sign-in per (virtual printer, member code), for the heartbeat (v0.71). The site stores it on
+    the code's row so the shop sees which members' slicers really reach the box, and from where (operator, 2026-10-18:
+    "have their information about script version number sent to us when they connect to the box"). Keyed by the code's
+    sha256, which the site already sent the hub; never the code. Thread-safe: MQTT and FTPS sign in on the servers'
+    loops while the heartbeat reads on its own thread. Bounded: the oldest entry goes first past max_keys."""
+
+    def __init__(self, *, max_keys: int = 1024, clock: Callable[[], float] | None = None) -> None:
+        self.max_keys = max(1, int(max_keys))
+        self.clock = clock or time.time
+        self._lock = threading.Lock()
+        self._pending: OrderedDict[tuple[str, str], dict] = OrderedDict()
+
+    def record(self, serial: str, code_sha256: str, ip: str | None) -> None:
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(self.clock()))
+        with self._lock:
+            key = (serial, code_sha256)
+            self._pending.pop(key, None)
+            self._pending[key] = {"serial": serial, "codeSha256": code_sha256, "at": at, "ip": ip or ""}
+            while len(self._pending) > self.max_keys:
+                self._pending.popitem(last=False)
+
+    def snapshot(self, limit: int = 64) -> list[dict]:
+        """The newest `limit` entries not yet acknowledged, newest last."""
+        with self._lock:
+            return [dict(v) for v in list(self._pending.values())[-limit:]]
+
+    def ack(self, sent: list[dict]) -> None:
+        """After a good heartbeat: drop what was sent, unless a newer sign-in replaced it meanwhile."""
+        with self._lock:
+            for e in sent:
+                key = (e["serial"], e["codeSha256"])
+                if self._pending.get(key, {}).get("at") == e["at"]:
+                    self._pending.pop(key, None)
+
+
+CONNECTS = ConnectLog()
+
+
 class MemberAuthSet:
     def __init__(
         self,
         members: tuple[VirtualPrinterMember, ...] | list[VirtualPrinterMember],
         *,
         limiter: AuthRateLimiter | None = None,
+        serial: str | None = None,
+        connects: ConnectLog | None = None,
     ) -> None:
         self.members = tuple(members)
         self.limiter = limiter or AuthRateLimiter()
+        self.serial = serial
+        self.connects = connects if connects is not None else CONNECTS
 
     def replace_members(
         self,
@@ -128,6 +172,11 @@ class MemberAuthSet:
             return AuthResult(ok=False, rate_limited=True)
         member_id = self.lookup_member_id(access_code)
         if member_id is not None:
+            if self.serial:
+                try:
+                    self.connects.record(self.serial, hashlib.sha256(access_code.encode("utf-8")).hexdigest(), ip)
+                except Exception:  # noqa: BLE001 - bookkeeping never refuses a member who signed in
+                    pass
             return AuthResult(ok=True, member_id=member_id)
         self.limiter.record_failure(ip, access_code)
         return AuthResult(ok=False)

@@ -71,6 +71,19 @@ sh -n update.sh
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
 
+## 0.71.0 candidate: every printer heard on every network leg, and who signs in to the virtual printers
+
+- **Discovery** listens 8 s (was 3) on the broadcast port 2021 and the multicast group 239.255.255.250:1990, joined on
+  every interface (`bambu_ssdp.py`). The 3 s window on 2021 alone heard about a third of the fleet per sweep; the shop
+  box also has a second network leg now (Equipment, VLAN 20, 10.44.20.10, 2026-10-18), and a multicast join on the
+  wildcard address covers only the default interface. A port that will not bind leaves the other one working.
+- **Member sign-ins** (`vprinter/auth.py` ConnectLog): every successful MQTT or FTPS sign-in records the latest
+  (virtual printer serial, member code sha256, client address, time). The heartbeat carries up to 64 as `vpConnects`
+  and drops them after a 200 unless a newer sign-in replaced one meanwhile, so a lost beat sends them again. The code
+  itself never leaves the sign-in; the site already holds the hash. The site keeps the latest per code (pstation 0165)
+  and shows it to the member and the desk.
+- The camera's "a refused frame is not a capture" and the next-beat retry shipped in 0.69; nothing changes there.
+
 ## 0.70.0 candidate: the phase, not the word "Printing", and status that does not wait for the heartbeat
 
 Built on v0.69.0, following pstation `reports/Live printer status design.md` (the operator, 2026-10-15: "it says

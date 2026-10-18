@@ -481,7 +481,7 @@ class _VirtualPrinterRuntime:
         self.config = config
         self.base_dir = base_dir / _safe_serial(config.serial)
         self.on_capture = on_capture
-        self.auth = MemberAuthSet(config.members)
+        self.auth = MemberAuthSet(config.members, serial=config.serial)
         self.capture = CaptureCoordinator(
             on_capture, log.warning, vp_serial=config.serial, vp_model=config.model
         )
