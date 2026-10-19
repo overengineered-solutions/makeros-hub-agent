@@ -338,3 +338,13 @@ Normalizes observed H2D nozzle/AMS bindings, advertises them through the existin
 An explicit HTTP camera snapshot overrides the native source for any printer. Every frame/failure upload carries a `camera-v1` identity derived from vendor/model/host/serial/Moonraker URL/snapshot URL; changing that source makes a fresh capture due. uStreamer offline placeholders are rejected.
 
 Paired pstation rollout: install the reviewed hub candidate FIRST and verify accepted images/version against the current website, then ship the preview-tested website with required source identity and migration 0093. Old website versions ignore the new query parameter; new versions reject source-less uploads. Updating the live OTA target requires independent operator approval. The separate adapter-retry branch is not included in this candidate.
+
+### v0.73: members' paper prints on the shop's Epson (2026-10-18)
+
+The site meters paper against the membership allowance (100 pages a month, 20 in colour, a dense page counts twice). The
+heartbeat says `paperReady` when /opt/ps-paper/run-paper is installed (oes-pool-deploy `scripts/install-paper.py`); the
+site's answer may then carry `paper: {host, jobs}`. For each job, one at a time and off the heartbeat thread
+(`makeros_hub/paper.py`): fetch the file, measure and render it in the sandboxed `ps-paper` container (`paper/`: no
+network, read-only, capped; Ghostscript inkcov for each page's ink, PWG raster at 300 dpi), POST the coverage to
+`/api/print/hub/paper`, and only on `{"print": true}` send the raster to the Epson over IPPS (Print-Job) and follow it with
+Get-Job-Attributes to completed or aborted (20 minutes at most), then POST the outcome. Tests: `tests/test_paper.py`.

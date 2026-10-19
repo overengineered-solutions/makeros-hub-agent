@@ -47,6 +47,7 @@ from .ingest import IngestServer
 from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import SLICE_RUNNER, PrinterManager
+from . import paper as paper_lane
 from .printers.camera import FF_SLOTS, CameraScheduler, collect_camera_frames, prime_camera_capabilities
 from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples, stub_detector
 from .printers.onnx_detector import (
@@ -105,6 +106,8 @@ def _validate_heartbeat(body: dict) -> None:
         raise TransportError("heartbeat response has invalid poll interval")
     if type(body.get("applied")) is not int or body["applied"] < 0:
         raise TransportError("heartbeat response missing applied count")
+    if "paper" in body and (not isinstance(body["paper"], dict) or not isinstance(body["paper"].get("jobs", []), list)):
+        raise TransportError("heartbeat response has invalid paper")
     for k in ("assignments", "pendingProbes", "pendingCommands", "fetches", "laserChecks"):
         if k in body and (not isinstance(body[k], list) or any(not isinstance(x, dict) for x in body[k])):
             raise TransportError(f"heartbeat response has invalid {k}")
@@ -763,6 +766,7 @@ def heartbeat_payload(
     camera_stats: dict | None = None,
     vp_connects: list[dict] | None = None,
     slicer_ready: bool | None = None,
+    paper_ready: bool | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -838,6 +842,8 @@ def heartbeat_payload(
     # offers automatic slicing, and hands this hub slice jobs, only while this is true.
     if slicer_ready is not None:
         payload["slicerReady"] = bool(slicer_ready)
+    if paper_ready is not None:
+        payload["paperReady"] = bool(paper_ready)   # v0.73: the site hands paper jobs only to a box that can render them
     # Lasers (v0.68): plug state, runs and gate link per laser in config-down (omitted when it lists none), and the
     # gate's verdicts on member files the cloud offered.
     if lasers:
@@ -1495,6 +1501,7 @@ def run(
     )
     queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
     fetch_lock = threading.Lock()   # v0.57: one web-upload fetch worker at a time
+    paper_lock = threading.Lock()   # v0.73: one paper print at a time (makeros_hub/paper.py)
     pending_queue_reports: list[dict] = report_outbox.load()   # v0.58: durable across restarts
     pending_probe_results: list[dict] = []
     # v0.69: durable like the queue reports — a result queued for the next beat survives a restart mid-print
@@ -1970,6 +1977,7 @@ def run(
                         camera_stats=camera_stats,
                         vp_connects=vp_connects,
                         slicer_ready=os.path.isfile(SLICE_RUNNER) and os.access(SLICE_RUNNER, os.X_OK),
+                        paper_ready=paper_lane.paper_ready(),
                     ),
                     bearer=credential,
                     retries=3,
@@ -2039,6 +2047,21 @@ def run(
                                 fetch_lock.release()
 
                         threading.Thread(target=_fetch_worker, name="web-upload-fetch", daemon=True).start()
+                    # v0.73: members' paper prints, one at a time, off the heartbeat thread (makeros_hub/paper.py)
+                    paper_body = resp.body.get("paper")
+                    if isinstance(paper_body, dict) and paper_body.get("jobs") and paper_lock.acquire(blocking=False):
+                        def _paper_worker(job=paper_body["jobs"][0], host=str(paper_body.get("host") or "")):
+                            try:
+                                outcome = paper_lane.process(
+                                    job, host, SPOOL_DIR,
+                                    getter=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential, max_bytes=20 * 1024 * 1024),
+                                    poster=lambda body: post_json(cfg.paper_url, body, bearer=credential, timeout=30.0).body,
+                                )
+                                log.info("paper job %s: %s", job.get("id"), outcome)
+                            finally:
+                                paper_lock.release()
+
+                        threading.Thread(target=_paper_worker, name="paper-print", daemon=True).start()
                     if pending_queue_reports:
                         before = len(pending_queue_reports)
                         pending_queue_reports = _flush_queue_status_reports(

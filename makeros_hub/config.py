@@ -87,6 +87,11 @@ class Config:
         return self.cloud_url.rstrip("/") + "/api/print/hub/config"
 
     @property
+    def paper_url(self) -> str:
+        # v0.73: members' paper prints (makeros_hub/paper.py): measurement in, the site's yes or no out, then the outcome
+        return self.cloud_url.rstrip("/") + "/api/print/hub/paper"
+
+    @property
     def submit_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/submit"
 
