@@ -60,13 +60,20 @@ _WIRE_KEYS = {
     "bedTargetC": "bedTargetC",
     "chamberC": "chamberC",
     "jobName": "jobName",
+    # v0.76, Klipper: the shared touchscreen's readings (rounded by the adapter; toolhead is {homed, x, y, z}).
+    "toolhead": "toolhead",
+    "speedPct": "speedPct",
+    "zOffset": "zOffset",
+    "fanPct": "fanPct",
+    "light": "light",
 }
 _HALF_DEGREE_KEYS = ("nozzleC", "nozzleTargetC", "bedC", "bedTargetC", "chamberC")
 _WHOLE_SECOND_KEYS = ("printDurationSec", "elapsedSec")
 _IDENTITY_KEYS = ("printerId", "sampledAt")
 # A printer that is not printing sends a delta only when one of these moved: its temperature drift is noise
 # ("idle printers silent"), but the moment it starts, stops, finishes (gcodeState FINISH) or changes file must go out.
-_TRANSITION_KEYS = ("connected", "state", "gcodeState", "preparing", "jobName")
+# v0.76: so must a jog, a homing or the light from the screen (an idle toolhead only moves when someone moves it).
+_TRANSITION_KEYS = ("connected", "state", "gcodeState", "preparing", "jobName", "toolhead", "light")
 _ACTIVE_STATES = frozenset({"printing", "paused"})
 
 

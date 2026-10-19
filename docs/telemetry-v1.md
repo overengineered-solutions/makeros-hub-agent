@@ -73,6 +73,11 @@ are 5 s.
 | `bedC`, `bedTargetC` | number °C | Klipper `heater_bed.temperature/target`; Bambu flat `bed_temper/bed_target_temper`, falling back to packed `device.bed.info.temp` |
 | `chamberC` | number °C | Bambu `chamber_temper`, falling back to the low word of `device.ctc.info.temp`; never Klipper, never A1/P1 (no sensor) |
 | `jobName` | string, max 300 | Klipper `print_stats.filename`; Bambu `subtask_name`, else `gcode_file` |
+| `toolhead` | `{homed, x?, y?, z?}` | v0.76, Klipper only: `homed` is `toolhead.homed_axes` (`"xyz"`, `""` after `M84`), `x`/`y`/`z` the commanded `toolhead.position` in mm, rounded to 0.01 (the frame the hub's jog range check uses) |
+| `speedPct` | int | v0.76, Klipper `gcode_move.speed_factor × 100` (the M220 value) |
+| `zOffset` | number mm | v0.76, Klipper `gcode_move.homing_origin[2]` (the `SET_GCODE_OFFSET` Z), rounded to 0.001 |
+| `fanPct` | int 0–100 | v0.76, Klipper part fan: `fan.speed × 100`, else `fan_generic fan0` (the SV08's M106 macro drives fan0 and fan1 together) |
+| `light` | bool | v0.76, Klipper `output_pin main_led.value > 0`; omitted on a printer without that pin |
 
 Every key except `printerId` and `sampledAt` is omit-when-unknown. The heartbeat carries the same values under the
 same names, except that the heartbeat keeps its historical `nozzleTempC` / `bedTempC` for what this contract calls
@@ -88,7 +93,8 @@ to whole minutes, `printDurationSec` and `elapsedSec` to whole seconds.
   (the M117 message cleared, the ETA gone) is sent as `null`, so the site can clear it. A printer that is not printing,
   paused or preparing is silent while only its temperatures drift; it is sent the moment `connected`, `state`,
   `gcodeState`, `preparing` or `jobName` moves (so a printer going offline, finishing — `gcodeState` `FINISH` — or
-  starting is never missed). A delta with no printers is not sent at all.
+  starting is never missed), and from v0.76 when `toolhead` or `light` moves (a jog, homing or the light from the
+  screen). A delta with no printers is not sent at all.
 - A **full** (`"full": true`) carries every connected printer with every known key. It is sent at start, after any
   non-2xx or transport error, when the site asks (`wantFull`), and at least every 60 s.
 

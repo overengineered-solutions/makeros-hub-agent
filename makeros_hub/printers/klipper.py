@@ -30,6 +30,7 @@ import hashlib
 import http.client
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -124,8 +125,14 @@ _QUERY_OBJECTS = (
     + "".join(f"&{urllib.parse.quote(zone)}=temperature,target" for zone in BED_ZONES)
     + "&virtual_sdcard=progress"
     "&display_status=progress,message"
-    "&toolhead=homed_axes"
+    "&toolhead=homed_axes,position,axis_minimum,axis_maximum"
     "&idle_timeout=state"
+    # v0.76: the shared touchscreen's readings (speed, Z offset, part fan, light). The SV08 has no [fan]: its M106 macro
+    # drives "fan_generic fan0" and fan1 together, so fan0 stands in for it.
+    "&gcode_move=speed_factor,homing_origin"
+    "&fan=speed"
+    "&fan_generic%20fan0=speed"
+    "&output_pin%20main_led=value"
 )
 
 # Mapping from Moonraker `print_stats.state` to the wire DTO's activity state.
@@ -156,6 +163,59 @@ _GCODE_STATE_MAP = {
 _LIVE_QUERY = "webhooks=state&print_stats=state,filename&idle_timeout=state"
 _STARTABLE_STATES = frozenset({"standby", "complete", "cancelled"})
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+# v0.76: the shared touchscreen's controls (operator, 2026-10-19: "all of it needs to run through the screen"). The site
+# sends {command: "klipper_action", params: {action, ...}} and the hub runs only the named actions below, built here from
+# validated params: never G-code the site hands it. Each action's params (besides `action`); any other key is bad_params.
+_ACTION_PARAMS: dict[str, tuple[str, ...]] = {
+    "home": (), "jog": ("axis", "mm"), "center": (), "motors_off": (),
+    "load_filament": (), "load_more": (), "unload_filament": (),
+    "preheat": ("nozzle", "bed"), "cooldown": (), "light": ("on",),
+    "qgl": (), "bed_mesh": (), "clean_nozzle": (),
+    "z_offset": ("delta",), "speed": ("pct",), "fan": ("pct",),
+    "emergency_stop": (), "firmware_restart": (),
+}
+# Parameterless actions -> their G-code, or (the two that bypass klippy's G-code queue) a Moonraker endpoint. home is
+# Klipper's G28; on the SV08, Sovol's G28 macro runs Z_OFFSET_CALIBRATION and SAVE_CONFIG (a Klipper restart) when the
+# probe is uncalibrated: the printer's own behaviour, not ours. MOVE_TO_CENTER homes first on the SV08 too.
+_PLAIN_ACTIONS = {
+    "home": "G28", "center": "MOVE_TO_CENTER", "motors_off": "M84",
+    "load_filament": "LOAD_FILAMENT", "load_more": "_CONTINUE_LOAD_FILAMENT", "unload_filament": "UNLOAD_FILAMENT",
+    "cooldown": "TURN_OFF_HEATERS", "qgl": "QUAD_GANTRY_LEVEL", "bed_mesh": "BED_MESH_CALIBRATE",
+    "clean_nozzle": "CLEAN_NOZZLE",
+    "emergency_stop": "/printer/emergency_stop", "firmware_restart": "/printer/firmware_restart",
+}
+# The Klipper object (lower-cased, as /printer/objects/list names it) an action needs; light's is its macro (see below).
+_ACTION_NEEDS = {
+    "center": "gcode_macro move_to_center", "load_filament": "gcode_macro load_filament",
+    "load_more": "gcode_macro _continue_load_filament", "unload_filament": "gcode_macro unload_filament",
+    "qgl": "quad_gantry_level", "bed_mesh": "bed_mesh", "clean_nozzle": "gcode_macro clean_nozzle",
+}
+# Refused while a print runs or is paused (printer_busy) / refused unless one does (not_printing). Everything else runs in
+# any state: light, and the two endpoint actions.
+_IDLE_ONLY_ACTIONS = frozenset({"home", "jog", "center", "motors_off", "load_filament", "load_more", "unload_filament",
+                                "preheat", "qgl", "bed_mesh", "clean_nozzle", "cooldown"})
+_PRINT_ONLY_ACTIONS = frozenset({"z_offset", "speed", "fan"})
+# Skip the running-action check, the fresh read and the state rules (still not_connected on a stale poll): the way
+# out of a stuck printer.
+_ENDPOINT_ACTIONS = frozenset({"emergency_stop", "firmware_restart"})
+# Minutes, not seconds (homing with the SV08's probe calibration, QGL, a mesh, a heat-and-load): sent on a thread.
+_LONG_ACTIONS = frozenset({"home", "center", "load_filament", "load_more", "unload_filament", "qgl", "bed_mesh",
+                           "clean_nozzle"})
+# The state an action is checked against, read fresh when it arrives (start_print's rule: the poll may be seconds old,
+# and a print just started from the screen or the queue must never get a jog inside its start routine).
+_ACTION_QUERY = "print_stats=state&toolhead=homed_axes,position,axis_minimum,axis_maximum"
+_JOG_STEPS_MM = frozenset({0.1, 1.0, 10.0, 50.0})
+_JOG_FEED = {"x": 6000, "y": 6000, "z": 600}
+# dispatch_commands runs on the heartbeat thread: a short action waits this long for klippy's answer, a long one this long
+# for an immediate refusal before it reports "started".
+ACTION_WAIT_SEC = 2.0
+LONG_ACTION_GRACE_SEC = 1.0
+# Moonraker answers /printer/gcode/script only when the script finished; past this the thread stops waiting (the printer
+# goes on regardless).
+LONG_ACTION_TIMEOUT_SEC = 900.0
+# Which macros and modules a printer has changes only with its config (a Klipper restart); firmware_restart drops it too.
+OBJECTS_LIST_TTL_SEC = 300.0
 
 
 class KlipperAdapter:
@@ -201,6 +261,10 @@ class KlipperAdapter:
         # v0.70: filename -> (metadata or None after a failed fetch, monotonic fetched-at); insertion-ordered so the
         # oldest file is evicted first. Written on the poll thread, read by status() under _lock.
         self._metadata: OrderedDict[str, tuple[Optional[dict], float]] = OrderedDict()
+        # v0.76: the screen's long action in flight (one at a time: klippy would only queue a second behind it), and the
+        # cached /printer/objects/list names (lower-cased) with when they were read.
+        self._running_action: Optional[str] = None
+        self._objects: Optional[tuple[frozenset, float]] = None
 
     # Bambu compat — every adapter exposes these. The model field is only
     # set by Bambu so the agent's status pipeline can omit it.
@@ -575,7 +639,11 @@ class KlipperAdapter:
                                         'stop' command maps here)
         We translate 'stop' → cancel to keep the command vocabulary aligned
         with Bambu's; the admin UI doesn't need to branch on vendor.
+
+        v0.76: 'klipper_action' is the shared touchscreen's named actions (_klipper_action).
         """
+        if command == "klipper_action":
+            return {**self._klipper_action(params), "command": command}
         cmd_path = {
             "pause": "/printer/print/pause",
             "resume": "/printer/print/resume",
@@ -695,6 +763,121 @@ class KlipperAdapter:
             "httpStatus": 200,
         }
 
+    # --- screen controls (v0.76) -----------------------------------------
+    def _klipper_action(self, params: Any) -> dict:
+        """One named action from the shared touchscreen: {ok, reason?, detail?}. Refusals, in order: _parse_action's
+        (unsupported_action, bad_params), not_connected (the poll's liveness rule, as for pause), then for everything but
+        the two endpoint actions action_running (a long one is still going), _check_state's against a fresh read, and
+        unsupported_on_printer (the macro or module is not on this printer).
+
+        How it is sent: Moonraker's POST /printer/gcode/script answers only once the script has run, and everything here
+        talks to Moonraker over stdlib urllib (no websocket client; writing one for this is not worth it). So a short
+        action (a jog, a temperature, the light, M220/M106, SET_GCODE_OFFSET) waits ACTION_WAIT_SEC for its answer, and
+        a long one (homing, QGL, a mesh, load/unload, cleaning, centring) is POSTed from its own daemon thread: the
+        heartbeat thread waits LONG_ACTION_GRACE_SEC for an immediate refusal and reports "started", and a failure that
+        comes back later goes to the log and the diag ring. A short action that times out may still run once klippy is
+        free, so it is reported as timeout, never retried here."""
+        now = time.monotonic()
+        with self._lock:
+            last_ok, running = self._last_poll_ok_at, self._running_action
+        try:
+            action, script, need = _parse_action(params)
+            if last_ok is None or (now - last_ok) > STALE_SEC:
+                raise _Refused("not_connected")
+            if action not in _ENDPOINT_ACTIONS:
+                if running:
+                    raise _Refused("action_running")
+                _check_state(params, self._fetch_once(_ACTION_QUERY, timeout=ACTION_WAIT_SEC))
+                if need and need not in self._printer_objects():
+                    raise _Refused("unsupported_on_printer")
+        except _Refused as refused:
+            return {"ok": False, "reason": refused.reason}
+        except Exception as exc:  # noqa: BLE001 - the fresh state or the objects list could not be read
+            return {"ok": False, "reason": _action_failure(exc)[0]}
+        if action in _LONG_ACTIONS:
+            return self._start_long_action(action, script)
+        path = script if action in _ENDPOINT_ACTIONS else _script_path(script)
+        try:
+            self._post_ok(path, ACTION_WAIT_SEC)
+        except Exception as exc:  # noqa: BLE001
+            reason, message = _action_failure(exc)
+            log.warning("klipper %s: action %s failed: %s %s", self.printer_id, action, reason, message)
+            self._diag("klipper", f"action {action} failed: {reason}")
+            if action == "jog" and isinstance(exc, urllib.error.HTTPError):
+                # klippy stops a script at its first error, so a refused G1 left the printer in G91: put G90 back
+                try:
+                    self._post_ok(_script_path("G90"), ACTION_WAIT_SEC)
+                except Exception as exc2:  # noqa: BLE001
+                    log.warning("klipper %s: G90 after a refused jog failed: %s", self.printer_id, _action_failure(exc2)[0])
+            return {"ok": False, "reason": reason}
+        if action == "firmware_restart":
+            with self._lock:
+                self._objects = None
+        log.info("klipper %s: action %s ok", self.printer_id, action)
+        return {"ok": True}
+
+    def _start_long_action(self, action: str, script: str) -> dict:
+        with self._lock:
+            if self._running_action:
+                return {"ok": False, "reason": "action_running"}
+            self._running_action = action
+        outcome: list[Optional[str]] = []   # appended once by the thread: None = finished ok, else the reason
+
+        def run() -> None:
+            try:
+                self._post_ok(_script_path(script), LONG_ACTION_TIMEOUT_SEC)
+                outcome.append(None)
+                log.info("klipper %s: action %s finished", self.printer_id, action)
+            except Exception as exc:  # noqa: BLE001 - never let the thread die with the action still marked running
+                reason, message = _action_failure(exc)
+                outcome.append(reason)
+                log.warning("klipper %s: action %s failed: %s %s", self.printer_id, action, reason, message)
+                self._diag("klipper", f"action {action} failed: {reason}")
+            finally:
+                with self._lock:
+                    self._running_action = None
+
+        thread = threading.Thread(target=run, name=f"klipper-{action}-{self.printer_id[:8]}", daemon=True)
+        thread.start()
+        thread.join(LONG_ACTION_GRACE_SEC)
+        if outcome and outcome[0] is not None:
+            return {"ok": False, "reason": outcome[0]}
+        return {"ok": True, "detail": "done" if outcome else "started"}
+
+    def _post_ok(self, path: str, timeout: float) -> None:
+        """POST one Moonraker endpoint; returns only on {"result": "ok"}, raises otherwise."""
+        req = urllib.request.Request(
+            f"{self.moonraker_url}{path}", method="POST", data=b"",
+            headers={"Content-Length": "0", "Accept": "application/json", "User-Agent": "makeros-hub-agent"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator LAN URL
+            body = resp.read(8 * 1024)
+        parsed = json.loads(body.decode("utf-8", errors="replace"))
+        if not (isinstance(parsed, dict) and parsed.get("result") == "ok"):
+            raise ValueError("answered without ok")
+
+    def _printer_objects(self) -> frozenset:
+        """GET /printer/objects/list, lower-cased ("gcode_macro load_filament", "quad_gantry_level"), cached for
+        OBJECTS_LIST_TTL_SEC. Raises when it cannot be read: an action is never run on a guess."""
+        now = time.monotonic()
+        with self._lock:
+            cached = self._objects
+        if cached is not None and now - cached[1] < OBJECTS_LIST_TTL_SEC:
+            return cached[0]
+        req = urllib.request.Request(f"{self.moonraker_url}/printer/objects/list",
+                                     headers={"Accept": "application/json", "User-Agent": "makeros-hub-agent"})
+        with urllib.request.urlopen(req, timeout=ACTION_WAIT_SEC) as resp:  # noqa: S310 - operator LAN URL
+            body = resp.read(256 * 1024)
+        parsed = json.loads(body.decode("utf-8", errors="replace"))
+        result = parsed.get("result") if isinstance(parsed, dict) else None
+        objects = result.get("objects") if isinstance(result, dict) else None
+        if not isinstance(objects, list):
+            raise ValueError("missing objects")
+        names = frozenset(o.lower() for o in objects if isinstance(o, str))
+        with self._lock:
+            self._objects = (names, now)
+        return names
+
     # --- polling loop -----------------------------------------------------
     def _poll_loop(self, stop: threading.Event) -> None:
         while not stop.is_set():
@@ -773,12 +956,12 @@ class KlipperAdapter:
             self._job_tracker.observe(data, time.monotonic())
         return was_first
 
-    def _fetch_once(self, query: str = _QUERY_OBJECTS) -> dict[str, Any]:
+    def _fetch_once(self, query: str = _QUERY_OBJECTS, *, timeout: float = HTTP_GET_TIMEOUT_SEC) -> dict[str, Any]:
         url = f"{self.moonraker_url}/printer/objects/query?{query}"
         req = urllib.request.Request(
             url, headers={"Accept": "application/json", "User-Agent": "makeros-hub-agent"}
         )
-        with urllib.request.urlopen(req, timeout=HTTP_GET_TIMEOUT_SEC) as resp:  # noqa: S310 - operator LAN URL
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator LAN URL
             body = resp.read(64 * 1024)
         parsed = json.loads(body.decode("utf-8", errors="replace"))
         # Moonraker shape: { result: { status: { print_stats: {...}, ... } } }
@@ -1015,6 +1198,32 @@ def _build_status(
             if target is not None:
                 out["bedTargetC"] = target
 
+        # v0.76: what the shared touchscreen shows beside its controls; each omitted unless Moonraker gave a number (it
+        # answers an object the printer lacks with null attributes).
+        toolhead = status.get("toolhead")
+        if isinstance(toolhead, dict) and isinstance(toolhead.get("homed_axes"), str):
+            head: dict[str, Any] = {"homed": toolhead["homed_axes"]}
+            xyz = [_axis(toolhead.get("position"), i) for i in range(3)]
+            if None not in xyz:
+                head.update(zip("xyz", (round(v, 2) for v in xyz)))
+            out["toolhead"] = head
+        move = status.get("gcode_move")
+        if isinstance(move, dict):
+            factor = _num(move.get("speed_factor"))
+            if factor is not None:
+                out["speedPct"] = round(factor * 100)
+            z_offset = _axis(move.get("homing_origin"), 2)
+            if z_offset is not None:
+                out["zOffset"] = round(z_offset, 3)
+        fan_speeds = [_num(f.get("speed")) for f in (status.get("fan"), status.get("fan_generic fan0")) if isinstance(f, dict)]
+        fan_speed = next((v for v in fan_speeds if v is not None), None)
+        if fan_speed is not None:
+            out["fanPct"] = round(fan_speed * 100)
+        led = status.get("output_pin main_led")
+        led_value = _num(led.get("value")) if isinstance(led, dict) else None
+        if led_value is not None:
+            out["light"] = led_value > 0
+
         # If print_stats said nothing, default to idle so the cloud doesn't
         # render this connection as 'offline' (no state) by accident.
         if "state" not in out:
@@ -1109,6 +1318,122 @@ def _classify_url_error(err: urllib.error.URLError) -> str:
     # Generic socket error / OSError — most often connection refused or
     # no-route-to-host. 'unreachable' is the safe default.
     return "unreachable"
+
+
+class _Refused(Exception):
+    """A klipper_action the hub will not run; `reason` is the directional word the site shows."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def _finite(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+
+def _whole(v: Any, low: int, high: int) -> bool:
+    return isinstance(v, int) and not isinstance(v, bool) and low <= v <= high
+
+
+def _axis(v: Any, i: int) -> Optional[float]:
+    return _num(v[i]) if isinstance(v, list) and len(v) > i else None
+
+
+def _script_path(script: str) -> str:
+    return "/printer/gcode/script?" + urllib.parse.urlencode({"script": script}, quote_via=urllib.parse.quote)
+
+
+def _parse_action(params: Any) -> tuple[str, str, Optional[str]]:
+    """Pure: the site's klipper_action params -> (action, the G-code script or Moonraker endpoint path, the Klipper object
+    it needs or None). Raises _Refused: unsupported_action, then bad_params (every param type, range and key checked)."""
+    action = params.get("action") if isinstance(params, dict) else None
+    if not isinstance(action, str) or action not in _ACTION_PARAMS:
+        raise _Refused("unsupported_action")
+    if set(params) != {"action", *_ACTION_PARAMS[action]}:
+        raise _Refused("bad_params")
+    need = _ACTION_NEEDS.get(action)
+    if action in _PLAIN_ACTIONS:
+        script = _PLAIN_ACTIONS[action]
+    elif action == "jog":
+        axis, mm = params["axis"], params["mm"]
+        if not isinstance(axis, str) or axis not in _JOG_FEED or not _finite(mm) or abs(mm) not in _JOG_STEPS_MM:
+            raise _Refused("bad_params")
+        script = f"G91\nG1 {axis.upper()}{mm:g} F{_JOG_FEED[axis]}\nG90"
+    elif action == "preheat":
+        if not (_whole(params["nozzle"], 0, 300) and _whole(params["bed"], 0, 110)):
+            raise _Refused("bad_params")
+        script = f"M104 S{params['nozzle']}\nM140 S{params['bed']}"
+    elif action == "light":
+        if not isinstance(params["on"], bool):
+            raise _Refused("bad_params")
+        script = "mainled_on" if params["on"] else "mainled_off"
+        need = f"gcode_macro {script}"
+    elif action == "z_offset":
+        delta = params["delta"]
+        if not (_finite(delta) and 0 < abs(delta) <= 0.1):
+            raise _Refused("bad_params")
+        script = f"SET_GCODE_OFFSET Z_ADJUST={delta:g} MOVE=1"
+    elif action == "speed":
+        if not _whole(params["pct"], 10, 300):
+            raise _Refused("bad_params")
+        script = f"M220 S{params['pct']}"
+    else:  # fan
+        if not _whole(params["pct"], 0, 100):
+            raise _Refused("bad_params")
+        script = f"M106 S{round(params['pct'] * 2.55)}"
+    return action, script, need
+
+
+def _check_state(params: dict, status: dict[str, Any]) -> None:
+    """Pure: may this parsed action run in `status` (an objects query with print_stats and toolhead)? Raises _Refused:
+    printer_stale, printer_busy / not_printing ("printing" and "paused" both count as a print), not_homed, out_of_range."""
+    action, axis, mm = params["action"], params.get("axis"), params.get("mm")
+    if action in _ENDPOINT_ACTIONS:
+        return
+    stats = status.get("print_stats")
+    state = stats.get("state") if isinstance(stats, dict) else None
+    if not isinstance(state, str):
+        raise _Refused("printer_stale")
+    printing = state in ("printing", "paused")
+    if printing and action in _IDLE_ONLY_ACTIONS:
+        raise _Refused("printer_busy")
+    if not printing and action in _PRINT_ONLY_ACTIONS:
+        raise _Refused("not_printing")
+    if action == "jog":
+        toolhead = status.get("toolhead") if isinstance(status.get("toolhead"), dict) else {}
+        homed = toolhead.get("homed_axes")
+        if not isinstance(homed, str) or axis not in homed:
+            raise _Refused("not_homed")
+        i = "xyz".index(axis)
+        pos, low, high = (_axis(toolhead.get(k), i) for k in ("position", "axis_minimum", "axis_maximum"))
+        if pos is None or low is None or high is None:
+            raise _Refused("printer_stale")
+        # toolhead.position is the commanded position, the frame axis_minimum/maximum are in (a relative G1 moves it by mm)
+        if not low - 1e-6 <= pos + mm <= high + 1e-6:
+            raise _Refused("out_of_range")
+
+
+def _action_failure(err: BaseException) -> tuple[str, str]:
+    """(directional reason, Klipper's message for the log) for a failed action. Klipper's own refusals are 400s that name
+    themselves ("Must home axis first", "Move out of range"), mapped to the words the hub's own checks use (Klipper checks
+    the same limits, against moves the hub cannot see coming)."""
+    if isinstance(err, urllib.error.HTTPError):
+        try:
+            message = _extract_moonraker_error_message(err.read(8 * 1024).decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            message = ""
+        m = message.lower()
+        if "must home" in m:
+            return "not_homed", message
+        if "out of range" in m:
+            return "out_of_range", message
+        if "shutdown" in m or "not ready" in m:
+            return "klipper_error", message
+        return ("gcode_error" if err.code == 400 else _classify_control_http_error(err.code, "")), message
+    if isinstance(err, urllib.error.URLError):
+        return _classify_url_error(err), ""
+    return _classify_error(err), ""
 
 
 class KlipperJobTracker:
