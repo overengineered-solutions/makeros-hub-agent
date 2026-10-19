@@ -56,3 +56,20 @@ def test_sleep_until_wakes_early_and_otherwise_waits_out_the_interval():
     ev.wait = real_wait
     stop.set()
     assert wake.sleep_until(stop, ev, 30) is False
+
+
+def test_watch_hands_the_live_views_over_at_once_v075():
+    stop, ev, got = threading.Event(), threading.Event(), []
+    answers = [R(200, {"work": True, "seq": 1, "cameraLive": [{"printerId": "p", "until": 5}]}), R(200, {"work": False, "seq": 1})]
+
+    def get(url, bearer, timeout):
+        if not answers:
+            stop.set()
+            return R(200, {"work": False, "seq": 1})
+        return answers.pop(0)
+
+    def boom(_):
+        got.append(_)
+        raise RuntimeError("a bad live update must not stop the wake lane")
+    wake.watch("u", "t", ev, stop, get=get, pause=lambda s: None, on_live=boom)
+    assert got == [[{"printerId": "p", "until": 5}]] and ev.is_set()

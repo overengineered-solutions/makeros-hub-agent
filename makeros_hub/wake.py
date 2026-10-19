@@ -5,6 +5,8 @@ every 30 s; between beats this thread holds one long request open on GET /api/pr
 answers within 25 s, at once when a job, a ready file, a cleared plate, a Pause or Stop, or a paper print appears for this
 box) and sets `wake`, which ends the heartbeat loop's sleep early. A site without the route (404) is left alone for ten
 minutes; any other failure backs off ten seconds. It never sends anything itself: the heartbeat does the work.
+v0.75: the answer also carries the site's live views (`cameraLive`), handed to `on_live` at once, so a live view's first
+frame does not wait for the heartbeat's camera beat.
 """
 from __future__ import annotations
 
@@ -17,7 +19,7 @@ from .http import TransportError, get_json
 log = logging.getLogger("makeros_hub.wake")
 
 
-def watch(url: str, bearer: str, wake: threading.Event, stop: threading.Event, *, get=get_json, pause=None) -> None:
+def watch(url: str, bearer: str, wake: threading.Event, stop: threading.Event, *, get=get_json, pause=None, on_live=None) -> None:
     pause = pause or stop.wait
     seq = -1
     while not stop.is_set():
@@ -28,6 +30,11 @@ def watch(url: str, bearer: str, wake: threading.Event, stop: threading.Event, *
                 seq = body["seq"]
             if body.get("work") is True:
                 wake.set()
+            if on_live is not None and isinstance(body.get("cameraLive"), list):
+                try:
+                    on_live(body["cameraLive"])
+                except Exception as e:  # noqa: BLE001 - a live-view hiccup must never stop the wake lane
+                    log.warning("wake watch: live view update failed: %s", e.__class__.__name__)
             if resp.status == 404:
                 pause(600)
             elif resp.status != 200:
@@ -50,7 +57,7 @@ def sleep_until(stop: threading.Event, wake: threading.Event, seconds: float, cl
     return False
 
 
-def start(cfg, bearer: str, wake: threading.Event, stop: threading.Event) -> threading.Thread:
-    t = threading.Thread(target=watch, args=(cfg.wait_url, bearer, wake, stop), name="wake-watch", daemon=True)
+def start(cfg, bearer: str, wake: threading.Event, stop: threading.Event, on_live=None) -> threading.Thread:
+    t = threading.Thread(target=watch, args=(cfg.wait_url, bearer, wake, stop), kwargs={"on_live": on_live}, name="wake-watch", daemon=True)
     t.start()
     return t

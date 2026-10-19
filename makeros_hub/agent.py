@@ -50,7 +50,9 @@ from .printers.manager import SLICE_RUNNER, PrinterManager
 from . import paper as paper_lane
 from . import wake as wake_lane
 from . import job_files
-from .printers.camera import FF_SLOTS, CameraScheduler, collect_camera_frames, prime_camera_capabilities
+from .printers.camera import FF_SLOTS, CameraScheduler, camera_source_kind, collect_camera_frames, prime_camera_capabilities
+from .gateway import GATEWAY
+from .live import LiveViews
 from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples, stub_detector
 from .printers.onnx_detector import (
     DetectorHolder,
@@ -770,6 +772,8 @@ def heartbeat_payload(
     vp_connects: list[dict] | None = None,
     slicer_ready: bool | None = None,
     paper_ready: bool | None = None,
+    camera_gateway: bool | None = None,
+    camera_live_stats: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -847,6 +851,12 @@ def heartbeat_payload(
         payload["slicerReady"] = bool(slicer_ready)
     if paper_ready is not None:
         payload["paperReady"] = bool(paper_ready)   # v0.73: the site hands paper jobs only to a box that can render them
+    # v0.75: whether the camera gateway answered recently (the site offers live view of the RTSPS printers only while it
+    # did), and each live view's frames sent / failed / average post ms, or why the hub could not run one
+    if camera_gateway is not None:
+        payload["cameraGateway"] = bool(camera_gateway)
+    if camera_live_stats:
+        payload["cameraLiveStats"] = list(camera_live_stats)[:8]
     # Lasers (v0.68): plug state, runs and gate link per laser in config-down (omitted when it lists none), and the
     # gate's verdicts on member files the cloud offered.
     if lasers:
@@ -1539,6 +1549,18 @@ def run(
     # Warm the ffmpeg socket-timeout capability probe now (at boot) so the first
     # camera beat doesn't pay the probe inside its capture deadline.
     prime_camera_capabilities()
+
+    # v0.75: live view, one frame a second while a member watches (live.py), through the camera gateway for the RTSPS
+    # printers (gateway.py). The site lists the views in its heartbeat and wake answers.
+    def _live_post(view, jpeg: bytes) -> int:
+        from urllib.parse import urlencode
+        q = urlencode({"printerId": view.printer_id, "sourceId": view.source_id})
+        return post_bytes(f"{cfg.camera_live_url}?{q}", jpeg, content_type="image/jpeg", bearer=credential, timeout=10.0)
+
+    live_views = LiveViews(
+        targets=lambda: {t["printerId"]: t for t in manager.camera_targets()
+                         if isinstance(t.get("printerId"), str) and (camera_enabled or t.get("cameraEnabled"))},
+        post=_live_post, gateway=GATEWAY)
     # V5 AI failure-watch — per-printer EWMA smoothing state (cold-start on a
     # re-enable or a stale gap so a fresh print doesn't inherit the prior
     # print's tail). The cloud applies the sensitivity-keyed threshold.
@@ -1605,7 +1627,7 @@ def run(
     start_telemetry(cfg, credential, manager.live_statuses, stop_event)
     # v0.73: check in at once when the site has new work for this box, instead of waiting out the 30 s beat
     wake_event = threading.Event()
-    wake_lane.start(cfg, credential, wake_event, stop_event)
+    wake_lane.start(cfg, credential, wake_event, stop_event, on_live=live_views.update)
     job_files.start(cfg, credential, stop_event)   # v0.74: copies OrcaSlicer sends up while the site's open queue asks
 
     # Start the OrcaSlicer ingest server (inbound HTTP on the LAN). Best-effort:
@@ -1733,6 +1755,8 @@ def run(
                     camera_scheduler.forget(
                         {t["printerId"] for t in eligible if t.get("printerId")}
                     )
+                    # v0.75: the gateway holds the camera-enabled RTSPS printers' streams (one GET every few minutes)
+                    GATEWAY.ensure_streams([t for t in eligible if camera_source_kind(t) == "bambu-rtsp"])
                     if eligible:
                         status_by_id = {
                             s.get("printerId"): s for s in statuses if s.get("printerId")
@@ -1985,6 +2009,8 @@ def run(
                         vp_connects=vp_connects,
                         slicer_ready=os.path.isfile(SLICE_RUNNER) and os.access(SLICE_RUNNER, os.X_OK),
                         paper_ready=paper_lane.paper_ready(),
+                        camera_gateway=GATEWAY.available(),
+                        camera_live_stats=live_views.stats(),
                     ),
                     bearer=credential,
                     retries=3,
@@ -2107,6 +2133,10 @@ def run(
                     # v0.69: printers the site wants on the 20 s tier (dirty idle plate, a plate tap, no photo); absent =
                     # an older site, and the scheduler falls back to config-down's cameraDense
                     camera_want = _camera_want(resp.body)
+                    try:
+                        live_views.update(resp.body.get("cameraLive"))   # v0.75; absent = an older site, workers untouched
+                    except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
+                        _record_diagnostic(diagnostics, "camera", f"live view update failed: {redact(str(exc))}")
                     # Re-pull the printer config when the cloud says it changed
                     # (a printer was added/edited/removed in the admin UI).
                     new_version = resp.body.get("configVersion")
@@ -2198,6 +2228,7 @@ def run(
         except Exception as exc:  # noqa: BLE001 - best-effort shutdown
             log.warning("virtual printer shutdown failed: %s", redact(str(exc)))
         manager.stop_all()
+        live_views.stop_all()
         laser_hub.stop()
         if ingest is not None:
             ingest.stop()

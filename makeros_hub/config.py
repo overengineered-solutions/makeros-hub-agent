@@ -119,6 +119,11 @@ class Config:
         return self.cloud_url.rstrip("/") + "/api/print/hub/camera"
 
     @property
+    def camera_live_url(self) -> str:
+        """POST one live-view frame (v0.75, raw JPEG): the site keeps only the newest, in memory."""
+        return self.cloud_url.rstrip("/") + "/api/print/hub/camera/live"
+
+    @property
     def queue_status_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/queue-status"
 

@@ -43,6 +43,7 @@ from .rtsp_camera import capture_frame as _rtsp_capture_frame
 from .rtsp_camera import capture_frame_with_reason as _rtsp_capture_with_reason
 from .rtsp_camera import _supported_timeout_flag as _rtsp_supported_timeout_flag
 from .rtsp_camera import _DEFAULT_TIMEOUT as _RTSP_DEADLINE_S
+from ..gateway import GATEWAY
 
 
 def prime_camera_capabilities() -> None:
@@ -185,6 +186,27 @@ def _snapshot_url(printer: dict[str, Any]) -> Optional[str]:
     return None
 
 
+GATEWAY_SKIP_S = 600.0
+_gateway_skip: dict[str, float] = {}   # printer id -> monotonic time the gateway is tried again after a timeout
+
+
+def _via_gateway(printer: dict[str, Any]) -> Optional[tuple[Optional[bytes], Optional[str], str]]:
+    """v0.75: an RTSPS still from the camera gateway when it holds this printer's stream, or None for the direct ffmpeg
+    path. A gateway timeout is the answer (the direct path would wait out the same dead camera past the beat) and sends
+    this printer direct for GATEWAY_SKIP_S; any other gateway failure falls through to the direct path, which names the
+    printer's own reason (liveview-off, auth-fail)."""
+    pid = printer.get("printerId")
+    if not GATEWAY.serves(pid) or time.monotonic() < _gateway_skip.get(pid, 0.0):
+        return None
+    jpeg, reason, detail = GATEWAY.frame(pid)
+    if jpeg:
+        return (jpeg, None, "")
+    if reason == "timeout":
+        _gateway_skip[pid] = time.monotonic() + GATEWAY_SKIP_S
+        return (None, "timeout", detail)
+    return None
+
+
 def capture_printer_frame(printer: dict[str, Any]) -> Optional[bytes]:
     """Capture one JPEG frame for `printer` using the source that fits its
     vendor, or None when there's no (working) camera path. Never raises."""
@@ -192,6 +214,9 @@ def capture_printer_frame(printer: dict[str, Any]) -> Optional[bytes]:
     if kind == "bambu-lan":
         return _bambu_capture_frame(str(printer.get("host")), str(printer.get("accessCode")))
     if kind == "bambu-rtsp":
+        via = _via_gateway(printer)
+        if via is not None:
+            return via[0]
         return _rtsp_capture_frame(str(printer.get("host")), str(printer.get("accessCode")))
     if kind == "http-snapshot":
         return http_snapshot(_snapshot_url(printer) or "")
@@ -222,6 +247,9 @@ def capture_printer_frame_with_reason(printer: dict[str, Any]) -> tuple[Optional
             return (r.jpeg, None, "")
         return (None, r.reason or "unknown", r.detail)
     if kind == "bambu-rtsp":
+        via = _via_gateway(printer)
+        if via is not None:
+            return via
         result: _RtspResult = _rtsp_capture_with_reason(
             str(printer.get("host")), str(printer.get("accessCode"))
         )

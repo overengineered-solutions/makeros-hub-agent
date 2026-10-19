@@ -126,6 +126,14 @@ class TestSlicerReady(unittest.TestCase):
         self.assertIs(heartbeat_payload(slicer_ready=False)["slicerReady"], False)
         self.assertNotIn("slicerReady", heartbeat_payload())
 
+    def test_heartbeat_names_the_camera_gateway_and_live_view_stats_v075(self):
+        p = heartbeat_payload(camera_gateway=True, camera_live_stats=[{"printerId": "p", "sent": 3, "failed": 0, "postMs": 80}])
+        self.assertIs(p["cameraGateway"], True)
+        self.assertEqual(p["cameraLiveStats"], [{"printerId": "p", "sent": 3, "failed": 0, "postMs": 80}])
+        self.assertIs(heartbeat_payload(camera_gateway=False)["cameraGateway"], False)
+        self.assertNotIn("cameraLiveStats", heartbeat_payload(camera_live_stats=[]))
+        self.assertNotIn("cameraGateway", heartbeat_payload())
+
 
 if __name__ == "__main__":
     unittest.main()
