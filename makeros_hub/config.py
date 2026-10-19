@@ -86,6 +86,10 @@ class Config:
     def config_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/config"
 
+    def job_file_url(self, job_id: str) -> str:
+        # v0.74: copy an OrcaSlicer send's file to the site so the job can move between boxes (makeros_hub/job_files.py)
+        return self.cloud_url.rstrip("/") + "/api/print/hub/job-file/" + job_id
+
     @property
     def wait_url(self) -> str:
         # v0.73: the long-poll that ends the heartbeat sleep when the site has new work for this box (makeros_hub/wake.py)

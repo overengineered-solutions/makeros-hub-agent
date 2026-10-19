@@ -49,6 +49,7 @@ from .probes import PROBES, run_probe, set_camera_targets_provider, set_effectiv
 from .printers.manager import SLICE_RUNNER, PrinterManager
 from . import paper as paper_lane
 from . import wake as wake_lane
+from . import job_files
 from .printers.camera import FF_SLOTS, CameraScheduler, collect_camera_frames, prime_camera_capabilities
 from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples, stub_detector
 from .printers.onnx_detector import (
@@ -493,6 +494,7 @@ def _drain_vprinter_submissions(
             )
             if outbox is not None:
                 outbox.remove(job.submission_uid)
+            job_files.offer(resp.body.get("jobId"), job.file_path)   # v0.74: so the job can move to another box's printer
             continue
 
         if resp.status == 200 and _rejected_submission(resp.body):
@@ -1604,6 +1606,7 @@ def run(
     # v0.73: check in at once when the site has new work for this box, instead of waiting out the 30 s beat
     wake_event = threading.Event()
     wake_lane.start(cfg, credential, wake_event, stop_event)
+    job_files.start(cfg, credential, stop_event)   # v0.74: copies OrcaSlicer sends up while the site's open queue asks
 
     # Start the OrcaSlicer ingest server (inbound HTTP on the LAN). Best-effort:
     # if the port is taken we log + continue (heartbeat/telemetry still work).
@@ -2035,6 +2038,7 @@ def run(
                             len(dispatch_reports),
                             len(assignments) if isinstance(assignments, list) else 0,
                         )
+                    job_files.want(resp.body.get("uploadJobFiles") is True)   # v0.74: the site's open queue is on
                     fetches = resp.body.get("fetches")
                     if isinstance(fetches, list) and fetches and fetch_lock.acquire(blocking=False):
                         # off the heartbeat thread (codex v0.57 r1): a slow download must never stall telemetry; one
