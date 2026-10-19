@@ -27,7 +27,9 @@ def test_picks_the_loaded_spools_own_preset_then_the_generic_one():
         "Generic PLA @BBL P2S": {"name": "Generic PLA @BBL P2S", "instantiation": "true", "filament_id": "GFL99", "compatible_printers": ["Bambu Lab P2S 0.4 nozzle"]},
     }
     assert ps.pick_filament(idx, m, "A1M", "PLA", "GFA00") == "Bambu PLA Basic @BBL A1M"
+    # 2026-10-19 (operator): an id the slicer does not know, stated as plain PLA, prints as generic PLA
     assert ps.pick_filament(idx, m, "A1M", "PLA", "GFZZ9") == "Generic PLA @BBL A1M"
+    assert ps.pick_filament(idx, m, "A1M", "PLA", "GFZZ9", "PLA") == "Generic PLA @BBL A1M"
     assert ps.pick_filament(idx, m, "A1M", "PLA", None) == "Generic PLA @BBL A1M"
     with pytest.raises(ps.SliceError):
         ps.pick_filament(idx, m, "A1M", "TPU", None)

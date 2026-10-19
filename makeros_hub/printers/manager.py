@@ -68,7 +68,9 @@ def slice_spec_of(spec: dict) -> dict:
     fil = spec.get("filament") if isinstance(spec.get("filament"), dict) else {}
     fixes = spec.get("fixes") if isinstance(spec.get("fixes"), dict) else {}
     out: dict = {"model": spec.get("model"),
-                 "filament": {k: fil.get(k) for k in ("type", "colorHex", "trayInfoIdx")},
+                 # material (v0.74.1): the spool's stated material, only when the site sends one
+                 "filament": {**{k: fil.get(k) for k in ("type", "colorHex", "trayInfoIdx")},
+                              **({"material": fil["material"]} if isinstance(fil.get("material"), str) and fil["material"].strip() else {})},
                  "fixes": {k: bool(fixes.get(k)) for k in ("orient", "brim", "supports") if k in fixes}}
     if isinstance(spec.get("scale"), (int, float)) and not isinstance(spec.get("scale"), bool):
         out["scale"] = float(spec["scale"])

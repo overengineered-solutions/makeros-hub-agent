@@ -68,6 +68,8 @@ def read_spec(raw: dict) -> dict:
         raise SliceError(f"automatic slicing does not know the material {fil.get('type')!r}")
     color = fil.get("colorHex")
     tray = fil.get("trayInfoIdx")
+    # the spool's stated material as the printer reports it ("PLA", "PETG-CF"); absent from a site before 2026-10-19
+    stated = str(fil.get("material") or "").strip().upper()[:24] or None
     fixes = raw.get("fixes") or {}
     scale = raw.get("scale", 1.0)
     if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not 0.05 <= float(scale) <= 20:
@@ -76,6 +78,7 @@ def read_spec(raw: dict) -> dict:
         "mesh": mesh, "model": model, "type": ftype,
         "color": color if isinstance(color, str) and HEX_RE.match(color) else None,
         "tray": tray if isinstance(tray, str) and TRAY_RE.match(tray) else None,
+        "stated": stated,
         "orient": bool(fixes.get("orient", True)), "brim": bool(fixes.get("brim")), "supports": bool(fixes.get("supports")),
         "scale": float(scale),
     }
@@ -113,14 +116,25 @@ def flatten(index: dict[str, dict], name: str) -> dict:
     return flat
 
 
-def pick_filament(index: dict[str, dict], machine: str, sfx: str, ftype: str, tray: str | None) -> str:
-    """The loaded spool's own preset when there is one for this printer (same Bambu filament id), else the generic one."""
+def pick_filament(index: dict[str, dict], machine: str, sfx: str, ftype: str, tray: str | None, stated: str | None = None) -> str:
+    """The loaded spool's own preset for this printer (same Bambu filament id). Operator, 2026-10-19: "automatic slicing
+    should absolutely use exact profiles of not only specialty spools but any we have information for", and "if we dont know
+    what it is but it is stated as pla then its okay to go generic ... i mainly meant when we know what it is". So: a spool
+    whose id has a preset for this printer always gets that preset. A spool the slicer does not know, stated as the plain
+    material (PLA, PETG), gets the generic preset of that material. One stated as a variant (PETG-CF, PLA-CF) with no exact
+    preset is refused: a carbon-fibre spool sliced as plain PETG is the failure this guards.
+
+    A preset belongs to this printer when its name carries "@BBL <model>" OR its compatible_printers names the printer:
+    Bambu's base printer, the X1 Carbon, has its presets without a suffix ("Generic PLA"), so a name-only search sliced the
+    X1C's generic spools with Bambu PLA Basic's settings (2026-10-19 coverage check against OrcaSlicer 2.4.2)."""
     def compatible(d: dict) -> bool:
         cp = d.get("compatible_printers")
         return d.get("instantiation") == "true" and (not cp or machine in cp)
     candidates = []
     for name, d in index.items():
-        if not compatible(d) or f"@BBL {sfx}" not in name or "nozzle" in name and "0.4 nozzle" not in name:
+        cp = d.get("compatible_printers") or []
+        mine = f"@BBL {sfx}" in name or machine in cp
+        if not compatible(d) or not mine or "nozzle" in name and "0.4 nozzle" not in name:
             continue
         flat_id = None
         n, guard = name, 0
@@ -130,11 +144,20 @@ def pick_filament(index: dict[str, dict], machine: str, sfx: str, ftype: str, tr
             guard += 1
         candidates.append((name, flat_id))
     if tray:
-        for name, fid in candidates:
-            if fid == tray:
-                return name
+        exact = sorted(name for name, fid in candidates if fid == tray)
+        if exact:
+            # several presets can share an id (a "@BBL X1C" variant and the unsuffixed base); prefer the printer's own name
+            return next((n for n in exact if f"@BBL {sfx}" in n), exact[0])
+        if stated and stated != ftype:
+            # the middle ground (operator, 2026-10-19: "some generic or bambu profiles for things like petg CF that might be
+            # worth falling back to"): the same variant's generic or Bambu preset for this printer, never plain PETG for CF
+            family = [n for n, _fid in candidates if n.upper().startswith((f"GENERIC {stated} ", f"BAMBU {stated} ")) or n.upper() in (f"GENERIC {stated}", f"BAMBU {stated}")]
+            if family:
+                return next((n for n in sorted(family) if n.startswith("Generic")), sorted(family)[0])
+            raise SliceError(f"the shop has no slicer profile for this {stated} spool ({tray}) on this printer")
     for name, _fid in candidates:
-        if name.startswith(f"Generic {ftype} @BBL {sfx}"):
+        # the X1C's generic is plain "Generic PLA"; the others carry "@BBL <model>"
+        if name.startswith(f"Generic {ftype} @BBL {sfx}") or name == f"Generic {ftype}":
             return name
     for name, _fid in candidates:
         if name.startswith(f"Bambu {ftype}") and "Basic" in name:
@@ -191,7 +214,7 @@ def run(job_dir: str = JOB) -> dict:
         process.update({"brim_type": "outer_only", "brim_width": "5"})
     if spec["supports"]:
         process.update({"enable_support": "1", "support_type": "tree(auto)"})
-    filament_name = pick_filament(filaments, machine_name, sfx, spec["type"], spec["tray"])
+    filament_name = pick_filament(filaments, machine_name, sfx, spec["type"], spec["tray"], spec.get("stated"))
     filament = flatten(filaments, filament_name)
     if spec["color"]:
         filament["filament_colour"] = [spec["color"]]
