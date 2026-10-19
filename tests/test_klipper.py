@@ -907,3 +907,42 @@ class TestKlipperStrict200(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestGigaBedZones(unittest.TestCase):
+    """v0.76: the OrangeStorm Giga's bed is four zones and its start G-code heats only those under the part. Shapes as the Giga
+    and the SV08 answered the same query on 2026-10-19 (an absent zone comes back with null attributes)."""
+
+    def _status(self, *zones):
+        names = ("heater_bed", "heater_generic heater_bed1", "heater_generic heater_bed2", "heater_generic heater_bed3")
+        st = {"print_stats": {"state": "printing", "filename": "giga.gcode", "print_duration": 60.0}}
+        for name, zone in zip(names, zones):
+            st[name] = zone
+        return st
+
+    def test_the_query_asks_for_every_zone_url_encoded(self):
+        from makeros_hub.printers import klipper
+        for part in ("&heater_bed=temperature,target", "&heater_generic%20heater_bed1=temperature,target",
+                     "&heater_generic%20heater_bed3=temperature,target"):
+            self.assertIn(part, klipper._QUERY_OBJECTS)
+        self.assertNotIn(" ", klipper._QUERY_OBJECTS)
+
+    def test_a_print_on_zone_two_shows_zone_two(self):
+        out = _build_status("g", self._status({"temperature": 23.1, "target": 0.0}, {"temperature": 23.0, "target": 0.0},
+                                              {"temperature": 58.4, "target": 60.0}, {"temperature": 23.2, "target": 0.0}), "connected")
+        self.assertEqual((out["bedTempC"], out["bedTargetC"]), (58.4, 60.0))
+
+    def test_all_off_shows_the_hottest_zone_cooling(self):
+        out = _build_status("g", self._status({"temperature": 31.0, "target": 0.0}, {"temperature": 44.5, "target": 0.0},
+                                              {"temperature": 25.0, "target": 0.0}, {"temperature": 22.0, "target": 0.0}), "connected")
+        self.assertEqual((out["bedTempC"], out["bedTargetC"]), (44.5, 0.0))
+
+    def test_a_single_bed_printer_reads_as_before(self):
+        absent = {"temperature": None, "target": None}
+        out = _build_status("s", self._status({"temperature": 54.96, "target": 55.0}, absent, absent, absent), "connected")
+        self.assertEqual((out["bedTempC"], out["bedTargetC"]), (54.96, 55.0))
+        only_temp = _build_status("s", self._status({"temperature": 60.1}), "connected")   # an older answer with no target
+        self.assertEqual(only_temp["bedTempC"], 60.1)
+        self.assertNotIn("bedTargetC", only_temp)
+        self.assertNotIn("bedTempC", _build_status("s", self._status(absent, absent), "connected"))
+

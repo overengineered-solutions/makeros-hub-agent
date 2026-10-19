@@ -114,11 +114,15 @@ JOB_NAME_MAX_CHARS = 300
 # v0.70: print_stats.info (SET_PRINT_STATS_INFO layers) and message, toolhead.homed_axes and idle_timeout.state join the
 # same request (Moonraker omits any object or attribute a printer does not have, so an older Klipper is unaffected). The
 # operator, 2026-10-15: "it says printing but... it also looks like its been sitting there for a long time".
+# v0.76: the Elegoo OrangeStorm Giga's bed is four zones, heater_bed plus "heater_generic heater_bed1".."3", and its OrcaSlicer
+# start G-code heats only the zones under the part, so heater_bed alone read "23 C" under a print on zone 2. A printer without
+# the zones answers them with null attributes (checked on the Giga's Klipper and the SV08's, 2026-10-19).
+BED_ZONES = ("heater_bed", "heater_generic heater_bed1", "heater_generic heater_bed2", "heater_generic heater_bed3")
 _QUERY_OBJECTS = (
     "print_stats=state,filename,print_duration,total_duration,info,message"
     "&extruder=temperature,target"
-    "&heater_bed=temperature,target"
-    "&virtual_sdcard=progress"
+    + "".join(f"&{urllib.parse.quote(zone)}=temperature,target" for zone in BED_ZONES)
+    + "&virtual_sdcard=progress"
     "&display_status=progress,message"
     "&toolhead=homed_axes"
     "&idle_timeout=state"
@@ -991,19 +995,25 @@ def _build_status(
                 if eta_sec is not None and eta_sec > 0:
                     out["etaMinutes"] = int(eta_sec / 60)
 
-        for obj, current_key, target_key in (
-            ("extruder", "nozzleTempC", "nozzleTargetC"),
-            ("heater_bed", "bedTempC", "bedTargetC"),
-        ):
-            heater = status.get(obj)
-            if isinstance(heater, dict):
-                t = _num(heater.get("temperature"))
-                if t is not None:
-                    out[current_key] = t
-                # The target tells 140/140 (held for calibration) from 140/215 (heating); today's card could not.
-                target = _num(heater.get("target"))
-                if target is not None:
-                    out[target_key] = target
+        heater = status.get("extruder")
+        if isinstance(heater, dict):
+            t = _num(heater.get("temperature"))
+            if t is not None:
+                out["nozzleTempC"] = t
+            # The target tells 140/140 (held for calibration) from 140/215 (heating); today's card could not.
+            target = _num(heater.get("target"))
+            if target is not None:
+                out["nozzleTargetC"] = target
+        # The bed is the zone with the highest target, else the hottest one (a bed cooling after a print).
+        zones = [(_num(z.get("target")), _num(z.get("temperature")))
+                 for z in (status.get(name) for name in BED_ZONES) if isinstance(z, dict)]
+        zones = [z for z in zones if z != (None, None)]
+        if zones:
+            target, t = max(zones, key=lambda z: (z[0] or 0.0, -1e9 if z[1] is None else z[1]))
+            if t is not None:
+                out["bedTempC"] = t
+            if target is not None:
+                out["bedTargetC"] = target
 
         # If print_stats said nothing, default to idle so the cloud doesn't
         # render this connection as 'offline' (no state) by accident.
