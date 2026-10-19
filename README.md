@@ -348,3 +348,8 @@ site's answer may then carry `paper: {host, jobs}`. For each job, one at a time 
 network, read-only, capped; Ghostscript inkcov for each page's ink, PWG raster at 300 dpi), POST the coverage to
 `/api/print/hub/paper`, and only on `{"print": true}` send the raster to the Epson over IPPS (Print-Job) and follow it with
 Get-Job-Attributes to completed or aborted (20 minutes at most), then POST the outcome. Tests: `tests/test_paper.py`.
+
+Also in v0.73: **checking in when there is work.** The heartbeat stays every 30 s, but `makeros_hub/wake.py` holds one
+long request open on `/api/print/hub/wait?since=<seq>`; the site answers at once when a job, a ready file, a cleared plate,
+a Pause or Stop, or a paper print appears for this box, and the loop's sleep ends early so the hub checks in within a
+second or two. Only new work rings it. A site without the route is left alone for ten minutes. Tests: `tests/test_wake.py`.

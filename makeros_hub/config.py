@@ -87,6 +87,11 @@ class Config:
         return self.cloud_url.rstrip("/") + "/api/print/hub/config"
 
     @property
+    def wait_url(self) -> str:
+        # v0.73: the long-poll that ends the heartbeat sleep when the site has new work for this box (makeros_hub/wake.py)
+        return self.cloud_url.rstrip("/") + "/api/print/hub/wait"
+
+    @property
     def paper_url(self) -> str:
         # v0.73: members' paper prints (makeros_hub/paper.py): measurement in, the site's yes or no out, then the outcome
         return self.cloud_url.rstrip("/") + "/api/print/hub/paper"

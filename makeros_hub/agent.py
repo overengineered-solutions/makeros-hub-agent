@@ -48,6 +48,7 @@ from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import SLICE_RUNNER, PrinterManager
 from . import paper as paper_lane
+from . import wake as wake_lane
 from .printers.camera import FF_SLOTS, CameraScheduler, collect_camera_frames, prime_camera_capabilities
 from .printers.failure_watch import FailureWatchSmoother, collect_failure_samples, stub_detector
 from .printers.onnx_detector import (
@@ -1600,6 +1601,9 @@ def run(
     # v0.70: status deltas every few seconds on their own daemon thread (docs/telemetry-v1.md), read from the adapters
     # directly; the heartbeat below keeps its cadence and content. Stops with the same stop_event; never raises.
     start_telemetry(cfg, credential, manager.live_statuses, stop_event)
+    # v0.73: check in at once when the site has new work for this box, instead of waiting out the 30 s beat
+    wake_event = threading.Event()
+    wake_lane.start(cfg, credential, wake_event, stop_event)
 
     # Start the OrcaSlicer ingest server (inbound HTTP on the LAN). Best-effort:
     # if the port is taken we log + continue (heartbeat/telemetry still work).
@@ -2163,7 +2167,8 @@ def run(
                 diagnostics=diagnostics,
                 outbox=vp_outbox,
             )
-            stop_event.wait(interval)
+            if wake_lane.sleep_until(stop_event, wake_event, interval):
+                log.info("new work from the site: checking in now")
     finally:
         _drain_vprinter_submissions_safely(
             vp_submission_queue,
