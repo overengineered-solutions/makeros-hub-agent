@@ -26,11 +26,13 @@ def test_parse_ipp_reads_a_job_id_and_status():
     assert status == 0 and attrs["job-id"] == [57] and attrs["job-state"] == [3]
 
 
-def _run(tmp_path, result, answer, sender_fails=False, followed=(True, "printed"), report_fails=False):
+def _run(tmp_path, result, answer, sender_fails=False, followed=(True, "printed"), report_fails=False, sender_exc=None, getter_fails=False):
     posted = []
 
     def getter(path, dest):
         assert path == f"/api/print/hub/paper-file/{JID}"
+        if getter_fails:
+            raise OSError("connection reset while downloading")
         open(dest, "wb").write(b"%PDF-1.4 fake")
 
     def runner(uid):
@@ -50,6 +52,8 @@ def _run(tmp_path, result, answer, sender_fails=False, followed=(True, "printed"
         return answer if "pages" in body else {"ok": True}
 
     def sender(host, pwg, name, media, colour, copies, two_sided):
+        if sender_exc is not None:
+            raise sender_exc
         if sender_fails:
             raise OSError("refused")
         assert os.path.getsize(pwg) == 4 and media == "letter" and colour and copies == 2 and not two_sided
@@ -131,10 +135,26 @@ def test_no_dispatch_without_a_durable_guard(tmp_path, monkeypatch):
     monkeypatch.setattr(paper.report_outbox, "save", lambda *a: False)
     out, posted = _run(tmp_path, {"ok": True, "pages": [{"c": 0, "m": 0, "y": 0, "k": 0.01}]}, {"print": True})
     assert out == "not sent: could not persist outcome guard"
-    assert len(posted) == 1
+    # nothing reached the printer, so it is a plain failure and the member's pages come back (review 2026-10-19)
+    assert len(posted) == 2 and posted[-1]["done"] is False
 
 
-def test_a_corrupt_receipt_blocks_new_dispatch(tmp_path):
+def test_a_corrupt_receipt_is_set_aside_and_printing_continues(tmp_path):
+    # review 2026-10-19: an unreadable receipt used to stop paper printing for everyone until a person found it
     (tmp_path / "paper-outcome.json").write_text("broken")
-    out, posted = _run(tmp_path, {"ok": True}, {"print": True})
-    assert out == "outcome report pending" and posted == []
+    out, posted = _run(tmp_path, {"ok": True, "pages": [{"c": 0, "m": 0, "y": 0, "k": 0.01}]}, {"print": True})
+    assert out == "printed" and posted[-1]["done"] is True
+    assert [f.name.startswith("paper-outcome.corrupt-") for f in tmp_path.iterdir() if f.name.startswith("paper-outcome.corrupt-")] == [True]
+
+
+def test_a_refused_connection_or_job_is_a_plain_failure_not_unknown(tmp_path):
+    for i, exc in enumerate((ConnectionRefusedError(111, "refused"), paper.PrinterRefused("the printer refused the job (IPP status 0x0400)"))):
+        case = tmp_path / f"case{i}"
+        case.mkdir()
+        out, posted = _run(case, {"ok": True, "pages": [{"c": 0, "m": 0, "y": 0, "k": 0.01}]}, {"print": True}, sender_exc=exc)
+        assert posted[-1]["done"] is False and "uncertain" not in posted[-1], out
+
+
+def test_a_download_hiccup_retries_instead_of_refusing_the_job(tmp_path):
+    out, posted = _run(tmp_path, {"ok": True}, {"print": True}, getter_fails=True)
+    assert out == "download failed; will retry" and posted == []

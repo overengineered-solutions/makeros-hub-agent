@@ -19,7 +19,9 @@ import ssl
 import struct
 import subprocess
 import time
+import errno
 import http.client
+import socket
 from pathlib import Path
 from . import report_outbox
 
@@ -102,6 +104,17 @@ def _ipp(host: str, body, length: int, timeout: float = 120.0) -> tuple[int, dic
         conn.close()
 
 
+class PrinterRefused(OSError):
+    """The printer answered and said no: nothing will print."""
+
+
+# Failures that prove no page could have come out: the printer refused the connection, or its address does not resolve or
+# route, or it answered refusing the job. Anything else after approval (a timeout, a reset mid-send) stays "unknown".
+def _never_reached(e: BaseException) -> bool:
+    return isinstance(e, (PrinterRefused, ConnectionRefusedError, socket.gaierror)) or (
+        isinstance(e, OSError) and e.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH))
+
+
 def send_to_printer(host: str, pwg_path: str, job_name: str, media: str, colour: bool, copies: int, two_sided: bool) -> int:
     head = print_job_request(host, job_name, media, colour, copies, two_sided)
     size = os.path.getsize(pwg_path)
@@ -113,7 +126,7 @@ def send_to_printer(host: str, pwg_path: str, job_name: str, media: str, colour:
                 yield chunk
     status, attrs = _ipp(host, body(), len(head) + size, timeout=300.0)
     if status >= 0x0100 or not attrs.get("job-id"):
-        raise OSError(f"the printer refused the job (IPP status 0x{status:04x})")
+        raise PrinterRefused(f"the printer refused the job (IPP status 0x{status:04x})")
     return int(attrs["job-id"][0])
 
 
@@ -144,10 +157,18 @@ def flush_reports(spool_dir: str, poster) -> bool:
     """Retry the receipt, never the physical print. Caller holds the paper worker lock."""
     path = Path(spool_dir) / "paper-outcome.json"
     try:
-        rows = json.loads(path.read_text()) if path.exists() else []
-        if not isinstance(rows, list) or any(not isinstance(r, dict) or not ID_RE.fullmatch(str(r.get("id", "")))
-                or not (isinstance(r.get("done"), bool) or r.get("uncertain") is True) for r in rows):
-            raise ValueError("invalid paper outcome outbox")
+        try:
+            rows = json.loads(path.read_text()) if path.exists() else []
+            if not isinstance(rows, list) or any(not isinstance(r, dict) or not ID_RE.fullmatch(str(r.get("id", "")))
+                    or not (isinstance(r.get("done"), bool) or r.get("uncertain") is True) for r in rows):
+                raise ValueError("invalid paper outcome outbox")
+        except ValueError as e:
+            # A receipt nobody can read must not stop paper printing forever. Set it aside for a person to read; the site
+            # turns the job it was about into a staff check after 45 minutes, because that job stays printing there.
+            aside = path.with_name(f"paper-outcome.corrupt-{int(time.time())}.json")
+            path.rename(aside)
+            log.warning("paper outcome receipt unreadable (%s); set aside as %s, paper printing continues", e, aside.name)
+            return True
         for row in rows:
             answer = poster(row)
             if not isinstance(answer, dict) or answer.get("ok") is not True:
@@ -178,7 +199,12 @@ def process(job: dict, host: str, spool_dir: str, *, getter, poster, runner=None
         name = FILES[job["fileType"]]
         with open(os.path.join(work, "job.json"), "w", encoding="utf-8") as fh:
             json.dump({"file": name, "media": job["media"], "colour": job.get("colour") is True}, fh)
-        getter(job.get("path"), os.path.join(work, name))
+        try:
+            getter(job.get("path"), os.path.join(work, name))
+        except OSError as e:
+            # a download hiccup is not the member's file being bad: leave the job queued, the next beat tries again
+            log.warning("paper job %s: download failed, will retry: %s", jid, e)
+            return "download failed; will retry"
         rc = (runner or (lambda uid: subprocess.run(["sudo", "-n", PAPER_RUNNER, uid], capture_output=True, timeout=660).returncode))(jid.replace("-", ""))
         try:
             result = json.load(open(os.path.join(work, "out", "result.json"), encoding="utf-8"))
@@ -192,13 +218,20 @@ def process(job: dict, host: str, spool_dir: str, *, getter, poster, runner=None
             return "not approved by the site"
         # A restart after sending cannot tell whether paper came out. Persist that uncertainty BEFORE sending.
         if not report_outbox.save([{"id": jid, "uncertain": True, "detail": "The hub restarted before confirming the printer outcome."}], receipt):
+            # nothing was sent, so this is a plain failure and the member's pages come back; if this post is lost too, the
+            # site's reaper makes it a staff check
+            try:
+                poster({"id": jid, "done": False, "detail": "not sent: the hub could not save its receipt"})
+            except Exception:  # noqa: BLE001
+                pass
             return "not sent: could not persist outcome guard"
         try:
             printer_job = sender(host, os.path.join(work, "out", "doc.pwg"), f"PS paper {jid[:8]}", job["media"], job.get("colour") is True,
                                  copies, job.get("twoSided") is True)
             ok, detail = follower(host, printer_job, time.monotonic() + FOLLOW_SECONDS)
         except Exception as e:  # noqa: BLE001 - bytes may have reached the printer before its reply was lost
-            ok, detail = None, f"printer outcome unknown: {type(e).__name__}"
+            # a refused connection or a refused job printed nothing: a plain failure gives the member's pages back
+            ok, detail = (False, f"not printed: {e}"[:300]) if _never_reached(e) else (None, f"printer outcome unknown: {type(e).__name__}")
         outcome = {"id": jid, "detail": detail[:300], **({"uncertain": True} if ok is None else {"done": ok})}
         if not report_outbox.save([outcome], receipt) or not flush_reports(spool_dir, poster):
             return "outcome report pending"
