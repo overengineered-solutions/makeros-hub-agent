@@ -20,6 +20,8 @@ import struct
 import subprocess
 import time
 import http.client
+from pathlib import Path
+from . import report_outbox
 
 log = logging.getLogger("makeros_hub.paper")
 
@@ -115,13 +117,15 @@ def send_to_printer(host: str, pwg_path: str, job_name: str, media: str, colour:
     return int(attrs["job-id"][0])
 
 
-def follow(host: str, job_id: int, deadline: float, sleep=time.sleep, now=time.monotonic) -> tuple[bool, str]:
+def follow(host: str, job_id: int, deadline: float, sleep=time.sleep, now=time.monotonic) -> tuple[bool | None, str]:
     """Poll the job until it ends: (printed?, a short reason). 9 completed, 7 canceled, 8 aborted."""
     reasons = ""
     while now() < deadline:
         q = job_attrs_request(host, job_id)
         try:
-            _status, attrs = _ipp(host, q, len(q), timeout=30.0)
+            status, attrs = _ipp(host, q, len(q), timeout=30.0)
+            if status >= 0x0100:
+                raise ValueError(f"IPP status 0x{status:04x}")
         except (OSError, ValueError) as e:
             reasons = f"lost the printer ({e})"
             sleep(10)
@@ -133,7 +137,25 @@ def follow(host: str, job_id: int, deadline: float, sleep=time.sleep, now=time.m
         if state in (7, 8):
             return False, f"the printer {'cancelled' if state == 7 else 'aborted'} it ({reasons})"
         sleep(10)
-    return False, f"not finished after {FOLLOW_SECONDS // 60} minutes ({reasons or 'no answer'})"
+    return None, f"not finished after {FOLLOW_SECONDS // 60} minutes ({reasons or 'no answer'})"
+
+
+def flush_reports(spool_dir: str, poster) -> bool:
+    """Retry the receipt, never the physical print. Caller holds the paper worker lock."""
+    path = Path(spool_dir) / "paper-outcome.json"
+    try:
+        rows = json.loads(path.read_text()) if path.exists() else []
+        if not isinstance(rows, list) or any(not isinstance(r, dict) or not ID_RE.fullmatch(str(r.get("id", "")))
+                or not (isinstance(r.get("done"), bool) or r.get("uncertain") is True) for r in rows):
+            raise ValueError("invalid paper outcome outbox")
+        for row in rows:
+            answer = poster(row)
+            if not isinstance(answer, dict) or answer.get("ok") is not True:
+                raise ValueError("site did not acknowledge paper outcome")
+        return not rows or report_outbox.save([], path)
+    except Exception as e:  # noqa: BLE001 - keep the receipt and block new dispatch until it is acknowledged
+        log.warning("paper outcome pending: %s", e)
+        return False
 
 
 # ── one job, end to end ──────────────────────────────────────────────────────────────────────────────────────────
@@ -145,8 +167,11 @@ def process(job: dict, host: str, spool_dir: str, *, getter, poster, runner=None
         return "skipped: bad job"
     if not HOST_RE.match(host or ""):
         return "skipped: no paper printer address"
+    if not flush_reports(spool_dir, poster):
+        return "outcome report pending"
     copies = job.get("copies") if isinstance(job.get("copies"), int) and 1 <= job["copies"] <= 10 else 1
     work = os.path.join(spool_dir, "paper-" + jid.replace("-", ""))
+    receipt = Path(spool_dir) / "paper-outcome.json"
     try:
         shutil.rmtree(work, ignore_errors=True)
         os.makedirs(work, mode=0o700)
@@ -165,19 +190,23 @@ def process(job: dict, host: str, spool_dir: str, *, getter, poster, runner=None
         answer = poster({"id": jid, "pages": result.get("pages") or []})
         if not (isinstance(answer, dict) and answer.get("print") is True):
             return "not approved by the site"
+        # A restart after sending cannot tell whether paper came out. Persist that uncertainty BEFORE sending.
+        if not report_outbox.save([{"id": jid, "uncertain": True, "detail": "The hub restarted before confirming the printer outcome."}], receipt):
+            return "not sent: could not persist outcome guard"
         try:
             printer_job = sender(host, os.path.join(work, "out", "doc.pwg"), f"PS paper {jid[:8]}", job["media"], job.get("colour") is True,
                                  copies, job.get("twoSided") is True)
-        except (OSError, ValueError) as e:
-            poster({"id": jid, "done": False, "detail": f"could not send to the printer: {e}"[:300]})
-            return "send failed"
-        ok, detail = follower(host, printer_job, time.monotonic() + FOLLOW_SECONDS)
-        poster({"id": jid, "done": ok, "detail": detail[:300]})
+            ok, detail = follower(host, printer_job, time.monotonic() + FOLLOW_SECONDS)
+        except Exception as e:  # noqa: BLE001 - bytes may have reached the printer before its reply was lost
+            ok, detail = None, f"printer outcome unknown: {type(e).__name__}"
+        outcome = {"id": jid, "detail": detail[:300], **({"uncertain": True} if ok is None else {"done": ok})}
+        if not report_outbox.save([outcome], receipt) or not flush_reports(spool_dir, poster):
+            return "outcome report pending"
         return detail
     except Exception as e:  # noqa: BLE001 - the worker must report and keep the hub alive
         log.warning("paper job %s failed: %s", jid, e)
         try:
-            poster({"id": jid, "done": False, "detail": f"the hub hit an error: {type(e).__name__}"})
+            poster({"id": jid, "measured": False, "reason": f"the hub hit an error: {type(e).__name__}"})
         except Exception:  # noqa: BLE001
             pass
         return f"error {type(e).__name__}"

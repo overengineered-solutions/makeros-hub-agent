@@ -26,7 +26,7 @@ def test_parse_ipp_reads_a_job_id_and_status():
     assert status == 0 and attrs["job-id"] == [57] and attrs["job-state"] == [3]
 
 
-def _run(tmp_path, result, answer, sender_fails=False, followed=(True, "printed")):
+def _run(tmp_path, result, answer, sender_fails=False, followed=(True, "printed"), report_fails=False):
     posted = []
 
     def getter(path, dest):
@@ -45,6 +45,8 @@ def _run(tmp_path, result, answer, sender_fails=False, followed=(True, "printed"
 
     def poster(body):
         posted.append(body)
+        if report_fails and body.get("done") is True:
+            raise OSError("site response lost after printing")
         return answer if "pages" in body else {"ok": True}
 
     def sender(host, pwg, name, media, colour, copies, two_sided):
@@ -56,7 +58,7 @@ def _run(tmp_path, result, answer, sender_fails=False, followed=(True, "printed"
     out = paper.process({"id": JID, "fileType": "pdf", "media": "letter", "colour": True, "copies": 2, "path": f"/api/print/hub/paper-file/{JID}"},
                         "192.168.1.42", str(tmp_path), getter=getter, poster=poster, runner=runner, sender=sender,
                         follower=lambda host, job, deadline: followed)
-    assert not any(p.name.startswith("paper-") for p in tmp_path.iterdir()), "the work directory is removed"
+    assert not any(p.is_dir() and p.name.startswith("paper-") for p in tmp_path.iterdir()), "the work directory is removed"
     return out, posted
 
 
@@ -76,9 +78,9 @@ def test_a_file_the_renderer_refuses_is_reported_not_printed(tmp_path):
     assert out == "refused by the renderer" and posted == [{"id": JID, "measured": False, "reason": "the PDF could not be read"}]
 
 
-def test_a_printer_that_refuses_is_reported(tmp_path):
+def test_a_send_error_is_unknown_because_the_printer_may_have_received_it(tmp_path):
     out, posted = _run(tmp_path, {"ok": True, "pages": [{"c": 0, "m": 0, "y": 0, "k": 0.01}]}, {"print": True}, sender_fails=True)
-    assert out == "send failed" and posted[-1]["done"] is False and "refused" in posted[-1]["detail"]
+    assert "unknown" in out and posted[-1]["uncertain"] is True
 
 
 def test_bad_jobs_and_addresses_are_skipped(tmp_path):
@@ -88,3 +90,51 @@ def test_bad_jobs_and_addresses_are_skipped(tmp_path):
     assert paper.process({"id": JID, "fileType": "exe", "media": "letter"}, "192.168.1.42", str(tmp_path), **kw).startswith("skipped")
     assert paper.process({"id": JID, "fileType": "pdf", "media": "letter"}, "8.8.8.8", str(tmp_path), **kw).startswith("skipped")
     assert called == []
+
+
+def test_lost_success_report_is_retried_without_reporting_a_print_failure(tmp_path):
+    out, posted = _run(tmp_path, {"ok": True, "pages": [{"c": 0, "m": 0, "y": 0, "k": 0.01}]},
+                       {"print": True}, report_fails=True)
+    assert not any(p.get("done") is False for p in posted)
+    assert "pending" in out
+    replayed = []
+    assert paper.flush_reports(str(tmp_path), lambda b: replayed.append(b) or {"ok": True})
+    assert replayed == [{"id": JID, "done": True, "detail": "printed"}]
+    assert paper.flush_reports(str(tmp_path), lambda b: replayed.append(b) or {"ok": True})
+    assert len(replayed) == 1
+
+
+def test_a_timeout_does_not_claim_the_printer_failed(tmp_path):
+    out, posted = _run(tmp_path, {"ok": True, "pages": [{"c": 0, "m": 0, "y": 0, "k": 0.01}]},
+                       {"print": True}, followed=(None, "printer outcome unknown"))
+    assert posted[-1] == {"id": JID, "uncertain": True, "detail": "printer outcome unknown"}
+
+
+def test_follow_timeout_is_unknown_and_ipp_error_cannot_confirm_completion(monkeypatch):
+    monkeypatch.setattr(paper, "_ipp", lambda *a, **k: (0x0400, {"job-state": [9]}))
+    clock = iter([0, 2])
+    ok, detail = paper.follow("192.168.1.42", 57, 1, sleep=lambda _: None, now=lambda: next(clock))
+    assert ok is None and "not finished" in detail
+
+
+def test_a_rejected_outcome_report_stays_durable(tmp_path):
+    from makeros_hub import report_outbox
+    report = {"id": JID, "done": True, "detail": "printed"}
+    report_outbox.save([report], tmp_path / "paper-outcome.json")
+    assert not paper.flush_reports(str(tmp_path), lambda _: {"error": "temporarily unavailable"})
+    posted = []
+    assert paper.flush_reports(str(tmp_path), lambda b: posted.append(b) or {"ok": True})
+    assert posted == [report]
+
+
+def test_no_dispatch_without_a_durable_guard(tmp_path, monkeypatch):
+    monkeypatch.setattr(paper.report_outbox, "save", lambda *a: False)
+    out, posted = _run(tmp_path, {"ok": True, "pages": [{"c": 0, "m": 0, "y": 0, "k": 0.01}]}, {"print": True})
+    assert out == "not sent: could not persist outcome guard"
+    assert len(posted) == 1
+
+
+def test_a_corrupt_receipt_blocks_new_dispatch(tmp_path):
+    (tmp_path / "paper-outcome.json").write_text("broken")
+    out, posted = _run(tmp_path, {"ok": True}, {"print": True})
+    assert out == "outcome report pending" and posted == []

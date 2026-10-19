@@ -2053,13 +2053,23 @@ def run(
                         threading.Thread(target=_fetch_worker, name="web-upload-fetch", daemon=True).start()
                     # v0.73: members' paper prints, one at a time, off the heartbeat thread (makeros_hub/paper.py)
                     paper_body = resp.body.get("paper")
-                    if isinstance(paper_body, dict) and paper_body.get("jobs") and paper_lock.acquire(blocking=False):
-                        def _paper_worker(job=paper_body["jobs"][0], host=str(paper_body.get("host") or "")):
+                    if paper_lock.acquire(blocking=False):
+                        def _paper_worker(body=paper_body):
                             try:
+                                def paper_post(payload):
+                                    result = post_json(cfg.paper_url, payload, bearer=credential, timeout=30.0)
+                                    if result.status != 200 or not isinstance(result.body, dict):
+                                        raise TransportError("paper response was not successful")
+                                    return result.body
+                                if not paper_lane.flush_reports(SPOOL_DIR, paper_post):
+                                    return
+                                if not isinstance(body, dict) or not body.get("jobs"):
+                                    return
+                                job = body["jobs"][0]
                                 outcome = paper_lane.process(
-                                    job, host, SPOOL_DIR,
+                                    job, str(body.get("host") or ""), SPOOL_DIR,
                                     getter=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential, max_bytes=20 * 1024 * 1024),
-                                    poster=lambda body: post_json(cfg.paper_url, body, bearer=credential, timeout=30.0).body,
+                                    poster=paper_post,
                                 )
                                 log.info("paper job %s: %s", job.get("id"), outcome)
                             finally:
