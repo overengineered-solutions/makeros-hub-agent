@@ -204,6 +204,13 @@ def build_push_status(
         }
     }
     if dual:
+        # OrcaSlicer reads `device` only when cfg, fun, aux and stat are all present
+        # (MachineObject::check_enable_np, OrcaSlicer 2.4.2); without them it ignores the
+        # block, keeps one extruder, and greys out Send for any filament on the left
+        # nozzle ("No extruder found for 1", live 2026-10-20). Empty strings pass the
+        # gate and claim no feature: Orca skips each empty one, so the sdcard flag and
+        # every capability default stay as they were.
+        report["print"].update(cfg="", fun="", aux="", stat="")
         # Hardware comes from the agreed live pair. Activity fields describe
         # this idle VIRTUAL device; hnow is the observed nozzle/extruder binding.
         report["print"]["device"] = {

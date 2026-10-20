@@ -174,3 +174,49 @@ class TestObservedVirtualH2d(unittest.TestCase):
             after = runtime._ams_version
             asyncio.run(runtime.apply_hot(changed))
             self.assertEqual(runtime._ams_version, after)
+
+
+def orca_nozzles(report):
+    """{extruder id: (diameter, flow)} as OrcaSlicer 2.4.2 reads a push_status (DeviceManager.cpp parse_json then
+    parse_new_info; DevExtruderSystem.cpp, DevNozzleSystem.cpp). Flat fields always give extruder 0; `device` counts
+    only behind check_enable_np, and a non-string cfg/fun/aux/stat throws inside a try that drops the whole block."""
+    flat = {0: (float(report["nozzle_diameter"]), "S")}
+    if not all(k in report for k in ("cfg", "fun", "aux", "stat")) or "device" not in report:
+        return flat
+    if not all(isinstance(report[k], str) for k in ("cfg", "fun", "aux", "stat")):
+        return flat
+    device = report["device"]
+    nozzles = {n["id"]: (float(n["diameter"]), n["type"][1:2] if len(n["type"]) >= 4 else "") for n in device["nozzle"]["info"]}
+    for e in device["extruder"]["info"]:
+        assert all(isinstance(e[k], int) for k in ("id", "info", "temp", "spre", "snow", "star", "stat", "hnow"))
+        assert all(isinstance(v, int) for v in e["filam_bak"])
+    return {e["id"]: nozzles.get(e["hnow"], (0.0, "")) for e in device["extruder"]["info"]}
+
+
+def orca_send_nozzle_ok(report, nozzle):
+    """SelectMachine.cpp _is_nozzle_data_valid for a filament on this physical nozzle (0 right, 1 left)."""
+    diameter, flow = orca_nozzles(report).get(nozzle, (0.0, ""))
+    return diameter > 0 and flow in ("S", "H", "A", "X")
+
+
+class TestOrcaReadsVirtualH2D(unittest.TestCase):
+    def report(self):
+        [cfg] = updated_configs_if_pools_changed([TestObservedVirtualH2d.config(self)], [status()], None, 0)
+        return build_push_status(units=2, trays=4, model=cfg.model, filaments=cfg.pool, nozzles=cfg.nozzles)["print"]
+
+    def test_orca_sees_both_nozzles_so_send_is_enabled_for_either(self):
+        report = self.report()
+        self.assertEqual(orca_nozzles(report), {0: (0.4, "S"), 1: (0.4, "S")})
+        self.assertTrue(orca_send_nozzle_ok(report, 0))
+        self.assertTrue(orca_send_nozzle_ok(report, 1))
+        self.assertIs(report["sdcard"], True)  # empty aux: Orca keeps the flat sdcard flag
+
+    def test_without_the_new_protocol_fields_orca_has_no_left_nozzle(self):
+        # The v0.76.0 report: the device block was there, Orca ignored it, Send was grey for the left nozzle.
+        report = {k: v for k, v in self.report().items() if k not in ("cfg", "fun", "aux", "stat")}
+        self.assertFalse(orca_send_nozzle_ok(report, 1))
+
+    def test_unobserved_hardware_still_advertises_no_device(self):
+        report = build_push_status(units=2, model="H2D", filaments=[], nozzles=())["print"]
+        self.assertNotIn("device", report)
+        self.assertNotIn("cfg", report)
