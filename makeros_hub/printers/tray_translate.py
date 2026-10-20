@@ -259,6 +259,10 @@ def _dual_nozzle_requirements(command: dict, required: list[dict], nozzles: Any)
     # Automatic nozzle_mapping uses another protocol/version; do not infer it.
     if command.get("nozzle_mapping") not in (None, [], "", "[]"):
         raise TrayTranslationError("unsupported_nozzle_mapping", "automatic nozzle mapping needs a captured Orca command before H2D dispatch")
+    # A LAN send (OrcaSlicer/Bambu Studio over LAN, captured live 2026-10-20) carries neither ams_mapping_info nor
+    # nozzles_info, only ams_mapping. The sliced plate names each filament's nozzle instead (capture._route_nozzles):
+    # extruderId + nozzleDiameterMm on the requirement. The task metadata, when present, still decides.
+    lan = "ams_mapping_info" not in command and "nozzles_info" not in command
     mapping = _json_array(command.get("ams_mapping_info"))
     expected = _json_array(command.get("nozzles_info"))
     observed = nozzles if isinstance(nozzles, list) else []
@@ -267,13 +271,17 @@ def _dual_nozzle_requirements(command: dict, required: list[dict], nozzles: Any)
         raise TrayTranslationError("unsupported_nozzle_mapping", "H2D filament indices are missing or ambiguous; re-send from OrcaSlicer")
     result = []
     for index, req in by_index.items():
-        entry = mapping[index] if 0 <= index < len(mapping) else None
-        eid = entry.get("nozzleId") if isinstance(entry, dict) else None
+        if lan:
+            eid, diameter = req.get("extruderId"), req.get("nozzleDiameterMm")
+        else:
+            entry = mapping[index] if 0 <= index < len(mapping) else None
+            eid = entry.get("nozzleId") if isinstance(entry, dict) else None
+            wanted = [n for n in expected if isinstance(n, dict) and type(n.get("id")) is int and n.get("id") == eid]
+            diameter = wanted[0].get("diameter") if len(wanted) == 1 else None
         if type(eid) is not int or eid not in (0, 1):
-            raise TrayTranslationError("unsupported_nozzle_mapping", "H2D filament nozzle is unknown; capture Orca ams_mapping_info/nozzles_info before dispatch")
+            raise TrayTranslationError("unsupported_nozzle_mapping", "H2D filament nozzle is unknown; re-slice for the H2D in current OrcaSlicer and send again")
         actual = [n for n in observed if isinstance(n, dict) and n.get("extruderId") == eid]
-        wanted = [n for n in expected if isinstance(n, dict) and type(n.get("id")) is int and n.get("id") == eid]
-        if len(actual) != 1 or len(wanted) != 1 or isinstance(wanted[0].get("diameter"), bool) or wanted[0].get("diameter") != actual[0].get("diameterMm"):
+        if len(actual) != 1 or isinstance(diameter, bool) or diameter != actual[0].get("diameterMm"):
             raise TrayTranslationError("unsupported_nozzle_mapping", f"H2D nozzle {eid} diameter is missing or differs from the sliced job")
         result.append(dict(req, extruderId=eid))
     return result

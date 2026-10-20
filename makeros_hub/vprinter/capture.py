@@ -21,6 +21,7 @@ log = logging.getLogger("makeros-hub.vprinter.capture")
 
 
 SLICE_INFO_PATH = "Metadata/slice_info.config"
+PROJECT_SETTINGS_PATH = "Metadata/project_settings.config"
 MAX_SLICE_INFO_BYTES = 10 * 1024 * 1024
 
 
@@ -472,6 +473,10 @@ def _vp_submit_filament(item: dict[str, Any]) -> dict[str, Any]:
     used_g = item.get("usedG")
     if isinstance(used_g, (int, float)) and not isinstance(used_g, bool) and used_g >= 0:
         filament["usedG"] = used_g
+    # v0.77: a two-extruder slice's nozzle per filament (0 right, 1 left) and its sliced diameter, from the plate
+    for key in ("extruderId", "nozzleDiameterMm"):
+        if key in item:
+            filament[key] = item[key]
     return filament
 
 
@@ -550,9 +555,25 @@ def parse_required_filaments(path: Path, plate: int | None = None) -> list[dict[
             if info.file_size > MAX_SLICE_INFO_BYTES:
                 return []
             raw = archive.read(info)
+            physical = _physical_extruder_map(archive)
     except (KeyError, OSError, zipfile.BadZipFile):
         return []
-    return parse_slice_info_config(raw, plate)
+    return parse_slice_info_config(raw, plate, physical)
+
+
+def _physical_extruder_map(archive: zipfile.ZipFile) -> list[int] | None:
+    """project_settings.config physical_extruder_map: logical extruder index → physical extruder (H2D ["1","0"]: the
+    slicer's extruder 1 is the left nozzle, physical 1; extruder 2 is the right, physical 0). Only a two-extruder map
+    counts; anything else is None."""
+    try:
+        info = archive.getinfo(PROJECT_SETTINGS_PATH)
+        if info.file_size > MAX_SLICE_INFO_BYTES:
+            return None
+        value = json.loads(archive.read(info)).get("physical_extruder_map")
+        mapping = [int(v) for v in value]
+    except (KeyError, ValueError, TypeError, AttributeError, RecursionError, OverflowError):   # OverflowError: int(Infinity)
+        return None
+    return mapping if sorted(mapping) == [0, 1] else None
 
 
 def _plate_element(root: ElementTree.Element, plate: int | None) -> ElementTree.Element | None:
@@ -571,7 +592,8 @@ def _plate_element(root: ElementTree.Element, plate: int | None) -> ElementTree.
     return None
 
 
-def parse_slice_info_config(raw: bytes | str, plate: int | None = None) -> list[dict[str, Any]]:
+def parse_slice_info_config(raw: bytes | str, plate: int | None = None,
+                            physical_extruder_map: list[int] | None = None) -> list[dict[str, Any]]:
     text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
     try:
         root = ElementTree.fromstring(text)
@@ -579,6 +601,7 @@ def parse_slice_info_config(raw: bytes | str, plate: int | None = None) -> list[
         return _parse_slice_info_fallback(text)
 
     by_slot: dict[int, dict[str, Any]] = {}
+    grouped: dict[int, tuple[int | None, float | None]] = {}   # slot → (group_id, nozzle_diameter) off <filament>
     # v0.56: a multi-plate project lists EVERY plate's filaments; only the sent plate's are required (a spool used
     # solely on another plate must neither block dispatch nor inflate the grams estimate).
     plate_scope = _plate_element(root, plate)
@@ -612,13 +635,44 @@ def parse_slice_info_config(raw: bytes | str, plate: int | None = None) -> list[
         used_g = _first_float(attrs, ("used_g", "weight", "used_grams"))
         if used_g is not None and used_g >= 0:
             item["usedG"] = round(used_g, 2)
+        if tag == "filament" and "group_id" in attrs:
+            grouped[slot] = (_first_int(attrs, ("group_id",)), _first_float(attrs, ("nozzle_diameter",)))
 
     # The project-wide metadata arrays (0-based) are a FALLBACK for files without per-filament elements (1-based
     # Bambu ids) — mixing the two bases produced phantom slot 0 entries (codex v0.56 r1), so they only seed an empty result.
     if not by_slot:
         _merge_array_metadata(scope, by_slot)   # plate-scoped when a plate was found (codex r3), else the whole file
+    if physical_extruder_map is not None:
+        _route_nozzles(scope, by_slot, grouped, physical_extruder_map)
 
     return [by_slot[slot] for slot in sorted(by_slot)]
+
+
+def _route_nozzles(scope: ElementTree.Element, by_slot: dict[int, dict[str, Any]],
+                   grouped: dict[int, tuple[int | None, float | None]], physical: list[int]) -> None:
+    """A two-extruder slice (H2D): the physical nozzle each filament prints on, from the plate itself, which is what the
+    G-code was made from. OrcaSlicer 2.4.2 writes it twice, <filament group_id> (0-based logical extruder) and the plate's
+    filament_maps (1-based logical, by filament id), and both must agree; physical_extruder_map turns logical into
+    physical (0 right, 1 left). Missing or disagreeing leaves the filament without extruderId: H2D dispatch refuses it.
+    The project-wide filament_map is NOT read: it is the project default, not what this plate was sliced with."""
+    maps = []
+    for element in scope.iter():
+        attrs = {_strip_ns(key).lower(): value for key, value in element.attrib.items()}
+        if _strip_ns(element.tag).lower() == "metadata" and (attrs.get("key") or "").lower() == "filament_maps":
+            maps.append(attrs.get("value") or "")
+    if len(maps) != 1:
+        return   # none, or several plates in scope: unknown
+    try:
+        filament_maps = [int(v) for v in maps[0].split()]
+    except ValueError:
+        return
+    for slot, item in by_slot.items():
+        group, diameter = grouped.get(slot, (None, None))
+        if group not in (0, 1) or not 1 <= slot <= len(filament_maps) or filament_maps[slot - 1] != group + 1:
+            continue
+        item["extruderId"] = physical[group]
+        if diameter is not None and 0 < diameter <= 2:
+            item["nozzleDiameterMm"] = diameter
 
 
 def sha256_file(path: Path) -> str:
