@@ -108,6 +108,30 @@ class TestLivePool(unittest.TestCase):
             [t["tray_info_idx"] for t in vp_pool_from_statuses(s, 1, 4)], ["GFA", "GFB"]
         )
 
+    def test_white_pla_takes_slot_one(self):
+        s = [
+            _status(
+                [
+                    {"slot": 0, "material": "PETG", "filamentId": "GFG00", "colorHex": "000000FF"},
+                    {"slot": 1, "material": "PLA", "filamentId": "GFA00", "colorHex": "000000FF"},
+                    {"slot": 2, "material": "PLA", "filamentId": "GFL99", "colorHex": "FFFFFFFF"},
+                    {"slot": 3, "material": "PETG", "filamentId": "GFG01", "colorHex": "FFFFFFFF"},
+                ]
+            )
+        ]
+        pool = vp_pool_from_statuses(s, 1, 4)
+        self.assertEqual((pool[0]["tray_type"], pool[0]["tray_color"]), ("PLA", "FFFFFFFF"))
+        # the rest keep the stable key order; white PETG is not white PLA
+        self.assertEqual([t["tray_info_idx"] for t in pool[1:]], ["GFG00", "GFG01", "GFA00"])
+
+    def test_white_pla_first_with_an_h2d_nozzle_key(self):
+        self.assertEqual(live_pool._display_order("PLA|GFL99|FFFFFFFF|extruder:1"), (False, "PLA|GFL99|FFFFFFFF|extruder:1"))
+
+    def test_no_white_pla_keeps_key_order(self):
+        s = [_status([{"slot": 0, "material": "PLA", "filamentId": "GFB", "colorHex": "FF0000FF"},
+                      {"slot": 1, "material": "PLA", "filamentId": "GFA", "colorHex": "F0E0C0FF"}])]
+        self.assertEqual([t["tray_info_idx"] for t in vp_pool_from_statuses(s, 1, 4)], ["GFA", "GFB"])
+
     def test_short_color_normalizes_to_8_hex(self):
         s = [_status([{"slot": 0, "material": "PLA", "filamentId": "X", "colorHex": "26A69A"}])]
         self.assertEqual(vp_pool_from_statuses(s, 1, 4)[0]["tray_color"], "26A69AFF")

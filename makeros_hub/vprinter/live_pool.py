@@ -109,6 +109,17 @@ def _spools(status: Any):
         yield vt_tray
 
 
+def _display_order(key: str) -> tuple[bool, str]:
+    """White PLA (near-neutral, every channel at least 0xE6) takes slot 1 when the pool has it, so filament #1 in
+    OrcaSlicer is always white PLA (operator 2026-10-21: "always putting generic pla white first if its an option so
+    people know #1 filament is white pla all the time"); everything else keeps the stable key order. Slots are only a
+    display order: a send maps by material, filament id and colour, never by slot number."""
+    material, _, color = key.split("|")[:3]  # an H2D key adds |extruder:N; its report still groups per nozzle
+    rgb = [int(color[i:i + 2], 16) for i in (0, 2, 4)]
+    white = material == "PLA" and min(rgb) >= 0xE6 and max(rgb) - min(rgb) <= 0x14
+    return (not white, key)
+
+
 def vp_pool_from_statuses(
     statuses: list[dict[str, Any]],
     units: int,
@@ -136,7 +147,7 @@ def vp_pool_from_statuses(
                 deduped.setdefault(key, tray)
 
     pool: list[dict[str, Any]] = []
-    for key in sorted(deduped):
+    for key in sorted(deduped, key=_display_order):
         t = deduped[key]
         material = _norm_material(t.get("material"))
         color = _norm_color(t.get("colorHex"))
