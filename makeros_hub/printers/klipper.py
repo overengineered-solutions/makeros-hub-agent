@@ -175,6 +175,7 @@ _ACTION_PARAMS: dict[str, tuple[str, ...]] = {
     "qgl": (), "bed_mesh": (), "clean_nozzle": (),
     "z_offset": ("delta",), "speed": ("pct",), "fan": ("pct",),
     "emergency_stop": (), "firmware_restart": (),
+    "aux_fan": ("pct",), "exhaust_fan": ("pct",),
 }
 # Parameterless actions -> their G-code, or (the two that bypass klippy's G-code queue) a Moonraker endpoint. home is
 # Klipper's G28; on the SV08, Sovol's G28 macro runs Z_OFFSET_CALIBRATION and SAVE_CONFIG (a Klipper restart) when the
@@ -194,7 +195,12 @@ _ACTION_NEEDS = {
     "center": "gcode_macro move_to_center", "load_filament": "gcode_macro load_filament",
     "load_more": "gcode_macro _continue_load_filament", "unload_filament": "gcode_macro unload_filament",
     "qgl": "quad_gantry_level", "bed_mesh": "bed_mesh", "clean_nozzle": "gcode_macro clean_nozzle",
+    "aux_fan": "fan_generic fan2", "exhaust_fan": "fan_generic fan3",
 }
+# v0.79 (operator, 2026-10-21, the sv08 report's question 6: "sure"): staff get the SV08's auxiliary and exhaust fans, any
+# state, 0-100 %. Refused on a printer without them (unsupported_on_printer).
+# ponytail: the SV08's names (printer.cfg: fan_generic fan2 auxiliary, fan3 exhaust); map per printer when another has them.
+_GENERIC_FANS = {"aux_fan": "fan2", "exhaust_fan": "fan3"}
 # Refused while a print runs or is paused (printer_busy) / refused unless one does (not_printing). v0.79: filament moves
 # run idle or paused (a runout pause needs them; Sovol's macros reheat to the print's own temperature then) and are refused
 # only while printing. Everything else runs in any state: light, and the two endpoint actions.
@@ -219,7 +225,7 @@ _LONG_ACTIONS = frozenset({"home", "center", "load_filament", "load_more", "unlo
 # v0.79 adds the heat, the probe and Sovol's load temperature variable (Klipper leaves out an object a printer lacks).
 _ACTION_QUERY = ("print_stats=state&toolhead=homed_axes,position,axis_minimum,axis_maximum&extruder=temperature,target"
                  "&heater_bed=temperature,target&probe=is_calibrated"
-                 "&gcode_macro%20_global_var=load_filament_extruder_temp")
+                 "&gcode_macro%20_global_var=load_filament_extruder_temp&gcode_macro%20_pstation_resume_heat=nozzle")
 _JOG_STEPS_MM = frozenset({0.1, 1.0, 10.0, 50.0})
 _JOG_FEED = {"x": 6000, "y": 6000, "z": 600}
 
@@ -251,6 +257,14 @@ SPEED_MAX_PCT = 150  # the Giga's Q9
 # but nothing stopped twenty of them pushing the nozzle 2 mm into the plate.
 Z_TUNE_MAX_MM = 0.3
 PROBE_BED_MAX_C = 90.0
+# A paused print that sits (operator, 2026-10-21, the sv08 report's D6: "makes sense"). At PAUSE_ALERT_SEC the status
+# carries printFault "paused_long", the shop's print-fault alert (as a Bambu printError is), and the diag ring hears it.
+# At PAUSE_COOL_SEC the nozzle goes to NOZZLE_STANDBY_C and the bed is left on, so the part stays stuck; but only on a
+# printer whose RESUME heats back first (the gcode_macro below, a printer change in the audit report). Sovol's RESUME does
+# not reheat, and at 140 Klipper refuses to extrude (min_extrude_temp 150), so a Resume from Sovol's screen would end the
+# print. A Resume from the site always heats back to the print's temperature and waits (_resume_script).
+PAUSE_ALERT_SEC, PAUSE_COOL_SEC = 1800.0, 3600.0
+_RESUME_HEAT = "_pstation_resume_heat"   # its variable `nozzle`: the target a paused print had, 0 = none
 # dispatch_commands runs on the heartbeat thread: a short action waits this long for klippy's answer, a long one this long
 # for an immediate refusal before it reports "started".
 ACTION_WAIT_SEC = 2.0
@@ -315,6 +329,11 @@ class KlipperAdapter:
         self._home_proven = False
         self._fil_at: Optional[float] = None
         self._z_tuned = 0.0
+        # The pause watch (PAUSE_ALERT_SEC), also under _lock: the nozzle target last seen while printing (what a resume
+        # heats back to), and this pause's {"at": first seen, "alerted", "cooled"}, None when not paused. A restarted hub
+        # counts a pause from when it first sees it (late, never early).
+        self._print_target: Optional[float] = None
+        self._pause: Optional[dict] = None
 
     # Bambu compat — every adapter exposes these. The model field is only
     # set by Bambu so the agent's status pipeline can omit it.
@@ -386,6 +405,7 @@ class KlipperAdapter:
             started = self._started
             metadata = self._metadata_for(data)
             proven = self._home_proven
+            paused_at = self._pause["at"] if self._pause else None
 
         if last is not None:
             out = _build_status(self.printer_id, data, "connected" if (now - last) <= STALE_SEC else "offline",
@@ -394,6 +414,8 @@ class KlipperAdapter:
                 # v0.79: "homed" is what a jog from the site may trust, so the screen says "Home first" exactly when
                 # the hub would refuse one (Klipper's homed_axes counts the SV08's guessed Z and the Giga's boot home).
                 out["toolhead"]["homed"] = ""
+            if paused_at is not None and now - paused_at >= PAUSE_ALERT_SEC:
+                out["printFault"] = "paused_long"   # v0.79: the site alerts the shop, once per print
             # v0.70: when this reading was taken (wall ms), so the site can say "updated 4 s ago" instead of dating
             # everything by the heartbeat's arrival. The poll clock is monotonic; its age is moved onto the wall clock.
             out["sampledAt"] = int((time.time() - (now - last)) * 1000)
@@ -699,6 +721,18 @@ class KlipperAdapter:
         """
         if command == "klipper_action":
             return {**self._klipper_action(params), "command": command}
+        if command == "resume":
+            with self._lock:
+                last_ok = self._last_poll_ok_at
+            if last_ok is not None and time.monotonic() - last_ok <= STALE_SEC:
+                try:
+                    script = self._resume_script()
+                except _Refused as refused:
+                    return {"ok": False, "reason": refused.reason, "command": command}
+                except Exception as exc:  # noqa: BLE001 - the fresh state could not be read: resume nothing blind
+                    return {"ok": False, "reason": _action_failure(exc)[0], "command": command}
+                if script:
+                    return {**self._start_long_action("resume", script), "command": command}
         cmd_path = {
             "pause": "/printer/print/pause",
             "resume": "/printer/print/resume",
@@ -927,13 +961,25 @@ class KlipperAdapter:
                 self._home_proven = False
 
     def _after_poll(self, data: dict[str, Any]) -> None:
-        """v0.79, on the poll thread after each good reading: the proven home, the per-print Z tune, the filament standby."""
+        """v0.79, on the poll thread after each good reading: the proven home, the per-print Z tune, the pause watch, the
+        filament standby."""
         self._note_homed(data)
-        in_print = _obj(data, "print_stats").get("state") in ("printing", "paused")
+        state = _obj(data, "print_stats").get("state")
+        target = _num(_obj(data, "extruder").get("target")) or 0.0
         with self._lock:
-            if not in_print:
+            if state not in ("printing", "paused"):
                 self._z_tuned = 0.0
+                self._print_target = None
+            elif target >= MIN_EXTRUDE_C and (state == "printing" or self._print_target is None):
+                self._print_target = target   # paused: only when the hub never saw it print (PAUSE keeps the target)
+            if state != "paused":
+                self._pause = None
+            elif self._pause is None:
+                self._pause = {"at": time.monotonic(), "alerted": False, "cooled": False}
+            pause = dict(self._pause) if self._pause else None
             fil_at = self._fil_at if self._running_action is None else None
+        if pause is not None:
+            self._pause_watch(data, pause)
         if fil_at is not None:
             self._filament_standby(data, fil_at)
 
@@ -966,6 +1012,63 @@ class KlipperAdapter:
             with self._lock:
                 if self._fil_at == fil_at:   # not a newer filament move since
                     self._fil_at = None
+
+    def _resume_script(self) -> Optional[str]:
+        """v0.79 (D6): a Resume from the site never starts a print cold. -> None to resume as before (the nozzle is at the
+        print's temperature, or the print is not paused: Moonraker answers that), else "M109 S<t> / RESUME", sent as a long
+        action. t is the target last seen while printing, else the one the printer saved (_RESUME_HEAT); never below the
+        current one.
+        Raises _Refused("nozzle_cold") when none of them is a filament temperature."""
+        fresh = self._fetch_once(_ACTION_QUERY, timeout=ACTION_WAIT_SEC)
+        if _obj(fresh, "print_stats").get("state") != "paused":
+            return None
+        heat = _obj(fresh, "extruder")
+        temp, target = _num(heat.get("temperature")) or 0.0, _num(heat.get("target")) or 0.0
+        with self._lock:
+            seen = self._print_target
+        saved = _num(_obj(fresh, f"gcode_macro {_RESUME_HEAT}").get("nozzle")) or 0.0
+        # what this hub saw it print at first: the printer's variable can be left over from a print cancelled while paused
+        want = max(seen or (saved if saved >= MIN_EXTRUDE_C else 0.0), target)
+        if want < MIN_EXTRUDE_C:
+            raise _Refused("nozzle_cold")
+        if target >= want - 0.5 and temp >= want - AT_TARGET_C:
+            return None
+        return f"M109 S{want:g}\nRESUME"
+
+    def _pause_watch(self, data: dict[str, Any], pause: dict) -> None:
+        """v0.79, on the poll thread while paused: at PAUSE_ALERT_SEC tell the log and the diag ring once (the status
+        carries printFault from then on); at PAUSE_COOL_SEC drop the nozzle to NOZZLE_STANDBY_C once, the bed untouched,
+        on a printer whose RESUME heats back (saving the print's target for it first)."""
+        age = time.monotonic() - pause["at"]
+        if age >= PAUSE_ALERT_SEC and not pause["alerted"]:
+            with self._lock:
+                if self._pause is not None:
+                    self._pause["alerted"] = True
+            log.warning("klipper %s: paused %.0f min", self.printer_id, age / 60)
+            self._diag("klipper", f"print paused {age / 60:.0f} min on {self.printer_id[:12]}")
+        if age < PAUSE_COOL_SEC or pause["cooled"]:
+            return
+        with self._lock:
+            if self._pause is not None:
+                self._pause["cooled"] = True   # once, whatever happens next
+            want = self._print_target
+        target = _num(_obj(data, "extruder").get("target")) or 0.0
+        if target <= NOZZLE_STANDBY_C:
+            return
+        try:
+            if f"gcode_macro {_RESUME_HEAT}" not in self._printer_objects():
+                log.warning("klipper %s: paused %.0f min, nozzle left at %g: this printer's RESUME does not heat back "
+                            "(no gcode_macro %s)", self.printer_id, age / 60, target, _RESUME_HEAT)
+                return
+            keep = max(want or 0.0, target)
+            self._post_ok(_script_path(f"SET_GCODE_VARIABLE MACRO={_RESUME_HEAT} VARIABLE=nozzle VALUE={keep:g}\n"
+                                       f"M104 S{NOZZLE_STANDBY_C}"), ACTION_WAIT_SEC)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("klipper %s: paused nozzle not cooled: %s", self.printer_id, _action_failure(exc)[0])
+            return
+        log.info("klipper %s: paused %.0f min, nozzle %g -> %d (Resume heats it back)", self.printer_id, age / 60, keep,
+                 NOZZLE_STANDBY_C)
+        self._diag("klipper", f"paused {age / 60:.0f} min: nozzle down to {NOZZLE_STANDBY_C} on {self.printer_id[:12]}")
 
     def _post_ok(self, path: str, timeout: float) -> None:
         """POST one Moonraker endpoint; returns only on {"result": "ok"}, raises otherwise."""
@@ -1499,6 +1602,10 @@ def _parse_action(params: Any) -> tuple[str, str, Optional[str]]:
         if not (_finite(delta) and 0 < abs(delta) <= 0.1):
             raise _Refused("bad_params")
         script = f"SET_GCODE_OFFSET Z_ADJUST={delta:g} MOVE=1"
+    elif action in _GENERIC_FANS:
+        if not _whole(params["pct"], 0, 100):
+            raise _Refused("bad_params")
+        script = f"SET_FAN_SPEED FAN={_GENERIC_FANS[action]} SPEED={params['pct'] / 100:g}"
     elif action == "speed":
         if not _whole(params["pct"], 10, SPEED_MAX_PCT):
             raise _Refused("bad_params")

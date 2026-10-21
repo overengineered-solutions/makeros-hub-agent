@@ -639,5 +639,149 @@ class TestZTune(unittest.TestCase):
         self.assertTrue(nudge()["ok"])
 
 
+class TestFans(unittest.TestCase):
+    """v0.79 (the sv08 report's question 6): staff get the SV08's auxiliary (fan2) and exhaust (fan3) fans."""
+
+    def test_whole_percent_any_state(self):
+        self.assertEqual(plan({"action": "aux_fan", "pct": 50}), ("aux_fan", "SET_FAN_SPEED FAN=fan2 SPEED=0.5",
+                                                                   "fan_generic fan2"))
+        self.assertEqual(plan({"action": "exhaust_fan", "pct": 100})[1:], ("SET_FAN_SPEED FAN=fan3 SPEED=1",
+                                                                           "fan_generic fan3"))
+        self.assertEqual(plan({"action": "exhaust_fan", "pct": 0})[1], "SET_FAN_SPEED FAN=fan3 SPEED=0")
+        for s in ("standby", "printing", "paused", "complete"):
+            self.assertEqual(refusal({"action": "aux_fan", "pct": 30}, state(s)), "accepted", s)
+        for pct in (-1, 101, 50.5, True, "50", None):
+            self.assertEqual(refusal({"action": "aux_fan", "pct": pct}), "bad_params", pct)
+        self.assertEqual(refusal({"action": "aux_fan"}), "bad_params")
+
+    def test_refused_on_a_printer_without_them(self):
+        mr = Moonraker(objects=["toolhead", "fan_generic fan2"])
+        self.addCleanup(mr.close)
+        a = KlipperAdapter("p1", mr.url)
+        a._record_poll(dict(IDLE))
+        self.assertEqual(a.send_command("klipper_action", {"action": "exhaust_fan", "pct": 50})["reason"],
+                         "unsupported_on_printer")
+        self.assertTrue(a.send_command("klipper_action", {"action": "aux_fan", "pct": 50})["ok"])
+        self.assertEqual(mr.posts, [("/printer/gcode/script", "SET_FAN_SPEED FAN=fan2 SPEED=0.5")])
+
+
+PAUSED = {**state("paused"), "extruder": {"temperature": 219.0, "target": 220.0}}
+PRINTING = {**state("printing"), "extruder": {"temperature": 219.0, "target": 220.0}}
+RESUME_HEAT = SV08_OBJECTS + ["gcode_macro _pstation_resume_heat"]
+
+
+class TestPauseWatch(unittest.TestCase):
+    """v0.79 (the sv08 report's D6): a paused print that sits is told to the shop at 30 min; at 60 min the nozzle drops to
+    140 (the bed is left on), only on a printer whose RESUME heats back."""
+
+    def setUp(self):
+        self.mr = Moonraker(objects=RESUME_HEAT)
+        self.addCleanup(self.mr.close)
+        self.a = KlipperAdapter("p1", self.mr.url)
+        self.a._record_poll(dict(PRINTING))
+        self.a._after_poll(PRINTING)
+
+    def paused_for(self, minutes, reading=PAUSED):
+        self.a._pause["at"] = time.monotonic() - minutes * 60
+        self.a._record_poll(dict(reading))
+        self.a._after_poll(reading)
+
+    def test_the_print_temperature_is_kept_and_the_pause_is_timed_from_when_it_was_seen(self):
+        self.assertEqual(self.a._print_target, 220.0)
+        self.a._after_poll({**PAUSED, "extruder": {"temperature": 140.0, "target": 140.0}})
+        self.assertEqual(self.a._print_target, 220.0)       # paused: what it printed at, not what it cooled to
+        self.assertIsNotNone(self.a._pause)
+        self.a._after_poll(state("complete"))
+        self.assertIsNone(self.a._pause)
+        self.assertIsNone(self.a._print_target)
+
+    def test_at_30_min_the_status_carries_the_fault_and_the_log_hears_it_once(self):
+        self.a._after_poll(PAUSED)
+        self.paused_for(29)
+        self.assertNotIn("printFault", self.a.status())
+        with self.assertLogs("makeros_hub.printers.klipper", "WARNING") as logs:
+            self.paused_for(31)
+            self.paused_for(32)
+        self.assertEqual(sum("paused 3" in line for line in logs.output), 1)
+        self.assertEqual(self.a.status()["printFault"], "paused_long")
+        self.assertEqual(self.mr.posts, [])                 # nothing sent at 30 min
+        self.a._record_poll(dict(PRINTING))
+        self.a._after_poll(PRINTING)                        # resumed
+        self.assertNotIn("printFault", self.a.status())
+
+    def test_at_60_min_the_nozzle_goes_to_140_once_and_the_bed_stays(self):
+        self.a._after_poll(PAUSED)
+        self.paused_for(59)
+        self.assertEqual(self.mr.posts, [])
+        self.paused_for(61)
+        self.paused_for(70)
+        self.assertEqual(self.mr.posts, [("/printer/gcode/script",
+                                          "SET_GCODE_VARIABLE MACRO=_pstation_resume_heat VARIABLE=nozzle VALUE=220\n"
+                                          "M104 S140")])
+
+    def test_never_on_a_printer_whose_resume_does_not_heat_back_nor_below_140(self):
+        self.mr.objects = list(SV08_OBJECTS)                # Sovol's RESUME as shipped
+        self.a._after_poll(PAUSED)
+        with self.assertLogs("makeros_hub.printers.klipper", "WARNING") as logs:
+            self.paused_for(61)
+        self.assertTrue(any("does not heat back" in line for line in logs.output))
+        self.assertEqual(self.mr.posts, [])
+        self.mr.objects = list(RESUME_HEAT)
+        self.a._objects = None
+        self.a._after_poll(state("complete"))
+        self.a._after_poll({**PAUSED, "extruder": {"temperature": 140.0, "target": 140.0}})
+        self.paused_for(61, {**PAUSED, "extruder": {"temperature": 140.0, "target": 140.0}})
+        self.assertEqual(self.mr.posts, [])
+
+
+class TestResume(unittest.TestCase):
+    """v0.79 (D6): a Resume from the site heats back to the print's temperature and waits; Sovol's RESUME never does."""
+
+    def setUp(self):
+        self.mr = Moonraker()
+        self.addCleanup(self.mr.close)
+        self.a = KlipperAdapter("p1", self.mr.url)
+        self.a._record_poll(dict(PAUSED))
+
+    def resume(self, reading, print_target=None):
+        self.mr.status = reading
+        self.a._print_target = print_target
+        out = self.a.send_command("resume")
+        self.assertTrue(_wait(lambda: self.a._running_action is None))
+        return out
+
+    def test_hot_resumes_as_before(self):
+        out = self.resume(PAUSED, 220.0)
+        self.assertEqual(out, {"ok": True, "command": "resume", "result": "ok"})
+        self.assertEqual(self.mr.posts, [("/printer/print/resume", None)])
+
+    def test_cooled_heats_back_to_the_print_temperature_and_waits_first(self):
+        out = self.resume({**PAUSED, "extruder": {"temperature": 141.0, "target": 140.0}}, 220.0)
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["command"], "resume")
+        self.assertEqual(self.mr.posts, [("/printer/gcode/script", "M109 S220\nRESUME")])
+
+    def test_after_a_hub_restart_the_printers_saved_target_is_used(self):
+        reading = {**PAUSED, "extruder": {"temperature": 25.0, "target": 0.0},
+                   "gcode_macro _pstation_resume_heat": {"nozzle": 230.0}}
+        self.assertTrue(self.resume(reading)["ok"])
+        self.assertEqual(self.mr.posts, [("/printer/gcode/script", "M109 S230\nRESUME")])
+
+    def test_what_the_hub_saw_it_print_at_wins_over_a_left_over_printer_value(self):
+        reading = {**PAUSED, "extruder": {"temperature": 140.0, "target": 140.0},
+                   "gcode_macro _pstation_resume_heat": {"nozzle": 240.0}}   # from a PETG print cancelled while paused
+        self.assertTrue(self.resume(reading, 215.0)["ok"])
+        self.assertEqual(self.mr.posts, [("/printer/gcode/script", "M109 S215\nRESUME")])
+
+    def test_cold_with_nothing_known_is_refused(self):
+        out = self.resume({**PAUSED, "extruder": {"temperature": 140.0, "target": 140.0}})
+        self.assertEqual(out, {"ok": False, "reason": "nozzle_cold", "command": "resume"})
+        self.assertEqual(self.mr.posts, [])
+
+    def test_not_paused_goes_to_moonraker_as_before(self):
+        self.resume(dict(PRINTING), 220.0)
+        self.assertEqual(self.mr.posts, [("/printer/print/resume", None)])
+
+
 if __name__ == "__main__":
     unittest.main()

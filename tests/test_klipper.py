@@ -371,6 +371,15 @@ class StubMoonrakerErrorPath(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_GET(self):
+        # v0.79: a resume reads the printer first (is it paused, is the nozzle hot); this one is between prints
+        body = b'{"result": {"status": {"print_stats": {"state": "standby"}}}}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def log_message(self, *_args, **_kw):
         return
 
