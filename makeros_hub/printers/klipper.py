@@ -167,21 +167,25 @@ _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 # v0.76: the shared touchscreen's controls (operator, 2026-10-19: "all of it needs to run through the screen"). The site
 # sends {command: "klipper_action", params: {action, ...}} and the hub runs only the named actions below, built here from
 # validated params: never G-code the site hands it. Each action's params (besides `action`); any other key is bad_params.
+# v0.79: preheat, load and unload name a material (MATERIALS), never a temperature.
 _ACTION_PARAMS: dict[str, tuple[str, ...]] = {
     "home": (), "jog": ("axis", "mm"), "center": (), "motors_off": (),
-    "load_filament": (), "load_more": (), "unload_filament": (),
-    "preheat": ("nozzle", "bed"), "cooldown": (), "light": ("on",),
+    "load_filament": ("material",), "load_more": (), "unload_filament": ("material",),
+    "preheat": ("material",), "cooldown": (), "light": ("on",),
     "qgl": (), "bed_mesh": (), "clean_nozzle": (),
     "z_offset": ("delta",), "speed": ("pct",), "fan": ("pct",),
     "emergency_stop": (), "firmware_restart": (),
 }
 # Parameterless actions -> their G-code, or (the two that bypass klippy's G-code queue) a Moonraker endpoint. home is
 # Klipper's G28; on the SV08, Sovol's G28 macro runs Z_OFFSET_CALIBRATION and SAVE_CONFIG (a Klipper restart) when the
-# probe is uncalibrated: the printer's own behaviour, not ours. MOVE_TO_CENTER homes first on the SV08 too.
+# probe is uncalibrated, so v0.79 refuses every homing action then (probe_uncalibrated). MOVE_TO_CENTER homes first on the
+# SV08 too. v0.79: Home ends 10 mm up, so a hot nozzle never rests on the plate (the SV08's homing_override already ends at
+# Z10: no move there); QGL re-homes Z after levelling, as the SV08's START_PRINT does, so the Z a jog trusts is true again.
+# Load and unload get their temperature and lift from _check_state.
 _PLAIN_ACTIONS = {
-    "home": "G28", "center": "MOVE_TO_CENTER", "motors_off": "M84",
+    "home": "G28\nG90\nG1 Z10 F600", "center": "MOVE_TO_CENTER", "motors_off": "M84",
     "load_filament": "LOAD_FILAMENT", "load_more": "_CONTINUE_LOAD_FILAMENT", "unload_filament": "UNLOAD_FILAMENT",
-    "cooldown": "TURN_OFF_HEATERS", "qgl": "QUAD_GANTRY_LEVEL", "bed_mesh": "BED_MESH_CALIBRATE",
+    "cooldown": "TURN_OFF_HEATERS", "qgl": "QUAD_GANTRY_LEVEL\nG28 Z", "bed_mesh": "BED_MESH_CALIBRATE",
     "clean_nozzle": "CLEAN_NOZZLE",
     "emergency_stop": "/printer/emergency_stop", "firmware_restart": "/printer/firmware_restart",
 }
@@ -191,11 +195,19 @@ _ACTION_NEEDS = {
     "load_more": "gcode_macro _continue_load_filament", "unload_filament": "gcode_macro unload_filament",
     "qgl": "quad_gantry_level", "bed_mesh": "bed_mesh", "clean_nozzle": "gcode_macro clean_nozzle",
 }
-# Refused while a print runs or is paused (printer_busy) / refused unless one does (not_printing). Everything else runs in
-# any state: light, and the two endpoint actions.
-_IDLE_ONLY_ACTIONS = frozenset({"home", "jog", "center", "motors_off", "load_filament", "load_more", "unload_filament",
-                                "preheat", "qgl", "bed_mesh", "clean_nozzle", "cooldown"})
+# Refused while a print runs or is paused (printer_busy) / refused unless one does (not_printing). v0.79: filament moves
+# run idle or paused (a runout pause needs them; Sovol's macros reheat to the print's own temperature then) and are refused
+# only while printing. Everything else runs in any state: light, and the two endpoint actions.
+_IDLE_ONLY_ACTIONS = frozenset({"home", "jog", "center", "motors_off", "preheat", "qgl", "bed_mesh", "clean_nozzle",
+                                "cooldown"})
+_FILAMENT_ACTIONS = frozenset({"load_filament", "load_more", "unload_filament"})
 _PRINT_ONLY_ACTIONS = frozenset({"z_offset", "speed", "fan"})
+# v0.79: every action that homes or probes. Refused when the probe says it is uncalibrated (on the SV08 a G28 would then
+# calibrate and SAVE_CONFIG, a Klipper restart: Barnes, 2026-10-21 report D10) or the bed is at PROBE_BED_MAX_C or more
+# (the SV08's eddy probe left its valid range at a 100 C bed: D9). Each also drops the home a jog trusts until it ends.
+_HOMING_ACTIONS = frozenset({"home", "center", "qgl", "bed_mesh", "clean_nozzle"})
+# ...and these restore it when they finish: each ends with a real G28 Z (qgl's own, MOVE_TO_CENTER's G28).
+_PROVES_HOME = frozenset({"home", "center", "qgl"})
 # Skip the running-action check, the fresh read and the state rules (still not_connected on a stale poll): the way
 # out of a stuck printer.
 _ENDPOINT_ACTIONS = frozenset({"emergency_stop", "firmware_restart"})
@@ -204,9 +216,41 @@ _LONG_ACTIONS = frozenset({"home", "center", "load_filament", "load_more", "unlo
                            "clean_nozzle"})
 # The state an action is checked against, read fresh when it arrives (start_print's rule: the poll may be seconds old,
 # and a print just started from the screen or the queue must never get a jog inside its start routine).
-_ACTION_QUERY = "print_stats=state&toolhead=homed_axes,position,axis_minimum,axis_maximum"
+# v0.79 adds the heat, the probe and Sovol's load temperature variable (Klipper leaves out an object a printer lacks).
+_ACTION_QUERY = ("print_stats=state&toolhead=homed_axes,position,axis_minimum,axis_maximum&extruder=temperature,target"
+                 "&heater_bed=temperature,target&probe=is_calibrated"
+                 "&gcode_macro%20_global_var=load_filament_extruder_temp")
 _JOG_STEPS_MM = frozenset({0.1, 1.0, 10.0, 50.0})
 _JOG_FEED = {"x": 6000, "y": 6000, "z": 600}
+
+# v0.79: the machine controls protect the printer from a tap (operator, 2026-10-21: "i definitely also want the stupid
+# logic of z and everything else fixed like we are doing weith the giga to make it run smoothly and protect it form
+# itself"). The rules are the Giga screen's (pstation reports/giga-screen-logic-audit-2026-10-21.md, "Decisions"); each
+# printer's own limits (axis range, max_temp, min_extrude_temp, its macros) still come from its Klipper.
+# Calibration knob: the lowest Z a jog may reach, mm, or the printer's own position_min when that is higher. Sovol's
+# stock screen stops at Z 0, where the nozzle touches the plate; 2 clears plates up to 2 mm apart (the Giga's are 0.84).
+JOG_Z_FLOOR_MM = 2.0
+LIFT_Z_MM = 10.0  # Home ends here, and an idle load or unload lifts here first when lower (the SV08's unload pushes 30 mm)
+# Load and unload temperature (Sovol's _global_var.load_filament_extruder_temp, 250 for everything) and the preheat bed,
+# per material; preheat holds the nozzle at NOZZLE_STANDBY_C so it neither oozes nor cooks while the bed settles (the
+# print's start G-code raises it). PLA and PETG only (the operator's rule for the Giga, 2026-10-21; for the SV08 it is
+# question 1 of reports/sv08-tft-screens-2026-10-21.md). Caps: nozzle 250, bed 100 (the Giga's Q3); a test holds every
+# value under them, and Klipper's own max_temp still refuses past the printer's limit.
+# ponytail: one table for every printer; make it per printer when one needs other numbers (the Giga's 1.0 mm nozzle).
+MATERIALS = {"PLA": (215, 60), "PETG": (240, 70)}
+NOZZLE_STANDBY_C = 140
+# Load more waits for the heat: the nozzle set to a filament temperature, and within AT_TARGET_C of it (Sovol's
+# _CONTINUE_LOAD_FILAMENT checks only min_extrude_temp 150, so it would push PETG at 151 on its way to 240).
+MIN_EXTRUDE_C = 170
+AT_TARGET_C = 5
+# After a filament change nothing waits hot: this long after the last filament move with no print, the nozzle goes to
+# NOZZLE_STANDBY_C, then off (the Giga's Q2; the SV08's own idle timeout is 30 min, Sovol's load leaves 250 on until then).
+FIL_STANDBY_SEC, FIL_OFF_SEC = 600.0, 1800.0
+SPEED_MAX_PCT = 150  # the Giga's Q9
+# Calibration knob: how far the Z offset may be nudged from here during one print, mm in total. Each nudge is at most 0.1,
+# but nothing stopped twenty of them pushing the nozzle 2 mm into the plate.
+Z_TUNE_MAX_MM = 0.3
+PROBE_BED_MAX_C = 90.0
 # dispatch_commands runs on the heartbeat thread: a short action waits this long for klippy's answer, a long one this long
 # for an immediate refusal before it reports "started".
 ACTION_WAIT_SEC = 2.0
@@ -265,6 +309,12 @@ class KlipperAdapter:
         # cached /printer/objects/list names (lower-cased) with when they were read.
         self._running_action: Optional[str] = None
         self._objects: Optional[tuple[frozenset, float]] = None
+        # v0.79, under _lock: a full home this hub saw finish and no reading has seen lost since (jogs and the load lift
+        # trust only that: _check_state); when the last filament move ended (_filament_standby); and the Z offset this hub
+        # has nudged during the current print (Z_TUNE_MAX_MM). All start empty: a restarted hub asks for a home again.
+        self._home_proven = False
+        self._fil_at: Optional[float] = None
+        self._z_tuned = 0.0
 
     # Bambu compat — every adapter exposes these. The model field is only
     # set by Bambu so the agent's status pipeline can omit it.
@@ -335,10 +385,15 @@ class KlipperAdapter:
             data = self._data
             started = self._started
             metadata = self._metadata_for(data)
+            proven = self._home_proven
 
         if last is not None:
             out = _build_status(self.printer_id, data, "connected" if (now - last) <= STALE_SEC else "offline",
                                 metadata=metadata)
+            if not proven and "toolhead" in out:
+                # v0.79: "homed" is what a jog from the site may trust, so the screen says "Home first" exactly when
+                # the hub would refuse one (Klipper's homed_axes counts the SV08's guessed Z and the Giga's boot home).
+                out["toolhead"]["homed"] = ""
             # v0.70: when this reading was taken (wall ms), so the site can say "updated 4 s ago" instead of dating
             # everything by the heartbeat's arrival. The poll clock is monotonic; its age is moved onto the wall clock.
             out["sampledAt"] = int((time.time() - (now - last)) * 1000)
@@ -767,7 +822,8 @@ class KlipperAdapter:
     def _klipper_action(self, params: Any) -> dict:
         """One named action from the shared touchscreen: {ok, reason?, detail?}. Refusals, in order: _parse_action's
         (unsupported_action, bad_params), not_connected (the poll's liveness rule, as for pause), then for everything but
-        the two endpoint actions action_running (a long one is still going), _check_state's against a fresh read, and
+        the two endpoint actions action_running (a long one is still going), _check_state's against a fresh read (v0.79:
+        the Z floor, a proven home, the heat, the probe, the Z tune; it also gives load and unload their temperature), and
         unsupported_on_printer (the macro or module is not on this printer).
 
         How it is sent: Moonraker's POST /printer/gcode/script answers only once the script has run, and everything here
@@ -787,13 +843,23 @@ class KlipperAdapter:
             if action not in _ENDPOINT_ACTIONS:
                 if running:
                     raise _Refused("action_running")
-                _check_state(params, self._fetch_once(_ACTION_QUERY, timeout=ACTION_WAIT_SEC))
+                fresh = self._fetch_once(_ACTION_QUERY, timeout=ACTION_WAIT_SEC)
+                self._note_homed(fresh)
+                with self._lock:
+                    proven, z_tuned = self._home_proven, self._z_tuned
+                script = _check_state(params, script, fresh, home_proven=proven, z_tuned=z_tuned)
                 if need and need not in self._printer_objects():
                     raise _Refused("unsupported_on_printer")
         except _Refused as refused:
             return {"ok": False, "reason": refused.reason}
         except Exception as exc:  # noqa: BLE001 - the fresh state or the objects list could not be read
             return {"ok": False, "reason": _action_failure(exc)[0]}
+        if action in _ENDPOINT_ACTIONS or action == "motors_off":   # whatever the answer, the home is gone
+            with self._lock:
+                self._home_proven = False
+        if action in _ENDPOINT_ACTIONS or action in ("preheat", "cooldown"):   # a new heat plan: no filament standby
+            with self._lock:
+                self._fil_at = None
         if action in _LONG_ACTIONS:
             return self._start_long_action(action, script)
         path = script if action in _ENDPOINT_ACTIONS else _script_path(script)
@@ -810,9 +876,11 @@ class KlipperAdapter:
                 except Exception as exc2:  # noqa: BLE001
                     log.warning("klipper %s: G90 after a refused jog failed: %s", self.printer_id, _action_failure(exc2)[0])
             return {"ok": False, "reason": reason}
-        if action == "firmware_restart":
-            with self._lock:
+        with self._lock:
+            if action == "firmware_restart":
                 self._objects = None
+            if action == "z_offset":
+                self._z_tuned += params["delta"]
         log.info("klipper %s: action %s ok", self.printer_id, action)
         return {"ok": True}
 
@@ -821,6 +889,8 @@ class KlipperAdapter:
             if self._running_action:
                 return {"ok": False, "reason": "action_running"}
             self._running_action = action
+            if action in _HOMING_ACTIONS:
+                self._home_proven = False
         outcome: list[Optional[str]] = []   # appended once by the thread: None = finished ok, else the reason
 
         def run() -> None:
@@ -828,6 +898,9 @@ class KlipperAdapter:
                 self._post_ok(_script_path(script), LONG_ACTION_TIMEOUT_SEC)
                 outcome.append(None)
                 log.info("klipper %s: action %s finished", self.printer_id, action)
+                if action in _PROVES_HOME:
+                    with self._lock:
+                        self._home_proven = True
             except Exception as exc:  # noqa: BLE001 - never let the thread die with the action still marked running
                 reason, message = _action_failure(exc)
                 outcome.append(reason)
@@ -836,6 +909,8 @@ class KlipperAdapter:
             finally:
                 with self._lock:
                     self._running_action = None
+                    if action in _FILAMENT_ACTIONS:   # failed or not, the macro may have left the nozzle hot
+                        self._fil_at = time.monotonic()
 
         thread = threading.Thread(target=run, name=f"klipper-{action}-{self.printer_id[:8]}", daemon=True)
         thread.start()
@@ -843,6 +918,54 @@ class KlipperAdapter:
         if outcome and outcome[0] is not None:
             return {"ok": False, "reason": outcome[0]}
         return {"ok": True, "detail": "done" if outcome else "started"}
+
+    def _note_homed(self, status: dict[str, Any]) -> None:
+        """A reading (the poll or an action's fresh read) where any axis is not homed ends the proven home: motors off, a
+        Klipper restart, a print's own M84."""
+        if not _all_homed(status):
+            with self._lock:
+                self._home_proven = False
+
+    def _after_poll(self, data: dict[str, Any]) -> None:
+        """v0.79, on the poll thread after each good reading: the proven home, the per-print Z tune, the filament standby."""
+        self._note_homed(data)
+        in_print = _obj(data, "print_stats").get("state") in ("printing", "paused")
+        with self._lock:
+            if not in_print:
+                self._z_tuned = 0.0
+            fil_at = self._fil_at if self._running_action is None else None
+        if fil_at is not None:
+            self._filament_standby(data, fil_at)
+
+    def _filament_standby(self, data: dict[str, Any], fil_at: float) -> None:
+        """The Giga's Q2 (operator, 2026-10-21): FIL_STANDBY_SEC after this hub's last filament move with no print, the
+        nozzle goes to NOZZLE_STANDBY_C; at FIL_OFF_SEC, off. A print ends it (the print owns its heat). A pause waits
+        and never cools: the SV08's RESUME does not reheat, so a paused nozzle must stay at the print's temperature.
+        ponytail: decided on the poll's reading, so a print started in the last 5 s can get one M104 during its start
+        routine, which heats again itself; a fresh read here would close that."""
+        state = _obj(data, "print_stats").get("state")
+        target = _num(_obj(data, "extruder").get("target")) or 0.0
+        age = time.monotonic() - fil_at
+        if state == "paused" or (state != "printing" and age < FIL_STANDBY_SEC):
+            return
+        ends = state == "printing" or age >= FIL_OFF_SEC
+        script = None
+        if state != "printing" and age >= FIL_OFF_SEC and target > 0:
+            script = "M104 S0"
+        elif state != "printing" and not ends and target > NOZZLE_STANDBY_C:
+            script = f"M104 S{NOZZLE_STANDBY_C}"
+        if script:
+            try:
+                self._post_ok(_script_path(script), ACTION_WAIT_SEC)
+                log.info("klipper %s: filament standby %s (%.0f min after the last filament move, no print)",
+                         self.printer_id, script, age / 60)
+            except Exception as exc:  # noqa: BLE001 - the printer's own idle timeout still turns the heat off
+                log.warning("klipper %s: filament standby %s not sent: %s", self.printer_id, script, _action_failure(exc)[0])
+                ends = True
+        if ends:
+            with self._lock:
+                if self._fil_at == fil_at:   # not a newer filament move since
+                    self._fil_at = None
 
     def _post_ok(self, path: str, timeout: float) -> None:
         """POST one Moonraker endpoint; returns only on {"result": "ok"}, raises otherwise."""
@@ -890,6 +1013,7 @@ class KlipperAdapter:
                     self._last_error_reason = reason
                     self._consecutive_failures += 1
                     failures = self._consecutive_failures
+                    self._home_proven = False   # v0.79: the printer may be restarting (the Giga fakes a home at boot)
                 # Adversarial review MED #13: first failure after a run of
                 # successes is WARN-level so it lands in the diag ring (which
                 # gates on WARN+). Subsequent failures stay at DEBUG so a
@@ -921,6 +1045,7 @@ class KlipperAdapter:
                 was_first = self._record_poll(data, stop)
                 if was_first is None:
                     return   # stopped while this poll was in flight
+                self._after_poll(data)
                 self._refresh_metadata(data)   # Publish and date the reading before a metadata request can delay it.
                 # Adversarial review MED #14: explicit "connected" log on
                 # the first-poll-success transition so the cloud admin diag
@@ -1353,6 +1478,8 @@ def _parse_action(params: Any) -> tuple[str, str, Optional[str]]:
     if set(params) != {"action", *_ACTION_PARAMS[action]}:
         raise _Refused("bad_params")
     need = _ACTION_NEEDS.get(action)
+    if "material" in params and not (isinstance(params["material"], str) and params["material"] in MATERIALS):
+        raise _Refused("bad_params")
     if action in _PLAIN_ACTIONS:
         script = _PLAIN_ACTIONS[action]
     elif action == "jog":
@@ -1361,9 +1488,7 @@ def _parse_action(params: Any) -> tuple[str, str, Optional[str]]:
             raise _Refused("bad_params")
         script = f"G91\nG1 {axis.upper()}{mm:g} F{_JOG_FEED[axis]}\nG90"
     elif action == "preheat":
-        if not (_whole(params["nozzle"], 0, 300) and _whole(params["bed"], 0, 110)):
-            raise _Refused("bad_params")
-        script = f"M104 S{params['nozzle']}\nM140 S{params['bed']}"
+        script = f"M104 S{NOZZLE_STANDBY_C}\nM140 S{MATERIALS[params['material']][1]}"
     elif action == "light":
         if not isinstance(params["on"], bool):
             raise _Refused("bad_params")
@@ -1375,7 +1500,7 @@ def _parse_action(params: Any) -> tuple[str, str, Optional[str]]:
             raise _Refused("bad_params")
         script = f"SET_GCODE_OFFSET Z_ADJUST={delta:g} MOVE=1"
     elif action == "speed":
-        if not _whole(params["pct"], 10, 300):
+        if not _whole(params["pct"], 10, SPEED_MAX_PCT):
             raise _Refused("bad_params")
         script = f"M220 S{params['pct']}"
     else:  # fan
@@ -1385,33 +1510,84 @@ def _parse_action(params: Any) -> tuple[str, str, Optional[str]]:
     return action, script, need
 
 
-def _check_state(params: dict, status: dict[str, Any]) -> None:
-    """Pure: may this parsed action run in `status` (an objects query with print_stats and toolhead)? Raises _Refused:
-    printer_stale, printer_busy / not_printing ("printing" and "paused" both count as a print), not_homed, out_of_range."""
-    action, axis, mm = params["action"], params.get("axis"), params.get("mm")
+def _obj(status: dict[str, Any], name: str) -> dict:
+    v = status.get(name)
+    return v if isinstance(v, dict) else {}
+
+
+def _all_homed(status: dict[str, Any]) -> bool:
+    homed = _obj(status, "toolhead").get("homed_axes")
+    return isinstance(homed, str) and set("xyz") <= set(homed.lower())
+
+
+def _check_state(params: dict, script: str, status: dict[str, Any], *, home_proven: bool = False,
+                 z_tuned: float = 0.0) -> str:
+    """Pure: may this parsed action run in `status` (the fresh _ACTION_QUERY read), and the script to send then. Raises
+    _Refused: printer_stale, printer_busy / not_printing ("printing" and "paused" both count as a print; filament moves are
+    refused only while printing), probe_uncalibrated, bed_too_hot, not_homed, z_floor, lift_first, out_of_range,
+    nozzle_cold, nozzle_heating, unsupported_on_printer, z_offset_limit.
+
+    home_proven: a full home this hub saw finish, never lost since (the adapter's _home_proven). homed_axes alone is not
+    enough: the SV08's homing_override marks Z homed at a guessed 0 on any G28 X or Y, and the Giga fakes "xyz" at boot.
+    z_tuned: the Z offset this hub has already nudged during this print."""
+    action = params["action"]
     if action in _ENDPOINT_ACTIONS:
-        return
-    stats = status.get("print_stats")
-    state = stats.get("state") if isinstance(stats, dict) else None
+        return script
+    state = _obj(status, "print_stats").get("state")
     if not isinstance(state, str):
         raise _Refused("printer_stale")
     printing = state in ("printing", "paused")
-    if printing and action in _IDLE_ONLY_ACTIONS:
+    if (printing and action in _IDLE_ONLY_ACTIONS) or (state == "printing" and action in _FILAMENT_ACTIONS):
         raise _Refused("printer_busy")
     if not printing and action in _PRINT_ONLY_ACTIONS:
         raise _Refused("not_printing")
+    toolhead = _obj(status, "toolhead")
+    z, z_low, z_high = (_axis(toolhead.get(k), 2) for k in ("position", "axis_minimum", "axis_maximum"))
+    if action in _HOMING_ACTIONS:
+        if _obj(status, "probe").get("is_calibrated") is False:
+            raise _Refused("probe_uncalibrated")
+        bed = _obj(status, "heater_bed")
+        if max(_num(bed.get("temperature")) or 0.0, _num(bed.get("target")) or 0.0) >= PROBE_BED_MAX_C:
+            raise _Refused("bed_too_hot")
     if action == "jog":
-        toolhead = status.get("toolhead") if isinstance(status.get("toolhead"), dict) else {}
-        homed = toolhead.get("homed_axes")
-        if not isinstance(homed, str) or axis not in homed:
+        axis, mm = params["axis"], params["mm"]
+        if not (home_proven and _all_homed(status)):
             raise _Refused("not_homed")
         i = "xyz".index(axis)
         pos, low, high = (_axis(toolhead.get(k), i) for k in ("position", "axis_minimum", "axis_maximum"))
-        if pos is None or low is None or high is None:
+        if pos is None or low is None or high is None or z is None or z_low is None:
             raise _Refused("printer_stale")
+        floor = max(JOG_Z_FLOOR_MM, z_low)
+        if axis != "z" and z < floor - 1e-6:
+            raise _Refused("lift_first")   # sideways only clear of the plate, its clips and the SV08's wiper
+        if axis == "z" and mm < 0 and pos + mm < floor - 1e-6:
+            raise _Refused("z_floor")      # up is always allowed, even from below the floor
         # toolhead.position is the commanded position, the frame axis_minimum/maximum are in (a relative G1 moves it by mm)
         if not low - 1e-6 <= pos + mm <= high + 1e-6:
             raise _Refused("out_of_range")
+    elif action == "load_more":
+        heat = _obj(status, "extruder")
+        temp, target = _num(heat.get("temperature")) or 0.0, _num(heat.get("target")) or 0.0
+        if target < MIN_EXTRUDE_C:
+            raise _Refused("nozzle_cold")      # a nozzle cooling with its heater off is cold, however hot it still reads
+        if temp < max(MIN_EXTRUDE_C, target - AT_TARGET_C):
+            raise _Refused("nozzle_heating")
+    elif action in ("load_filament", "unload_filament"):
+        # Sovol's macros heat to _global_var.load_filament_extruder_temp and wait (paused: the print's own target when it
+        # is at least min_extrude_temp). Set it to the material's for this move only, then put the printer's value back.
+        # A printer without that variable cannot be told a temperature: refused rather than loaded at 250.
+        was = _num(_obj(status, "gcode_macro _global_var").get("load_filament_extruder_temp"))
+        if was is None:
+            raise _Refused("unsupported_on_printer")
+        lift = ""
+        if (state != "paused" and home_proven and _all_homed(status) and z is not None and z_high is not None
+                and z < LIFT_Z_MM - 1e-6 <= z_high):   # paused: parked by PAUSE, and RESUME puts it back
+            lift = f"G90\nG1 Z{LIFT_Z_MM:g} F600\n"
+        var = "SET_GCODE_VARIABLE MACRO=_global_var VARIABLE=load_filament_extruder_temp VALUE="
+        script = f"{lift}{var}{MATERIALS[params['material']][0]}\n{script}\n{var}{was:g}"
+    elif action == "z_offset" and abs(z_tuned + params["delta"]) > Z_TUNE_MAX_MM + 1e-9:
+        raise _Refused("z_offset_limit")
+    return script
 
 
 def _action_failure(err: BaseException) -> tuple[str, str]:
