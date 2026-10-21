@@ -12,11 +12,12 @@ job.json:
   {"mesh": "part.stl", "model": "A1 Mini" | "P2S" | "X1C",
    "filament": {"trayInfoIdx": "GFA00" | null, "type": "PLA", "colorHex": "#F2754E"},
    "fixes": {"orient": true, "brim": false, "supports": false}, "scale": 1.0}
+  All three fixes are required booleans.
 
 Presets: Bambu's own system presets bundled with OrcaSlicer, resolved through their `inherits` chains here (the CLI does
 not load the vendor bundle, so an unresolved preset silently loses its density, filament id and process values; checked
-2026-10-18), marked `from: system` (the CLI refuses a machine preset from a user), then the shop's overrides: the
-textured PEI plate, a brim, tree supports. The model code Bambu writes into slice_info (N1, N7, BL-P001) comes from the
+2026-10-18), marked `from: system` (the CLI refuses a machine preset from a user), then the shop's own settings
+(SHOP_PROCESS) and the member's choices, each written out in both states (shop_process()). The model code Bambu writes into slice_info (N1, N7, BL-P001) comes from the
 vendor's printer definition: the CLI leaves it blank, and the hub refuses a plate without it.
 
 Stdlib only. `python3 ps_slice.py selftest` checks the pure parts without the slicer.
@@ -42,10 +43,28 @@ MODELS = {
     "X1C": ("Bambu Lab X1 Carbon 0.4 nozzle", "X1C"),
 }
 PROCESS = "0.20mm Standard @BBL {sfx}"
+
+# The shop's own settings for every automatic slice, per model, in one place. Each value is written into the process, so a
+# preset change or an OrcaSlicer default never decides it quietly. Change a model's line here and the hub's next release
+# slices with it; the site's OrcaSlicer setup download should carry the same values (reports/auto-slice-quality-plan).
+# sparse_infill_pattern (operator, 2026-10-21: "the auto slicer defaults to gyroid which is overkill and takes longer"):
+# Bambu's presets give crosshatch, whose wavy transition layers look like gyroid. Cubic at the same 15% sliced 3 to 16%
+# faster than crosshatch and 5 to 32% faster than gyroid (the most on the biggest parts), 1 to 3% lighter, and is a 3D
+# pattern that is strong in every direction (OrcaSlicer 2.4.2, four shop parts on the A1 mini, two on the P2S and X1C,
+# 2026-10-21; the table is in pstation reports/auto-slice-quality-plan-2026-10-21.md). Grid was as fast but crosses
+# itself in every layer.
+SHOP_PROCESS: dict[str, dict[str, str]] = {
+    "A1 Mini": {"sparse_infill_pattern": "cubic", "sparse_infill_density": "15%"},
+    "P2S": {"sparse_infill_pattern": "cubic", "sparse_infill_density": "15%"},
+    "X1C": {"sparse_infill_pattern": "cubic", "sparse_infill_density": "15%"},
+}
 TYPES = {"PLA", "PETG", "ABS", "ASA", "TPU"}
 MESH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,118}\.(stl|obj|3mf)$", re.I)
 HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
 TRAY_RE = re.compile(r"^[A-Z0-9]{3,8}$")
+
+
+FIX_WORDS = {"orient": "turn the part onto its best side", "brim": "add a brim", "supports": "add supports"}
 
 
 class SliceError(Exception):
@@ -71,6 +90,11 @@ def read_spec(raw: dict) -> dict:
     # the spool's stated material as the printer reports it ("PLA", "PETG-CF"); absent from a site before 2026-10-19
     stated = str(fil.get("material") or "").strip().upper()[:24] or None
     fixes = raw.get("fixes") or {}
+    # every Print it choice arrives as true or false (operator, 2026-10-21: an unticked brim still got OrcaSlicer's "auto"
+    # brim); a request that leaves one out is refused rather than given a default nobody chose
+    for k in ("orient", "brim", "supports"):
+        if not isinstance(fixes.get(k), bool):
+            raise SliceError(f"the slice request does not say whether to {FIX_WORDS[k]}")
     scale = raw.get("scale", 1.0)
     if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not 0.05 <= float(scale) <= 20:
         raise SliceError("the size change is outside what the slicer accepts")
@@ -79,7 +103,7 @@ def read_spec(raw: dict) -> dict:
         "color": color if isinstance(color, str) and HEX_RE.match(color) else None,
         "tray": tray if isinstance(tray, str) and TRAY_RE.match(tray) else None,
         "stated": stated,
-        "orient": bool(fixes.get("orient", True)), "brim": bool(fixes.get("brim")), "supports": bool(fixes.get("supports")),
+        "orient": fixes["orient"], "brim": fixes["brim"], "supports": fixes["supports"],
         "scale": float(scale),
     }
 
@@ -168,6 +192,23 @@ def pick_filament(index: dict[str, dict], machine: str, sfx: str, ftype: str, tr
     raise SliceError(f"there is no {ftype} preset for this printer")
 
 
+def shop_process(spec: dict) -> dict[str, str]:
+    """The process values the shop sets on every automatic slice: its per-model settings, then each Print it choice in both
+    states. Unticked means off, never OrcaSlicer's "auto" (its brim_type default is auto_brim, which the Bambu presets leave
+    unset, so a part got a brim nobody asked for)."""
+    out = dict(SHOP_PROCESS[spec["model"]])
+    out.update({"brim_type": "outer_only", "brim_width": "5"} if spec["brim"] else {"brim_type": "no_brim"})
+    out.update({"enable_support": "1", "support_type": "tree(auto)"} if spec["supports"] else {"enable_support": "0"})
+    return out
+
+
+def orca_args(spec: dict, paths: dict[str, str], out: str, mesh: str) -> list[str]:
+    """The OrcaSlicer command line, with orientation and scale stated every time, not only when they differ from a default."""
+    return [ORCA, "--slice", "0", "--arrange", "1", "--orient", "1" if spec["orient"] else "0", "--scale", f"{spec['scale']:.4f}",
+            "--load-settings", f"{paths['machine']};{paths['process']}", "--load-filaments", paths["filament"],
+            "--outputdir", out, "--export-3mf", "sliced.3mf", mesh]
+
+
 def set_model_id(threemf: str, model_id: str) -> None:
     """Write the printer's model code into Metadata/slice_info.config, as Bambu Studio and OrcaSlicer's desktop app do."""
     tmp = threemf + ".tmp"
@@ -209,11 +250,8 @@ def run(job_dir: str = JOB) -> dict:
     if not model_id:
         raise SliceError("the slicer's presets do not name this printer's model code")
     process = flatten(processes, PROCESS.format(sfx=sfx))
+    process.update(shop_process(spec))
     process["curr_bed_type"] = vendor.get("default_bed_type") or "Textured PEI Plate"
-    if spec["brim"]:
-        process.update({"brim_type": "outer_only", "brim_width": "5"})
-    if spec["supports"]:
-        process.update({"enable_support": "1", "support_type": "tree(auto)"})
     filament_name = pick_filament(filaments, machine_name, sfx, spec["type"], spec["tray"], spec.get("stated"))
     filament = flatten(filaments, filament_name)
     if spec["color"]:
@@ -227,12 +265,7 @@ def run(job_dir: str = JOB) -> dict:
         paths[kind] = os.path.join(work, f"{kind}.json")
         with open(paths[kind], "w", encoding="utf-8") as fh:
             json.dump(d, fh)
-    args = [ORCA, "--slice", "0", "--arrange", "1", "--orient", "1" if spec["orient"] else "0",
-            "--load-settings", f"{paths['machine']};{paths['process']}", "--load-filaments", paths["filament"],
-            "--outputdir", out, "--export-3mf", "sliced.3mf"]
-    if spec["scale"] != 1.0:
-        args += ["--scale", f"{spec['scale']:.4f}"]
-    args.append(os.path.join(job_dir, spec["mesh"]))
+    args = orca_args(spec, paths, out, os.path.join(job_dir, spec["mesh"]))
     p = subprocess.run(args, capture_output=True, text=True, timeout=540, env={**os.environ, "HOME": "/tmp"})
     sliced = os.path.join(out, "sliced.3mf")
     if p.returncode != 0 or not os.path.exists(sliced):
@@ -251,11 +284,15 @@ def run(job_dir: str = JOB) -> dict:
 
 
 def selftest() -> None:
-    ok = {"mesh": "part.stl", "model": "A1 Mini", "filament": {"type": "pla", "colorHex": "#F2754E", "trayInfoIdx": "GFA00"}}
+    ok = {"mesh": "part.stl", "model": "A1 Mini", "filament": {"type": "pla", "colorHex": "#F2754E", "trayInfoIdx": "GFA00"},
+          "fixes": {"orient": True, "brim": False, "supports": False}}
     s = read_spec(ok)
+    assert set(SHOP_PROCESS) == set(MODELS), "every model the auto path slices for needs its shop settings"
+    assert shop_process(s)["brim_type"] == "no_brim" and shop_process(s)["enable_support"] == "0", shop_process(s)
     assert s["type"] == "PLA" and s["color"] == "#F2754E" and s["tray"] == "GFA00" and s["orient"] and not s["brim"], s
     for bad in ({**ok, "model": "H2D"}, {**ok, "mesh": "../x.stl"}, {**ok, "mesh": "x.exe"},
-                {**ok, "filament": {"type": "wood"}}, {**ok, "scale": 50}, {**ok, "scale": True}):
+                {**ok, "filament": {"type": "wood"}}, {**ok, "scale": 50}, {**ok, "scale": True},
+                {**ok, "fixes": {"orient": True, "brim": False}}, {**ok, "fixes": {"orient": True, "brim": 1, "supports": False}}):
         try:
             read_spec(bad)
         except SliceError:
