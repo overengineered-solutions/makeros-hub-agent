@@ -46,7 +46,7 @@ from .http import get_to_file, TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
 from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
-from .printers.manager import SLICE_RUNNER, PrinterManager
+from .printers.manager import SLICE_RUNNER, SLICER_CAPS, PrinterManager, probe_slicer
 from . import paper as paper_lane
 from . import wake as wake_lane
 from . import job_files
@@ -771,6 +771,7 @@ def heartbeat_payload(
     camera_stats: dict | None = None,
     vp_connects: list[dict] | None = None,
     slicer_ready: bool | None = None,
+    slicer_caps: dict | None = None,
     paper_ready: bool | None = None,
     camera_gateway: bool | None = None,
     camera_live_stats: list[dict] | None = None,
@@ -849,6 +850,10 @@ def heartbeat_payload(
     # offers automatic slicing, and hands this hub slice jobs, only while this is true.
     if slicer_ready is not None:
         payload["slicerReady"] = bool(slicer_ready)
+    # Send to PS step 2: what the installed slicer image says it takes (manager.SlicerCaps), only while it can slice; absent =
+    # unknown, and the site sends this box only what every image since 0.72 takes
+    if slicer_ready and isinstance(slicer_caps, dict):
+        payload["slicerCaps"] = dict(slicer_caps)
     if paper_ready is not None:
         payload["paperReady"] = bool(paper_ready)   # v0.73: the site hands paper jobs only to a box that can render them
     # v0.75: whether the camera gateway answered recently (the site offers live view of the RTSPS printers only while it
@@ -1986,6 +1991,7 @@ def run(
                 except Exception as exc:  # noqa: BLE001 - never sink the heartbeat
                     _record_diagnostic(diagnostics, "laser", f"laser report failed: {redact(str(exc))}")
                 vp_connects = VP_CONNECTS.snapshot(64)
+                slicer_ready = os.path.isfile(SLICE_RUNNER) and os.access(SLICE_RUNNER, os.X_OK)
                 resp = post_json(
                     cfg.heartbeat_url,
                     heartbeat_payload(
@@ -2007,7 +2013,8 @@ def run(
                         laser_file_checks=laser_report.file_checks if laser_report else None,
                         camera_stats=camera_stats,
                         vp_connects=vp_connects,
-                        slicer_ready=os.path.isfile(SLICE_RUNNER) and os.access(SLICE_RUNNER, os.X_OK),
+                        slicer_ready=slicer_ready,
+                        slicer_caps=SLICER_CAPS.value,
                         paper_ready=paper_lane.paper_ready(),
                         camera_gateway=GATEWAY.available(),
                         camera_live_stats=live_views.stats(),
@@ -2081,6 +2088,17 @@ def run(
                                 fetch_lock.release()
 
                         threading.Thread(target=_fetch_worker, name="web-upload-fetch", daemon=True).start()
+                    # Send to PS step 2: ask the installed slicer image what it takes, at start and every 15 minutes, between
+                    # slices (the fetch lock; a slice result refreshes it too), so the site never sends a size it refuses
+                    if slicer_ready and SLICER_CAPS.stale() and fetch_lock.acquire(blocking=False):
+                        def _probe_worker():
+                            try:
+                                SLICER_CAPS.seen(probe_slicer(SPOOL_DIR))
+                                log.info("slicer probe: %s", SLICER_CAPS.value or "unknown (an image before step 2)")
+                            finally:
+                                fetch_lock.release()
+
+                        threading.Thread(target=_probe_worker, name="slicer-probe", daemon=True).start()
                     # v0.73: members' paper prints, one at a time, off the heartbeat thread (makeros_hub/paper.py)
                     paper_body = resp.body.get("paper")
                     if paper_lock.acquire(blocking=False):

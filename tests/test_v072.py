@@ -10,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 from makeros_hub.agent import heartbeat_payload
-from makeros_hub.printers.manager import PrinterManager, slice_spec_of
+from makeros_hub.printers.manager import SLICER_CAPS, PrinterManager, parse_slicer_caps, probe_slicer, slice_spec_of
 
 SLICED_INFO = b"""<?xml version="1.0"?><config><plate><metadata key="index" value="1"/><metadata key="printer_model_id" value="N1"/>
 <filament id="1" tray_info_idx="GFA00" type="PLA" color="#1E90FF" used_m="1.2" used_g="3.68"/></plate></config>"""
@@ -133,6 +133,82 @@ class TestSlicerReady(unittest.TestCase):
         self.assertIs(heartbeat_payload(camera_gateway=False)["cameraGateway"], False)
         self.assertNotIn("cameraLiveStats", heartbeat_payload(camera_live_stats=[]))
         self.assertNotIn("cameraGateway", heartbeat_payload())
+
+
+CAPS = {"scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42, "P2S": 0.42}}
+
+
+class TestSlicerCaps(unittest.TestCase):
+    """Send to PS step 2 (review): the site gates sizes on what the installed ps-slicer image says it takes, read from the image
+    by a probe job and from every slice result, never from the agent's version (an agent and its image can differ)."""
+
+    def test_the_probe_asks_the_image_through_the_runner_and_leaves_nothing_behind(self):
+        with tempfile.TemporaryDirectory() as d:
+            seen = []
+            def runner(uid):
+                work = Path(d) / uid / ".slice"
+                seen.append(json.loads((work / "job.json").read_text()))
+                (work / "out").mkdir()
+                (work / "out" / "result.json").write_text(json.dumps({"ok": True, "probe": True, **CAPS}))
+                return 0
+            self.assertEqual(parse_slicer_caps(probe_slicer(d, runner)), CAPS)
+            self.assertEqual(seen, [{"probe": True}])
+            self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_an_image_before_step_2_or_a_runner_that_cannot_start_is_unknown(self):
+        with tempfile.TemporaryDirectory() as d:
+            def old(uid):   # the old image refuses a probe as a slice request without a mesh
+                work = Path(d) / uid / ".slice"
+                (work / "out").mkdir()
+                (work / "out" / "result.json").write_text(json.dumps({"ok": False, "error": "the file name is not one the slicer accepts"}))
+                return 3
+            def broken(uid):
+                raise FileNotFoundError("sudo")
+            self.assertIsNone(parse_slicer_caps(probe_slicer(d, old)))
+            self.assertIsNone(probe_slicer(d, broken))
+            self.assertEqual(list(Path(d).iterdir()), [])
+
+    def test_caps_are_read_strictly(self):
+        self.assertEqual(parse_slicer_caps({**CAPS, "lineWidth": {"A1 Mini": 0.42, "x" * 41: 0.4, "P2S": "0.42", "X1C": 9, "H2D": True}}),
+                         {"scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42}})
+        for bad in ({}, {"scaleMin": "0.001", "scaleMax": 1000}, {"scaleMin": 0, "scaleMax": 1}, {"scaleMin": 2, "scaleMax": 1},
+                    {"scaleMin": 0.001, "scaleMax": float("inf")}, {"scaleMin": float("nan"), "scaleMax": 1}, {"scaleMin": True, "scaleMax": 1},
+                    {"scaleMin": 0.001, "scaleMax": 1e7}, None, "caps"):
+            self.assertIsNone(parse_slicer_caps(bad), bad)
+        self.assertEqual(parse_slicer_caps({"scaleMin": 0.05, "scaleMax": 20}), {"scaleMin": 0.05, "scaleMax": 20.0, "lineWidth": {}})
+
+    def test_every_slice_result_refreshes_what_the_image_takes_and_its_settings_reach_the_site(self):
+        with tempfile.TemporaryDirectory() as d:
+            settings = {"sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%", "wall_loops": "2"}
+            ok = {"ok": True, "grams": 3.68, "seconds": 1174, "supportUsed": False, "filament": "Bambu PLA Basic @BBL A1M",
+                  "process": "0.20mm Standard @BBL A1M", "settings": settings, "modelId": "N1", "plates": 1, **CAPS}
+            reports = []
+            def runner(uid, result=ok):
+                work = Path(d) / uid / ".slice"
+                (work / "out").mkdir()
+                (work / "out" / "result.json").write_text(json.dumps(result))
+                if result.get("ok"):
+                    (work / "out" / "sliced.3mf").write_bytes(sliced_plate())
+                return 0 if result.get("ok") else 3
+            def get(path, dest):
+                Path(dest).write_bytes(MESH)
+                return hashlib.sha256(MESH).hexdigest(), len(MESH)
+            def report(body):
+                reports.append(body)
+                return _Resp()
+            SLICER_CAPS.seen(None)
+            PrinterManager().fetch_uploads([fetch()], d, getter=get, reporter=report, slice_runner=runner)
+            self.assertEqual(reports[-1]["slice"]["settings"], settings)
+            self.assertEqual(SLICER_CAPS.value, CAPS)
+            # the image is rolled back under the agent: its next answer says nothing, and the box is unknown again
+            PrinterManager().fetch_uploads([fetch(submissionUid="0123456789abcdef")], d, getter=get, reporter=report,
+                                           slice_runner=lambda uid: runner(uid, {"ok": False, "error": "the size change is outside what the slicer accepts"}))
+            self.assertIsNone(SLICER_CAPS.value)
+
+    def test_the_heartbeat_carries_the_images_answer_only_while_the_box_can_slice(self):
+        self.assertEqual(heartbeat_payload(slicer_ready=True, slicer_caps=CAPS)["slicerCaps"], CAPS)
+        self.assertNotIn("slicerCaps", heartbeat_payload(slicer_ready=False, slicer_caps=CAPS))
+        self.assertNotIn("slicerCaps", heartbeat_payload(slicer_ready=True, slicer_caps=None))
 
 
 if __name__ == "__main__":

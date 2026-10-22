@@ -12,7 +12,9 @@ job.json:
   {"mesh": "part.stl", "model": "A1 Mini" | "P2S" | "X1C",
    "filament": {"trayInfoIdx": "GFA00" | null, "type": "PLA", "colorHex": "#F2754E"},
    "fixes": {"orient": true, "brim": false, "supports": false}, "scale": 1.0}
-  All three fixes are required booleans.
+  All three fixes are required booleans. scale is the site's one factor (the file's units and the member's scale); this
+  wrapper applies it to the mesh (scale_stl), never OrcaSlicer.
+  {"probe": true} instead asks what this image slices (caps()); every result.json carries the same answer.
 
 Presets: Bambu's own system presets bundled with OrcaSlicer, resolved through their `inherits` chains here (the CLI does
 not load the vendor bundle, so an unresolved preset silently loses its density, filament id and process values; checked
@@ -27,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import zipfile
@@ -64,6 +67,9 @@ SHOP_PROCESS: dict[str, dict[str, str]] = {
 # read it. 1:1000 of a file in millimetres up to a file in metres at full size; what fits is the bed's to say. Hubs before this
 # took 0.05 to 20, and the site sends nothing outside that to a hub that reports an older version.
 SCALE_MIN, SCALE_MAX = 0.001, 1000.0
+# The process values that change what prints, reported with every slice (Send to PS step 2 review): the site binds the member's
+# approval to them, so a job moved between boxes whose settings differ (cubic against rectilinear infill) asks the member again.
+SETTINGS_KEYS = ("layer_height", "wall_loops", "sparse_infill_pattern", "sparse_infill_density", "top_shell_layers", "bottom_shell_layers")
 TYPES = {"PLA", "PETG", "ABS", "ASA", "TPU"}
 MESH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,118}\.(stl|obj|3mf)$", re.I)
 HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
@@ -198,6 +204,52 @@ def pick_filament(index: dict[str, dict], machine: str, sfx: str, ftype: str, tr
     raise SliceError(f"there is no {ftype} preset for this printer")
 
 
+def _first(v):
+    return (v[0] if v else None) if isinstance(v, list) else v
+
+
+def effective_settings(process: dict) -> dict[str, str]:
+    """SETTINGS_KEYS as this slice used them: the preset after the shop's settings and the member's choices."""
+    out = {}
+    for k in SETTINGS_KEYS:
+        v = _first(process.get(k))
+        if isinstance(v, (str, int, float)) and not isinstance(v, bool):
+            out[k] = str(v)[:24]
+    return out
+
+
+def line_width(process: dict, machine: dict) -> float | None:
+    """The outer wall's line width the process lays, in mm: a number, or a percent of the machine's nozzle."""
+    raw, nozzle = _first(process.get("outer_wall_line_width") or process.get("line_width")), _first(machine.get("nozzle_diameter"))
+    try:
+        text = str(raw).strip()
+        width = float(text[:-1]) / 100 * float(nozzle) if text.endswith("%") else float(text)
+    except (TypeError, ValueError):
+        return None
+    return round(width, 3) if 0 < width <= 5 else None
+
+
+def caps(processes: dict | None = None, machines: dict | None = None) -> dict:
+    """What this image slices, for the hub to report to the site (Send to PS step 2): the scale range read_spec takes, and per
+    model the outer wall line width of the process it slices with, so the site's minimum wall is two of this image's lines.
+    Read from the image, so a box whose agent and image differ reports the image. Never raises: a preset that does not read
+    leaves its model out."""
+    out: dict = {"scaleMin": SCALE_MIN, "scaleMax": SCALE_MAX, "lineWidth": {}}
+    try:
+        processes = load_index("process") if processes is None else processes
+        machines = load_index("machine") if machines is None else machines
+    except OSError:
+        return out
+    for model, (machine_name, sfx) in MODELS.items():
+        try:
+            width = line_width(flatten(processes, PROCESS.format(sfx=sfx)), flatten(machines, machine_name))
+        except SliceError:
+            continue
+        if width:
+            out["lineWidth"][model] = width
+    return out
+
+
 def shop_process(spec: dict) -> dict[str, str]:
     """The process values the shop sets on every automatic slice: its per-model settings, then each Print it choice in both
     states. Unticked means off, never OrcaSlicer's "auto" (its brim_type default is auto_brim, which the Bambu presets leave
@@ -209,11 +261,29 @@ def shop_process(spec: dict) -> dict[str, str]:
 
 
 def orca_args(spec: dict, paths: dict[str, str], out: str, mesh: str) -> list[str]:
-    """The OrcaSlicer command line, with orientation and scale stated every time, not only when they differ from a default."""
-    # eight decimals: four rounded 1:150 (0.006667) to 0.0067, half a percent off; 1:1000 keeps three significant digits
-    return [ORCA, "--slice", "0", "--arrange", "1", "--orient", "1" if spec["orient"] else "0", "--scale", f"{spec['scale']:.8f}",
+    """The OrcaSlicer command line, with orientation stated every time, not only when it differs from a default. No --scale:
+    the mesh it is given is already at its printed size (scale_stl)."""
+    return [ORCA, "--slice", "0", "--arrange", "1", "--orient", "1" if spec["orient"] else "0",
             "--load-settings", f"{paths['machine']};{paths['process']}", "--load-filaments", paths["filament"],
             "--outputdir", out, "--export-3mf", "sliced.3mf", mesh]
+
+
+def scale_stl(src: str, dst: str, factor: float) -> None:
+    """The member's mesh at its printed size: every vertex times the factor, once, written to dst (src, the hub's copy, stays as
+    it came). OrcaSlicer 2.4.2's own --scale crashed on every factor but 1 (exit 139, a 20 mm cube at 2x) and checked the bed
+    before scaling (a 20 m building at 1:150 "does not fit"), measured 2026-10-22 against the ps-slicer:2.4.2-1 image, which
+    is why the hubs up to 0.79 could not slice any Print it size but 100%. The site sends its checked mesh as a binary STL."""
+    with open(src, "rb") as fh:
+        data = bytearray(fh.read())
+    n = struct.unpack_from("<I", data, 80)[0] if len(data) >= 84 else -1
+    if factor != 1.0 and len(data) != 84 + 50 * n:
+        raise SliceError("the shop's slicer can resize only the binary STL the site sends")
+    if factor != 1.0:
+        for i in range(n):
+            at = 84 + 50 * i + 12   # past the facet normal, which a uniform scale leaves as it is
+            struct.pack_into("<9f", data, at, *(c * factor for c in struct.unpack_from("<9f", data, at)))
+    with open(dst, "wb") as fh:
+        fh.write(data)
 
 
 def set_model_id(threemf: str, model_id: str) -> None:
@@ -246,9 +316,13 @@ def summarize(threemf: str) -> dict:
             "plates": sum(1 for n in names if re.fullmatch(r"Metadata/plate_\d+\.gcode", n))}
 
 
-def run(job_dir: str = JOB) -> dict:
+def run(job_dir: str | None = None) -> dict:
+    job_dir = job_dir or JOB
     with open(os.path.join(job_dir, "job.json"), encoding="utf-8") as fh:
-        spec = read_spec(json.load(fh))
+        raw = json.load(fh)
+    if isinstance(raw, dict) and raw.get("probe") is True:
+        return {"ok": True, "probe": True, **caps()}   # the hub asking what this image slices; nothing is sliced
+    spec = read_spec(raw)
     machine_name, sfx = MODELS[spec["model"]]
     machines, processes, filaments = load_index("machine"), load_index("process"), load_index("filament")
     machine = flatten(machines, machine_name)
@@ -272,7 +346,9 @@ def run(job_dir: str = JOB) -> dict:
         paths[kind] = os.path.join(work, f"{kind}.json")
         with open(paths[kind], "w", encoding="utf-8") as fh:
             json.dump(d, fh)
-    args = orca_args(spec, paths, out, os.path.join(job_dir, spec["mesh"]))
+    mesh = os.path.join(work, spec["mesh"])
+    scale_stl(os.path.join(job_dir, spec["mesh"]), mesh, spec["scale"])
+    args = orca_args(spec, paths, out, mesh)
     p = subprocess.run(args, capture_output=True, text=True, timeout=540, env={**os.environ, "HOME": "/tmp"})
     sliced = os.path.join(out, "sliced.3mf")
     if p.returncode != 0 or not os.path.exists(sliced):
@@ -282,7 +358,8 @@ def run(job_dir: str = JOB) -> dict:
         tail = (p.stdout + p.stderr).strip().splitlines()[-3:]
         raise SliceError("the slicer could not slice this part" + (f" ({' / '.join(tail)[:300]})" if tail else ""))
     set_model_id(sliced, model_id)
-    result = {"ok": True, "filament": filament_name, "process": PROCESS.format(sfx=sfx), **summarize(sliced)}
+    result = {"ok": True, "filament": filament_name, "process": PROCESS.format(sfx=sfx), "settings": effective_settings(process),
+              **summarize(sliced), **caps(processes, machines)}
     if result["plates"] != 1:
         raise SliceError(f"the part does not fit one plate (the slicer made {result['plates']}); scale it down or split it")
     if result["grams"] <= 0:
@@ -313,6 +390,14 @@ def selftest() -> None:
         raise AssertionError("a loop was accepted")
     except SliceError:
         pass
+    assert effective_settings({"wall_loops": "2", "sparse_infill_pattern": "rectilinear", "layer_height": ["0.2"], "x": "y"}) == \
+        {"wall_loops": "2", "sparse_infill_pattern": "rectilinear", "layer_height": "0.2"}
+    assert line_width({"outer_wall_line_width": "0.42"}, {}) == 0.42
+    assert line_width({"outer_wall_line_width": "105%"}, {"nozzle_diameter": ["0.4"]}) == 0.42
+    assert line_width({"outer_wall_line_width": "0"}, {}) is None and line_width({}, {}) is None
+    if os.path.isdir(PROFILES):   # inside the image (its build runs this): every model's process names its line width
+        got = caps()
+        assert set(got["lineWidth"]) == set(MODELS) and (got["scaleMin"], got["scaleMax"]) == (SCALE_MIN, SCALE_MAX), got
     print("selftest ok")
 
 
@@ -325,7 +410,7 @@ def main(argv: list[str]) -> int:
         result = run()
     except (SliceError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         reason = str(exc) if isinstance(exc, SliceError) else "the slicer stopped before it finished"
-        result = {"ok": False, "error": reason}
+        result = {"ok": False, "error": reason, **caps()}   # a refusal still says what this image takes
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as fh:
         json.dump(result, fh)

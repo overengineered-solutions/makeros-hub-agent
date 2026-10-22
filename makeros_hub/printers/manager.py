@@ -63,6 +63,65 @@ def run_slice_job(uid: str) -> int:
     return subprocess.run(["sudo", "-n", SLICE_RUNNER, uid], capture_output=True, timeout=SLICE_TIMEOUT_SEC).returncode
 
 
+def parse_slicer_caps(result) -> dict | None:
+    """What a ps-slicer result.json says its image slices (Send to PS step 2), strictly: two finite numbers with
+    0 < scaleMin <= scaleMax <= 1e6, and line widths in (0, 5] mm under at most 16 short model names. Anything else, or an
+    image from before this one that says nothing, is unknown (None)."""
+    import math
+    if not isinstance(result, dict):
+        return None
+    def num(v) -> bool:
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    lo, hi = result.get("scaleMin"), result.get("scaleMax")
+    if not (num(lo) and num(hi) and 0 < lo <= hi <= 1e6):
+        return None
+    widths = result.get("lineWidth") if isinstance(result.get("lineWidth"), dict) else {}
+    return {"scaleMin": float(lo), "scaleMax": float(hi),
+            "lineWidth": {k: float(v) for k, v in list(widths.items())[:16] if isinstance(k, str) and 0 < len(k) <= 40 and num(v) and 0 < v <= 5}}
+
+
+class SlicerCaps:
+    """What the installed ps-slicer image says it slices, for the heartbeat (slicerCaps). Read from the image itself (a probe
+    job, and every slice result), never from the agent's own version: install-slicer.py installs the image by its own box
+    tap, so an agent and its image can differ, and an image can be rolled back under a running agent. Refreshed every
+    REFRESH_SEC; None = unknown, which the site reads as the 0.05 to 20 every image since 0.72 takes."""
+    REFRESH_SEC = 15 * 60
+
+    def __init__(self) -> None:
+        self.value: dict | None = None
+        self.checked_at: float | None = None
+
+    def seen(self, result) -> None:
+        self.value = parse_slicer_caps(result)
+        self.checked_at = time.monotonic()
+
+    def stale(self) -> bool:
+        return self.checked_at is None or time.monotonic() - self.checked_at > self.REFRESH_SEC
+
+
+SLICER_CAPS = SlicerCaps()
+
+
+def probe_slicer(spool_dir, runner=run_slice_job) -> dict | None:
+    """Ask the installed image what it slices: a job of {"probe": true} through the runner a slice uses, in the spool like
+    one. An image from before this one refuses it as a slice request, so its answer reads as unknown. Leaves nothing behind."""
+    import shutil
+    import uuid
+    uid = uuid.uuid4().hex
+    root = Path(spool_dir) / uid
+    try:
+        work = root / ".slice"
+        work.mkdir(parents=True, mode=0o700)
+        (work / "job.json").write_text(json.dumps({"probe": True}), encoding="utf-8")
+        runner(uid)
+        return json.loads((work / "out" / "result.json").read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001 - a probe that cannot run says nothing; the slicer is then unknown
+        log.info("slicer probe: no answer (%s)", exc)
+        return None
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def slice_spec_of(spec: dict) -> dict:
     """Only the fields the slicer reads, so nothing else from the cloud reaches the job file (the wrapper validates them)."""
     fil = spec.get("filament") if isinstance(spec.get("filament"), dict) else {}
@@ -697,7 +756,7 @@ class PrinterManager:
                 if model_id:
                     body["printerModelId"] = model_id   # the cloud refuses a file sliced for another printer (audit)
                 if sliced is not None:
-                    body["slice"] = {k: sliced.get(k) for k in ("grams", "seconds", "supportUsed", "filament", "process")}
+                    body["slice"] = {k: sliced.get(k) for k in ("grams", "seconds", "supportUsed", "filament", "process", "settings")}
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
                 if grams:
                     body["estGrams"] = int(math.ceil(sum(grams)))
@@ -765,6 +824,7 @@ class PrinterManager:
             result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
         except (OSError, ValueError):
             result = {}
+        SLICER_CAPS.seen(result)   # every slice says what the image that ran it takes (step 2): a rolled-back image shows at once
         sliced_file = work / "out" / "sliced.3mf"
         if not (isinstance(result, dict) and result.get("ok") and sliced_file.exists()):
             reason = result.get("error") if isinstance(result, dict) and isinstance(result.get("error"), str) else \

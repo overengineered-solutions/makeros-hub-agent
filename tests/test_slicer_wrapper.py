@@ -2,6 +2,8 @@
 
 import importlib.util
 import io
+import json
+import struct
 import zipfile
 from pathlib import Path
 
@@ -82,12 +84,35 @@ def test_the_orientation_choice_is_on_the_command_line_both_ways(orient, flag):
     assert args[args.index("--orient") + 1] == flag
 
 
-@pytest.mark.parametrize("scale, text", [(1.0, "1.00000000"), (0.5, "0.50000000"), (2.25, "2.25000000"),
-                                         (1 / 150, "0.00666667"), (0.005, "0.00500000"), (0.001, "0.00100000"), (5.0, "5.00000000")])
-def test_the_scale_is_on_the_command_line_every_time_even_at_full_size(scale, text):
-    args = ps.orca_args(ps.read_spec({**SPEC, "scale": scale}), PATHS, "/job/out", "/job/part.stl")
-    assert args[args.index("--scale") + 1] == text
-    assert args[-1] == "/job/part.stl"
+@pytest.mark.parametrize("scale", [1.0, 0.5, 1 / 150, 5.0])
+def test_orcaslicer_is_never_given_a_scale(scale):
+    # 2026-10-22, ps-slicer:2.4.2-1: OrcaSlicer's --scale crashed (exit 139) on every factor but 1; the wrapper sizes the mesh
+    args = ps.orca_args(ps.read_spec({**SPEC, "scale": scale}), PATHS, "/job/out", "/job/work/part.stl")
+    assert "--scale" not in args
+    assert args[-1] == "/job/work/part.stl"
+
+
+def _stl(*tris) -> bytes:
+    out = bytearray(80) + struct.pack("<I", len(tris))
+    for t in tris:
+        out += struct.pack("<3f", 0, 0, -1) + struct.pack("<9f", *t) + b"\0\0"
+    return bytes(out)
+
+
+def test_the_wrapper_sizes_the_binary_stl_once_and_leaves_the_hubs_copy(tmp_path):
+    src, dst = tmp_path / "part.stl", tmp_path / "work.stl"
+    src.write_bytes(_stl((0, 0, 0, 20000, 0, 0, 0, 10000, 0)))
+    ps.scale_stl(str(src), str(dst), 1 / 200)
+    got = dst.read_bytes()
+    assert struct.unpack_from("<3f", got, 84) == (0, 0, -1)   # the normal, unchanged
+    assert struct.unpack_from("<9f", got, 96) == pytest.approx((0, 0, 0, 100, 0, 0, 0, 50, 0))
+    assert src.read_bytes() == _stl((0, 0, 0, 20000, 0, 0, 0, 10000, 0))
+    ps.scale_stl(str(src), str(dst), 1.0)
+    assert dst.read_bytes() == src.read_bytes()
+    text = tmp_path / "text.stl"
+    text.write_bytes(b"solid x\nendsolid x\n")
+    with pytest.raises(ps.SliceError, match="binary STL"):
+        ps.scale_stl(str(text), str(dst), 2.0)
 
 
 # Send to PS step 2 (operator, 2026-10-22: students "shrink them down to scale without losing walls to thinness"): the site
@@ -118,3 +143,42 @@ def test_every_model_carries_the_shops_infill_pattern_explicitly(model):
 def test_a_request_that_leaves_a_choice_out_is_refused(fixes):
     with pytest.raises(ps.SliceError, match="does not say whether to"):
         ps.read_spec({**SPEC, "fixes": fixes})
+
+
+def _profiles(tmp_path, widths):
+    """A preset tree with each model's machine and process; widths: model -> outer_wall_line_width (absent leaves it out)."""
+    for kind in ("machine", "process", "filament"):
+        (tmp_path / kind).mkdir(parents=True)
+    for model, (machine, sfx) in ps.MODELS.items():
+        (tmp_path / "machine" / f"{sfx}.json").write_text(json.dumps({"name": machine, "nozzle_diameter": ["0.4"]}))
+        process = {"name": ps.PROCESS.format(sfx=sfx), "wall_loops": "2"}
+        if widths.get(model) is not None:
+            process["outer_wall_line_width"] = widths[model]
+        (tmp_path / "process" / f"{sfx}.json").write_text(json.dumps(process))
+    return str(tmp_path)
+
+
+# Send to PS step 2 (review): the hub asks the image itself what it slices; the answer carries the scale range and, per model,
+# the outer wall line width of the process it slices with (the site's minimum wall is two of those lines)
+def test_a_probe_is_answered_with_what_this_image_slices_and_slices_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(ps, "PROFILES", _profiles(tmp_path / "p", {"A1 Mini": "0.42", "P2S": "105%"}))
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / "job.json").write_text(json.dumps({"probe": True}))
+    assert ps.run(str(job)) == {"ok": True, "probe": True, "scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42, "P2S": 0.42}}
+    assert not (job / "work").exists()
+
+
+def test_a_refusal_still_says_what_this_image_takes(tmp_path, monkeypatch):
+    monkeypatch.setattr(ps, "PROFILES", _profiles(tmp_path / "p", {}))
+    monkeypatch.setattr(ps, "JOB", str(tmp_path))
+    (tmp_path / "job.json").write_text(json.dumps({**SPEC, "scale": 0.0001}))
+    assert ps.main(["ps_slice.py"]) == 3
+    result = json.loads((tmp_path / "out" / "result.json").read_text())
+    assert result["ok"] is False and "size change" in result["error"] and (result["scaleMin"], result["scaleMax"]) == (0.001, 1000.0)
+
+
+def test_the_settings_reported_are_the_ones_this_slice_used():
+    process = {"layer_height": "0.2", "wall_loops": "2", "sparse_infill_pattern": "crosshatch", "sparse_infill_density": "15%", "brim_type": "auto_brim"}
+    process.update(ps.shop_process(ps.read_spec(SPEC)))
+    assert ps.effective_settings(process) == {"layer_height": "0.2", "wall_loops": "2", "sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%"}
