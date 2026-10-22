@@ -47,17 +47,23 @@ PROCESS = "0.20mm Standard @BBL {sfx}"
 # The shop's own settings for every automatic slice, per model, in one place. Each value is written into the process, so a
 # preset change or an OrcaSlicer default never decides it quietly. Change a model's line here and the hub's next release
 # slices with it; the site's OrcaSlicer setup download should carry the same values (reports/auto-slice-quality-plan).
-# sparse_infill_pattern (operator, 2026-10-21: "the auto slicer defaults to gyroid which is overkill and takes longer"):
-# Bambu's presets give crosshatch, whose wavy transition layers look like gyroid. Cubic at the same 15% sliced 3 to 16%
-# faster than crosshatch and 5 to 32% faster than gyroid (the most on the biggest parts), 1 to 3% lighter, and is a 3D
-# pattern that is strong in every direction (OrcaSlicer 2.4.2, four shop parts on the A1 mini, two on the P2S and X1C,
-# 2026-10-21; the table is in pstation reports/auto-slice-quality-plan-2026-10-21.md). Grid was as fast but crosses
-# itself in every layer.
+# sparse_infill_pattern: rectilinear (operator, 2026-10-22: "I like rectilinear"; board 6e8c967f). It lays one direction of
+# lines per layer, turning 90 degrees each layer, so the nozzle never crosses lines it laid in the same layer; cubic, chosen
+# first, lays three directions that cross in every layer, as grid does (nozzle scraping at speed). Bambu's presets give
+# crosshatch, whose wavy transition layers look like gyroid ("the auto slicer defaults to gyroid which is overkill and takes
+# longer", 2026-10-21). On the shop's four parts on the A1 mini at 15% (OrcaSlicer 2.4.2, 2026-10-21; the table is in pstation
+# reports/auto-slice-quality-plan-2026-10-21.md) rectilinear sliced within 1% of cubic's time, 3 to 15% faster than crosshatch
+# and 4 to 30% faster than gyroid, and 1 to 3.5% heavier than cubic. It is weaker between layers than a 3D pattern; a pull test
+# on the bracket would measure what that costs. Not yet timed on the P2S and X1C.
 SHOP_PROCESS: dict[str, dict[str, str]] = {
-    "A1 Mini": {"sparse_infill_pattern": "cubic", "sparse_infill_density": "15%"},
-    "P2S": {"sparse_infill_pattern": "cubic", "sparse_infill_density": "15%"},
-    "X1C": {"sparse_infill_pattern": "cubic", "sparse_infill_density": "15%"},
+    "A1 Mini": {"sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%"},
+    "P2S": {"sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%"},
+    "X1C": {"sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%"},
 }
+# The factor the site sends (Send to PS step 2): the file's units and the member's scale in one number on the file as the site
+# read it. 1:1000 of a file in millimetres up to a file in metres at full size; what fits is the bed's to say. Hubs before this
+# took 0.05 to 20, and the site sends nothing outside that to a hub that reports an older version.
+SCALE_MIN, SCALE_MAX = 0.001, 1000.0
 TYPES = {"PLA", "PETG", "ABS", "ASA", "TPU"}
 MESH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._()-]{0,118}\.(stl|obj|3mf)$", re.I)
 HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
@@ -72,8 +78,8 @@ class SliceError(Exception):
 
 
 def read_spec(raw: dict) -> dict:
-    """Validate job.json: an unknown model, a mesh name that is not a plain file name, an odd colour, a scale outside 0.05 to 20
-    are refused with a sentence a member can read."""
+    """Validate job.json: an unknown model, a mesh name that is not a plain file name, an odd colour, a scale outside SCALE_MIN to
+    SCALE_MAX are refused with a sentence a member can read."""
     if not isinstance(raw, dict):
         raise SliceError("the slice request is not readable")
     mesh, model = raw.get("mesh"), raw.get("model")
@@ -96,7 +102,7 @@ def read_spec(raw: dict) -> dict:
         if not isinstance(fixes.get(k), bool):
             raise SliceError(f"the slice request does not say whether to {FIX_WORDS[k]}")
     scale = raw.get("scale", 1.0)
-    if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not 0.05 <= float(scale) <= 20:
+    if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not SCALE_MIN <= float(scale) <= SCALE_MAX:
         raise SliceError("the size change is outside what the slicer accepts")
     return {
         "mesh": mesh, "model": model, "type": ftype,
@@ -204,7 +210,8 @@ def shop_process(spec: dict) -> dict[str, str]:
 
 def orca_args(spec: dict, paths: dict[str, str], out: str, mesh: str) -> list[str]:
     """The OrcaSlicer command line, with orientation and scale stated every time, not only when they differ from a default."""
-    return [ORCA, "--slice", "0", "--arrange", "1", "--orient", "1" if spec["orient"] else "0", "--scale", f"{spec['scale']:.4f}",
+    # eight decimals: four rounded 1:150 (0.006667) to 0.0067, half a percent off; 1:1000 keeps three significant digits
+    return [ORCA, "--slice", "0", "--arrange", "1", "--orient", "1" if spec["orient"] else "0", "--scale", f"{spec['scale']:.8f}",
             "--load-settings", f"{paths['machine']};{paths['process']}", "--load-filaments", paths["filament"],
             "--outputdir", out, "--export-3mf", "sliced.3mf", mesh]
 
@@ -291,7 +298,7 @@ def selftest() -> None:
     assert shop_process(s)["brim_type"] == "no_brim" and shop_process(s)["enable_support"] == "0", shop_process(s)
     assert s["type"] == "PLA" and s["color"] == "#F2754E" and s["tray"] == "GFA00" and s["orient"] and not s["brim"], s
     for bad in ({**ok, "model": "H2D"}, {**ok, "mesh": "../x.stl"}, {**ok, "mesh": "x.exe"},
-                {**ok, "filament": {"type": "wood"}}, {**ok, "scale": 50}, {**ok, "scale": True},
+                {**ok, "filament": {"type": "wood"}}, {**ok, "scale": 5000}, {**ok, "scale": 0.0005}, {**ok, "scale": True},
                 {**ok, "fixes": {"orient": True, "brim": False}}, {**ok, "fixes": {"orient": True, "brim": 1, "supports": False}}):
         try:
             read_spec(bad)

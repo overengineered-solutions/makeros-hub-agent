@@ -82,19 +82,35 @@ def test_the_orientation_choice_is_on_the_command_line_both_ways(orient, flag):
     assert args[args.index("--orient") + 1] == flag
 
 
-@pytest.mark.parametrize("scale, text", [(1.0, "1.0000"), (0.5, "0.5000"), (2.25, "2.2500")])
+@pytest.mark.parametrize("scale, text", [(1.0, "1.00000000"), (0.5, "0.50000000"), (2.25, "2.25000000"),
+                                         (1 / 150, "0.00666667"), (0.005, "0.00500000"), (0.001, "0.00100000"), (5.0, "5.00000000")])
 def test_the_scale_is_on_the_command_line_every_time_even_at_full_size(scale, text):
     args = ps.orca_args(ps.read_spec({**SPEC, "scale": scale}), PATHS, "/job/out", "/job/part.stl")
     assert args[args.index("--scale") + 1] == text
     assert args[-1] == "/job/part.stl"
 
 
+# Send to PS step 2 (operator, 2026-10-22: students "shrink them down to scale without losing walls to thinness"): the site
+# sends one factor, the file's units and the member's scale together, so a building at 1:200 is 0.005 and one drawn in metres
+# at 1:20 is 50. The old 0.05 to 20 refused both.
+@pytest.mark.parametrize("scale", [0.001, 0.005, 1 / 150, 0.05, 1, 20, 50, 1000])
+def test_the_scale_takes_what_the_site_sends(scale):
+    assert ps.read_spec({**SPEC, "scale": scale})["scale"] == scale
+
+
+@pytest.mark.parametrize("scale", [0, -1, 0.0009, 1000.5, float("inf"), float("nan"), "0.005", None, True])
+def test_a_scale_outside_the_range_or_not_a_number_is_refused(scale):
+    with pytest.raises(ps.SliceError, match="size change"):
+        ps.read_spec({**SPEC, "scale": scale})
+
+
 @pytest.mark.parametrize("model", sorted(ps.MODELS))
 def test_every_model_carries_the_shops_infill_pattern_explicitly(model):
     # operator, 2026-10-21: "the auto slicer defaults to gyroid which is overkill and takes longer"; the pattern is the
-    # shop's choice per model, written into every slice, never left to the preset
+    # shop's choice per model, written into every slice, never left to the preset. 2026-10-22: "I like rectilinear" (board
+    # 6e8c967f: cubic crosses itself in every layer)
     got = ps.shop_process(ps.read_spec({**SPEC, "model": model}))
-    assert got["sparse_infill_pattern"] == ps.SHOP_PROCESS[model]["sparse_infill_pattern"] != "gyroid"
+    assert got["sparse_infill_pattern"] == ps.SHOP_PROCESS[model]["sparse_infill_pattern"] == "rectilinear"
     assert got["sparse_infill_density"].endswith("%")
 
 
