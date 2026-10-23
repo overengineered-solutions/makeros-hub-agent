@@ -37,7 +37,7 @@ from .jobs import JobTracker
 from .manager import BUSY_GCODE_STATES   # manager imports this module lazily, so no import cycle
 _IDENTITY_KEYS = ("subtask_name", "gcode_file", "task_id", "subtask_id")   # which print the merged report describes
 from .queue_progress import QueueProgressTracker, _fsync_dir, _safe_file_component
-from ..vprinter.capture import parse_printer_model_id
+from ..vprinter.capture import parse_printer_model_id, parse_required_filaments
 from ..vprinter.report import MODEL_PRODUCT_NAMES
 
 QUEUE_PROGRESS_DIR = Path(os.environ.get("MAKEROS_HUB_QUEUE_PROGRESS_DIR", "/var/lib/makeros-hub/queue-progress"))
@@ -58,6 +58,20 @@ CONNECT_TIMEOUT_SEC = 20
 STALE_SEC = 150
 PUSHALL = json.dumps({"pushing": {"command": "pushall"}})
 GET_VERSION = json.dumps({"info": {"command": "get_version"}})
+
+
+# Operator, 2026-10-23: "anything petg on a mini just needs to be rejected with a message about why, even if someone loads petg
+# etc." The site refuses it first (spool-match.ts plaOnlyRefusal); this is the last check before a mini is told anything.
+PLA_ONLY_MODELS = {"A1 MINI"}
+
+
+def _pla_only_refusal(path, plate: int, model: str | None) -> str | None:
+    """'pla_only' when the printer takes PLA only and the plate names any other material (PLA-CF, PLA Matte and PLA+ are PLA);
+    None otherwise. A plate naming no material is the site's to refuse (it reads the plate before dispatch)."""
+    if (model or "").strip().upper() not in PLA_ONLY_MODELS:
+        return None
+    types = [str(f.get("material") or "").strip().upper() for f in parse_required_filaments(Path(path), plate)]
+    return "pla_only" if any(t and not t.startswith("PLA") for t in types) else None
 
 
 def _redact_serials(value):
@@ -461,6 +475,10 @@ class BambuAdapter:
         if not _sliced_model_matches(local_path, self.model):
             log.warning("bambu %s: refusing %s — sliced model missing or mismatched", self.printer_id, queue_job_id)
             return {"ok": False, "reason": "model_mismatch"}
+        refusal = _pla_only_refusal(local_path, plate, self.model)
+        if refusal:
+            log.warning("bambu %s: refusing %s — the plate is not PLA and this printer prints PLA only", self.printer_id, queue_job_id)
+            return {"ok": False, "reason": refusal}
 
         try:
             bambu_send.upload_3mf(self.host, self._access_code, local_path, file_name)

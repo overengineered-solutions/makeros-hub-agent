@@ -1,6 +1,7 @@
 """Tests for BambuAdapter.send_command — LAN control commands (pause/resume/stop)."""
 
 import json
+import os
 import sys
 import types
 import logging
@@ -347,6 +348,31 @@ class TestAutoRefill(unittest.TestCase):
         self.assertIs(bambu_parse.auto_refill_state({"home_flag": 0}), False)
         self.assertIs(bambu_parse.auto_refill_state({"cfg": "zz", "home_flag": 0}), False)
         self.assertIsNone(bambu_parse.auto_refill_state({}))
+
+
+class TestPlaOnly(unittest.TestCase):
+    """Operator, 2026-10-23: "anything petg on a mini just needs to be rejected with a message about why, even if someone loads
+    petg etc." The last check before a mini is told to print: the plate's own materials, PLA variants allowed."""
+
+    def _file(self, *types):
+        import tempfile, zipfile
+        fils = "".join(f'<filament id="{i + 1}" type="{t}" color="#FFFFFF" used_g="3"/>' for i, t in enumerate(types))
+        xml = f'<?xml version="1.0"?><config><plate><metadata key="index" value="1"/>{fils}</plate></config>'
+        f = tempfile.NamedTemporaryFile(suffix=".3mf", delete=False)
+        with zipfile.ZipFile(f, "w") as z:
+            z.writestr("Metadata/slice_info.config", xml)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_refuses_anything_but_pla_on_a_mini_only(self):
+        from makeros_hub.printers.bambu import _pla_only_refusal
+        self.assertIsNone(_pla_only_refusal(self._file("PLA"), 1, "A1 Mini"))
+        self.assertIsNone(_pla_only_refusal(self._file("PLA", "PLA-CF"), 1, "A1 Mini"))
+        self.assertEqual(_pla_only_refusal(self._file("PLA", "PETG"), 1, "A1 Mini"), "pla_only")
+        self.assertEqual(_pla_only_refusal(self._file("PETG"), 1, "a1 mini"), "pla_only")
+        self.assertIsNone(_pla_only_refusal(self._file(), 1, "A1 Mini"))   # names no material: the site refuses it before dispatch
+        self.assertIsNone(_pla_only_refusal(self._file("PETG"), 1, "P2S"))
 
 
 class TestDeviceCapture(unittest.TestCase):
