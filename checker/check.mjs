@@ -1,4 +1,4 @@
-// ps-checker fe8d7840d85f, format 2: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
+// ps-checker 6771b402a106, format 2: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
 
 // src/checker/main.ts
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -73,7 +73,7 @@ var TOO_BIG = `The file is over ${MIB(MAX_FILE_BYTES)}, too big to check here. A
 var PLATES = {
   "A1 Mini": { areas: [[177.5, 177.5]], height: 180 },
   "P2S": { areas: [[253.5, 253.5]], height: 256 },
-  "X1C": { areas: [[235.5, 253.5], [253.5, 225.5]], height: 250 },
+  "X1C": { areas: [[234, 253.5], [253.5, 234]], height: 250 },
   "H2D": { areas: [[297.5, 317.5]], height: 325 },
   "Sovol SV08 MAX": { areas: [[500, 500]], height: 500 },
   "Elegoo OrangeStorm Giga": { areas: [[800, 800]], height: 1e3 }
@@ -1283,7 +1283,7 @@ function bounded(report) {
 }
 
 // src/checker/main.ts
-var CHECKER_VERSION = true ? "fe8d7840d85f" : "source";
+var CHECKER_VERSION = true ? "6771b402a106" : "source";
 var JOB = process.env.PS_JOB_DIR ?? "/job";
 function readJob(raw) {
   if (!raw || typeof raw !== "object") return "job.json is not an object";

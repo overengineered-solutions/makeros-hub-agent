@@ -181,12 +181,15 @@ def test_the_h2d_slices_on_the_nozzle_the_spec_names_and_dispatch_reads_it(tmp_p
 
 
 # The edges the site's check takes from this slicer (pstation printability.ts PLATES, 2026-10-23): about 1.25 mm clear of every edge,
-# the X1C's lidar corner and 250 mm height, the 300 mm of the H2D both nozzles reach. A part the check says fits must slice.
+# the X1C's 250 mm height and the corner it keeps clear (a part beside it, turned round on the bed if need be, its short side held to
+# 234 because the arrange refused a 235 square and 235 x 245 yet took 235.5 x 253.5), the 300 mm of the H2D both nozzles reach, which
+# turns nothing round. A part the check says fits as it sits must slice.
 @pytest.mark.parametrize("model, nozzle, size, fits", [
     ("A1 Mini", None, (177.5, 177.5, 1), True), ("A1 Mini", None, (178, 178, 1), False),
     ("X1C", None, (10, 10, 249), True), ("X1C", None, (10, 10, 252), False),
-    ("X1C", None, (228, 228, 1), True), ("X1C", None, (236, 236, 1), False),
-    ("H2D", "left", (297.5, 317.5, 1), True), ("H2D", "right", (298, 318, 1), False),
+    ("X1C", None, (234, 234, 1), True), ("X1C", None, (234, 253.5, 1), True), ("X1C", None, (253.5, 234, 1), True),
+    ("X1C", None, (250, 230, 10), True), ("X1C", None, (235, 235, 1), False), ("X1C", None, (236, 236, 1), False),
+    ("H2D", "left", (297.5, 317.5, 1), True), ("H2D", "right", (298, 318, 1), False), ("H2D", "left", (300, 297, 1), False),
 ])
 def test_the_bed_edges_the_sites_check_uses(tmp_path, model, nozzle, size, fits):
     result, _ = _slice(tmp_path, _box_stl(*size), model=model, nozzle=nozzle)

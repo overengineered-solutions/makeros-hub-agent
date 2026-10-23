@@ -81,7 +81,8 @@ print would have to settle is listed for the operator in pstation `reports/autos
     (`"nozzle": "left" | "right"`); the wrapper puts the member's one filament on it with OrcaSlicer's manual filament map,
     turned into a logical extruder by the preset's own `physical_extruder_map`, so the plate's `group_id` is the nozzle hub
     0.77's dispatch reads. An H2D spec without a nozzle is refused. The image's slicer caps now name the H2D, and the site
-    offers a model only on a box whose image names it.
+    offers, hands out or moves an H2D job only to a box whose image names it and whose agent is 0.82 or later (an 0.81 agent
+    drops the nozzle, so its 0.82 image would refuse every H2D job).
   - **The A1 minis take PLA only** (operator, 2026-10-22); the site offers nothing else there and the wrapper refuses it too.
   - **`supportUsed` is what the slice laid** (its G-code's Support features). slice_info's `support_used` is only the
     setting, so a ticked box over a part that needed none told the member "with temporary supports".
@@ -91,8 +92,8 @@ print would have to settle is listed for the operator in pstation `reports/autos
     and the infill is rectilinear on every model (board 6e8c967f).
 - `makeros_hub/printers/manager.py` `slice_spec_of` passes the nozzle into the job file, only as "left" or "right".
 - `checker/check.mjs` is pstation's check at format 2: a part fits a bed only where the shop's slicer takes it (measured with
-  this image: about 1.25 mm clear of every edge, the X1C's 250 mm height and lidar corner, the 300 mm of the H2D both nozzles
-  reach), and tall-and-slender is judged on what stands on the bed.
+  this image: about 1.25 mm clear of every edge, the X1C's 250 mm height and lidar corner with its short side held to 234, the
+  300 mm of the H2D both nozzles reach), and tall-and-slender is judged on what stands on the bed.
 - `tests/test_real_slice.py` slices each of these through the image: the brim both ways, supports laid or not, the H2D on
   each nozzle read back by the dispatch parser, and the bed edges the site's check uses.
 - Install order: the hub release, then `install-slicer.py` and `install-checker.py` for this tag (the site hands checks only to
