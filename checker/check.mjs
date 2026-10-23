@@ -1,4 +1,4 @@
-// ps-checker 96ea7bdbcfd9, format 1: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
+// ps-checker c564b6b06692, format 1: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
 
 // src/checker/main.ts
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -7,6 +7,49 @@ import { deflateSync } from "node:zlib";
 
 // src/lib/printability.ts
 import { inflateRawSync } from "node:zlib";
+
+// src/lib/threemf-zip.ts
+var ZipError = class extends Error {
+};
+var MAX_SLICE_INFO = 1024 * 1024;
+function zipDirectory(bytes) {
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let eocd = -1;
+  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) if (dv.getUint32(i, true) === 101010256) {
+    eocd = i;
+    break;
+  }
+  if (eocd < 0) throw new ZipError("The 3MF zip is damaged: no directory at its end.");
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (let e = 0; e < count; e++) {
+    if (p + 46 > bytes.length || dv.getUint32(p, true) !== 33639248) throw new ZipError("The 3MF zip directory is damaged.");
+    const nlen = dv.getUint16(p + 28, true), xlen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true);
+    const name = new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + nlen));
+    if (seen.has(name)) throw new ZipError("The 3MF zip lists an entry twice.");
+    seen.add(name);
+    out.push({
+      name,
+      method: dv.getUint16(p + 10, true),
+      crc: dv.getUint32(p + 16, true),
+      csize: dv.getUint32(p + 20, true),
+      usize: dv.getUint32(p + 24, true),
+      local: dv.getUint32(p + 42, true)
+    });
+    p += 46 + nlen + xlen + clen;
+  }
+  return out;
+}
+function entryData(bytes, e) {
+  if (e.csize === 4294967295 || e.usize === 4294967295) throw new ZipError("The 3MF uses a zip format the check does not read (zip64).");
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (e.local + 30 > bytes.length || dv.getUint32(e.local, true) !== 67324752) throw new ZipError("The 3MF zip entry is damaged.");
+  const nlen = dv.getUint16(e.local + 26, true), start = e.local + 30 + nlen + dv.getUint16(e.local + 28, true);
+  if (start + e.csize > bytes.length || dv.getUint16(e.local + 8, true) !== e.method || new TextDecoder().decode(bytes.subarray(e.local + 30, e.local + 30 + nlen)) !== e.name) throw new ZipError("The 3MF zip entry is damaged.");
+  return { start, data: bytes.subarray(start, start + e.csize) };
+}
 
 // src/lib/print-scale.ts
 var UNIT_MM = { millimeter: 1, centimeter: 10, meter: 1e3, inch: 25.4, foot: 304.8, micron: 1e-3 };
@@ -83,21 +126,14 @@ function budgetRefusal(bytes, fileName = "") {
   return n > MAX_TRIANGLES ? tooDetailed(n).message : null;
 }
 function modelBytes(bytes) {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let eocd = -1;
-  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) if (dv.getUint32(i, true) === 101010256) {
-    eocd = i;
-    break;
+  let entries;
+  try {
+    entries = zipDirectory(bytes);
+  } catch (e) {
+    if (e instanceof ZipError) return null;
+    throw e;
   }
-  if (eocd < 0) return null;
-  let p = dv.getUint32(eocd + 16, true), total = 0;
-  for (let e = 0, count = dv.getUint16(eocd + 10, true); e < count; e++) {
-    if (p + 46 > bytes.length || dv.getUint32(p, true) !== 33639248) return null;
-    const usize = dv.getUint32(p + 24, true), nlen = dv.getUint16(p + 28, true);
-    if (/\.model$/i.test(new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + nlen)))) total += usize;
-    p += 46 + nlen + dv.getUint16(p + 30, true) + dv.getUint16(p + 32, true);
-  }
-  return total;
+  return entries.reduce((total, e) => /\.model$/i.test(e.name) ? total + e.usize : total, 0);
 }
 function parseStl(bytes) {
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -240,33 +276,28 @@ function parse3mf(bytes) {
   };
 }
 function unzipModels(bytes) {
-  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let eocd = -1;
-  for (let i = bytes.length - 22; i >= Math.max(0, bytes.length - 65557); i--) if (dv.getUint32(i, true) === 101010256) {
-    eocd = i;
-    break;
-  }
-  if (eocd < 0) throw new PrintabilityError("The 3MF zip is damaged: no directory at its end.");
-  const count = dv.getUint16(eocd + 10, true);
-  let p = dv.getUint32(eocd + 16, true);
   const out = /* @__PURE__ */ new Map();
   const read = [];
   let inflated = 0;
-  for (let e = 0; e < count; e++) {
-    if (p + 46 > bytes.length || dv.getUint32(p, true) !== 33639248) throw new PrintabilityError("The 3MF zip directory is damaged.");
-    const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true), usize = dv.getUint32(p + 24, true);
-    const nlen = dv.getUint16(p + 28, true), xlen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true);
-    const local = dv.getUint32(p + 42, true);
-    const name = new TextDecoder().decode(bytes.subarray(p + 46, p + 46 + nlen));
-    p += 46 + nlen + xlen + clen;
+  let entries;
+  try {
+    entries = zipDirectory(bytes);
+  } catch (e) {
+    throw e instanceof ZipError ? new PrintabilityError(e.message) : e;
+  }
+  for (const entry of entries) {
+    const { name, method, csize, usize, local } = entry;
     if (!/\.model$/i.test(name)) continue;
     if (csize === 4294967295 || usize === 4294967295) throw new PrintabilityError("The 3MF uses a zip format the check does not read (zip64).");
     if (inflated + usize > MAX_INFLATED_BYTES) throw new PrintabilityError(`This 3MF unpacks to more than ${MIB(MAX_INFLATED_BYTES)} of model, too detailed to check here. Reduce its detail (fewer triangles) and check it again.`);
-    if (local + 30 > bytes.length || dv.getUint32(local, true) !== 67324752) throw new PrintabilityError("The 3MF zip entry is damaged.");
-    const start = local + 30 + dv.getUint16(local + 26, true) + dv.getUint16(local + 28, true);
-    if (start + csize > bytes.length || read.some(([a, b]) => local < b && start + csize > a)) throw new PrintabilityError("The 3MF zip entry is damaged.");
+    let start, data;
+    try {
+      ({ start, data } = entryData(bytes, entry));
+    } catch (e) {
+      throw e instanceof ZipError ? new PrintabilityError(e.message) : e;
+    }
+    if (read.some(([a, b]) => local < b && start + csize > a)) throw new PrintabilityError("The 3MF zip entry is damaged.");
     read.push([local, start + csize]);
-    const data = bytes.subarray(start, start + csize);
     let raw = null;
     try {
       raw = method === 0 ? data : method === 8 ? inflateRawSync(data, { maxOutputLength: Math.max(usize, 1) }) : null;
@@ -1248,7 +1279,7 @@ function bounded(report) {
 }
 
 // src/checker/main.ts
-var CHECKER_VERSION = true ? "96ea7bdbcfd9" : "source";
+var CHECKER_VERSION = true ? "c564b6b06692" : "source";
 var JOB = process.env.PS_JOB_DIR ?? "/job";
 function readJob(raw) {
   if (!raw || typeof raw !== "object") return "job.json is not an object";
