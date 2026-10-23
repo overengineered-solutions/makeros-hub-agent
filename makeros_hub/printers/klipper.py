@@ -135,7 +135,7 @@ _QUERY_OBJECTS = (
     "&output_pin%20main_led=value"
     # v0.82: the printer's heater hold (pstation printers/*/config: shop.cfg on the SV08s, pstation-hold.cfg on the Giga).
     # A printer without it answers null attributes (read on both, 2026-10-23).
-    "&gcode_macro%20_pstation_hold=active,minutes,ceiling_minutes"
+    "&gcode_macro%20_pstation_hold=active,minutes,ceiling_minutes,since"
 )
 # v0.82 (operator, 2026-10-23: "I do not want to just turn heaters off if we have a chance to recover a print"): a print
 # stopped on an error or paused keeps its bed warm with the nozzle off, the motors on, until someone answers or the
@@ -1477,6 +1477,9 @@ def _build_status(
             minutes, ceiling = _int(hold.get("minutes")), _int(hold.get("ceiling_minutes"))
             if minutes is not None and ceiling is not None and 0 <= minutes <= ceiling:
                 out["hold"] = {"minutes": minutes, "ceilingMinutes": ceiling}
+                since = _num(hold.get("since"))   # the printer's clock when the hold began: its identity for the site's alert
+                if since is not None and since > 0:
+                    out["hold"]["since"] = round(since, 1)
 
         # If print_stats said nothing, default to idle so the cloud doesn't
         # render this connection as 'offline' (no state) by accident.

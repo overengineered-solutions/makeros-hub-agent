@@ -503,9 +503,11 @@ class TestReadings(unittest.TestCase):
         self.assertNotIn("toolhead", _build_status("p", {"toolhead": {"homed_axes": "xyz"}}, "offline"))
 
     def test_the_heater_hold_only_when_the_printer_says_it_holds(self):
-        self.assertIn("&gcode_macro%20_pstation_hold=active,minutes,ceiling_minutes", klipper._QUERY_OBJECTS)
+        self.assertIn("&gcode_macro%20_pstation_hold=active,minutes,ceiling_minutes,since", klipper._QUERY_OBJECTS)
         held = lambda **h: self.status(**{"gcode_macro _pstation_hold": h})
         self.assertEqual(held(active=True, minutes=12, ceiling_minutes=2880)["hold"], {"minutes": 12, "ceilingMinutes": 2880})
+        self.assertEqual(held(active=True, minutes=1, ceiling_minutes=2880, since=92026.0239)["hold"],
+                         {"minutes": 1, "ceilingMinutes": 2880, "since": 92026.0})
         self.assertNotIn("hold", held(active=False, minutes=12, ceiling_minutes=2880))
         self.assertNotIn("hold", held(active=None, minutes=None, ceiling_minutes=None))   # a printer without the hold
         self.assertNotIn("hold", held(active=True, minutes=3000, ceiling_minutes=2880))
