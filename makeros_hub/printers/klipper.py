@@ -1381,6 +1381,11 @@ def _build_status(
             # "printing" print with none is still in its start routine.
             if print_dur is not None:
                 out["preparing"] = state_raw == "printing" and print_dur == 0
+            # v0.82: what stopped it, in Klipper's words ("Extrude only move too long ..."). Queried since v0.70 but never sent,
+            # so a Klipper error reached the site as "without a description": the hold alert and the fault move both read it.
+            message = print_stats.get("message")
+            if state_raw == "error" and isinstance(message, str) and message.strip():
+                out["errorReason"] = message.strip()[:200]
             info = print_stats.get("info")
             if isinstance(info, dict):
                 current, total = _int(info.get("current_layer")), _int(info.get("total_layer"))
@@ -1462,8 +1467,12 @@ def _build_status(
         led_value = _num(led.get("value")) if isinstance(led, dict) else None
         if led_value is not None:
             out["light"] = led_value > 0
-        # v0.82: only what the printer says it is holding; omitted when it holds nothing or has no hold
+        # v0.82: only what the printer says it is holding; omitted when it holds nothing or has no hold. heaterHold: the
+        # printer runs the hold at all, so the site waits for it instead of alerting a bare long pause (paused_long comes
+        # from this hub a few seconds before the printer's own idle timeout starts the hold).
         hold = status.get(_HOLD)
+        if isinstance(hold, dict) and isinstance(hold.get("active"), bool):
+            out["heaterHold"] = True
         if isinstance(hold, dict) and hold.get("active") is True:
             minutes, ceiling = _int(hold.get("minutes")), _int(hold.get("ceiling_minutes"))
             if minutes is not None and ceiling is not None and 0 <= minutes <= ceiling:

@@ -510,6 +510,15 @@ class TestReadings(unittest.TestCase):
         self.assertNotIn("hold", held(active=None, minutes=None, ceiling_minutes=None))   # a printer without the hold
         self.assertNotIn("hold", held(active=True, minutes=3000, ceiling_minutes=2880))
         self.assertNotIn("hold", held(active=True, minutes=True, ceiling_minutes=2880))
+        self.assertTrue(held(active=False, minutes=0, ceiling_minutes=2880)["heaterHold"])
+        self.assertNotIn("heaterHold", held(active=None, minutes=None, ceiling_minutes=None))
+
+    def test_a_klipper_error_carries_its_own_words(self):
+        error = lambda **ps: _build_status("p", {"print_stats": {"state": "error", **ps}}, "connected")
+        self.assertEqual(error(message="Extrude only move too long (-642.480mm vs 300.000mm)\nSee the 'max_extrude_only_distance' "
+                               "config option for details")["errorReason"][:52], "Extrude only move too long (-642.480mm vs 300.000mm)")
+        self.assertNotIn("errorReason", error(message=""))
+        self.assertNotIn("errorReason", _build_status("p", {"print_stats": {"state": "paused", "message": "x"}}, "connected"))
 
     def test_a_hold_starting_or_ending_is_sent_at_once_for_a_printer_in_error(self):
         row = {"printerId": "p", "connectionState": "connected", "sampledAt": 1, "state": "error"}
