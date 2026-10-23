@@ -19,8 +19,8 @@ SLICED_INFO = b"""<?xml version="1.0"?><config><plate><metadata key="index" valu
 def sliced_plate() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("Metadata/slice_info.config", SLICED_INFO)
-        z.writestr("Metadata/plate_1.gcode", b"; sliced by the shop")
+        z.writestr(zipfile.ZipInfo("Metadata/slice_info.config"), SLICED_INFO)
+        z.writestr(zipfile.ZipInfo("Metadata/plate_1.gcode"), b"; sliced by the shop")
     return buf.getvalue()
 
 
@@ -114,6 +114,10 @@ class TestSliceUploads(unittest.TestCase):
             self.assertEqual(self.runs, [])
 
     def test_only_the_slicer_fields_reach_the_job_file(self):
+        choice = {"version": 1, "thicken": True, "moveLargeGaps": False}
+        self.assertEqual(slice_spec_of({**SPEC, "prepare": choice})["prepare"], choice)
+        self.assertEqual(parse_slicer_caps({"scaleMin": 0.001, "scaleMax": 1000, "prepareVersion": 1})["prepareVersion"], 1)
+        self.assertNotIn("prepareVersion", parse_slicer_caps({"scaleMin": 0.001, "scaleMax": 1000, "prepareVersion": True}))
         self.assertEqual(slice_spec_of(SPEC), {"model": "A1 Mini", "filament": {"type": "PLA", "colorHex": "#1E90FF", "trayInfoIdx": "GFA00"},
                                                "fixes": {"orient": True, "brim": False}, "scale": 1.0})
         self.assertEqual(slice_spec_of({"model": "P2S", "filament": "x", "fixes": [], "scale": True}),
@@ -217,3 +221,46 @@ class TestSlicerCaps(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_prepare_round_trip_refusal_and_cache_binds_choices(tmp_path):
+    m = PrinterManager()
+    reports, jobs = [], []
+    request = {"version": 1, "thicken": True, "moveLargeGaps": False}
+    proposal = {"version": 1, "changes": [], "blocked": []}
+
+    def get(path, dest):
+        Path(dest).write_bytes(MESH)
+        return hashlib.sha256(MESH).hexdigest(), len(MESH)
+
+    def report(body):
+        reports.append(body)
+        return _Resp()
+
+    def runner(uid):
+        work = tmp_path / uid / ".slice"
+        jobs.append(json.loads((work / "job.json").read_text()))
+        (work / "out").mkdir()
+        (work / "out/result.json").write_text(json.dumps({"ok": True, "prepare": proposal, "grams": 4}))
+        (work / "out/sliced.3mf").write_bytes(sliced_plate())
+        return 0
+
+    sent = fetch(slice={**SPEC, "prepare": request})
+    for _ in range(2):
+        assert m.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 1
+    assert len(jobs) == 1 and jobs[0]["prepare"] == request
+    assert reports[-1]["slice"]["prepare"] == proposal
+    # Same mesh, different chosen repairs: the old plate and report cannot be reused.
+    sent["slice"] = {**SPEC, "prepare": {**request, "moveLargeGaps": True}}
+    assert m.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 1
+    assert len(jobs) == 2
+
+    def refuse(uid):
+        work = tmp_path / uid / ".slice"
+        (work / "out").mkdir()
+        (work / "out/result.json").write_text(json.dumps({"ok": False, "error": "Pick a bigger scale.", "prepare": proposal}))
+        return 3
+    sent["slice"] = {**SPEC, "prepare": {**request, "thicken": False}}
+    assert m.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=refuse) == 0
+    assert reports[-1]["slice"]["prepare"] == proposal
+    assert reports[-1]["sliceError"] == "Pick a bigger scale."

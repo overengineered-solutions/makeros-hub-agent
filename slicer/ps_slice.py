@@ -23,7 +23,7 @@ not load the vendor bundle, so an unresolved preset silently loses its density, 
 (SHOP_PROCESS) and the member's choices, each written out in both states (shop_process()). The model code Bambu writes into slice_info (N1, N7, BL-P001) comes from the
 vendor's printer definition: the CLI leaves it blank, and the hub refuses a plate without it.
 
-Stdlib only. `python3 ps_slice.py selftest` checks the pure parts without the slicer.
+Validation is stdlib-only. Preparation uses the pinned container packages; `prepare-selftest` exercises their geometry.
 """
 from __future__ import annotations
 
@@ -92,6 +92,296 @@ class SliceError(Exception):
     pass
 
 
+# These imports stay inside prepare_model: install-slicer.py's local preflight is stdlib-only; member geometry runs only
+# in the container, whose Dockerfile pins the permissive kernels (operator, 2026-10-23: "Have PStation fix it").
+def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: float) -> dict:
+    import base64
+    import hashlib
+    import io
+    import math
+    import numpy as np
+    import networkx as nx
+    import trimesh
+    from manifold3d import Manifold, Mesh, OpType, CrossSection
+    from PIL import Image, ImageDraw
+
+    broken = "We could not repair this file safely. Export it again as a closed solid."
+    surface = "Your model has no thickness. Give the walls a thickness in your program."
+    tiny = "These are too small to print at this scale. Leave them off, or print a bigger scale."
+    opening = "Thickening this wall would close the window beside it. Pick a bigger scale or fix it in your model."
+    exact = "Thickening this wall would change a room size, the footprint or a connecting face. Pick a bigger scale or fix it in your model."
+    changes, blocked = [], []
+    original = trimesh.load_mesh(src, file_type="stl", process=False)
+    if not 0 < len(original.faces) <= 300_000 or not np.isfinite(original.vertices).all():
+        raise SliceError(broken)
+    original.merge_vertices()
+    original.apply_scale(scale)
+    parts = list(original.split(only_watertight=False, repair=False))
+    if not 0 < len(parts) <= 128:
+        raise SliceError("There are too many separate pieces to fix safely. Send a smaller selection from your model.")
+
+    def measure(meshes):
+        mesh = trimesh.util.concatenate(meshes)
+        return {"size": [round(float(x), 6) for x in mesh.extents],
+                "volume": round(sum(abs(float(m.volume)) for m in meshes), 6), "parts": len(meshes)}
+
+    # The same projection and scale in both pictures. Orange marks the affected surfaces, including material that was added.
+    def picture(meshes, marked, bounds):
+        basis = np.array([[0.7071, -0.7071, 0], [0.4082, 0.4082, -0.8165], [0.5774, 0.5774, 0.5774]])
+        corners = trimesh.bounds.corners(bounds) @ basis.T
+        lo, hi = corners[:, :2].min(axis=0), corners[:, :2].max(axis=0)
+        zoom = min(440 / max(hi[0] - lo[0], 0.01), 280 / max(hi[1] - lo[1], 0.01))
+        im = Image.new("RGB", (480, 320), "#f8fafc")
+        draw = ImageDraw.Draw(im)
+        triangles = []
+        for index, mesh in enumerate(meshes):
+            pts = mesh.triangles @ basis.T
+            for tri in pts:
+                xy = (tri[:, :2] - (hi + lo) / 2) * zoom + [240, 160]
+                triangles.append((float(tri[:, 2].mean()), [tuple(v) for v in xy], index in marked))
+        for _, xy, mark in sorted(triangles, key=lambda t: t[0]):
+            draw.polygon(xy, fill="#f59e0b" if mark else "#94a3b8", outline="#b45309" if mark else "#64748b")
+        out = io.BytesIO()
+        im.save(out, format="PNG", optimize=True)
+        return base64.b64encode(out.getvalue()).decode("ascii")
+
+    def record(fix, words, before, after, unit, old, new, marked=None, default=True):
+        bounds = np.array([np.minimum(trimesh.util.concatenate(old).bounds[0], trimesh.util.concatenate(new).bounds[0]),
+                           np.maximum(trimesh.util.concatenate(old).bounds[1], trimesh.util.concatenate(new).bounds[1])])
+        marks = set(range(max(len(old), len(new)))) if marked is None else set(marked)
+        changes.append({"fix": fix, "words": words, "before": before, "after": after, "unit": unit, "default": default,
+                        "beforeImage": picture(old, marks, bounds), "afterImage": picture(new, marks, bounds)})
+
+    before = measure(parts)
+    start = [p.copy() for p in parts]
+    # A zero-height surface cannot be given an inside by a repair. Small holes: only planar triangles/quads <= 1 mm across.
+    filled, repaired, inward = 0, [], []
+    for i, p in enumerate(parts):
+        if min(p.extents) < 1e-6:
+            blocked.append(surface)
+            continue
+        edges = p.edges_sorted[trimesh.grouping.group_rows(p.edges_sorted, require_count=1)]
+        if len(edges):
+            graph = nx.from_edgelist(edges)
+            loops = nx.cycle_basis(graph)
+            if any(d != 2 for _, d in graph.degree) or not loops:
+                blocked.append(broken)
+                continue
+            if any(len(loop) not in (3, 4) or np.linalg.norm(np.ptp(p.vertices[loop], axis=0)) > 1.0 or
+                   np.linalg.svd(p.vertices[loop] - p.vertices[loop].mean(axis=0), compute_uv=False)[-1] > 0.01 for loop in loops):
+                blocked.append(broken)
+                continue
+            if not trimesh.repair.fill_holes(p):
+                blocked.append(broken)
+                continue
+            filled += len(loops)
+            repaired.append(i)
+        trimesh.repair.fix_winding(p)
+        inward.append(p.volume < 0)
+        trimesh.repair.fix_normals(p, multibody=False)
+        if not p.is_volume:
+            blocked.append(broken)
+    if filled:
+        record("holes", f"Filled {filled} small surface hole(s), each no more than 1 mm across.", filled, 0, "holes", start, parts, repaired)
+
+    def solid(p):
+        m = Manifold(Mesh(np.asarray(p.vertices, dtype=np.float32), np.asarray(p.faces, dtype=np.uint32)))
+        if m.status().name != "NoError" or m.is_empty():
+            raise SliceError(broken)
+        return m
+
+    def mesh(m):
+        data = m.to_mesh()
+        return trimesh.Trimesh(np.array(data.vert_properties)[:, :3], np.array(data.tri_verts), process=False)
+
+    # Nested shells are cavities, not inside-out parts to fill. Ambiguous intersections stay with the boolean kernel.
+    solids = []
+    if not blocked:
+        parents = []
+        for i, p in enumerate(parts):
+            containers = [j for j, q in enumerate(parts) if i != j and np.all(q.bounds[0] < p.bounds[0]) and
+                          np.all(q.bounds[1] > p.bounds[1]) and q.contains(p.vertices).all()]
+            parents.append(min(containers, key=lambda j: parts[j].volume) if containers and inward[i] else None)
+        depths = []
+        for i in range(len(parts)):
+            d, parent = 0, parents[i]
+            while parent is not None:
+                d, parent = d + 1, parents[parent]
+            depths.append(d)
+        for i, p in enumerate(parts):
+            if depths[i] % 2:
+                continue
+            s = solid(p)
+            for j, parent in enumerate(parents):
+                if parent == i:
+                    s = s - solid(parts[j])
+            solids.append(s)
+        # A correctly inward cavity was never a flipped-face problem: put its winding back before measuring the repair.
+        for i, p in enumerate(parts):
+            if depths[i] % 2:
+                p.invert()
+        face_counts = [int(np.any(start[i].faces != p.faces[:len(start[i].faces)], axis=1).sum()) for i, p in enumerate(parts)]
+        flipped = sum(face_counts)
+        if flipped:
+            record("faces", f"Turned {flipped} inside-out or flipped face(s) the right way.", flipped, 0, "faces", start, parts,
+                   [i for i, n in enumerate(face_counts) if n])
+        parts = [mesh(s) for s in solids]
+        before["volume"] = round(sum(float(s.volume()) for s in solids), 6)
+
+    if not blocked:
+        old = [p.copy() for p in parts]
+        bottom = min(float(p.bounds[0, 2]) for p in parts)
+        if abs(bottom) > 1e-5:
+            for p in parts:
+                p.apply_translation([0, 0, -bottom])
+            record("bed", f"Moved the whole model {abs(bottom):.3f} mm {'down' if bottom > 0 else 'up'} to the bed.", bottom, 0, "mm", old, parts)
+
+        # First wall pilot: closed rectangular walls. No voxel wrap: it would round exact mating faces.
+        # shortcut: curved, tapered and joined thin walls are refused; extend with protected-face data and tolerance coupons.
+        old = [p.copy() for p in parts]
+        footprint = CrossSection(Manifold.batch_boolean([solid(p) for p in parts], OpType.Add).project().to_polygons())
+        for i, world in enumerate(old):
+            vertical = world.face_normals[np.abs(world.face_normals[:, 2]) < 1e-6]
+            normals = np.unique(np.round(vertical, 6), axis=0)
+            normal = min(normals, key=lambda n: np.ptp(world.vertices @ n)) if 0 < len(normals) <= 32 else np.array([1., 0., 0.])
+            normal = normal / np.linalg.norm(normal)
+            frame = np.array([normal, [-normal[1], normal[0], 0], [0, 0, 1]])
+            transform = np.eye(4)
+            transform[:3, :3] = frame
+            p = world.copy()
+            p.apply_transform(transform)
+            boxes = [np.array([(q.vertices @ frame.T).min(axis=0), (q.vertices @ frame.T).max(axis=0)]) for q in old]
+            full = np.array([np.min([b[0] for b in boxes], axis=0), np.max([b[1] for b in boxes], axis=0)])
+            axis = 0
+            width = float(p.extents[axis])
+            box = math.isclose(abs(p.volume), float(np.prod(p.extents)), rel_tol=1e-5)
+            if not box:
+                # Deterministic screening of every small component plus up to 3000 faces of a larger one.
+                pick = np.linspace(0, len(p.faces) - 1, min(3000, len(p.faces)), dtype=int)
+                points, normals = p.triangles_center[pick], p.face_normals[pick]
+                origins = points - normals * 1e-5
+                hits, rays, _ = p.ray.intersects_location(origins, -normals, multiple_hits=False)
+                lengths = np.linalg.norm(hits - origins[rays], axis=1)
+                if np.any((lengths < min_wall - 1e-4) & (np.abs(normals[rays, 2]) < 0.5)):
+                    blocked.append("We cannot thicken these walls while keeping their openings and connecting faces exact. Pick a bigger scale or fix them in your model.")
+                continue
+            if p.extents[2] <= width:
+                if p.extents[2] < 0.4:
+                    blocked.append("This floor is too thin to print. Give it at least 0.4 mm at print size in your model, or pick a bigger scale.")
+                continue
+            if width >= min_wall - 1e-5:
+                continue
+            if not request["thicken"]:
+                blocked.append("This model still has thin walls. Choose wall thickening or pick a bigger scale.")
+                continue
+            if width < min_wall / 4:
+                blocked.append(tiny)
+                continue
+            low = abs(p.bounds[0, axis] - full[0, axis]) < 1e-5
+            high = abs(p.bounds[1, axis] - full[1, axis]) < 1e-5
+            if low and high:
+                blocked.append(exact)
+                continue
+            addition = min_wall - width
+            bounds = p.bounds.copy()
+            bounds[0, axis] -= 0 if low else addition if high else addition / 2
+            bounds[1, axis] += 0 if high else addition if low else addition / 2
+            candidate = trimesh.creation.box(bounds=bounds)
+            # Any opposing part means a protected room/opening or mating surface. Do not narrow even a still-open gap.
+            others = [j for j, b in enumerate(boxes) if j != i and all(
+                min(p.bounds[1, k], b[1, k]) - max(p.bounds[0, k], b[0, k]) > 1e-5 for k in range(3) if k != axis)
+                and (b[1, axis] <= p.bounds[0, axis] + 1e-5 or b[0, axis] >= p.bounds[1, axis] - 1e-5)]
+            if others:
+                closes = any(min(bounds[1, axis], boxes[j][1, axis]) - max(bounds[0, axis], boxes[j][0, axis]) > 1e-5 for j in others)
+                blocked.append(opening if closes else exact)
+                continue
+            if any(j != i and min(p.bounds[1, 2], b[1, 2]) - max(p.bounds[0, 2], b[0, 2]) > 1e-5 and
+                   min(p.bounds[1, 0], b[1, 0]) - max(p.bounds[0, 0], b[0, 0]) > 1e-5 and
+                   (abs(p.bounds[1, 1] - b[0, 1]) < 1e-5 or abs(p.bounds[0, 1] - b[1, 1]) < 1e-5) for j, b in enumerate(boxes)):
+                blocked.append(exact)
+                continue
+            if np.any(bounds[0, :2] < full[0, :2] - 1e-5) or np.any(bounds[1, :2] > full[1, :2] + 1e-5):
+                blocked.append(exact)
+                continue
+            # Union, with a subtraction proof: not one bit of the original solid may be lost.
+            candidate.apply_transform(np.linalg.inv(transform))
+            a, b = solid(world), solid(candidate)
+            grown = a + b
+            if (CrossSection(grown.project().to_polygons()) - footprint).area() > 1e-4:   # float32 boolean round-trip, square mm
+                blocked.append(exact)
+                continue
+            if (a - grown).volume() > 1e-6:
+                raise SliceError(broken)
+            was = [x.copy() for x in parts]
+            parts[i] = mesh(grown)
+            record("walls", f"Thickened wall {i + 1} from {width:.3f} to {min_wall:.3f} mm {'inward' if low or high else 'equally from its centre'}; added up to {addition if low or high else addition / 2:.3f} mm.",
+                   width, min_wall, "mm", was, parts, [i])
+
+        was = [p.copy() for p in parts]
+        union = Manifold.batch_boolean([solid(p) for p in parts], OpType.Add)
+        if union.status().name != "NoError":
+            raise SliceError(broken)
+        shells = [mesh(m) for m in union.decompose()]
+        parts = [p for p in shells if p.volume > 0]
+        for cavity in (p for p in shells if p.volume < 0):
+            enclosing = [i for i, p in enumerate(parts) if np.all(p.bounds[0] < cavity.bounds[0]) and
+                         np.all(p.bounds[1] > cavity.bounds[1]) and p.contains(cavity.vertices).all()]
+            if not enclosing:
+                raise SliceError(broken)
+            i = min(enclosing, key=lambda j: parts[j].volume)
+            parts[i] = trimesh.util.concatenate([parts[i], cavity])
+        if len(parts) < len(was) or sum(abs(p.volume) for p in was) - union.volume() > 1e-4:
+            record("merge", f"Merged overlapping or face-joined pieces: {len(was)} pieces became {len(parts)} solid(s).", len(was), len(parts), "parts", was, parts)
+
+        # Cast down from bottom faces, never a bounding box: a roof above an opening must not be put on an imaginary floor.
+        parts.sort(key=lambda p: float(p.bounds[0, 2]))
+        for i, p in enumerate(parts):
+            if p.bounds[0, 2] <= 1e-5:
+                continue
+            feet = p.vertices[np.isclose(p.vertices[:, 2], p.bounds[0, 2], atol=1e-5)]
+            feet = np.vstack([feet, feet.mean(axis=0)])
+            if len(feet) > 2000:
+                blocked.append(broken)
+                continue
+            floors = np.zeros(len(feet))
+            for j, q in enumerate(parts):
+                if j == i or q.bounds[0, 2] >= p.bounds[0, 2]:
+                    continue
+                hits, rays, _ = q.ray.intersects_location(feet + [0, 0, 1e-5], np.tile([0, 0, -1], (len(feet), 1)), multiple_hits=False)
+                for hit, ray in zip(hits, rays):
+                    floors[ray] = max(floors[ray], hit[2])
+            gap = float(p.bounds[0, 2] - floors.max())
+            if gap <= 1e-5:
+                continue
+            if floors.min() <= 1e-5 or floors.max() - floors.min() > 0.01:
+                blocked.append(f"Piece {i + 1} has no flat surface underneath it. Put it on the bed in your model, or ask at the desk.")
+                continue
+            if gap >= 2 and not request["moveLargeGaps"]:
+                blocked.append(f"Piece {i + 1} is {gap:.3f} mm above what is below it. Choose to move pieces across gaps of 2 mm or more, or fix it in your model.")
+                continue
+            was = [x.copy() for x in parts]
+            moved = p.copy()
+            moved.apply_translation([0, 0, -gap])
+            if any((solid(moved) ^ solid(q)).volume() > 1e-5 for j, q in enumerate(parts) if j != i):
+                blocked.append(f"Moving piece {i + 1} would run into another part. Fix its position in your model.")
+                continue
+            parts[i] = moved
+            record("lower", f"Moved piece {i + 1} down {gap:.3f} mm onto the flat surface below it.", gap, 0, "mm", was, parts, [i], default=gap < 2)
+
+    result_mesh = trimesh.util.concatenate(parts)
+    data = result_mesh.export(file_type="stl")
+    result = {"version": 1, "inputSha256": hashlib.sha256(open(src, "rb").read()).hexdigest(), "sha256": hashlib.sha256(data).hexdigest(),
+              "settings": {**request, "minWall": min_wall, "scale": scale}, "before": before, "after": measure(parts),
+              "changes": changes, "blocked": list(dict.fromkeys(blocked))}
+    if len(json.dumps(result)) > 450_000:
+        raise SliceError("There are too many changes to show safely at once. Send a smaller selection from your model.")
+    if not blocked:
+        with open(dst, "wb") as fh:
+            fh.write(data)
+    print(f"prepare: processed={len(changes)}, expected={len(changes)}, blocked={len(result['blocked'])}", flush=True)
+    return result
+
+
 def read_spec(raw: dict) -> dict:
     """Validate job.json: an unknown model, a mesh name that is not a plain file name, an odd colour, a scale outside SCALE_MIN to
     SCALE_MAX are refused with a sentence a member can read."""
@@ -124,13 +414,18 @@ def read_spec(raw: dict) -> dict:
     scale = raw.get("scale", 1.0)
     if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not SCALE_MIN <= float(scale) <= SCALE_MAX:
         raise SliceError("the size change is outside what the slicer accepts")
+    prepare = raw.get("prepare")
+    if prepare is not None and (not isinstance(prepare, dict) or set(prepare) != {"version", "moveLargeGaps", "thicken"} or
+                                type(prepare["version"]) is not int or prepare["version"] != 1 or
+                                any(type(prepare[k]) is not bool for k in ("moveLargeGaps", "thicken"))):
+        raise SliceError("the model fix choices are not readable; check the file again")
     return {
         "mesh": mesh, "model": model, "type": ftype,
         "color": color if isinstance(color, str) and HEX_RE.match(color) else None,
         "tray": tray if isinstance(tray, str) and TRAY_RE.match(tray) else None,
         "stated": stated,
         "orient": fixes["orient"], "brim": fixes["brim"], "supports": fixes["supports"],
-        "scale": float(scale), "nozzle": nozzle if model in TWO_NOZZLES else None,
+        "scale": float(scale), "nozzle": nozzle if model in TWO_NOZZLES else None, "prepare": prepare,
     }
 
 
@@ -248,7 +543,7 @@ def caps(processes: dict | None = None, machines: dict | None = None) -> dict:
     model the outer wall line width of the process it slices with, so the site's minimum wall is two of this image's lines.
     Read from the image, so a box whose agent and image differ reports the image. Never raises: a preset that does not read
     leaves its model out."""
-    out: dict = {"scaleMin": SCALE_MIN, "scaleMax": SCALE_MAX, "lineWidth": {}}
+    out: dict = {"scaleMin": SCALE_MIN, "scaleMax": SCALE_MAX, "lineWidth": {}, "prepareVersion": 1}
     try:
         processes = load_index("process") if processes is None else processes
         machines = load_index("machine") if machines is None else machines
@@ -380,7 +675,19 @@ def run(job_dir: str | None = None) -> dict:
         with open(paths[kind], "w", encoding="utf-8") as fh:
             json.dump(d, fh)
     mesh = os.path.join(work, spec["mesh"])
-    scale_stl(os.path.join(job_dir, spec["mesh"]), mesh, spec["scale"])
+    prepared = None
+    if spec["prepare"]:
+        width = line_width(process, machine)
+        if width is None:
+            raise SliceError("the printer's extrusion width is unknown, so its walls cannot be fixed safely")
+        prepared = prepare_model(os.path.join(job_dir, spec["mesh"]), mesh, spec["prepare"], width * 2, spec["scale"])
+        # Persist the offer even when the geometry or slicer refuses it; no refused mesh goes to Orca.
+        with open(os.path.join(out, "prepare.json"), "w", encoding="utf-8") as fh:
+            json.dump(prepared, fh)
+        if prepared["blocked"]:
+            raise SliceError(" ".join(prepared["blocked"]))
+    else:
+        scale_stl(os.path.join(job_dir, spec["mesh"]), mesh, spec["scale"])
     args = orca_args(spec, paths, out, mesh)
     p = subprocess.run(args, capture_output=True, text=True, timeout=540, env={**os.environ, "HOME": "/tmp"})
     sliced = os.path.join(out, "sliced.3mf")
@@ -393,6 +700,14 @@ def run(job_dir: str | None = None) -> dict:
     set_model_id(sliced, model_id)
     result = {"ok": True, "filament": filament_name, "process": PROCESS.format(sfx=sfx), "settings": effective_settings(process),
               **summarize(sliced), **caps(processes, machines)}
+    if prepared:
+        result["prepare"] = prepared
+        # Orca 2.4.2 reports these as text in result.json. A prepared file with disappearing or floating regions is not approved.
+        log_path = os.path.join(out, "result.json")
+        if os.path.exists(log_path):
+            warnings = json.dumps(json.load(open(log_path, encoding="utf-8"))).lower()
+            if any(w in warnings for w in ("floating regions", "floating cantilever", "empty layers", "too thin")):
+                raise SliceError("The slice still has missing or floating parts. Pick a bigger scale or fix it in your model.")
     if result["plates"] != 1:
         raise SliceError(f"the part does not fit one plate (the slicer made {result['plates']}); scale it down or split it")
     if result["grams"] <= 0:
@@ -449,16 +764,33 @@ def main(argv: list[str]) -> int:
     if argv[1:] == ["selftest"]:
         selftest()
         return 0
+    if argv[1:] == ["prepare-selftest"]:
+        import tempfile
+        import trimesh
+        with tempfile.TemporaryDirectory() as root:
+            src, dst = os.path.join(root, "in.stl"), os.path.join(root, "fixed.stl")
+            base = trimesh.creation.box(bounds=[[0, 0, 3], [20, 20, 5]])
+            wall = trimesh.creation.box(bounds=[[0, 0, 5], [0.5, 20, 15]])
+            trimesh.util.concatenate([base, wall]).export(src)
+            got = prepare_model(src, dst, {"version": 1, "thicken": True, "moveLargeGaps": False}, 0.84, 1)
+            assert not got["blocked"] and {c["fix"] for c in got["changes"]} >= {"walls", "bed", "merge"}, got["blocked"]
+            after = trimesh.load_mesh(dst)
+            assert after.is_volume and after.bounds[0, 2] == 0 and after.volume > base.volume + wall.volume
+        print("prepare selftest ok")
+        return 0
     out = os.path.join(JOB, "out")
     try:
         result = run()
     except (SliceError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         reason = str(exc) if isinstance(exc, SliceError) else "the slicer stopped before it finished"
         result = {"ok": False, "error": reason, **caps()}   # a refusal still says what this image takes
+        prepare_path = os.path.join(out, "prepare.json")
+        if os.path.exists(prepare_path):
+            result["prepare"] = json.load(open(prepare_path, encoding="utf-8"))
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as fh:
         json.dump(result, fh)
-    print(json.dumps(result))
+    print(json.dumps({k: v for k, v in result.items() if k != "prepare"}))
     return 0 if result.get("ok") else 3
 
 

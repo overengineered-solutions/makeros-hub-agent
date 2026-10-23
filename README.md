@@ -71,6 +71,22 @@ sh -n update.sh
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
 
+## 0.83.0 candidate: “Have PStation fix it”
+
+The site's `prepare` choice runs inside ps-slicer before OrcaSlicer, at the chosen print size: whole-model bed placement,
+small floating gaps (under 2 mm; larger gaps need the member's choice), overlap union, face winding, small surface holes,
+and a first wall pilot. Closed rectangular vertical walls grow to two of the resolved process's extrusion widths; interior
+walls grow from their centre, exterior walls inward. The original file is untouched. Protected footprints, room gaps and
+connecting faces refuse a conflicting change. Curved, tapered and joined thin walls need another scale or a model edit.
+Every proposed change has marked before/after pictures and measurements. The site receives the report and the actual sliced
+grams, then waits for its existing member price approval. A failed preparation cannot dispatch.
+
+Install the hub release **and rebuild ps-slicer with `install-slicer.py`** from the same release: the new permissive geometry
+packages live in that container, not in the hub's Python environment. Both hub >=0.83 and image `prepareVersion: 1` are required
+by migration 0211's site. No checker change or new checker install is needed beyond 0.82's format-2 prerequisite. The plugin is
+unchanged. The image build runs `prepare-selftest`; synthetic geometry tests are in `tests/test_prepare.py`. Student-file and
+physical tolerance pilots are still needed before widening the wall cases or promising print success.
+
 ## 0.82.0 candidate: automatic slicing for the H2D, and slices that say what they laid
 
 Operator, 2026-10-23: "lets tune some auto slice and evaluation stuff." No tuning number changed here: every value a test

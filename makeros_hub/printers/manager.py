@@ -77,6 +77,7 @@ def parse_slicer_caps(result) -> dict | None:
         return None
     widths = result.get("lineWidth") if isinstance(result.get("lineWidth"), dict) else {}
     return {"scaleMin": float(lo), "scaleMax": float(hi),
+            **({"prepareVersion": 1} if type(result.get("prepareVersion")) is int and result["prepareVersion"] == 1 else {}),
             "lineWidth": {k: float(v) for k, v in list(widths.items())[:16] if isinstance(k, str) and 0 < len(k) <= 40 and num(v) and 0 < v <= 5}}
 
 
@@ -136,6 +137,8 @@ def slice_spec_of(spec: dict) -> dict:
     # v0.82 (board 459044ef): a two-nozzle printer's nozzle whose AMS holds the spool; the wrapper refuses anything else
     if spec.get("nozzle") in ("left", "right"):
         out["nozzle"] = spec["nozzle"]
+    if "prepare" in spec:
+        out["prepare"] = spec["prepare"]   # preserve malformed choices too: the container must refuse, never silently omit a fix
     return out
 
 
@@ -756,7 +759,7 @@ class PrinterManager:
                 if model_id:
                     body["printerModelId"] = model_id   # the cloud refuses a file sliced for another printer (audit)
                 if sliced is not None:
-                    body["slice"] = {k: sliced.get(k) for k in ("grams", "seconds", "supportUsed", "filament", "process", "settings")}
+                    body["slice"] = {k: sliced.get(k) for k in ("grams", "seconds", "supportUsed", "filament", "process", "settings", "prepare")}
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
                 if grams:
                     body["estGrams"] = int(math.ceil(sum(grams)))
@@ -790,7 +793,8 @@ class PrinterManager:
         if dest.exists() and result_path.exists() and mesh.exists() and stream_sha(mesh) == sha:
             try:
                 done = json.loads(result_path.read_text(encoding="utf-8"))
-                if isinstance(done, dict) and done.get("ok"):
+                same = json.loads((work / "job.json").read_text(encoding="utf-8")) == {**slice_spec_of(spec), "mesh": mesh_name}
+                if isinstance(done, dict) and done.get("ok") and same:
                     return done
             except (OSError, ValueError):
                 pass
@@ -830,7 +834,8 @@ class PrinterManager:
             reason = result.get("error") if isinstance(result, dict) and isinstance(result.get("error"), str) else \
                 ("the shop's slicer is not available right now" if rc == -1 else "the slicer stopped before it finished")
             log.warning("slice upload %s: not sliced (rc %s): %s", job_id, rc, reason)
-            reporter({"queueJobId": job_id, "sha256": sha, "sliceError": reason[:300]})
+            reporter({"queueJobId": job_id, "sha256": sha, "sliceError": reason[:300],
+                      **({"slice": {"prepare": result["prepare"]}} if isinstance(result, dict) and "prepare" in result else {})})
             return None
         os.replace(sliced_file, dest)
         log.info("slice upload %s: sliced in %.1f s (%s g, %s s print)", job_id, time.monotonic() - started, result.get("grams"), result.get("seconds"))

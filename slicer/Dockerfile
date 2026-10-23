@@ -6,7 +6,7 @@ FROM ubuntu:24.04
 ARG ORCA_VERSION=2.4.2
 ARG ORCA_SHA256=d12fb8c8eac1aecd2dfb6377acd48f994f8fa439ed5292fa532dd82880f029fd
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      libwebkit2gtk-4.1-0 libopengl0 libglu1-mesa libmspack0 libgl1 libegl1 libgtk-3-0 libsm6 libice6 python3 ca-certificates curl \
+      libwebkit2gtk-4.1-0 libopengl0 libglu1-mesa libmspack0 libgl1 libegl1 libgtk-3-0 libsm6 libice6 python3 python3-venv ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 RUN cd /tmp \
     && curl -fsSL -o orca.AppImage "https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v${ORCA_VERSION}/OrcaSlicer_Linux_AppImage_Ubuntu2404_V${ORCA_VERSION}.AppImage" \
@@ -17,7 +17,10 @@ RUN cd /tmp \
 # every library the binary links must resolve here, or the build stops (2026-10-18: libSM and libICE came in only by accident)
 RUN ! ldd /opt/orca/bin/orca-slicer | grep 'not found'
 COPY ps_slice.py /opt/ps-slice/ps_slice.py
-RUN python3 /opt/ps-slice/ps_slice.py selftest
+RUN python3 -m venv /opt/prepare \
+    && /opt/prepare/bin/pip install --no-cache-dir manifold3d==3.5.4 trimesh==5.1.1 numpy==2.5.4 scipy==1.17.1 networkx==3.6.1 rtree==1.4.1 pillow==12.3.0
+ENV PATH="/opt/prepare/bin:$PATH"
+RUN python3 /opt/ps-slice/ps_slice.py selftest && python3 /opt/ps-slice/ps_slice.py prepare-selftest
 RUN useradd -m -u 10001 slicer
 USER slicer
 WORKDIR /job
