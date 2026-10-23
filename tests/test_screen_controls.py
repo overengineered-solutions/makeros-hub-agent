@@ -167,6 +167,17 @@ class TestStateRules(unittest.TestCase):
             for params in self.IDLE_ONLY:
                 self.assertEqual(refusal(params, state(s)), "accepted", (s, params))
 
+    def test_a_held_print_is_a_print_and_cool_down_lets_it_go(self):
+        # v0.82: an error stop the printer holds keeps its part and its place; only Cool down ends it from here
+        held = {**state("error", HOT), "gcode_macro _pstation_hold": {"active": True}}
+        for params in self.IDLE_ONLY:
+            want = "accepted" if params["action"] == "cooldown" else "printer_busy"
+            self.assertEqual(refusal(params, held), want, params)
+        for params in self.FILAMENT + self.ANY:
+            self.assertEqual(refusal(params, held), "accepted", params)   # a repair, the light, the stops
+        self.assertEqual(refusal({"action": "home"}, {**held, "gcode_macro _pstation_hold": {"active": None}}), "accepted")
+        self.assertIn("&gcode_macro%20_pstation_hold=active", klipper._ACTION_QUERY)
+
     def test_filament_moves_run_idle_or_paused_never_while_printing(self):
         # v0.79 (report D5): a runout pause was a dead end
         for params in self.FILAMENT:

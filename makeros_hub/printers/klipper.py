@@ -232,7 +232,8 @@ _LONG_ACTIONS = frozenset({"home", "center", "load_filament", "load_more", "unlo
 # v0.79 adds the heat, the probe and Sovol's load temperature variable (Klipper leaves out an object a printer lacks).
 _ACTION_QUERY = ("print_stats=state&toolhead=homed_axes,position,axis_minimum,axis_maximum&extruder=temperature,target"
                  "&heater_bed=temperature,target&probe=is_calibrated"
-                 "&gcode_macro%20_global_var=load_filament_extruder_temp&gcode_macro%20_pstation_resume_heat=nozzle")
+                 "&gcode_macro%20_global_var=load_filament_extruder_temp&gcode_macro%20_pstation_resume_heat=nozzle"
+                 "&gcode_macro%20_pstation_hold=active")
 _JOG_STEPS_MM = frozenset({0.1, 1.0, 10.0, 50.0})
 _JOG_FEED = {"x": 6000, "y": 6000, "z": 600}
 
@@ -1660,7 +1661,11 @@ def _check_state(params: dict, script: str, status: dict[str, Any], *, home_prov
     if not isinstance(state, str):
         raise _Refused("printer_stale")
     printing = state in ("printing", "paused")
-    if (printing and action in _IDLE_ONLY_ACTIONS) or (state == "printing" and action in _FILAMENT_ACTIONS):
+    # v0.82: a print the printer holds (stopped on an error, its part on the warm bed, the motors keeping their place) is a
+    # print too: homing would drive into the part and motors off loses its place. Cool down is how a hold is let go.
+    held = _obj(status, _HOLD).get("active") is True
+    if (action in _IDLE_ONLY_ACTIONS and (printing or (held and action != "cooldown"))) or (
+            state == "printing" and action in _FILAMENT_ACTIONS):
         raise _Refused("printer_busy")
     if not printing and action in _PRINT_ONLY_ACTIONS:
         raise _Refused("not_printing")
