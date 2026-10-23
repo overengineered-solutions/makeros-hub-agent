@@ -1012,6 +1012,38 @@ class TestCaptureAssembly(unittest.TestCase):
         self.assertNotEqual(base, changed_plate)
         self.assertNotEqual(base, changed_mapping)
 
+    def test_orca_plate_2_send_keeps_plate_2_and_an_unnamed_plate_comes_from_a_one_plate_file(self):
+        # v0.80.1 (2026-10-22): OrcaSlicer 2.4.2 keeps a plate's own number, so sending plate 2 uploads a file holding only
+        # Metadata/plate_2.gcode with param "Metadata/plate_2.gcode". The plate rides to the site as 2 (the site prints what
+        # it is told); a command that names no plate used to reach the site as null and print plate 1.
+        slice_info = ('<?xml version="1.0"?><config><plate><metadata key="index" value="2"/>'
+                      '<filament id="1" tray_info_idx="GFL99" type="PLA" color="#FFFFFF" used_g="12.30"/></plate></config>')
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "faces.3mf"
+            with zipfile.ZipFile(path, "w") as archive:
+                archive.writestr("Metadata/slice_info.config", slice_info)
+                archive.writestr("Metadata/plate_2.gcode", "; plate 2")
+                archive.writestr("Metadata/plate_1.png", b"\x89PNG")   # Orca keeps every plate's picture; only the gcode counts
+            upload = UploadRecord("member-1", "faces.3mf", path, hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_size)
+            sent = parse_project_file_command({"print": {"command": "project_file", "param": "Metadata/plate_2.gcode", "file": "faces.3mf",
+                                                         "url": "ftp:///faces.3mf", "use_ams": True, "ams_mapping": [0]}}, "member-1")
+            assert sent is not None
+            job = assemble_captured_job(upload, sent)
+            body = build_vp_submit_body(job, model="X1C")
+            self.assertEqual((sent.plate, job.plate, body["plate"]), (2, 2, 2))
+            self.assertEqual(body["requiredFilaments"], [{"slot": 1, "type": "PLA", "color": "FFFFFFFF", "trayInfoIdx": "GFL99", "idx": "GFL99", "usedG": 12.3}])
+
+            unnamed = parse_project_file_command({"print": {"command": "project_file", "file": "faces.3mf"}}, "member-1")
+            assert unnamed is not None and unnamed.plate is None
+            derived = assemble_captured_job(upload, unnamed)
+            self.assertEqual((derived.plate, build_vp_submit_body(derived, model="X1C")["plate"]), (2, 2))
+
+            # two plates and no plate named: the hub does not guess (the dispatch check refuses a plate the file lacks)
+            with zipfile.ZipFile(path, "a") as archive:
+                archive.writestr("Metadata/plate_3.gcode", "; plate 3")
+            two = UploadRecord("member-1", "faces.3mf", path, hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_size)
+            self.assertIsNone(assemble_captured_job(two, unnamed).plate)
+
     def test_build_vp_submit_body_maps_cloud_contract_fields(self):
         job = CapturedJob(
             member_id="member-1",

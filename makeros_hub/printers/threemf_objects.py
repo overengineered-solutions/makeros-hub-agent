@@ -12,6 +12,7 @@ so it's unit-testable without a printer; never raises.
 from __future__ import annotations
 
 import logging
+import re
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -91,3 +92,21 @@ def parse_plate_objects(threemf_path, plate: int = 1) -> list[dict]:
             return []
         return deduped
     return []
+
+
+_PLATE_GCODE = re.compile(r"Metadata/plate_(\d+)\.gcode")
+
+
+def gcode_plates(threemf_path) -> list[int] | None:
+    """The plates whose G-code a sliced 3MF holds (``Metadata/plate_N.gcode``), sorted: the plates a printer can start from it.
+
+    v0.80.1 (2026-10-22): OrcaSlicer 2.4.2's Export plate sliced file keeps the plate's own number, so plate 2 of a project
+    exports as a file holding only plate_2.gcode; told to print plate 1, an X1C stopped with 0500-4003 ("unable to parse the
+    file") and the hub saw only start_not_observed. ``None`` when the file is not a readable zip (a Klipper .gcode): not a
+    3MF, so not this check's business."""
+    try:
+        with zipfile.ZipFile(threemf_path) as zf:
+            names = zf.namelist()
+    except (OSError, zipfile.BadZipFile):
+        return None
+    return sorted({int(m.group(1)) for m in map(_PLATE_GCODE.fullmatch, names) if m})

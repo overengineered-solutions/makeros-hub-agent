@@ -24,7 +24,7 @@ from typing import Any
 
 from ..diagnostics import get_default, redact
 from .queue_progress import write_json_durably
-from .threemf_objects import parse_plate_objects
+from .threemf_objects import gcode_plates, parse_plate_objects
 
 log = logging.getLogger("makeros-hub.printers")
 
@@ -1036,6 +1036,14 @@ class PrinterManager:
                 continue
 
             plate_int = plate_of(assignment.get("plate"))   # v0.57: the same coercion the fetch used
+            # v0.80.1: never tell a printer to start a plate the file does not hold — it accepts the command and stops on
+            # its screen (X1C 0500-4003), which the hub could only report as start_not_observed two minutes later
+            held_plates = gcode_plates(local_path)
+            if held_plates is not None and plate_int not in held_plates:
+                holds = f"; it holds plate {', '.join(map(str, held_plates))}" if held_plates else "; it holds no sliced plate"
+                log.warning("assignment %s: %s has no plate %d%s — not starting it", queue_job_id, file_name, plate_int, holds)
+                emit(held(f"plate_missing: the file has no plate {plate_int}{holds}"))
+                continue
             # Enumerate the plate's skippable objects from the staged 3MF so the
             # cloud can offer per-object cancel. Best-effort: a parse miss just
             # omits the list (skip simply isn't offered for that job).

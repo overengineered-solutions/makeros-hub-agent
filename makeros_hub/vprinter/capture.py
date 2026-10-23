@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
+from ..printers.threemf_objects import gcode_plates
+
 log = logging.getLogger("makeros-hub.vprinter.capture")
 
 
@@ -364,10 +366,17 @@ def assemble_captured_job(
     ams_mapping = intent.ams_mapping
     if intent.ams_mapping2 is not None:
         ams_mapping = {"ams_mapping": intent.ams_mapping, "ams_mapping2": intent.ams_mapping2}
+    plate = intent.plate
+    if plate is None:
+        # v0.80.1: a command that names no plate (no `plate`, no plate_N in param/url) reached the site as null and printed
+        # plate 1; a file that holds one plate can only mean that one (OrcaSlicer keeps a plate's own number, plate_2.gcode)
+        held = gcode_plates(upload.file_path)
+        if held and len(held) == 1:
+            plate = held[0]
     submission_uid = _deterministic_submission_uid(
         upload.member_id,
         upload.sha256,
-        intent.plate,
+        plate,
         ams_mapping,
         upload.file_path.name,
     )
@@ -379,10 +388,10 @@ def assemble_captured_job(
         size=upload.size,
         ams_mapping=ams_mapping,
         use_ams=intent.use_ams,
-        required_filaments=parse_required_filaments(upload.file_path, intent.plate),
+        required_filaments=parse_required_filaments(upload.file_path, plate),
         submitted_at=submitted_at or datetime.now(timezone.utc),
         submission_uid=submission_uid,
-        plate=intent.plate,
+        plate=plate,
         vp_serial=vp_serial,
         vp_model=vp_model,
         raw_print=replayable_print(intent.raw),
