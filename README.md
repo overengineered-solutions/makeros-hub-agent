@@ -71,6 +71,33 @@ sh -n update.sh
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
 
+## 0.82.0 candidate: automatic slicing for the H2D, and slices that say what they laid
+
+Operator, 2026-10-23: "lets tune some auto slice and evaluation stuff." No tuning number changed here: every value a test
+print would have to settle is listed for the operator in pstation `reports/autoslice-tune-2026-10-23.md`.
+
+- `slicer/ps_slice.py` (the ps-slicer image; `install-slicer.py` rebuilds it from this tag):
+  - **The H2D slices automatically** (board 459044ef). The site's spec names the nozzle whose AMS holds the member's spool
+    (`"nozzle": "left" | "right"`); the wrapper puts the member's one filament on it with OrcaSlicer's manual filament map,
+    turned into a logical extruder by the preset's own `physical_extruder_map`, so the plate's `group_id` is the nozzle hub
+    0.77's dispatch reads. An H2D spec without a nozzle is refused. The image's slicer caps now name the H2D, and the site
+    offers a model only on a box whose image names it.
+  - **The A1 minis take PLA only** (operator, 2026-10-22); the site offers nothing else there and the wrapper refuses it too.
+  - **`supportUsed` is what the slice laid** (its G-code's Support features). slice_info's `support_used` is only the
+    setting, so a ticked box over a part that needed none told the member "with temporary supports".
+  - The selftest checks every model's 0.4 mm nozzle and 0.20 mm layer against the presets (operator, 2026-10-22: "we should
+    never auto switch to a different nozzle size or layer height").
+  - Already in 0.80 and checked again here: an unticked brim is `no_brim` and leaves no Brim in the G-code (board 72f424f2),
+    and the infill is rectilinear on every model (board 6e8c967f).
+- `makeros_hub/printers/manager.py` `slice_spec_of` passes the nozzle into the job file, only as "left" or "right".
+- `checker/check.mjs` is pstation's check at format 2: a part fits a bed only where the shop's slicer takes it (measured with
+  this image: about 1.25 mm clear of every edge, the X1C's 250 mm height and lidar corner, the 300 mm of the H2D both nozzles
+  reach), and tall-and-slender is judged on what stands on the bed.
+- `tests/test_real_slice.py` slices each of these through the image: the brim both ways, supports laid or not, the H2D on
+  each nozzle read back by the dispatch parser, and the bed edges the site's check uses.
+- Install order: the hub release, then `install-slicer.py` and `install-checker.py` for this tag (the site hands checks only to
+  a box at format 2, so the box goes first), then the site.
+
 ## 0.81.0 candidate: members' file checks run on the shop box
 
 Operator, 2026-10-22: "Let's go ahead and do the work to get it on the shop box instead of raising the linode cap". The

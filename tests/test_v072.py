@@ -118,6 +118,10 @@ class TestSliceUploads(unittest.TestCase):
                                                "fixes": {"orient": True, "brim": False}, "scale": 1.0})
         self.assertEqual(slice_spec_of({"model": "P2S", "filament": "x", "fixes": [], "scale": True}),
                          {"model": "P2S", "filament": {"type": None, "colorHex": None, "trayInfoIdx": None}, "fixes": {}})
+        # v0.82: the H2D's nozzle reaches the job file only as "left" or "right"
+        self.assertEqual(slice_spec_of({**SPEC, "model": "H2D", "nozzle": "left"})["nozzle"], "left")
+        for odd in (1, "LEFT", None, {"x": 1}):
+            self.assertNotIn("nozzle", slice_spec_of({**SPEC, "model": "H2D", "nozzle": odd}))
 
 
 class TestSlicerReady(unittest.TestCase):

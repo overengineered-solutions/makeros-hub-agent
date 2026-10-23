@@ -1,4 +1,4 @@
-// ps-checker c564b6b06692, format 1: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
+// ps-checker fe8d7840d85f, format 2: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
 
 // src/checker/main.ts
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -70,15 +70,21 @@ var MAX_INFLATED_BYTES = 32 * 1024 * 1024;
 var RAY_SAMPLES = 6e3;
 var MIB = (n) => `${Math.round(n / 1048576)} MB`;
 var TOO_BIG = `The file is over ${MIB(MAX_FILE_BYTES)}, too big to check here. A binary STL or a 3MF of the same model is usually much smaller: export it as one of those.`;
-var BUILD_VOLUMES = {
-  "A1 Mini": [180, 180, 180],
-  "P2S": [256, 256, 256],
-  "X1C": [256, 256, 256],
-  "H2D": [325, 320, 325],
-  "Sovol SV08 MAX": [500, 500, 500],
-  "Elegoo OrangeStorm Giga": [800, 800, 1e3]
-  // Elegoo's stated volume; OrcaSlicer's profile allows 810 x 805 x 1010
+var PLATES = {
+  "A1 Mini": { areas: [[177.5, 177.5]], height: 180 },
+  "P2S": { areas: [[253.5, 253.5]], height: 256 },
+  "X1C": { areas: [[235.5, 253.5], [253.5, 225.5]], height: 250 },
+  "H2D": { areas: [[297.5, 317.5]], height: 325 },
+  "Sovol SV08 MAX": { areas: [[500, 500]], height: 500 },
+  "Elegoo OrangeStorm Giga": { areas: [[800, 800]], height: 1e3 }
 };
+function fitsPlate(model, [x, y, z]) {
+  const p = PLATES[model];
+  if (!p) return null;
+  const on = (a, b, c) => c <= p.height && p.areas.some(([w, d]) => a <= w && b <= d);
+  const asIs = on(x, y, z);
+  return { asIs, turned: !asIs && [[y, x, z], [x, z, y], [z, x, y], [y, z, x], [z, y, x]].some(([a, b, c]) => on(a, b, c)) };
+}
 var SUPPORT_SLOPE_DEG = 30;
 var OVERHANG_NZ = -Math.cos(SUPPORT_SLOPE_DEG * Math.PI / 180);
 var SELF_SUPPORT_MM = 1.5;
@@ -356,7 +362,7 @@ function sizeMesh(mesh, units, scale) {
   if (factor !== 1) for (let i = 0; i < mesh.positions.length; i++) mesh.positions[i] *= factor;
   return { factor, units: units === "file" ? readIn : units, fromFile: units === "file" && !!mesh.unit };
 }
-function analyze(mesh, models = Object.keys(BUILD_VOLUMES), minWallMm = MIN_WALL_MM, stage = () => {
+function analyze(mesh, models = Object.keys(PLATES), minWallMm = MIN_WALL_MM, stage = () => {
 }) {
   const P = mesh.positions, n = mesh.triangles;
   if (!n) throw new PrintabilityError("The file has no triangles.");
@@ -423,11 +429,9 @@ function analyze(mesh, models = Object.keys(BUILD_VOLUMES), minWallMm = MIN_WALL
   const shell = Math.min(volume, area * 0.84), infill = Math.max(0, volume - shell) * 0.15;
   const solid = shell + infill;
   const grams = { pla: round1(solid * 124e-5), petg: round1(solid * 127e-5) };
-  const fits = models.filter((m) => BUILD_VOLUMES[m]).map((model) => {
-    const v = BUILD_VOLUMES[model];
-    const asIs = size[0] <= v[0] && size[1] <= v[1] && size[2] <= v[2];
-    const s = [...size].sort((a, b) => a - b), w = [...v].sort((a, b) => a - b);
-    return { model, asIs, turned: !asIs && s.every((d, i) => d <= w[i]) };
+  const fits = models.flatMap((model) => {
+    const f = fitsPlate(model, size);
+    return f ? [{ model, ...f }] : [];
   });
   const report = {
     kind: mesh.kind,
@@ -1176,13 +1180,13 @@ function findingsFor(r) {
     });
   }
   if (r.parts.count > 1 && !r.parts.judged) f.push({ id: "parts-unchecked", level: "warn", title: "Could not check every part", detail: r.parts.count > MAX_PARTS ? `It has ${r.parts.count.toLocaleString("en-US")} separate parts, more than the ${MAX_PARTS.toLocaleString("en-US")} the check looks at one by one, so it did not check which of them would start in the air. Look over the parts in your design program, or join them into fewer solids.` : "Its parts meet in so many places that the check could not look at them all, so it did not check which of them would start in the air. Look over the parts in your design program." });
-  if (fl.baseMm[0] >= WARP_BASE_MM && fl.contactMm2 >= WARP_CONTACT_MM2) f.push({ id: "warp", level: "warn", title: "A big flat base: its corners may lift", detail: `${Math.round(fl.contactMm2 / 100)} cm² sits flat on the bed across ${mm(fl.baseMm[0])} by ${mm(fl.baseMm[1])}. As a big part cools it shrinks, and its corners can curl up off the bed. A brim holds them down; a closed printer (the P2S or X1C) keeps the air around it warm and still; rounded corners in the design help most.` });
+  if (fl.baseMm[0] >= WARP_BASE_MM && fl.contactMm2 >= WARP_CONTACT_MM2) f.push({ id: "warp", level: "warn", title: "A big flat base: its corners may lift", detail: `${Math.round(fl.contactMm2 / 100)} cm² sits flat on the bed across ${mm(fl.baseMm[0])} by ${mm(fl.baseMm[1])}. As a big part cools it shrinks, and its corners can curl up off the bed. A brim holds them down; a closed printer (the P2S, X1C or H2D) keeps the air around it warm and still; rounded corners in the design help most.` });
   if (r.overhangCm2 >= 0.5) f.push({ id: "overhang", level: "warn", title: "Needs supports", detail: `${r.overhangCm2} cm² hangs out over open air at less than ${SUPPORT_SLOPE_DEG} degrees from level, marked orange in the picture: our slicer holds that up with supports. Turn on supports, or turn the part so those faces point up.` });
   const t = r.thin;
   if (t.minMm !== null && t.under04Pct >= 0.5) f.push({ id: "too-thin", level: "fail", title: "Parts of it are too thin to print", detail: `About ${t.under04Pct}% of the sampled surface sits on a wall thinner than the printer can lay down (thinnest ${mm(t.minMm)}), marked red: under 0.4 mm side to side, one nozzle line, or 0.2 mm top to bottom, one layer. Those areas will be missing. Make walls at least ${+t.minWallMm.toFixed(2)} mm, two lines across, and flat parts at least ${mm(MIN_SLAB_MM)}.` });
   else if (t.minMm !== null && t.under08Pct >= 1) f.push({ id: "thin", level: "warn", title: "Some walls are very thin", detail: `About ${t.under08Pct}% of the sampled surface sits on a thin wall (thinnest ${mm(t.minMm)}), marked red. It prints as one or two lines or layers and breaks easily.` });
-  const base = Math.max(1, Math.min(x, y));
-  if (z > 30 && z / base > 8) f.push({ id: "tall-thin", level: "warn", title: "Tall and slender", detail: `${mm(z)} tall on a ${mm(base)} base: it may wobble or snap while printing. Add a brim, print it lying down, or print several together.` });
+  const base = Math.max(1, fl.contactMm2 > 0 ? fl.baseMm[1] : Math.min(x, y));
+  if (z > 30 && z / base > 8) f.push({ id: "tall-thin", level: "warn", title: "Tall and slender", detail: `${mm(z)} tall standing on ${mm(base)} across: it may wobble or snap while printing. Add a brim, print it lying down, or print several together.` });
   if (!f.some((x2) => x2.level !== "ok")) f.unshift({ id: "looks-good", level: "ok", title: "Looks printable", detail: "This check found no problems. Small details may still be missed. A slice with our own settings gives the exact time and material." });
   return f;
 }
@@ -1251,7 +1255,7 @@ function render(mesh, marks, width = 640, height = 480) {
 }
 
 // src/lib/check-job.ts
-var CHECKER_FORMAT = 1;
+var CHECKER_FORMAT = 2;
 var MAX_REPORT_CHARS = 6e5;
 function checkFile(input, stage = () => {
 }) {
@@ -1279,7 +1283,7 @@ function bounded(report) {
 }
 
 // src/checker/main.ts
-var CHECKER_VERSION = true ? "c564b6b06692" : "source";
+var CHECKER_VERSION = true ? "fe8d7840d85f" : "source";
 var JOB = process.env.PS_JOB_DIR ?? "/job";
 function readJob(raw) {
   if (!raw || typeof raw !== "object") return "job.json is not an object";
