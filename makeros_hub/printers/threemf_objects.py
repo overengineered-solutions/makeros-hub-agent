@@ -6,15 +6,20 @@ object name into `Metadata/slice_info.config` — verified verbatim against its
 own writer (bbs_3mf.cpp: `<object identify_id="K" name="..." skipped=".."/>`
 under `<plate>`, plus a `label_object_enabled` plate metadata) and its own
 parser (SkipPartCanvas.cpp `ModelSettingHelper`). Pure stdlib (zipfile + xml)
-so it's unit-testable without a printer; never raises.
+so it's unit-testable without a printer; parse_plate_objects never raises. The
+plate checks below (v0.80.1) raise Unreadable3mf; the dispatch pass holds that
+one assignment.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
+import struct
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 
 log = logging.getLogger("makeros-hub.printers")
 
@@ -94,19 +99,70 @@ def parse_plate_objects(threemf_path, plate: int = 1) -> list[dict]:
     return []
 
 
-_PLATE_GCODE = re.compile(r"Metadata/plate_(\d+)\.gcode")
+# v0.80.1 (2026-10-22): OrcaSlicer 2.4.2's Export plate sliced file keeps the plate's own number, so plate 2 of a project exports
+# as a file holding only plate_2.gcode; told to print plate 1, an X1C stopped with 0500-4003 ("unable to parse the file") and
+# the hub saw only start_not_observed, six times for one member. The printer is asked for exactly Metadata/plate_N.gcode, so
+# only that canonical name counts (N 1 to 64, no padding: plate_02.gcode is not plate 2), and a number is never parsed past
+# two digits (a 5,000-digit name once raised out of int()).
+_CANONICAL_PLATE = r"[1-9]|[1-5][0-9]|6[0-4]"
+_PLATE_GCODE = re.compile(rf"Metadata/plate_({_CANONICAL_PLATE})\.gcode")
+_PLATE_VALUE = re.compile(_CANONICAL_PLATE)
+
+
+class Unreadable3mf(Exception):
+    """A sliced 3MF the hub must not send: a damaged zip, an entry listed twice, or a plate entry no printer could read."""
+
+
+def plate_named(value) -> int | None:
+    """The plate a message names: an int 1..64, or that number as a canonical digit string; anything else names none."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 1 <= value <= 64 else None
+    if isinstance(value, str) and _PLATE_VALUE.fullmatch(value.strip()):
+        return int(value.strip())
+    return None
 
 
 def gcode_plates(threemf_path) -> list[int] | None:
-    """The plates whose G-code a sliced 3MF holds (``Metadata/plate_N.gcode``), sorted: the plates a printer can start from it.
-
-    v0.80.1 (2026-10-22): OrcaSlicer 2.4.2's Export plate sliced file keeps the plate's own number, so plate 2 of a project
-    exports as a file holding only plate_2.gcode; told to print plate 1, an X1C stopped with 0500-4003 ("unable to parse the
-    file") and the hub saw only start_not_observed. ``None`` when the file is not a readable zip (a Klipper .gcode): not a
-    3MF, so not this check's business."""
+    """The plates whose G-code a sliced 3MF holds, ascending: the plates a printer can be told to start from it. ``None`` when
+    the file is not a zip at all (a Klipper .gcode: no plates, not this check's business). Raises Unreadable3mf for a damaged
+    zip or one that lists a name twice (two readers could read two different files under one name)."""
+    with open(threemf_path, "rb") as fh:
+        if fh.read(4) != b"PK\x03\x04":
+            return None
     try:
         with zipfile.ZipFile(threemf_path) as zf:
             names = zf.namelist()
-    except (OSError, zipfile.BadZipFile):
-        return None
-    return sorted({int(m.group(1)) for m in map(_PLATE_GCODE.fullmatch, names) if m})
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise Unreadable3mf("the file is a damaged zip") from exc
+    if len(names) != len(set(names)):
+        raise Unreadable3mf("the file lists an entry twice")
+    return sorted(int(m.group(1)) for m in map(_PLATE_GCODE.fullmatch, names) if m)
+
+
+def check_plate_entry(threemf_path, plate: int) -> None:
+    """The plate's G-code entry is one a printer can read: stored or deflated, its local header names it with the directory's
+    compression, its data lies inside the file, and its stream starts. Raises Unreadable3mf."""
+    name = f"Metadata/plate_{plate}.gcode"
+    damaged = Unreadable3mf(f"plate {plate}'s entry in the file is damaged")
+    try:
+        size = os.path.getsize(threemf_path)
+        with zipfile.ZipFile(threemf_path) as zf, open(threemf_path, "rb") as fh:
+            info = zf.getinfo(name)
+            if info.compress_type not in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+                raise Unreadable3mf(f"plate {plate} uses a compression the printer does not read")
+            fh.seek(info.header_offset)
+            head = fh.read(30)
+            if len(head) != 30 or head[:4] != b"PK\x03\x04":
+                raise damaged
+            (method,) = struct.unpack_from("<H", head, 8)
+            nlen, xlen = struct.unpack_from("<HH", head, 26)
+            if method != info.compress_type or fh.read(nlen) != name.encode() or info.header_offset + 30 + nlen + xlen + info.compress_size > size:
+                raise damaged
+            with zf.open(info) as stream:
+                stream.read(1)
+    except Unreadable3mf:
+        raise
+    except (OSError, KeyError, zipfile.BadZipFile, zlib.error, EOFError, ValueError, NotImplementedError) as exc:
+        raise damaged from exc

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
-from ..printers.threemf_objects import gcode_plates
+from ..printers.threemf_objects import Unreadable3mf, gcode_plates, plate_named
 
 log = logging.getLogger("makeros-hub.vprinter.capture")
 
@@ -368,9 +368,13 @@ def assemble_captured_job(
         ams_mapping = {"ams_mapping": intent.ams_mapping, "ams_mapping2": intent.ams_mapping2}
     plate = intent.plate
     if plate is None:
-        # v0.80.1: a command that names no plate (no `plate`, no plate_N in param/url) reached the site as null and printed
-        # plate 1; a file that holds one plate can only mean that one (OrcaSlicer keeps a plate's own number, plate_2.gcode)
-        held = gcode_plates(upload.file_path)
+        # v0.80.1: a command that names no plate reached the site as null and printed plate 1. A file that holds one plate can
+        # only mean that one (OrcaSlicer keeps a plate's own number, plate_2.gcode); with several it stays unnamed, the site
+        # sends none and the dispatch check refuses it as plate_unchosen, which the member's card turns into "choose a plate".
+        try:
+            held = gcode_plates(upload.file_path)
+        except (OSError, Unreadable3mf):
+            held = None   # the dispatch check refuses the file with its reason; the capture itself never drops a Send
         if held and len(held) == 1:
             plate = held[0]
     submission_uid = _deterministic_submission_uid(
@@ -510,18 +514,22 @@ def parse_project_file_command(parsed: Any, member_id: str) -> ProjectFileIntent
     )
 
 
+_PARAM_PLATE = re.compile(r"Metadata/plate_([1-9]|[1-5][0-9]|6[0-4])\.gcode")
+
+
 def _resolve_plate(print_obj: dict[str, Any]) -> int | None:
-    plate = _optional_int(print_obj.get("plate"))
+    """The plate the member's command names, 1..64, or None. v0.80.1: only the canonical plate path counts in `param`/`url`
+    (OrcaSlicer sends "Metadata/plate_3.gcode"); a file name such as "part_plate_3.3mf" in the url names no plate, and an
+    out-of-range or padded number names none rather than a wrong one."""
+    plate = plate_named(print_obj.get("plate"))
     if plate is not None:
         return plate
-    # Bambu often encodes the plate only in `param`/`url`, e.g.
-    # "Metadata/plate_1.gcode" -> plate 1.
     for key in ("param", "url"):
         value = print_obj.get(key)
         if isinstance(value, str):
-            match = re.search(r"plate_(\d+)", value)
+            match = _PARAM_PLATE.search(value)
             if match:
-                return _optional_int(match.group(1))
+                return int(match.group(1))
     return None
 
 

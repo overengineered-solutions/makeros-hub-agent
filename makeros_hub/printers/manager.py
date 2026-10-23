@@ -24,7 +24,7 @@ from typing import Any
 
 from ..diagnostics import get_default, redact
 from .queue_progress import write_json_durably
-from .threemf_objects import gcode_plates, parse_plate_objects
+from .threemf_objects import Unreadable3mf, check_plate_entry, gcode_plates, parse_plate_objects, plate_named
 
 log = logging.getLogger("makeros-hub.printers")
 
@@ -139,13 +139,8 @@ def slice_spec_of(spec: dict) -> dict:
 def plate_of(value) -> int:
     """The plate a cloud message names: a positive int (a digit string is coerced), 1..64; anything else = plate 1 — the
     SAME rule for a fetch (what we parse) and an assignment (what we print), so the two can never disagree (codex v0.57)."""
-    if isinstance(value, bool):
-        return 1
-    if isinstance(value, str) and value.strip().isdigit():
-        value = int(value.strip())
-    if isinstance(value, int) and 1 <= value <= 64:
-        return value
-    return 1
+    # v0.80.1: a canonical number only, never int() of an arbitrary digit string (4,300+ digits raise ValueError)
+    return plate_named(value) or 1
 
 
 def _fingerprint(p: dict) -> tuple:
@@ -1035,14 +1030,34 @@ class PrinterManager:
                 emit(held("file_not_found"))
                 continue
 
-            plate_int = plate_of(assignment.get("plate"))   # v0.57: the same coercion the fetch used
-            # v0.80.1: never tell a printer to start a plate the file does not hold — it accepts the command and stops on
-            # its screen (X1C 0500-4003), which the hub could only report as start_not_observed two minutes later
-            held_plates = gcode_plates(local_path)
-            if held_plates is not None and plate_int not in held_plates:
-                holds = f"; it holds plate {', '.join(map(str, held_plates))}" if held_plates else "; it holds no sliced plate"
-                log.warning("assignment %s: %s has no plate %d%s — not starting it", queue_job_id, file_name, plate_int, holds)
-                emit(held(f"plate_missing: the file has no plate {plate_int}{holds}"))
+            # v0.80.1: never tell a printer to start a plate the file does not hold (it takes the command and stops on its
+            # screen, X1C 0500-4003, which the hub could only report as start_not_observed two minutes later), and never guess
+            # one: an assignment that names no plate (an OrcaSlicer send that did not say) prints a one-plate file's own plate
+            # and is refused for a file with several. Any trouble reading the file holds this assignment, never the pass.
+            refusal = None
+            try:
+                named = plate_named(assignment.get("plate"))
+                held_plates = gcode_plates(local_path)
+                plate_int = named or 1   # not a zip (a Klipper .gcode): its adapter takes no plate
+                if held_plates is not None:
+                    holds = ", ".join(map(str, held_plates))
+                    if not held_plates:
+                        refusal = f"plate_missing: the file has no plate {named or 1}; it holds no sliced plate"
+                    elif named is None and len(held_plates) > 1:
+                        refusal = f"plate_unchosen: no plate was named; the file holds plate {holds}"
+                    elif named is not None and named not in held_plates:
+                        refusal = f"plate_missing: the file has no plate {named}; it holds plate {holds}"
+                    else:
+                        plate_int = named or held_plates[0]
+                        check_plate_entry(local_path, plate_int)
+            except Unreadable3mf as exc:
+                refusal = f"plate_unreadable: {exc}"[:200]
+            except Exception as exc:  # noqa: BLE001 — a file that breaks the check holds its own assignment only
+                log.warning("assignment %s: plate check failed: %s", queue_job_id, exc)
+                refusal = "plate_unreadable: the file could not be read"
+            if refusal:
+                log.warning("assignment %s: %s — not starting it", queue_job_id, refusal)
+                emit(held(refusal))
                 continue
             # Enumerate the plate's skippable objects from the staged 3MF so the
             # cloud can offer per-object cancel. Best-effort: a parse miss just
