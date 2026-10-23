@@ -1,6 +1,7 @@
 """Tests for BambuAdapter.send_command — LAN control commands (pause/resume/stop)."""
 
 import json
+import os
 import sys
 import types
 import logging
@@ -292,6 +293,86 @@ class _Msg:
 
 def _msg(doc):
     return _Msg(doc)
+
+
+class TestAutoRefill(unittest.TestCase):
+    """AMS filament backup (operator, 2026-10-23: "lets activate the pool switchover and then definitely test it"): the
+    hub turns it on when an idle printer reports it off, never mid-print, never on a printer that says it can't, and
+    gives up after three tries a connection."""
+
+    CFG_OFF = format(0, "x")
+    CFG_ON = format(1 << 18, "x")
+
+    def _adapter(self, **print_fields):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True)
+        adapter._connack = "ok"
+        adapter._state_seen = True
+        adapter._data = {"print": {"gcode_state": "IDLE", **print_fields}}
+        return adapter
+
+    def test_turns_it_on_when_reported_off_then_rate_limits_and_gives_up(self):
+        adapter = self._adapter(cfg=self.CFG_OFF)
+        published = adapter._client.published
+        adapter.ensure_auto_refill()
+        self.assertEqual(len(published), 1)
+        sent = json.loads(published[0][1])["print"]
+        self.assertEqual((sent["command"], sent["auto_switch_filament"]), ("print_option", True))
+        adapter.ensure_auto_refill()
+        self.assertEqual(len(published), 1)   # ten minutes apart
+        for _ in range(10):
+            adapter._refill_asked_at -= 601
+            adapter.ensure_auto_refill()
+        self.assertEqual(len(published), 3)   # three tries a connection
+
+    def test_leaves_it_alone_when_on_unknown_unsupported_printing_or_unseen(self):
+        cases = [
+            self._adapter(cfg=self.CFG_ON),
+            self._adapter(home_flag=1 << 10),
+            self._adapter(),   # reports neither field
+            self._adapter(cfg=self.CFG_OFF, support_filament_backup=False),
+            self._adapter(cfg=self.CFG_OFF, gcode_state="RUNNING"),
+            self._adapter(cfg=self.CFG_OFF, gcode_state="PAUSE"),
+        ]
+        unseen = self._adapter(cfg=self.CFG_OFF)
+        unseen._state_seen = False
+        for adapter in cases + [unseen]:
+            adapter.ensure_auto_refill()
+            self.assertEqual(adapter._client.published, [])
+
+    def test_state_reads_cfg_over_home_flag(self):
+        from makeros_hub.printers import bambu_parse
+        self.assertIs(bambu_parse.auto_refill_state({"cfg": self.CFG_ON, "home_flag": 0}), True)
+        self.assertIs(bambu_parse.auto_refill_state({"cfg": self.CFG_OFF, "home_flag": 1 << 10}), False)
+        self.assertIs(bambu_parse.auto_refill_state({"home_flag": 1 << 10}), True)
+        self.assertIs(bambu_parse.auto_refill_state({"home_flag": 0}), False)
+        self.assertIs(bambu_parse.auto_refill_state({"cfg": "zz", "home_flag": 0}), False)
+        self.assertIsNone(bambu_parse.auto_refill_state({}))
+
+
+class TestPlaOnly(unittest.TestCase):
+    """Operator, 2026-10-23: "anything petg on a mini just needs to be rejected with a message about why, even if someone loads
+    petg etc." The last check before a mini is told to print: the plate's own materials, PLA variants allowed."""
+
+    def _file(self, *types):
+        import tempfile, zipfile
+        fils = "".join(f'<filament id="{i + 1}" type="{t}" color="#FFFFFF" used_g="3"/>' for i, t in enumerate(types))
+        xml = f'<?xml version="1.0"?><config><plate><metadata key="index" value="1"/>{fils}</plate></config>'
+        f = tempfile.NamedTemporaryFile(suffix=".3mf", delete=False)
+        with zipfile.ZipFile(f, "w") as z:
+            z.writestr("Metadata/slice_info.config", xml)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_refuses_anything_but_pla_on_a_mini_only(self):
+        from makeros_hub.printers.bambu import _pla_only_refusal
+        self.assertIsNone(_pla_only_refusal(self._file("PLA"), 1, "A1 Mini"))
+        self.assertIsNone(_pla_only_refusal(self._file("PLA", "PLA-CF"), 1, "A1 Mini"))
+        self.assertEqual(_pla_only_refusal(self._file("PLA", "PETG"), 1, "A1 Mini"), "pla_only")
+        self.assertEqual(_pla_only_refusal(self._file("PETG"), 1, "a1 mini"), "pla_only")
+        self.assertIsNone(_pla_only_refusal(self._file(), 1, "A1 Mini"))   # names no material: the site refuses it before dispatch
+        self.assertIsNone(_pla_only_refusal(self._file("PETG"), 1, "P2S"))
 
 
 class TestDeviceCapture(unittest.TestCase):

@@ -465,12 +465,14 @@ class PrinterManager:
                 # Adapters that support it re-ask for get_version until the printer answers with its real module list
                 # (only the A1 minis replied to the connect-time request; the other models' lists are what a VP of that
                 # model must present to OrcaSlicer). Read-only, self-limiting, and never allowed to sink a beat.
-                ask = getattr(adapter, "request_version_if_missing", None)
-                if callable(ask):
-                    try:
-                        ask()
-                    except Exception:  # noqa: BLE001 — a version probe is never worth a failed status read
-                        pass
+                # The same goes for keeping AMS filament backup on (2026-10-23): a nudge, never allowed to sink a beat.
+                for name in ("request_version_if_missing", "ensure_auto_refill"):
+                    ask = getattr(adapter, name, None)
+                    if callable(ask):
+                        try:
+                            ask()
+                        except Exception:  # noqa: BLE001 — a probe or nudge is never worth a failed status read
+                            pass
                 out.append(adapter.status())
             except Exception as e:  # noqa: BLE001 — one bad adapter must not sink the heartbeat
                 code = self._access_code_for(pid)
