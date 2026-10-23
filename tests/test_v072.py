@@ -223,11 +223,23 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def test_prepare_round_trip_refusal_and_cache_binds_choices(tmp_path):
+def test_prepare_round_trip_refusal_and_cache_binds_choices(tmp_path, monkeypatch):
+    from makeros_hub import checks
     m = PrinterManager()
-    reports, jobs = [], []
+    reports, jobs, rechecks = [], [], []
     request = {"version": 1, "thicken": True, "moveLargeGaps": False}
-    proposal = {"version": 1, "changes": [], "blocked": []}
+    proposal = {"version": 1, "checked": False, "sha256": hashlib.sha256(MESH).hexdigest(),
+                "settings": {"minWall": 0.84}, "changes": [], "blocked": []}
+
+    def recheck(uid):
+        work = tmp_path / uid / ".check"
+        rechecks.append(json.loads((work / "job.json").read_text()))
+        assert (work / "model.stl").read_bytes() == MESH
+        (work / "out").mkdir()
+        (work / "out/report.json").write_text(json.dumps({"format": 2, "version": "synthetic", "ok": True,
+            "report": {"findings": [{"id": "looks-good", "level": "ok", "title": "Looks printable"}]}}))
+        return 0
+    monkeypatch.setattr(checks, "run_check_job", recheck)
 
     def get(path, dest):
         Path(dest).write_bytes(MESH)
@@ -240,6 +252,8 @@ def test_prepare_round_trip_refusal_and_cache_binds_choices(tmp_path):
     def runner(uid):
         work = tmp_path / uid / ".slice"
         jobs.append(json.loads((work / "job.json").read_text()))
+        (work / "work").mkdir()
+        (work / "work/cube.stl").write_bytes(MESH)
         (work / "out").mkdir()
         (work / "out/result.json").write_text(json.dumps({"ok": True, "prepare": proposal, "grams": 4}))
         (work / "out/sliced.3mf").write_bytes(sliced_plate())
@@ -249,7 +263,14 @@ def test_prepare_round_trip_refusal_and_cache_binds_choices(tmp_path):
     for _ in range(2):
         assert m.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 1
     assert len(jobs) == 1 and jobs[0]["prepare"] == request
-    assert reports[-1]["slice"]["prepare"] == proposal
+    assert reports[-1]["slice"]["prepare"] == {**proposal, "checked": True}
+    assert len(rechecks) == 2 and rechecks[0]["scale"] == 1   # cache hits recheck too; candidate is already sized
+    # A previously successful slice is withheld if its candidate is missing or changed.
+    candidate = tmp_path / sent["submissionUid"] / ".slice/work/cube.stl"
+    candidate.write_bytes(b"different geometry")
+    assert m.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 0
+    assert "could not check" in reports[-1]["sliceError"]
+    assert not (tmp_path / sent["submissionUid"] / sent["fileName"]).exists()
     # Same mesh, different chosen repairs: the old plate and report cannot be reused.
     sent["slice"] = {**SPEC, "prepare": {**request, "moveLargeGaps": True}}
     assert m.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 1

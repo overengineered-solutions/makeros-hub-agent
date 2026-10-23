@@ -4,6 +4,7 @@ Print it's slicer copy and posts the report, all inside the check's seconds, and
 that writes what the ps-checker container writes; tests/test_run_check_box.py runs the real runner on a box."""
 
 import base64
+import hashlib
 import json
 import os
 import threading
@@ -20,6 +21,32 @@ ATTEMPT = "66666666-7777-4888-9999-aaaaaaaaaaaa"
 PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 40
 REPORT = {"kind": "stl", "parts": {"count": 1}, "findings": [{"id": "looks-good"}]}
 WHO = {"format": 1, "version": "abc123"}
+
+
+@pytest.mark.parametrize("answer,rc", [
+    (None, 124),
+    ({"format": 2, "version": "test", "ok": True, "report": {"findings": []}}, 0),
+    ({"format": 1, "version": "test", "ok": True, "report": {"findings": [{"id": "good", "level": "ok", "title": "Good"}]}}, 0),
+    ({"format": 2, "version": "test", "ok": True, "report": {"findings": [{"id": "too-thin", "level": "fail", "title": "Too thin"}]}}, 0),
+    ({"format": 2, "version": "test", "ok": True, "report": {"findings": [{"id": "open", "level": "fail", "title": "Not closed"}]}}, 0),
+    ({"format": 2, "version": "test", "ok": True, "report": {"findings": [{"id": "future-failure", "level": "fail", "title": "Unresolved"}]}}, 0),
+    ({"format": 2, "version": "test", "ok": True, "report": {"findings": [{"id": "good", "level": "ok", "title": "Good"}]}}, 137),
+])
+def test_prepared_check_never_clears_missing_old_failed_or_unresolved_results(tmp_path, monkeypatch, answer, rc):
+    candidate = tmp_path / "candidate.stl"
+    candidate.write_bytes(b"synthetic candidate")
+    prepared = {"checked": True, "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(), "settings": {"minWall": 0.84}}
+    spool = tmp_path / "spool"
+    def runner(uid):
+        if answer is not None:
+            out = spool / uid / ".check/out"
+            out.mkdir()
+            (out / "report.json").write_text(json.dumps(answer))
+        return rc
+    monkeypatch.setattr(checks, "run_check_job", runner)
+    blocked = checks.check_prepared_model(spool, candidate, prepared, {"model": "A1 Mini", "fixes": {"orient": True}})
+    assert blocked and prepared["checked"] is False
+    assert not list(spool.iterdir())
 
 
 def check(**over):

@@ -126,8 +126,7 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
                 "volume": round(sum(abs(float(m.volume)) for m in meshes), 6), "parts": len(meshes)}
 
     # The same projection and scale in both pictures. Orange marks the affected surfaces, including material that was added.
-    def picture(meshes, marked, bounds):
-        basis = np.array([[0.7071, -0.7071, 0], [0.4082, 0.4082, -0.8165], [0.5774, 0.5774, 0.5774]])
+    def picture(meshes, marked, bounds, basis, edges):
         corners = trimesh.bounds.corners(bounds) @ basis.T
         lo, hi = corners[:, :2].min(axis=0), corners[:, :2].max(axis=0)
         zoom = min(440 / max(hi[0] - lo[0], 0.01), 280 / max(hi[1] - lo[1], 0.01))
@@ -136,26 +135,47 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
         triangles = []
         for index, mesh in enumerate(meshes):
             pts = mesh.triangles @ basis.T
-            for tri in pts:
+            for face, tri in enumerate(pts):
                 xy = (tri[:, :2] - (hi + lo) / 2) * zoom + [240, 160]
-                triangles.append((float(tri[:, 2].mean()), [tuple(v) for v in xy], index in marked))
-        for _, xy, mark in sorted(triangles, key=lambda t: t[0]):
-            draw.polygon(xy, fill="#f59e0b" if mark else "#94a3b8", outline="#b45309" if mark else "#64748b")
+                mark = index in marked and (marked[index] is None or face in marked[index])
+                front = mesh.face_normals[face] @ basis[2] > 0
+                triangles.append((float(tri[:, 2].mean()), [tuple(v) for v in xy], mark, front))
+        for _, xy, mark, front in sorted(triangles, key=lambda t: t[0]):
+            draw.polygon(xy, fill=("#f59e0b" if front else "#b45309") if mark else "#94a3b8", outline="#b45309" if mark else "#64748b")
+        for i, boundary in edges.items():
+            for edge in boundary:
+                xy = ((meshes[i].vertices[edge] @ basis.T)[:, :2] - (hi + lo) / 2) * zoom + [240, 160]
+                draw.line([tuple(v) for v in xy], fill="#f59e0b", width=3)
         out = io.BytesIO()
         im.save(out, format="PNG", optimize=True)
         return base64.b64encode(out.getvalue()).decode("ascii")
 
-    def record(fix, words, before, after, unit, old, new, marked=None, default=True):
+    def record(fix, words, before, after, unit, old, new, marked=None, default=True, face_marks=None, edges=None):
         bounds = np.array([np.minimum(trimesh.util.concatenate(old).bounds[0], trimesh.util.concatenate(new).bounds[0]),
                            np.maximum(trimesh.util.concatenate(old).bounds[1], trimesh.util.concatenate(new).bounds[1])])
-        marks = set(range(max(len(old), len(new)))) if marked is None else set(marked)
+        marks = {i: None for i in (range(max(len(old), len(new))) if marked is None else marked)}
+        old_marks, new_marks = face_marks if face_marks is not None else (marks, marks)
+        basis = np.array([[0.7071, -0.7071, 0], [0.4082, 0.4082, -0.8165], [0.5774, 0.5774, 0.5774]])
+        if face_marks is not None:
+            # Look at a repaired face, including one hidden from the usual shop view.
+            i = next(iter(new_marks))
+            normal = new[i].face_normals[next(iter(new_marks[i]))]
+            up = np.array([0., 0., 1.]) if abs(normal[2]) < 0.9 else np.array([0., 1., 0.])
+            right = np.cross(up, normal)
+            right /= np.linalg.norm(right)
+            view = normal + right * 0.35 + up * 0.25
+            view /= np.linalg.norm(view)
+            right = np.cross(up, view)
+            right /= np.linalg.norm(right)
+            basis = np.array([right, -np.cross(view, right), view])
         changes.append({"fix": fix, "words": words, "before": before, "after": after, "unit": unit, "default": default,
-                        "beforeImage": picture(old, marks, bounds), "afterImage": picture(new, marks, bounds)})
+                        "beforeImage": picture(old, old_marks, bounds, basis, edges or {}), "afterImage": picture(new, new_marks, bounds, basis, {})})
 
     before = measure(parts)
     start = [p.copy() for p in parts]
     # A zero-height surface cannot be given an inside by a repair. Small holes: only planar triangles/quads <= 1 mm across.
-    filled, repaired, inward, processed = 0, [], [], 0
+    filled, hole_faces, hole_edges, inward, processed = 0, {}, {}, [], 0
+    patched = [p.copy() for p in parts]
     for i, p in enumerate(parts):
         processed += 1
         if min(p.extents) < 1e-6:
@@ -176,14 +196,25 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
                 blocked.append(broken)
                 continue
             filled += len(loops)
-            repaired.append(i)
+            hole_faces[i] = set(range(len(start[i].faces), len(p.faces)))
+            hole_edges[i] = edges
+        patched[i] = p.copy()
         trimesh.repair.fix_winding(p)
+        # fix_winding starts at an arbitrary triangle; keep the majority's direction before judging nested shells.
+        turned = np.sum(np.einsum('ij,ij->i', patched[i].face_normals, p.face_normals) < 0)
+        if turned * 2 == len(p.faces):
+            blocked.append(broken)
+        elif turned * 2 > len(p.faces):
+            p.faces = p.faces[:, ::-1].copy()
         inward.append(p.volume < 0)
-        trimesh.repair.fix_normals(p, multibody=False)
+        # Assign faces so trimesh drops cached normals too; 5.1.1 invert() can keep the old normals.
+        if p.volume < 0:
+            p.faces = p.faces[:, ::-1].copy()
         if not p.is_volume:
             blocked.append(broken)
     if filled:
-        record("holes", f"Filled {filled} small surface hole(s), each no more than 1 mm across.", filled, 0, "holes", start, parts, repaired)
+        record("holes", f"Filled {filled} small surface hole(s), each no more than 1 mm across.", filled, 0, "holes", start, patched,
+               face_marks=({}, hole_faces), edges=hole_edges)
 
     def solid(p):
         m = Manifold(Mesh(np.asarray(p.vertices, dtype=np.float32), np.asarray(p.faces, dtype=np.uint32)))
@@ -195,20 +226,30 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
         data = m.to_mesh()
         return trimesh.Trimesh(np.array(data.vert_properties)[:, :3], np.array(data.tri_verts), process=False)
 
-    # Nested shells are cavities, not inside-out parts to fill. Ambiguous intersections stay with the boolean kernel.
+    # Containment defines the shell group; its outer shell sets the winding of the whole group.
     solids = []
     if not blocked:
+        shells = [solid(p) for p in parts]
         parents = []
         for i, p in enumerate(parts):
-            containers = [j for j, q in enumerate(parts) if i != j and np.all(q.bounds[0] < p.bounds[0]) and
-                          np.all(q.bounds[1] > p.bounds[1]) and q.contains(p.vertices).all()]
-            parents.append(min(containers, key=lambda j: parts[j].volume) if containers and inward[i] else None)
+            containers = [j for j, q in enumerate(parts) if i != j and np.all(q.bounds[0] <= p.bounds[0]) and
+                          np.all(q.bounds[1] >= p.bounds[1]) and (shells[i] - shells[j]).volume() < 1e-6]
+            if any(not (np.all(parts[j].bounds[0] < p.bounds[0]) and np.all(parts[j].bounds[1] > p.bounds[1])) for j in containers):
+                raise SliceError(broken)   # touching shells do not prove a closed cavity
+            parents.append(min(containers, key=lambda j: parts[j].volume) if containers else None)
+            if any((shells[a] - shells[b]).volume() > 1e-6 and (shells[b] - shells[a]).volume() > 1e-6
+                   for a in containers for b in containers):
+                blocked.append(broken)
         depths = []
         for i in range(len(parts)):
             d, parent = 0, parents[i]
             while parent is not None:
                 d, parent = d + 1, parents[parent]
             depths.append(d)
+            if parents[i] is not None and inward[i] == inward[parents[i]]:
+                blocked.append(broken)   # nested solids with no alternating winding do not prove a cavity
+        if blocked:
+            raise SliceError(broken)
         for i, p in enumerate(parts):
             if depths[i] % 2:
                 continue
@@ -220,12 +261,13 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
         # A correctly inward cavity was never a flipped-face problem: put its winding back before measuring the repair.
         for i, p in enumerate(parts):
             if depths[i] % 2:
-                p.invert()
-        face_counts = [int(np.any(start[i].faces != p.faces[:len(start[i].faces)], axis=1).sum()) for i, p in enumerate(parts)]
-        flipped = sum(face_counts)
+                p.faces = p.faces[:, ::-1].copy()
+        face_marks = {i: set(np.flatnonzero(np.any(patched[i].faces != p.faces, axis=1))) for i, p in enumerate(parts)}
+        face_marks = {i: faces for i, faces in face_marks.items() if faces}
+        flipped = sum(len(faces) for faces in face_marks.values())
         if flipped:
-            record("faces", f"Turned {flipped} inside-out or flipped face(s) the right way.", flipped, 0, "faces", start, parts,
-                   [i for i, n in enumerate(face_counts) if n])
+            record("faces", f"Turned {flipped} inside-out or flipped face(s) the right way.", flipped, 0, "faces", patched, parts,
+                   face_marks=(face_marks, face_marks))
         parts = [mesh(s) for s in solids]
         before["volume"] = round(sum(float(s.volume()) for s in solids), 6)
 
@@ -263,7 +305,10 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
                 origins = points - normals * 1e-5
                 hits, rays, _ = p.ray.intersects_location(origins, -normals, multiple_hits=False)
                 lengths = np.linalg.norm(hits - origins[rays], axis=1)
-                if np.any((lengths < min_wall - 1e-4) & (np.abs(normals[rays, 2]) < 0.5)):
+                horizontal = np.abs(normals[rays, 2]) > 0.7
+                if np.any((lengths < 0.4 - 1e-4) & horizontal):
+                    blocked.append("This floor is too thin to print. Give it at least 0.4 mm at print size in your model, or pick a bigger scale.")
+                if np.any((lengths < min_wall - 1e-4) & ~horizontal):
                     blocked.append("We cannot thicken these walls while keeping their openings and connecting faces exact. Pick a bigger scale or fix them in your model.")
                 continue
             if p.extents[2] <= width:
@@ -371,7 +416,7 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
 
     result_mesh = trimesh.util.concatenate(parts)
     data = result_mesh.export(file_type="stl")
-    result = {"version": 1, "inputSha256": hashlib.sha256(open(src, "rb").read()).hexdigest(), "sha256": hashlib.sha256(data).hexdigest(),
+    result = {"version": 1, "checked": False, "inputSha256": hashlib.sha256(open(src, "rb").read()).hexdigest(), "sha256": hashlib.sha256(data).hexdigest(),
               "settings": {**request, "minWall": min_wall, "scale": scale}, "before": before, "after": measure(parts),
               "changes": changes, "blocked": list(dict.fromkeys(blocked))}
     if len(json.dumps(result)) > 450_000:

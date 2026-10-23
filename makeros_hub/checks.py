@@ -16,6 +16,7 @@ Stdlib only, like the rest of the agent.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -101,6 +102,44 @@ def read_output(path: Path, cap: int) -> bytes | None:
             return None
         data = fh.read(cap + 1)
     return data if len(data) <= cap else None
+
+
+def check_prepared_model(spool_dir: Path, candidate: Path, prepared: dict, spec: dict) -> list[str]:
+    """Recheck the exact prepared bytes with the existing sandboxed checker before offering the slice, including cache hits."""
+    root = spool_dir / uuid.uuid4().hex
+    try:
+        prepared["checked"] = False
+        data = read_output(candidate, MAX_CHECK_BYTES)
+        wall = prepared.get("settings", {}).get("minWall")
+        if data is None or hashlib.sha256(data).hexdigest() != prepared.get("sha256") or \
+                type(wall) not in (int, float) or not 0.1 <= wall <= 10:
+            raise ValueError("prepared mesh or wall measurement does not match its report")
+        work = root / ".check"
+        work.mkdir(parents=True, mode=0o700)
+        (work / "model.stl").write_bytes(data)
+        (work / "job.json").write_text(json.dumps({"name": "model.stl", "units": "millimeter", "scale": 1,
+            "models": [spec["model"]], "minWall": wall, "picture": False, "stl": False}), encoding="utf-8")
+        rc = run_check_job(root.name)
+        raw = read_output(work / "out" / "report.json", MAX_REPORT_BYTES)
+        report = json.loads(raw) if raw else None
+        who = parse_checker(report)
+        if rc != 0 or not who or who["format"] < 2 or report.get("ok") is not True:
+            raise ValueError("prepared model checker did not finish with a current report")
+        findings = report.get("report", {}).get("findings")
+        if not isinstance(findings, list) or not findings or any(not isinstance(f, dict) or
+                f.get("level") not in ("ok", "warn", "fail") or not isinstance(f.get("id"), str) or
+                not isinstance(f.get("title"), str) or not 0 < len(f["title"]) <= 200 for f in findings):
+            raise ValueError("prepared model checker findings do not read")
+        blocked = [f["title"] + ". Fix the file and check it again." for f in findings if f["level"] == "fail" and
+                   not (f["id"] == "no-first-layer" and spec.get("fixes", {}).get("orient") is True)]
+        prepared["checked"] = not blocked
+        log.info("prepared check: processed=%d, expected=%d, blocked=%d", len(findings), len(findings), len(blocked))
+        return blocked
+    except Exception as exc:  # noqa: BLE001 - missing, old or failed checkers must not clear a failed file
+        log.warning("prepared check failed: %s", exc)
+        return ["The shop could not check the prepared model. Your original is unchanged. Try again or ask through Help."]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def probe_checker(spool_dir, runner=run_check_job) -> dict | None:

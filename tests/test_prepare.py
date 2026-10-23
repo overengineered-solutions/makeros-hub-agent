@@ -1,6 +1,11 @@
-"""Synthetic geometry only. Run with the same pinned packages as the ps-slicer image."""
+"""Synthetic geometry only. Uses the ps-slicer's pinned packages; checker regressions also run the vendored bundle with Node."""
 import hashlib
+import base64
+import io
 import importlib.util
+import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -8,6 +13,7 @@ import pytest
 np = pytest.importorskip("numpy")
 trimesh = pytest.importorskip("trimesh")
 pytest.importorskip("manifold3d")
+from PIL import Image
 spec = importlib.util.spec_from_file_location("ps_slice_prepare", Path(__file__).resolve().parents[1] / "slicer/ps_slice.py")
 ps = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ps)
@@ -87,6 +93,52 @@ def test_hollow_is_not_filled_or_called_a_flipped_face(tmp_path):
     assert not any(c["fix"] == "faces" for c in r["changes"])
 
 
+@pytest.mark.parametrize("island", [False, True])
+def test_globally_reversed_hollow_keeps_its_cavity(tmp_path, island):
+    outer = box([0, 0, 0], [10, 10, 10])
+    outer.invert()
+    parts = [outer, box([2, 2, 2], [8, 8, 8])]
+    if island:
+        inner = box([4, 4, 4], [6, 6, 6])
+        inner.invert()
+        parts.append(inner)
+    r, out = run(tmp_path, parts, large=True)
+    volume = 792 if island else 784
+    assert out.volume == pytest.approx(volume)
+    assert r["before"]["volume"] == r["after"]["volume"] == volume
+    assert not out.contains([[3, 3, 3]])[0]
+    assert next(c for c in r["changes"] if c["fix"] == "faces")["before"] == (36 if island else 24)
+
+
+def test_ambiguous_nested_winding_is_refused(tmp_path):
+    with pytest.raises(ps.SliceError, match="could not repair"):
+        run(tmp_path, [box([0, 0, 0], [10, 10, 10]), box([2, 2, 2], [8, 8, 8])])
+    assert not (tmp_path / "prepared.stl").exists()
+    touching = box([0, 2, 2], [8, 8, 8])
+    touching.invert()
+    with pytest.raises(ps.SliceError, match="could not repair"):
+        run(tmp_path, [box([0, 0, 0], [10, 10, 10]), touching])
+
+
+def image_colors(encoded):
+    pixels = np.array(Image.open(io.BytesIO(base64.b64decode(encoded))))
+    orange = np.sum(np.all(pixels == [245, 158, 11], axis=2) | np.all(pixels == [180, 83, 9], axis=2))
+    grey = np.sum(np.all(pixels == [148, 163, 184], axis=2))
+    return orange, grey
+
+
+def test_one_flipped_face_marks_only_that_face_in_both_views(tmp_path):
+    p = box([0, 0, 0], [10, 10, 10])
+    p.faces[0] = p.faces[0][::-1]   # hidden in the default view
+    r, _ = run(tmp_path, [p])
+    c = next(c for c in r["changes"] if c["fix"] == "faces")
+    assert c["before"] == 1
+    assert c["beforeImage"] != c["afterImage"]
+    for key in ["beforeImage", "afterImage"]:
+        orange, grey = image_colors(c[key])
+        assert orange > 1000 and grey > orange   # the other surfaces stay unmarked
+
+
 def test_only_small_holes_are_filled(tmp_path):
     p = box([0, 0, 0], [0.5, 0.5, 2])
     top = np.where(p.face_normals[:, 2] > 0.9)[0]
@@ -94,6 +146,11 @@ def test_only_small_holes_are_filled(tmp_path):
     r, out = run(tmp_path, [p], wall=0.2)
     assert not r["blocked"] and out.is_volume and out.volume == pytest.approx(0.5)
     assert next(c for c in r["changes"] if c["fix"] == "holes")["before"] == 1
+    c = next(c for c in r["changes"] if c["fix"] == "holes")
+    before_orange, before_grey = image_colors(c["beforeImage"])
+    after_orange, after_grey = image_colors(c["afterImage"])
+    assert 0 < before_orange < after_orange   # boundary before, added face after
+    assert before_grey > after_orange and after_grey > after_orange
     p = box([0, 0, 0], [20, 20, 20])
     p.update_faces(np.arange(len(p.faces)) != 0)
     (tmp_path / "prepared.stl").unlink()
@@ -180,3 +237,60 @@ def test_thin_floor_is_refused_even_when_its_sides_are_wide(tmp_path):
     r, out = run(tmp_path, [box([0, 0, 0], [20, 20, 0.2])])
     assert out is None
     assert any('floor is too thin' in b for b in r['blocked'])
+
+
+def checker(work, data):
+    work.mkdir(parents=True)
+    (work / "model.stl").write_bytes(data)
+    (work / "job.json").write_text(json.dumps({"name": "model.stl", "units": "millimeter", "scale": 1,
+        "models": ["A1 Mini"], "minWall": 0.84, "picture": False, "stl": False}))
+    subprocess.run(["node", str(Path(__file__).resolve().parents[1] / "checker/check.mjs")],
+                   env={**os.environ, "PS_JOB_DIR": str(work)}, check=True, capture_output=True)
+    return json.loads((work / "out/report.json").read_text())
+
+
+@pytest.mark.parametrize("beside_solid", [False, True])
+def test_failed_circular_floor_cannot_be_cleared_by_preparation(tmp_path, beside_solid):
+    floor = trimesh.creation.cylinder(radius=10, height=0.1, sections=64)
+    floor.apply_translation([0, 0, 0.05])
+    parts = [floor] + ([box([30, 0, 0], [40, 10, 10])] if beside_solid else [])
+    before = checker(tmp_path / "check", trimesh.util.concatenate(parts).export(file_type="stl"))
+    assert any(f["id"] == "too-thin" and f["level"] == "fail" for f in before["report"]["findings"])
+    r, out = run(tmp_path, parts)
+    assert out is None and any("floor is too thin" in b for b in r["blocked"])
+
+
+def test_failed_wall_is_cleared_only_after_thickening_passes_the_same_checker(tmp_path):
+    parts = [box([0, 0, 0], [20, 20, 2]), box([0, 4, 2], [0.3, 16, 12])]
+    before = checker(tmp_path / "before-check", trimesh.util.concatenate(parts).export(file_type="stl"))
+    assert any(f["id"] == "too-thin" and f["level"] == "fail" for f in before["report"]["findings"])
+    report, out = run(tmp_path, parts)
+    assert out is not None and any(c["fix"] == "walls" for c in report["changes"])
+    after = checker(tmp_path / "after-check", (tmp_path / "prepared.stl").read_bytes())
+    assert not any(f["level"] == "fail" for f in after["report"]["findings"])
+
+
+def test_failed_cone_bed_contact_survives_preparation_until_orient_selected(tmp_path, monkeypatch):
+    from makeros_hub import checks
+    cone = trimesh.creation.cone(radius=10, height=20, sections=64)
+    cone.apply_transform(trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0]))
+    cone.apply_translation([0, 0, 20])
+    before = checker(tmp_path / "before-check", cone.export(file_type="stl"))
+    assert any(f["id"] == "no-first-layer" and f["level"] == "fail" for f in before["report"]["findings"])
+    report, out = run(tmp_path, [cone])
+    assert out is not None
+    spool = tmp_path / "spool"
+    def run_check(uid):
+        work = spool / uid / ".check"
+        subprocess.run(["node", str(Path(__file__).resolve().parents[1] / "checker/check.mjs")],
+                       env={**os.environ, "PS_JOB_DIR": str(work)}, check=True, capture_output=True)
+        return 0
+    monkeypatch.setattr(checks, "run_check_job", run_check)
+    for orient in [False, True]:
+        blocked = checks.check_prepared_model(spool, tmp_path / "prepared.stl", report,
+            {"model": "A1 Mini", "fixes": {"orient": orient}})
+        assert bool(blocked) is not orient
+        assert report["checked"] is orient
+        if not orient:
+            assert any("barely touches the bed" in b for b in blocked)
+    assert not list(spool.iterdir())

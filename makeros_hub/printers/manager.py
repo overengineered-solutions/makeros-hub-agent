@@ -790,12 +790,31 @@ class PrinterManager:
         work = dest_dir / ".slice"
         mesh = work / mesh_name
         result_path = work / "out" / "result.json"
+
+        def checked(result):
+            if "prepare" not in spec:
+                return True
+            from ..checks import check_prepared_model
+            prepared = result.get("prepare")
+            if not isinstance(prepared, dict) or not isinstance(prepared.get("blocked"), list):
+                reasons = ["The shop did not report the model fixes. Check the file again."]
+            else:
+                reasons = prepared["blocked"] or check_prepared_model(dest_dir.parent, work / "work" / mesh_name, prepared, spec)
+                prepared["blocked"] = reasons
+            if reasons:
+                dest.unlink(missing_ok=True)
+                reporter({"queueJobId": job_id, "sha256": sha, "sliceError": " ".join(reasons)[:300],
+                          **({"slice": {"prepare": prepared}} if isinstance(prepared, dict) else {})})
+                return False
+            result_path.write_text(json.dumps(result), encoding="utf-8")
+            return True
+
         if dest.exists() and result_path.exists() and mesh.exists() and stream_sha(mesh) == sha:
             try:
                 done = json.loads(result_path.read_text(encoding="utf-8"))
                 same = json.loads((work / "job.json").read_text(encoding="utf-8")) == {**slice_spec_of(spec), "mesh": mesh_name}
                 if isinstance(done, dict) and done.get("ok") and same:
-                    return done
+                    return done if checked(done) else None
             except (OSError, ValueError):
                 pass
         if work.is_symlink():
@@ -836,6 +855,8 @@ class PrinterManager:
             log.warning("slice upload %s: not sliced (rc %s): %s", job_id, rc, reason)
             reporter({"queueJobId": job_id, "sha256": sha, "sliceError": reason[:300],
                       **({"slice": {"prepare": result["prepare"]}} if isinstance(result, dict) and "prepare" in result else {})})
+            return None
+        if not checked(result):
             return None
         os.replace(sliced_file, dest)
         log.info("slice upload %s: sliced in %.1f s (%s g, %s s print)", job_id, time.monotonic() - started, result.get("grams"), result.get("seconds"))
