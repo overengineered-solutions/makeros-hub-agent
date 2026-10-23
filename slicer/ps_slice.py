@@ -155,8 +155,9 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
     before = measure(parts)
     start = [p.copy() for p in parts]
     # A zero-height surface cannot be given an inside by a repair. Small holes: only planar triangles/quads <= 1 mm across.
-    filled, repaired, inward = 0, [], []
+    filled, repaired, inward, processed = 0, [], [], 0
     for i, p in enumerate(parts):
+        processed += 1
         if min(p.extents) < 1e-6:
             blocked.append(surface)
             continue
@@ -378,7 +379,7 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
     if not blocked:
         with open(dst, "wb") as fh:
             fh.write(data)
-    print(f"prepare: processed={len(changes)}, expected={len(changes)}, blocked={len(result['blocked'])}", flush=True)
+    print(f"prepare: processed={processed}, expected={len(start)}, changes={len(changes)}, blocked={len(result['blocked'])}", flush=True)
     return result
 
 

@@ -142,6 +142,8 @@ def test_tiny_detail_and_zero_thickness_have_plan_wording(tmp_path):
 
 
 def test_whole_shell_budget_and_bad_choices_fail_closed(tmp_path):
+    with pytest.raises(ps.SliceError, match="too many separate pieces"):
+        run(tmp_path, [box([i * 3, 0, 0], [i * 3 + 1, 1, 1]) for i in range(129)])
     raw = {"mesh": "x.stl", "model": "A1 Mini", "filament": {"type": "PLA"}, "fixes": {"orient": False, "brim": False, "supports": False}}
     for choice in [True, {}, {"version": 1, "thicken": True, "moveLargeGaps": "false"}, {"version": True, "thicken": True, "moveLargeGaps": False}]:
         with pytest.raises(ps.SliceError):

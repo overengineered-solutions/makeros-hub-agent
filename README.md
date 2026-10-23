@@ -1,6 +1,6 @@
 # Procrastination Station shop-box agent
 
-The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.70.0 review candidate**, not evidence that the installed shop box has been updated.
+The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.83.0 review candidate**, not evidence that the installed shop box has been updated.
 
 The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Read [SECURITY.md](SECURITY.md) for the boundaries and limitations.
 
