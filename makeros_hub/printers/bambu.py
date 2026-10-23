@@ -110,6 +110,8 @@ class BambuAdapter:
         self._version_asked_at = 0.0
         self._version_asks = 0
         self._device_logged = False
+        self._refill_asked_at = 0.0
+        self._refill_asks = 0
         self._client: mqtt.Client | None = None
         # Terminal-job detection over the merged state (pure; fed under _lock).
         self._jobs = JobTracker(printer_id, serial, state_path=TERMINAL_JOBS_DIR / f"{_safe_file_component(printer_id)}.json")
@@ -172,6 +174,7 @@ class BambuAdapter:
             self._error_reason = None
             self._connected_at_ms = int(time.time() * 1000)
             self._state_seen = False
+            self._refill_asks = 0
             # v0.69: which print the printer is on must come from THIS connection's reports, never the cached ones
             cached = self._data.get("print")
             if isinstance(cached, dict):
@@ -277,6 +280,34 @@ class BambuAdapter:
             client.publish(self._request_topic, GET_VERSION)
         except Exception as exc:  # noqa: BLE001 — a version probe must never disturb the poll
             log.debug("bambu %s: get_version re-ask failed: %s", self.printer_id, exc)
+
+    def ensure_auto_refill(self) -> None:
+        """Keep AMS filament backup on, so a spool that runs out mid-print carries on from an identical spool in the AMS
+        (operator, 2026-10-23: "lets activate the pool switchover and then definitely test it"). Bambu Studio's own toggle
+        (DeviceManager.cpp command_ams_switch_filament); it is a printer setting that survives a reboot. Sent only when
+        the printer reports it off, does not report it unsupported, and is not printing; at most three tries a
+        connection, ten minutes apart, so a printer that ignores it is not pestered."""
+        now = time.monotonic()
+        with self._lock:
+            print_obj = self._data.get("print")
+            if not self._state_seen or not isinstance(print_obj, dict) or self._refill_asks >= 3:
+                return
+            if now - self._refill_asked_at < 600 or bambu_parse.auto_refill_state(print_obj) is not False:
+                return
+            if print_obj.get("support_filament_backup") is False or print_obj.get("gcode_state") in BUSY_GCODE_STATES:
+                return
+            self._refill_asked_at = now
+            self._refill_asks += 1
+            asks = self._refill_asks
+        client = self._client
+        if client is None:
+            return
+        payload = {"print": {"command": "print_option", "sequence_id": os.urandom(4).hex(), "auto_switch_filament": True}}
+        try:
+            client.publish(self._request_topic, json.dumps(payload))
+            log.info("bambu %s: AMS filament backup was off; asked the printer to turn it on (try %d)", self.printer_id, asks)
+        except Exception as exc:  # noqa: BLE001 — a settings nudge must never disturb the poll
+            log.warning("bambu %s: AMS filament backup request failed: %s", self.printer_id, exc)
 
     # --- status read (any thread) -----------------------------------------
     def status(self) -> dict:

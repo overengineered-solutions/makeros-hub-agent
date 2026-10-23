@@ -535,6 +535,22 @@ def build_unidentified_spools(print_obj: dict) -> list[dict] | None:
     return out or None
 
 
+def auto_refill_state(print_obj: dict) -> bool | None:
+    """AMS filament backup ("auto refill" in Bambu Studio) as the printer reports it: bit 18 of the hex string print.cfg on
+    current firmware, else bit 10 of print.home_flag (Bambu Studio DeviceManager.cpp: parse_home_flag runs first and
+    parse_new_info's cfg overrides it). None when the printer reports neither."""
+    cfg = print_obj.get("cfg")
+    if isinstance(cfg, str) and cfg.strip():
+        try:
+            return bool((int(cfg.strip(), 16) >> 18) & 1)
+        except ValueError:
+            pass
+    flag = print_obj.get("home_flag")
+    if isinstance(flag, int) and not isinstance(flag, bool):
+        return bool((flag >> 10) & 1)
+    return None
+
+
 def build_active_tray(print_obj: dict) -> int | None:
     """The currently-selected AMS global tray index, or None for external(254)/
     none(255)/absent."""
@@ -645,6 +661,9 @@ def normalize_status(
         active = build_active_tray(print_obj)
         if active is not None:
             out["amsActiveTray"] = active
+        refill = auto_refill_state(print_obj)
+        if refill is not None:
+            out["amsAutoRefill"] = refill
         unidentified = build_unidentified_spools(print_obj)
         if unidentified:
             out["unidentifiedSpools"] = unidentified
