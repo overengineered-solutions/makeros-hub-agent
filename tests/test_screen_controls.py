@@ -167,6 +167,17 @@ class TestStateRules(unittest.TestCase):
             for params in self.IDLE_ONLY:
                 self.assertEqual(refusal(params, state(s)), "accepted", (s, params))
 
+    def test_a_held_print_is_a_print_and_cool_down_lets_it_go(self):
+        # v0.82: an error stop the printer holds keeps its part and its place; only Cool down ends it from here
+        held = {**state("error", HOT), "gcode_macro _pstation_hold": {"active": True}}
+        for params in self.IDLE_ONLY:
+            want = "accepted" if params["action"] == "cooldown" else "printer_busy"
+            self.assertEqual(refusal(params, held), want, params)
+        for params in self.FILAMENT + self.ANY:
+            self.assertEqual(refusal(params, held), "accepted", params)   # a repair, the light, the stops
+        self.assertEqual(refusal({"action": "home"}, {**held, "gcode_macro _pstation_hold": {"active": None}}), "accepted")
+        self.assertIn("&gcode_macro%20_pstation_hold=active", klipper._ACTION_QUERY)
+
     def test_filament_moves_run_idle_or_paused_never_while_printing(self):
         # v0.79 (report D5): a runout pause was a dead end
         for params in self.FILAMENT:
@@ -491,6 +502,33 @@ class TestReadings(unittest.TestCase):
         self.assertNotIn("toolhead", self.status())
         self.assertNotIn("toolhead", _build_status("p", {"toolhead": {"homed_axes": "xyz"}}, "offline"))
 
+    def test_the_heater_hold_only_when_the_printer_says_it_holds(self):
+        self.assertIn("&gcode_macro%20_pstation_hold=active,minutes,ceiling_minutes,since", klipper._QUERY_OBJECTS)
+        held = lambda **h: self.status(**{"gcode_macro _pstation_hold": h})
+        self.assertEqual(held(active=True, minutes=12, ceiling_minutes=2880)["hold"], {"minutes": 12, "ceilingMinutes": 2880})
+        self.assertEqual(held(active=True, minutes=1, ceiling_minutes=2880, since=92026.0239)["hold"],
+                         {"minutes": 1, "ceilingMinutes": 2880, "since": 92026.0})
+        self.assertNotIn("hold", held(active=False, minutes=12, ceiling_minutes=2880))
+        self.assertNotIn("hold", held(active=None, minutes=None, ceiling_minutes=None))   # a printer without the hold
+        self.assertNotIn("hold", held(active=True, minutes=3000, ceiling_minutes=2880))
+        self.assertNotIn("hold", held(active=True, minutes=True, ceiling_minutes=2880))
+        self.assertTrue(held(active=False, minutes=0, ceiling_minutes=2880)["heaterHold"])
+        self.assertNotIn("heaterHold", held(active=None, minutes=None, ceiling_minutes=None))
+
+    def test_a_klipper_error_carries_its_own_words(self):
+        error = lambda **ps: _build_status("p", {"print_stats": {"state": "error", **ps}}, "connected")
+        self.assertEqual(error(message="Extrude only move too long (-642.480mm vs 300.000mm)\nSee the 'max_extrude_only_distance' "
+                               "config option for details")["errorReason"][:52], "Extrude only move too long (-642.480mm vs 300.000mm)")
+        self.assertNotIn("errorReason", error(message=""))
+        self.assertNotIn("errorReason", _build_status("p", {"print_stats": {"state": "paused", "message": "x"}}, "connected"))
+
+    def test_a_hold_starting_or_ending_is_sent_at_once_for_a_printer_in_error(self):
+        row = {"printerId": "p", "connectionState": "connected", "sampledAt": 1, "state": "error"}
+        before = telemetry.project(row)
+        held = telemetry.project({**row, "sampledAt": 2, "hold": {"minutes": 0, "ceilingMinutes": 2880}})
+        self.assertEqual(telemetry.delta(before, held)["hold"], {"minutes": 0, "ceilingMinutes": 2880})
+        self.assertIsNone(telemetry.delta(held, telemetry.project({**row, "sampledAt": 3}))["hold"])
+
     def test_the_push_carries_them_and_an_idle_jog_is_sent(self):
         row = {"printerId": "p", "connectionState": "connected", "sampledAt": 1, "state": "idle",
                "toolhead": {"homed": "xyz", "x": 1.0, "y": 2.0, "z": 3.0}, "light": True, "speedPct": 100,
@@ -718,6 +756,13 @@ class TestPauseWatch(unittest.TestCase):
         self.assertEqual(self.mr.posts, [("/printer/gcode/script",
                                           "SET_GCODE_VARIABLE MACRO=_pstation_resume_heat VARIABLE=nozzle VALUE=220\n"
                                           "M104 S140")])
+
+    def test_never_on_a_printer_that_holds_its_own_heat(self):
+        held = {**PAUSED, "gcode_macro _pstation_hold": {"active": False, "minutes": 0, "ceiling_minutes": 2880}}
+        self.a._after_poll(held)
+        self.paused_for(61, held)
+        self.assertEqual(self.mr.posts, [])                 # v0.82: its hold turns the nozzle off itself
+        self.assertEqual(self.a.status()["printFault"], "paused_long")   # the shop is still told
 
     def test_never_on_a_printer_whose_resume_does_not_heat_back_nor_below_140(self):
         self.mr.objects = list(SV08_OBJECTS)                # Sovol's RESUME as shipped
