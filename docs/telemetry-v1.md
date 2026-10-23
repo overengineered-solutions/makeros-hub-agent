@@ -78,6 +78,7 @@ are 5 s.
 | `zOffset` | number mm | v0.76, Klipper `gcode_move.homing_origin[2]` (the `SET_GCODE_OFFSET` Z), rounded to 0.001 |
 | `fanPct` | int 0–100 | v0.76, Klipper part fan: `fan.speed × 100`, else `fan_generic fan0` (the SV08's M106 macro drives fan0 and fan1 together) |
 | `light` | bool | v0.76, Klipper `output_pin main_led.value > 0`; omitted on a printer without that pin |
+| `hold` | `{minutes, ceilingMinutes}` | v0.82, Klipper: the printer's heater hold (`gcode_macro _pstation_hold`, pstation `printers/*/config`): a print stopped on an error or paused keeps the bed warm, the nozzle off and the motors on. `minutes` held so far, `ceilingMinutes` when the printer turns everything off itself. Present only while `active` is true; a transition key, so it starts and ends at once |
 
 Every key except `printerId` and `sampledAt` is omit-when-unknown. The heartbeat carries the same values under the
 same names, except that the heartbeat keeps its historical `nozzleTempC` / `bedTempC` for what this contract calls

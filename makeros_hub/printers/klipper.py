@@ -133,7 +133,14 @@ _QUERY_OBJECTS = (
     "&fan=speed"
     "&fan_generic%20fan0=speed"
     "&output_pin%20main_led=value"
+    # v0.82: the printer's heater hold (pstation printers/*/config: shop.cfg on the SV08s, pstation-hold.cfg on the Giga).
+    # A printer without it answers null attributes (read on both, 2026-10-23).
+    "&gcode_macro%20_pstation_hold=active,minutes,ceiling_minutes"
 )
+# v0.82 (operator, 2026-10-23: "I do not want to just turn heaters off if we have a chance to recover a print"): a print
+# stopped on an error or paused keeps its bed warm with the nozzle off, the motors on, until someone answers or the
+# printer's own ceiling (48 h). The printer owns the timing, so it holds with the hub down too; the hub only reports it.
+_HOLD = "gcode_macro _pstation_hold"
 
 # Mapping from Moonraker `print_stats.state` to the wire DTO's activity state.
 # Moonraker's state machine: 'standby' | 'printing' | 'paused' | 'complete' |
@@ -263,6 +270,7 @@ PROBE_BED_MAX_C = 90.0
 # printer whose RESUME heats back first (the gcode_macro below, a printer change in the audit report). Sovol's RESUME does
 # not reheat, and at 140 Klipper refuses to extrude (min_extrude_temp 150), so a Resume from Sovol's screen would end the
 # print. A Resume from the site always heats back to the print's temperature and waits (_resume_script).
+# v0.82: never on a printer with its own heater hold (_HOLD below): it turns the nozzle off itself after 30 min.
 PAUSE_ALERT_SEC, PAUSE_COOL_SEC = 1800.0, 3600.0
 _RESUME_HEAT = "_pstation_resume_heat"   # its variable `nozzle`: the target a paused print had, 0 = none
 # dispatch_commands runs on the heartbeat thread: a short action waits this long for klippy's answer, a long one this long
@@ -1048,6 +1056,8 @@ class KlipperAdapter:
             self._diag("klipper", f"print paused {age / 60:.0f} min on {self.printer_id[:12]}")
         if age < PAUSE_COOL_SEC or pause["cooled"]:
             return
+        if isinstance(_obj(data, _HOLD).get("active"), bool):
+            return   # v0.82: the printer runs its own heater hold (its nozzle is off after 30 min); one owner of the heat
         with self._lock:
             if self._pause is not None:
                 self._pause["cooled"] = True   # once, whatever happens next
@@ -1451,6 +1461,12 @@ def _build_status(
         led_value = _num(led.get("value")) if isinstance(led, dict) else None
         if led_value is not None:
             out["light"] = led_value > 0
+        # v0.82: only what the printer says it is holding; omitted when it holds nothing or has no hold
+        hold = status.get(_HOLD)
+        if isinstance(hold, dict) and hold.get("active") is True:
+            minutes, ceiling = _int(hold.get("minutes")), _int(hold.get("ceiling_minutes"))
+            if minutes is not None and ceiling is not None and 0 <= minutes <= ceiling:
+                out["hold"] = {"minutes": minutes, "ceilingMinutes": ceiling}
 
         # If print_stats said nothing, default to idle so the cloud doesn't
         # render this connection as 'offline' (no state) by accident.

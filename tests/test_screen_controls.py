@@ -491,6 +491,22 @@ class TestReadings(unittest.TestCase):
         self.assertNotIn("toolhead", self.status())
         self.assertNotIn("toolhead", _build_status("p", {"toolhead": {"homed_axes": "xyz"}}, "offline"))
 
+    def test_the_heater_hold_only_when_the_printer_says_it_holds(self):
+        self.assertIn("&gcode_macro%20_pstation_hold=active,minutes,ceiling_minutes", klipper._QUERY_OBJECTS)
+        held = lambda **h: self.status(**{"gcode_macro _pstation_hold": h})
+        self.assertEqual(held(active=True, minutes=12, ceiling_minutes=2880)["hold"], {"minutes": 12, "ceilingMinutes": 2880})
+        self.assertNotIn("hold", held(active=False, minutes=12, ceiling_minutes=2880))
+        self.assertNotIn("hold", held(active=None, minutes=None, ceiling_minutes=None))   # a printer without the hold
+        self.assertNotIn("hold", held(active=True, minutes=3000, ceiling_minutes=2880))
+        self.assertNotIn("hold", held(active=True, minutes=True, ceiling_minutes=2880))
+
+    def test_a_hold_starting_or_ending_is_sent_at_once_for_a_printer_in_error(self):
+        row = {"printerId": "p", "connectionState": "connected", "sampledAt": 1, "state": "error"}
+        before = telemetry.project(row)
+        held = telemetry.project({**row, "sampledAt": 2, "hold": {"minutes": 0, "ceilingMinutes": 2880}})
+        self.assertEqual(telemetry.delta(before, held)["hold"], {"minutes": 0, "ceilingMinutes": 2880})
+        self.assertIsNone(telemetry.delta(held, telemetry.project({**row, "sampledAt": 3}))["hold"])
+
     def test_the_push_carries_them_and_an_idle_jog_is_sent(self):
         row = {"printerId": "p", "connectionState": "connected", "sampledAt": 1, "state": "idle",
                "toolhead": {"homed": "xyz", "x": 1.0, "y": 2.0, "z": 3.0}, "light": True, "speedPct": 100,
@@ -718,6 +734,13 @@ class TestPauseWatch(unittest.TestCase):
         self.assertEqual(self.mr.posts, [("/printer/gcode/script",
                                           "SET_GCODE_VARIABLE MACRO=_pstation_resume_heat VARIABLE=nozzle VALUE=220\n"
                                           "M104 S140")])
+
+    def test_never_on_a_printer_that_holds_its_own_heat(self):
+        held = {**PAUSED, "gcode_macro _pstation_hold": {"active": False, "minutes": 0, "ceiling_minutes": 2880}}
+        self.a._after_poll(held)
+        self.paused_for(61, held)
+        self.assertEqual(self.mr.posts, [])                 # v0.82: its hold turns the nozzle off itself
+        self.assertEqual(self.a.status()["printFault"], "paused_long")   # the shop is still told
 
     def test_never_on_a_printer_whose_resume_does_not_heat_back_nor_below_140(self):
         self.mr.objects = list(SV08_OBJECTS)                # Sovol's RESUME as shipped
