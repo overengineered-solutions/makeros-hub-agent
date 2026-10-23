@@ -71,6 +71,22 @@ sh -n update.sh
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
 
+## Next candidate: members' file checks run on the shop box
+
+Operator, 2026-10-22: "Let's go ahead and do the work to get it on the shop box instead of raising the linode cap". The
+site's Will it print? check no longer parses a mesh on the website; it queues the file and hands it here.
+
+- The heartbeat carries `checker` (`{format, version}` of the installed image, from a probe at start and every 15 minutes,
+  and from every check's own report), only while `/opt/ps-checker/run-check` is installed. The site hands checks
+  (`checks`, one a beat, each with an attempt token) only to a box whose checker format is at least its own.
+- `makeros_hub/checks.py` fetches the file with the hub token into `<spool>/<id>/.check`, writes `job.json`, runs
+  `sudo -n /opt/ps-checker/run-check <id>` (root-owned, installed by oes-pool-deploy `scripts/install-checker.py`: no
+  network, read-only root, 2 GB, 2 CPUs, 64 processes, 150 s, as the hub's user), sends Print it's slicer copy when asked
+  and posts the report, then removes the folder. One check at a time; a busy site (its one upload slot taken) is waited for
+  2 s a try, up to a minute; anything the site refuses is dropped and its lease takes the check back.
+- `checker/` holds the container: Node 22 on Alpine and `check.mjs`, the site's own check code bundled by pstation
+  `scripts/build-checker.mjs`. Its first line names the pstation commit and format; rebuild it there, never edit it here.
+
 ## 0.72.0 candidate: the shop slices members' checked files itself
 
 Operator, 2026-10-18: "after we evaluate it we automatically slice it based on the material they want and the size and

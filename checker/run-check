@@ -1,0 +1,23 @@
+#!/bin/sh
+# run-check <job id>: one member file check for the hub, in the locked-down ps-checker container (checker/Dockerfile).
+# Installed root:root 0755 at /opt/ps-checker/run-check by oes-pool-deploy scripts/install-checker.py; the hub's service user may run
+# exactly this through sudo. The id names <spool>/<id>/.check, which must be a real directory owned by the hub's user (no symlink
+# anywhere on the way); the container sees only that directory, as that user, with no network, a read-only root, 2 GB of memory,
+# 2 CPUs, 64 processes and 150 seconds. Exit 124 at the time limit, 137 when it was stopped for memory; otherwise the checker's own
+# /job/out/report.json says how the check went.
+set -eu
+SPOOL=/var/lib/makeros-hub/spool
+HUB_USER=makeros-hub
+IMAGE=ps-checker:current
+id="${1:-}"
+case "$id" in ""|*[!0-9a-f]*) echo "run-check: the job id is lowercase hex" >&2; exit 2 ;; esac
+[ "${#id}" -ge 8 ] && [ "${#id}" -le 64 ] || { echo "run-check: the job id is 8 to 64 characters" >&2; exit 2; }
+dir="$SPOOL/$id/.check"
+real=$(realpath -e -- "$dir" 2>/dev/null) || { echo "run-check: no check job at $dir" >&2; exit 2; }
+[ "$real" = "$dir" ] || { echo "run-check: $dir is not a plain directory" >&2; exit 2; }
+[ -d "$real" ] || { echo "run-check: $dir is not a directory" >&2; exit 2; }
+uid=$(id -u "$HUB_USER"); gid=$(id -g "$HUB_USER")
+[ "$(stat -c %u "$real")" = "$uid" ] || { echo "run-check: $dir is not the hub's" >&2; exit 2; }
+exec timeout 150 docker run --rm --network none --read-only --tmpfs /tmp:size=64m,mode=1777 \
+  --memory 2g --memory-swap 2g --cpus 2 --pids-limit 64 --security-opt no-new-privileges --cap-drop ALL \
+  --user "$uid:$gid" -e HOME=/tmp -v "$real":/job "$IMAGE"

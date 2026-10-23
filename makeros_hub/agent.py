@@ -48,6 +48,7 @@ from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import SLICE_RUNNER, SLICER_CAPS, PrinterManager, probe_slicer
 from . import paper as paper_lane
+from . import checks as check_lane
 from . import wake as wake_lane
 from . import job_files
 from .printers.camera import FF_SLOTS, CameraScheduler, camera_source_kind, collect_camera_frames, prime_camera_capabilities
@@ -772,6 +773,7 @@ def heartbeat_payload(
     vp_connects: list[dict] | None = None,
     slicer_ready: bool | None = None,
     slicer_caps: dict | None = None,
+    checker: dict | None = None,
     paper_ready: bool | None = None,
     camera_gateway: bool | None = None,
     camera_live_stats: list[dict] | None = None,
@@ -854,6 +856,10 @@ def heartbeat_payload(
     # unknown, and the site sends this box only what every image since 0.72 takes
     if slicer_ready and isinstance(slicer_caps, dict):
         payload["slicerCaps"] = dict(slicer_caps)
+    # v0.81: what the installed file checker is ({format, version}, read from the image: checks.CHECKER), only while it is installed
+    # and has answered; absent = no checks for this box (pstation hands checks only to a checker at least its own format)
+    if isinstance(checker, dict):
+        payload["checker"] = {"format": checker.get("format"), "version": checker.get("version")}
     if paper_ready is not None:
         payload["paperReady"] = bool(paper_ready)   # v0.73: the site hands paper jobs only to a box that can render them
     # v0.75: whether the camera gateway answered recently (the site offers live view of the RTSPS printers only while it
@@ -1519,6 +1525,7 @@ def run(
     )
     queue_status_reporter = make_queue_status_reporter(cfg, credential, diagnostics=diagnostics)
     fetch_lock = threading.Lock()   # v0.57: one web-upload fetch worker at a time
+    check_lock = threading.Lock()   # v0.81: one member file check at a time (makeros_hub/checks.py)
     paper_lock = threading.Lock()   # v0.73: one paper print at a time (makeros_hub/paper.py)
     pending_queue_reports: list[dict] = report_outbox.load()   # v0.58: durable across restarts
     pending_probe_results: list[dict] = []
@@ -1992,6 +1999,7 @@ def run(
                     _record_diagnostic(diagnostics, "laser", f"laser report failed: {redact(str(exc))}")
                 vp_connects = VP_CONNECTS.snapshot(64)
                 slicer_ready = os.path.isfile(SLICE_RUNNER) and os.access(SLICE_RUNNER, os.X_OK)
+                checker_ready = check_lane.checker_installed()
                 resp = post_json(
                     cfg.heartbeat_url,
                     heartbeat_payload(
@@ -2015,6 +2023,7 @@ def run(
                         vp_connects=vp_connects,
                         slicer_ready=slicer_ready,
                         slicer_caps=SLICER_CAPS.value,
+                        checker=check_lane.CHECKER.value if checker_ready else None,
                         paper_ready=paper_lane.paper_ready(),
                         camera_gateway=GATEWAY.available(),
                         camera_live_stats=live_views.stats(),
@@ -2099,6 +2108,32 @@ def run(
                                 fetch_lock.release()
 
                         threading.Thread(target=_probe_worker, name="slicer-probe", daemon=True).start()
+                    # v0.81: a member's file check, one at a time, off the heartbeat thread (makeros_hub/checks.py); and what the
+                    # installed checker is, at start and every 15 minutes between checks, so the site hands checks only to a box that has one
+                    checks = resp.body.get("checks")
+                    if checker_ready and isinstance(checks, list) and checks and check_lock.acquire(blocking=False):
+                        def _check_worker(items=checks):
+                            try:
+                                check_lane.run_checks(
+                                    items,
+                                    SPOOL_DIR,
+                                    getter=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential, max_bytes=check_lane.MAX_CHECK_BYTES),
+                                    post_json=lambda path, body: post_json(cfg.file_url(path), body, bearer=credential, timeout=60.0),
+                                    post_bytes=lambda path, data: post_bytes(cfg.file_url(path), data, bearer=credential, timeout=120.0),
+                                )
+                            finally:
+                                check_lock.release()
+
+                        threading.Thread(target=_check_worker, name="file-check", daemon=True).start()
+                    if checker_ready and check_lane.CHECKER.stale() and check_lock.acquire(blocking=False):
+                        def _checker_probe():
+                            try:
+                                check_lane.CHECKER.seen(check_lane.probe_checker(SPOOL_DIR))
+                                log.info("checker probe: %s", check_lane.CHECKER.value or "no answer")
+                            finally:
+                                check_lock.release()
+
+                        threading.Thread(target=_checker_probe, name="checker-probe", daemon=True).start()
                     # v0.73: members' paper prints, one at a time, off the heartbeat thread (makeros_hub/paper.py)
                     paper_body = resp.body.get("paper")
                     if paper_lock.acquire(blocking=False):
