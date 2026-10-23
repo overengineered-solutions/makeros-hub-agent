@@ -27,6 +27,8 @@ Validation is stdlib-only. Preparation uses the pinned container packages; `prep
 """
 from __future__ import annotations
 
+import xml.etree.ElementTree as ET
+import math
 import json
 import os
 import re
@@ -465,7 +467,7 @@ def read_spec(raw: dict) -> dict:
                                 type(prepare["version"]) is not int or prepare["version"] != 1 or
                                 any(type(prepare[k]) is not bool for k in ("moveLargeGaps", "thicken"))):
         raise SliceError("the model fix choices are not readable; check the file again")
-    return {
+    result = {
         "mesh": mesh, "model": model, "type": ftype,
         "color": color if isinstance(color, str) and HEX_RE.match(color) else None,
         "tray": tray if isinstance(tray, str) and TRAY_RE.match(tray) else None,
@@ -473,6 +475,38 @@ def read_spec(raw: dict) -> dict:
         "orient": fixes["orient"], "brim": fixes["brim"], "supports": fixes["supports"],
         "scale": float(scale), "nozzle": nozzle if model in TWO_NOZZLES else None, "prepare": prepare,
     }
+    if "colours" in raw:
+        # Preparation can reorder or replace triangles, invalidating the checked colour ranges.
+        if prepare is not None:
+            raise SliceError("Model fixes need one colour. Pick one spool for all layers, or fix the model in your design program before using layer colours.")
+        colours = raw["colours"]
+        if not isinstance(colours, dict) or set(colours) != {"filaments", "parts"}:
+            raise SliceError("the layer colours could not be read")
+        fs, parts = colours["filaments"], colours["parts"]
+        if not isinstance(fs, list) or not 2 <= len(fs) <= 64 or not isinstance(parts, list) or not 1 <= len(parts) <= 2000:
+            raise SliceError("the layer colours are outside the slicer's limits")
+        checked = []
+        for f in fs:
+            if not isinstance(f, dict) or not HEX_RE.fullmatch(str(f.get("colorHex", ""))):
+                raise SliceError("a layer's spool colour is missing")
+            child = read_spec({"mesh": mesh, "model": model, "filament": f, "nozzle": f.get("nozzle"), "fixes": fixes, "scale": scale})
+            if child["type"] == "TPU" or not child["stated"]:
+                raise SliceError("layer colours need one stated material that can change through the AMS")
+            checked.append(child)
+        if len({f["stated"] for f in checked}) != 1:
+            raise SliceError("layer colours must all use the same material")
+        end, used = 0, set()
+        for part in parts:
+            if not isinstance(part, dict) or any(type(part.get(k)) is not int for k in ("first", "count", "filament")):
+                raise SliceError("a layer's triangle range could not be read")
+            if part["first"] != end or part["count"] <= 0 or not 0 <= part["filament"] < len(fs):
+                raise SliceError("the layer ranges do not cover the model exactly once")
+            end += part["count"]
+            used.add(part["filament"])
+        if end > 300000 or used != set(range(len(fs))):
+            raise SliceError("the layer ranges or spools do not match the model")
+        result["colours"] = {"filaments": checked, "parts": parts}
+    return result
 
 
 def load_index(kind: str) -> dict[str, dict]:
@@ -589,7 +623,7 @@ def caps(processes: dict | None = None, machines: dict | None = None) -> dict:
     model the outer wall line width of the process it slices with, so the site's minimum wall is two of this image's lines.
     Read from the image, so a box whose agent and image differ reports the image. Never raises: a preset that does not read
     leaves its model out."""
-    out: dict = {"scaleMin": SCALE_MIN, "scaleMax": SCALE_MAX, "lineWidth": {}, "prepareVersion": 1}
+    out: dict = {"scaleMin": SCALE_MIN, "scaleMax": SCALE_MAX, "lineWidth": {}, "prepareVersion": 1, "colours": True}
     try:
         processes = load_index("process") if processes is None else processes
         machines = load_index("machine") if machines is None else machines
@@ -654,6 +688,47 @@ def scale_stl(src: str, dst: str, factor: float) -> None:
         fh.write(data)
 
 
+def colour_3mf(stl: str, dst: str, parts: list[dict]) -> None:
+    """One assembled object with one volume per checked object: arrange/orient cannot separate the model's parts."""
+    with open(stl, "rb") as fh:
+        data = fh.read()
+    n = struct.unpack_from("<I", data, 80)[0] if len(data) >= 84 else -1
+    if len(data) != 84 + n * 50 or sum(p["count"] for p in parts) != n:
+        raise SliceError("the layer ranges do not match the checked STL")
+    model = ET.Element("model", {"unit": "millimeter", "xml:lang": "en-US", "xmlns": "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"})
+    resources = ET.SubElement(model, "resources")
+    config = ET.Element("config")
+    parent_id = len(parts) + 1
+    obj_settings = ET.SubElement(config, "object", {"id": str(parent_id)})
+    ET.SubElement(obj_settings, "metadata", {"key": "name", "value": "Layer colours"})
+    for i, part in enumerate(parts):
+        obj = ET.SubElement(resources, "object", {"id": str(i + 1), "type": "model"})
+        mesh = ET.SubElement(obj, "mesh")
+        vertices = ET.SubElement(mesh, "vertices")
+        triangles = ET.SubElement(mesh, "triangles")
+        for t in range(part["count"]):
+            coords = struct.unpack_from("<9f", data, 84 + (part["first"] + t) * 50 + 12)
+            if not all(math.isfinite(c) for c in coords):
+                raise SliceError("the checked model has a coordinate that is not finite")
+            for v in range(3):
+                ET.SubElement(vertices, "vertex", dict(zip(("x", "y", "z"), (format(c, ".9g") for c in coords[v * 3:v * 3 + 3]))))
+            ET.SubElement(triangles, "triangle", {"v1": str(t * 3), "v2": str(t * 3 + 1), "v3": str(t * 3 + 2)})
+        volume = ET.SubElement(obj_settings, "part", {"id": str(i + 1), "subtype": "normal_part"})
+        ET.SubElement(volume, "metadata", {"key": "name", "value": "Part " + str(i + 1)})
+        ET.SubElement(volume, "metadata", {"key": "extruder", "value": str(part["filament"] + 1)})
+    parent = ET.SubElement(resources, "object", {"id": str(parent_id), "type": "model"})
+    components = ET.SubElement(parent, "components")
+    for i in range(len(parts)):
+        ET.SubElement(components, "component", {"objectid": str(i + 1)})
+    build = ET.SubElement(model, "build")
+    ET.SubElement(build, "item", {"objectid": str(parent_id)})
+    with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("3D/3dmodel.model", ET.tostring(model, encoding="utf-8", xml_declaration=True))
+        z.writestr("Metadata/model_settings.config", ET.tostring(config, encoding="utf-8", xml_declaration=True))
+        z.writestr("[Content_Types].xml", '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/></Types>')
+        z.writestr("_rels/.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>')
+
+
 def set_model_id(threemf: str, model_id: str) -> None:
     """Write the printer's model code into Metadata/slice_info.config, as Bambu Studio and OrcaSlicer's desktop app do."""
     tmp = threemf + ".tmp"
@@ -705,21 +780,31 @@ def run(job_dir: str | None = None) -> dict:
     process = flatten(processes, PROCESS.format(sfx=sfx))
     process.update(shop_process(spec))
     process["curr_bed_type"] = vendor.get("default_bed_type") or "Textured PEI Plate"
+    if "colours" in spec:
+        # Keep the tower inside the A1 bed, past the X1C exclusion and in both H2D nozzle areas; crowded plates still fail collision checks.
+        process.update({"wipe_tower_x": ["40" if spec["model"] in {"X1C", "H2D"} else "15"], "wipe_tower_y": ["15"]})
+    selected = spec["colours"]["filaments"] if "colours" in spec else [spec]
     if spec.get("nozzle"):
-        process.update(nozzle_map(machine, spec["nozzle"]))
-    filament_name = pick_filament(filaments, machine_name, sfx, spec["type"], spec["tray"], spec.get("stated"))
-    filament = flatten(filaments, filament_name)
-    if spec["color"]:
-        filament["filament_colour"] = [spec["color"]]
+        process.update({"filament_map_mode": "Manual", "filament_map": [nozzle_map(machine, f["nozzle"])["filament_map"][0] for f in selected]})
+    filament_names, presets = [], []
+    for f in selected:
+        name = pick_filament(filaments, machine_name, sfx, f["type"], f["tray"], f.get("stated"))
+        preset = flatten(filaments, name)
+        if f["color"]:
+            preset["filament_colour"] = [f["color"]]
+        filament_names.append(name)
+        presets.append(preset)
+    filament_name = "; ".join(filament_names)
     work = os.path.join(job_dir, "work")
     out = os.path.join(job_dir, "out")
     os.makedirs(work, exist_ok=True)
     os.makedirs(out, exist_ok=True)
     paths = {}
-    for kind, d in (("machine", machine), ("process", process), ("filament", filament)):
+    for kind, d in [("machine", machine), ("process", process)] + [("filament" + str(i), f) for i, f in enumerate(presets)]:
         paths[kind] = os.path.join(work, f"{kind}.json")
         with open(paths[kind], "w", encoding="utf-8") as fh:
             json.dump(d, fh)
+    paths["filament"] = ";".join(paths["filament" + str(i)] for i in range(len(presets)))
     mesh = os.path.join(work, spec["mesh"])
     prepared = None
     if spec["prepare"]:
@@ -734,6 +819,10 @@ def run(job_dir: str | None = None) -> dict:
             raise SliceError(" ".join(prepared["blocked"]))
     else:
         scale_stl(os.path.join(job_dir, spec["mesh"]), mesh, spec["scale"])
+    if "colours" in spec:
+        assembled = os.path.join(work, "colours.3mf")
+        colour_3mf(mesh, assembled, spec["colours"]["parts"])
+        mesh = assembled
     args = orca_args(spec, paths, out, mesh)
     p = subprocess.run(args, capture_output=True, text=True, timeout=540, env={**os.environ, "HOME": "/tmp"})
     sliced = os.path.join(out, "sliced.3mf")

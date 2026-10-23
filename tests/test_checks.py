@@ -49,6 +49,26 @@ def test_prepared_check_never_clears_missing_old_failed_or_unresolved_results(tm
     assert not list(spool.iterdir())
 
 
+@pytest.mark.parametrize("checker_format", [2, 3])
+def test_prepared_candidate_accepts_current_checker_formats(tmp_path, monkeypatch, checker_format):
+    candidate = tmp_path / "candidate.stl"
+    candidate.write_bytes(b"synthetic candidate")
+    prepared = {"sha256": hashlib.sha256(candidate.read_bytes()).hexdigest(), "settings": {"minWall": 0.84}}
+    spool = tmp_path / "spool"
+    def runner(uid):
+        work = spool / uid / ".check"
+        assert (work / "model.stl").read_bytes() == candidate.read_bytes()
+        assert json.loads((work / "job.json").read_text())["scale"] == 1
+        (work / "out").mkdir()
+        (work / "out/report.json").write_text(json.dumps({"format": checker_format, "version": "test", "ok": True,
+            "report": {"findings": [{"id": "good", "level": "ok", "title": "Good"}]}}))
+        return 0
+    monkeypatch.setattr(checks, "run_check_job", runner)
+    assert checks.check_prepared_model(spool, candidate, prepared, {"model": "A1 Mini"}) == []
+    assert prepared["checked"] is True
+    assert not list(spool.iterdir())
+
+
 def check(**over):
     c = {"checkId": CID, "attempt": ATTEMPT, "fileName": "model.stl", "sizeBytes": 10, "units": "file", "scale": 0.005, "models": ["P2S"],
          "minWall": 0.84, "picture": True, "stl": False, "path": f"/api/print/hub/check/{CID}", "seconds": 270}

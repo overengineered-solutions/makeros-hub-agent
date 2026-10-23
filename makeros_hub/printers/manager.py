@@ -77,6 +77,7 @@ def parse_slicer_caps(result) -> dict | None:
         return None
     widths = result.get("lineWidth") if isinstance(result.get("lineWidth"), dict) else {}
     return {"scaleMin": float(lo), "scaleMax": float(hi),
+            **({"colours": True} if result.get("colours") is True else {}),
             **({"prepareVersion": 1} if type(result.get("prepareVersion")) is int and result["prepareVersion"] == 1 else {}),
             "lineWidth": {k: float(v) for k, v in list(widths.items())[:16] if isinstance(k, str) and 0 < len(k) <= 40 and num(v) and 0 < v <= 5}}
 
@@ -132,6 +133,8 @@ def slice_spec_of(spec: dict) -> dict:
                  "filament": {**{k: fil.get(k) for k in ("type", "colorHex", "trayInfoIdx")},
                               **({"material": fil["material"]} if isinstance(fil.get("material"), str) and fil["material"].strip() else {})},
                  "fixes": {k: bool(fixes.get(k)) for k in ("orient", "brim", "supports") if k in fixes}}
+    if "colours" in spec:
+        out["colours"] = spec["colours"]   # the slicer validates the complete object and spool map
     if isinstance(spec.get("scale"), (int, float)) and not isinstance(spec.get("scale"), bool):
         out["scale"] = float(spec["scale"])
     # v0.82 (board 459044ef): a two-nozzle printer's nozzle whose AMS holds the spool; the wrapper refuses anything else

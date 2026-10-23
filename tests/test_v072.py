@@ -143,7 +143,7 @@ class TestSlicerReady(unittest.TestCase):
         self.assertNotIn("cameraGateway", heartbeat_payload())
 
 
-CAPS = {"scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42, "P2S": 0.42}}
+CAPS = {"scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42, "P2S": 0.42}, "prepareVersion": 1, "colours": True}
 
 
 class TestSlicerCaps(unittest.TestCase):
@@ -178,7 +178,9 @@ class TestSlicerCaps(unittest.TestCase):
 
     def test_caps_are_read_strictly(self):
         self.assertEqual(parse_slicer_caps({**CAPS, "lineWidth": {"A1 Mini": 0.42, "x" * 41: 0.4, "P2S": "0.42", "X1C": 9, "H2D": True}}),
-                         {"scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42}})
+                         {**CAPS, "lineWidth": {"A1 Mini": 0.42}})
+        for bad in (False, 1, "true", None):
+            self.assertNotIn("colours", parse_slicer_caps({**CAPS, "colours": bad}))
         for bad in ({}, {"scaleMin": "0.001", "scaleMax": 1000}, {"scaleMin": 0, "scaleMax": 1}, {"scaleMin": 2, "scaleMax": 1},
                     {"scaleMin": 0.001, "scaleMax": float("inf")}, {"scaleMin": float("nan"), "scaleMax": 1}, {"scaleMin": True, "scaleMax": 1},
                     {"scaleMin": 0.001, "scaleMax": 1e7}, None, "caps"):

@@ -207,7 +207,7 @@ def test_a_probe_is_answered_with_what_this_image_slices_and_slices_nothing(tmp_
     job = tmp_path / "job"
     job.mkdir()
     (job / "job.json").write_text(json.dumps({"probe": True}))
-    assert ps.run(str(job)) == {"ok": True, "probe": True, "scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42, "P2S": 0.42}, "prepareVersion": 1}
+    assert ps.run(str(job)) == {"ok": True, "probe": True, "scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42, "P2S": 0.42}, "prepareVersion": 1, "colours": True}
     assert not (job / "work").exists()
 
 

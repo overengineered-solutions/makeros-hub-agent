@@ -49,13 +49,15 @@ def _box_stl(x: float, y: float, z: float) -> bytes:
 
 
 def _slice(tmp_path: Path, stl: bytes, scale: float = 1.0, model: str = "A1 Mini", nozzle: str | None = None,
+           colours: dict | None = None,
            **fixes: bool) -> tuple[dict, str]:
     job = tmp_path / "job"
     job.mkdir()
     (job / "part.stl").write_bytes(stl)
     (job / "job.json").write_text(json.dumps({"mesh": "part.stl", "model": model, "scale": scale,
-                                              "filament": {"type": "PLA", "colorHex": "#FFFFFF", "trayInfoIdx": None},
+                                              "filament": colours["filaments"][0] if colours else {"type": "PLA", "colorHex": "#FFFFFF", "trayInfoIdx": None},
                                               "fixes": {"orient": False, "brim": False, "supports": False, **fixes},
+                                              **({"colours": colours} if colours else {}),
                                               **({"nozzle": nozzle} if nozzle else {})}))
     os.chmod(job, 0o777)
     subprocess.run(["docker", "run", "--rm", "--network", "none", "--read-only", "--tmpfs", "/tmp:size=1g,mode=1777",
@@ -178,6 +180,27 @@ def test_the_h2d_slices_on_the_nozzle_the_spec_names_and_dispatch_reads_it(tmp_p
     assert result["ok"] and result["modelId"] == "O1D" and result["lineWidth"]["H2D"] == LINE, result
     (filament,) = parse_required_filaments(tmp_path / "job" / "out" / "sliced.3mf", 1)
     assert filament["extruderId"] == extruder and filament["nozzleDiameterMm"] == 0.4
+
+
+@pytest.mark.parametrize("model", ["A1 Mini", "P2S", "X1C", "H2D"])
+def test_layer_colours_keep_both_spools_presets_and_h2d_nozzles(tmp_path, model):
+    from makeros_hub.vprinter.capture import parse_required_filaments
+    filaments = [dict(type="PLA", material="PLA", colorHex=colour, trayInfoIdx=tray, nozzle=nozzle)
+                 for colour, tray, nozzle in [("#FF0000", "GFA00", "right"), ("#0000FF", None, "left")]]
+    colours = {"filaments": filaments, "parts": [{"first": 0, "count": 12, "filament": 0}, {"first": 12, "count": 12, "filament": 1}]}
+    result, _ = _slice(tmp_path, _boxes_stl((0, 0, 0, 20, 20, 10), (20, 0, 0, 40, 20, 10)),
+                       scale=0.5, model=model, nozzle="right" if model == "H2D" else None, colours=colours)
+    assert result["ok"] and result["plates"] == 1, result
+    assert result["prepareVersion"] == 1 and result["colours"] is True
+    assert "Bambu PLA Basic" in result["filament"] and "Generic PLA" in result["filament"]
+    used = parse_required_filaments(tmp_path / "job/out/sliced.3mf", 1)
+    assert len(used) == 2
+    for actual, expected in zip(sorted(used, key=lambda f: f["slot"]), filaments):
+        assert actual["color"] == expected["colorHex"][1:] + "FF"
+        assert actual["material"] == "PLA"
+        if model == "H2D":
+            assert actual["extruderId"] == (0 if expected["nozzle"] == "right" else 1)
+            assert actual["nozzleDiameterMm"] == 0.4
 
 
 # The edges the site's check takes from this slicer (pstation printability.ts PLATES, 2026-10-23): about 1.25 mm clear of every edge,
