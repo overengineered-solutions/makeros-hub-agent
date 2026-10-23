@@ -133,6 +133,9 @@ def slice_spec_of(spec: dict) -> dict:
                  "fixes": {k: bool(fixes.get(k)) for k in ("orient", "brim", "supports") if k in fixes}}
     if isinstance(spec.get("scale"), (int, float)) and not isinstance(spec.get("scale"), bool):
         out["scale"] = float(spec["scale"])
+    # v0.82 (board 459044ef): a two-nozzle printer's nozzle whose AMS holds the spool; the wrapper refuses anything else
+    if spec.get("nozzle") in ("left", "right"):
+        out["nozzle"] = spec["nozzle"]
     return out
 
 

@@ -134,9 +134,51 @@ def test_every_model_carries_the_shops_infill_pattern_explicitly(model):
     # operator, 2026-10-21: "the auto slicer defaults to gyroid which is overkill and takes longer"; the pattern is the
     # shop's choice per model, written into every slice, never left to the preset. 2026-10-22: "I like rectilinear" (board
     # 6e8c967f: cubic crosses itself in every layer)
-    got = ps.shop_process(ps.read_spec({**SPEC, "model": model}))
+    got = ps.shop_process(ps.read_spec({**SPEC, "model": model, "nozzle": "left"}))
     assert got["sparse_infill_pattern"] == ps.SHOP_PROCESS[model]["sparse_infill_pattern"] == "rectilinear"
     assert got["sparse_infill_density"].endswith("%")
+
+
+# operator, 2026-10-22: "A1 minis PLA only"; the site offers them nothing else, and the wrapper refuses it too
+@pytest.mark.parametrize("model, ftype, ok", [("A1 Mini", "PLA", True), ("A1 Mini", "PETG", False), ("A1 Mini", "TPU", False), ("P2S", "PETG", True)])
+def test_the_a1_minis_take_pla_only(model, ftype, ok):
+    raw = {**SPEC, "model": model, "filament": {**SPEC["filament"], "type": ftype}}
+    if ok:
+        assert ps.read_spec(raw)["type"] == ftype
+    else:
+        with pytest.raises(ps.SliceError, match="prints PLA only"):
+            ps.read_spec(raw)
+
+
+# board 459044ef: the H2D's two nozzles. The spec names the one whose AMS holds the member's spool; the slice maps the member's one
+# filament to it (OrcaSlicer's manual filament map, a logical extruder from 1), turned into a logical extruder by the preset's own
+# physical_extruder_map, so the plate's group_id is what hub 0.77's dispatch reads (tests/test_real_slice.py slices it for real)
+def test_a_two_nozzle_printer_is_told_the_nozzle_and_the_map_follows_the_preset():
+    with pytest.raises(ps.SliceError, match="nozzles holds the spool"):
+        ps.read_spec({**SPEC, "model": "H2D"})
+    with pytest.raises(ps.SliceError, match="nozzles holds the spool"):
+        ps.read_spec({**SPEC, "model": "H2D", "nozzle": 1})
+    assert ps.read_spec({**SPEC, "model": "H2D", "nozzle": "right"})["nozzle"] == "right"
+    assert ps.read_spec({**SPEC, "nozzle": "right"})["nozzle"] is None   # a one-nozzle printer ignores it
+    h2d = {"physical_extruder_map": ["1", "0"]}   # Bambu Lab H2D 0.4 nozzle, OrcaSlicer 2.4.2
+    assert ps.nozzle_map(h2d, "left") == {"filament_map_mode": "Manual", "filament_map": ["1"]}
+    assert ps.nozzle_map(h2d, "right") == {"filament_map_mode": "Manual", "filament_map": ["2"]}
+    assert ps.nozzle_map({"physical_extruder_map": ["0", "1"]}, "left")["filament_map"] == ["2"]
+    for bad in ({}, {"physical_extruder_map": ["0"]}, {"physical_extruder_map": ["x", "y"]}):
+        with pytest.raises(ps.SliceError, match="which nozzle is which"):
+            ps.nozzle_map(bad, "left")
+
+
+# board 72f424f2, "show the member what the slice actually used": slice_info's support_used is OrcaSlicer's enable_support, so a
+# ticked box over a part that needed none said "with temporary supports"; the G-code says what was laid
+@pytest.mark.parametrize("gcode, made", [("; FEATURE: Outer wall\nG1 X1 E1\n", False), ("; FEATURE: Support\nG1 X1 E1\n", True),
+                                         ("; FEATURE: Support interface\nG1 X1 E1\n", True)])
+def test_supports_are_reported_as_the_gcode_lays_them(tmp_path, gcode, made):
+    f = tmp_path / "sliced.3mf"
+    with zipfile.ZipFile(f, "w") as z:
+        z.writestr("Metadata/slice_info.config", '<config><plate><metadata key="support_used" value="true"/><filament id="1" used_g="2"/></plate></config>')
+        z.writestr("Metadata/plate_1.gcode", gcode)
+    assert ps.summarize(str(f))["supportUsed"] is made
 
 
 @pytest.mark.parametrize("fixes", [{"orient": True, "brim": False}, {"orient": True, "brim": "no", "supports": False}, {}])

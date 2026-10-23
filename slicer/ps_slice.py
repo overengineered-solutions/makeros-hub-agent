@@ -9,11 +9,12 @@ only, capped). Output: /job/out/sliced.3mf, a Bambu sliced plate the hub reads l
 /job/out/result.json.
 
 job.json:
-  {"mesh": "part.stl", "model": "A1 Mini" | "P2S" | "X1C",
+  {"mesh": "part.stl", "model": "A1 Mini" | "P2S" | "X1C" | "H2D",
    "filament": {"trayInfoIdx": "GFA00" | null, "type": "PLA", "colorHex": "#F2754E"},
-   "fixes": {"orient": true, "brim": false, "supports": false}, "scale": 1.0}
+   "fixes": {"orient": true, "brim": false, "supports": false}, "scale": 1.0, "nozzle": "left" | "right" (the H2D only)}
   All three fixes are required booleans. scale is the site's one factor (the file's units and the member's scale); this
-  wrapper applies it to the mesh (scale_stl), never OrcaSlicer.
+  wrapper applies it to the mesh (scale_stl), never OrcaSlicer. nozzle: on a two-nozzle printer, the one whose AMS holds the
+  member's spool; the plate names it, and the hub dispatches on it (0.77).
   {"probe": true} instead asks what this image slices (caps()); every result.json carries the same answer.
 
 Presets: Bambu's own system presets bundled with OrcaSlicer, resolved through their `inherits` chains here (the CLI does
@@ -39,13 +40,20 @@ PROFILES = os.environ.get("PS_PROFILES", "/opt/orca/resources/profiles/BBL")
 JOB = os.environ.get("PS_JOB_DIR", "/job")
 
 # The shop's printer models the auto path slices for: the site's model name -> the Bambu machine preset and the suffix
-# its process and filament presets carry. H2D waits: two nozzles need an extruder choice the spec does not carry yet.
+# its process and filament presets carry. Every one is the 0.4 mm nozzle and the 0.20 mm process, always: operator, 2026-10-22,
+# "we should never auto switch to a different nozzle size or layer height" (selftest checks both against the presets).
 MODELS = {
     "A1 Mini": ("Bambu Lab A1 mini 0.4 nozzle", "A1M"),
     "P2S": ("Bambu Lab P2S 0.4 nozzle", "P2S"),
     "X1C": ("Bambu Lab X1 Carbon 0.4 nozzle", "X1C"),
+    "H2D": ("Bambu Lab H2D 0.4 nozzle", "H2D"),   # board 459044ef: the spec names the nozzle (filament_map below)
 }
 PROCESS = "0.20mm Standard @BBL {sfx}"
+# A two-nozzle printer's nozzles as the printer reports them (bambu_parse extruderId: 0 right, 1 left).
+NOZZLES = {"right": 0, "left": 1}
+TWO_NOZZLES = {"H2D"}
+# Operator, 2026-10-22: "A1 minis PLA only" (an open printer; PETG and the rest go to the closed ones).
+PLA_ONLY = {"A1 Mini"}
 
 # The shop's own settings for every automatic slice, per model, in one place. Each value is written into the process, so a
 # preset change or an OrcaSlicer default never decides it quietly. Change a model's line here and the hub's next release
@@ -62,6 +70,7 @@ SHOP_PROCESS: dict[str, dict[str, str]] = {
     "A1 Mini": {"sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%"},
     "P2S": {"sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%"},
     "X1C": {"sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%"},
+    "H2D": {"sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%"},
 }
 # The factor the site sends (Send to PS step 2): the file's units and the member's scale in one number on the file as the site
 # read it. 1:1000 of a file in millimetres up to a file in metres at full size; what fits is the bed's to say. Hubs before this
@@ -107,6 +116,11 @@ def read_spec(raw: dict) -> dict:
     for k in ("orient", "brim", "supports"):
         if not isinstance(fixes.get(k), bool):
             raise SliceError(f"the slice request does not say whether to {FIX_WORDS[k]}")
+    if model in PLA_ONLY and ftype != "PLA":
+        raise SliceError(f"the {model} prints PLA only; pick a closed printer for {ftype}")
+    nozzle = raw.get("nozzle")
+    if model in TWO_NOZZLES and nozzle not in NOZZLES:
+        raise SliceError(f"the slice request does not say which of the {model}'s nozzles holds the spool")
     scale = raw.get("scale", 1.0)
     if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not SCALE_MIN <= float(scale) <= SCALE_MAX:
         raise SliceError("the size change is outside what the slicer accepts")
@@ -116,7 +130,7 @@ def read_spec(raw: dict) -> dict:
         "tray": tray if isinstance(tray, str) and TRAY_RE.match(tray) else None,
         "stated": stated,
         "orient": fixes["orient"], "brim": fixes["brim"], "supports": fixes["supports"],
-        "scale": float(scale),
+        "scale": float(scale), "nozzle": nozzle if model in TWO_NOZZLES else None,
     }
 
 
@@ -260,6 +274,19 @@ def shop_process(spec: dict) -> dict[str, str]:
     return out
 
 
+def nozzle_map(machine: dict, nozzle: str) -> dict:
+    """The member's one filament on the nozzle the spec names (board 459044ef: "put the member's filament on the nozzle whose AMS
+    has that spool (filament_map manual), so hub 0.77's plate routing reads it"). OrcaSlicer's manual map names a logical extruder
+    from 1; the machine preset's physical_extruder_map says which nozzle each is (the H2D's ["1", "0"]: extruder 1 is the left)."""
+    try:
+        physical = [int(v) for v in machine.get("physical_extruder_map") or []]
+    except (TypeError, ValueError):
+        physical = []
+    if NOZZLES[nozzle] not in physical:
+        raise SliceError("the slicer's presets do not say which nozzle is which")
+    return {"filament_map_mode": "Manual", "filament_map": [str(physical.index(NOZZLES[nozzle]) + 1)]}
+
+
 def orca_args(spec: dict, paths: dict[str, str], out: str, mesh: str) -> list[str]:
     """The OrcaSlicer command line, with orientation stated every time, not only when it differs from a default. No --scale:
     the mesh it is given is already at its printed size (scale_stl)."""
@@ -308,9 +335,13 @@ def summarize(threemf: str) -> dict:
         if "Metadata/plate_1.gcode" not in names:
             raise SliceError("the slicer produced no print for plate 1")
         info = z.read("Metadata/slice_info.config").decode("utf-8")
+        gcode = z.read("Metadata/plate_1.gcode")
     grams = sum(float(g) for g in re.findall(r'<filament [^>]*used_g="([0-9.]+)"', info))
     seconds = int(float((re.search(r'key="prediction" value="([0-9.]+)"', info) or [0, "0"])[1]))
-    support = (re.search(r'key="support_used" value="(\w+)"', info) or [0, "false"])[1] == "true"
+    # supports the slice laid, from its G-code's Support features; slice_info's support_used is only the setting (OrcaSlicer
+    # writes enable_support there, PrintApply.cpp), so a ticked box over a part that needed none read "with temporary supports"
+    # on the member's confirm card (board 72f424f2: "show the member what the slice actually used")
+    support = b"; FEATURE: Support" in gcode
     model_id = (re.search(r'key="printer_model_id" value="([^"]*)"', info) or [0, ""])[1]
     return {"grams": round(grams, 2), "seconds": seconds, "supportUsed": support, "modelId": model_id,
             "plates": sum(1 for n in names if re.fullmatch(r"Metadata/plate_\d+\.gcode", n))}
@@ -333,6 +364,8 @@ def run(job_dir: str | None = None) -> dict:
     process = flatten(processes, PROCESS.format(sfx=sfx))
     process.update(shop_process(spec))
     process["curr_bed_type"] = vendor.get("default_bed_type") or "Textured PEI Plate"
+    if spec.get("nozzle"):
+        process.update(nozzle_map(machine, spec["nozzle"]))
     filament_name = pick_filament(filaments, machine_name, sfx, spec["type"], spec["tray"], spec.get("stated"))
     filament = flatten(filaments, filament_name)
     if spec["color"]:
@@ -374,15 +407,18 @@ def selftest() -> None:
     assert set(SHOP_PROCESS) == set(MODELS), "every model the auto path slices for needs its shop settings"
     assert shop_process(s)["brim_type"] == "no_brim" and shop_process(s)["enable_support"] == "0", shop_process(s)
     assert s["type"] == "PLA" and s["color"] == "#F2754E" and s["tray"] == "GFA00" and s["orient"] and not s["brim"], s
-    for bad in ({**ok, "model": "H2D"}, {**ok, "mesh": "../x.stl"}, {**ok, "mesh": "x.exe"},
-                {**ok, "filament": {"type": "wood"}}, {**ok, "scale": 5000}, {**ok, "scale": 0.0005}, {**ok, "scale": True},
+    assert read_spec({**ok, "model": "H2D", "nozzle": "left"})["nozzle"] == "left" and s["nozzle"] is None
+    assert nozzle_map({"physical_extruder_map": ["1", "0"]}, "left") == {"filament_map_mode": "Manual", "filament_map": ["1"]}
+    assert nozzle_map({"physical_extruder_map": ["1", "0"]}, "right")["filament_map"] == ["2"]
+    for bad in ({**ok, "model": "H2D"}, {**ok, "model": "H2D", "nozzle": "middle"}, {**ok, "mesh": "../x.stl"}, {**ok, "mesh": "x.exe"},
+                {**ok, "filament": {"type": "wood"}}, {**ok, "filament": {"type": "PETG"}}, {**ok, "scale": 5000}, {**ok, "scale": 0.0005}, {**ok, "scale": True},
                 {**ok, "fixes": {"orient": True, "brim": False}}, {**ok, "fixes": {"orient": True, "brim": 1, "supports": False}}):
         try:
             read_spec(bad)
         except SliceError:
             continue
         raise AssertionError(f"accepted {bad}")
-    assert read_spec({**ok, "filament": {"type": "PETG", "colorHex": "red", "trayInfoIdx": "x;"}})["color"] is None
+    assert read_spec({**ok, "model": "P2S", "filament": {"type": "PETG", "colorHex": "red", "trayInfoIdx": "x;"}})["color"] is None
     idx = {"a": {"name": "a", "inherits": "b", "k": 1}, "b": {"name": "b", "k": 0, "j": 2}}
     assert flatten(idx, "a") == {"name": "a", "inherits": "", "k": 1, "j": 2, "from": "system"}
     try:
@@ -398,6 +434,14 @@ def selftest() -> None:
     if os.path.isdir(PROFILES):   # inside the image (its build runs this): every model's process names its line width
         got = caps()
         assert set(got["lineWidth"]) == set(MODELS) and (got["scaleMin"], got["scaleMax"]) == (SCALE_MIN, SCALE_MAX), got
+        # the 0.4 mm nozzle and the 0.20 mm layer on every model, whatever a preset update brings (operator, 2026-10-22: "we should
+        # never auto switch to a different nozzle size or layer height"), and each nozzle of a two-nozzle printer its own extruder
+        machines, processes = load_index("machine"), load_index("process")
+        for model, (machine_name, sfx) in MODELS.items():
+            m, p = flatten(machines, machine_name), flatten(processes, PROCESS.format(sfx=sfx))
+            assert set(m["nozzle_diameter"]) == {"0.4"} and str(_first(p["layer_height"])) == "0.2", model
+            if model in TWO_NOZZLES:
+                assert nozzle_map(m, "left") != nozzle_map(m, "right"), model
     print("selftest ok")
 
 
