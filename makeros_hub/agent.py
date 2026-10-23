@@ -857,9 +857,10 @@ def heartbeat_payload(
     if slicer_ready and isinstance(slicer_caps, dict):
         payload["slicerCaps"] = dict(slicer_caps)
     # v0.81: what the installed file checker is ({format, version}, read from the image: checks.CHECKER), only while it is installed
-    # and has answered; absent = no checks for this box (pstation hands checks only to a checker at least its own format)
+    # and has answered, and whether the one check worker is free; absent = no checks for this box (pstation hands a check only to a
+    # checker at least its own format, and only on a beat that says the worker is free)
     if isinstance(checker, dict):
-        payload["checker"] = {"format": checker.get("format"), "version": checker.get("version")}
+        payload["checker"] = {"format": checker.get("format"), "version": checker.get("version"), "free": checker.get("free") is True}
     if paper_ready is not None:
         payload["paperReady"] = bool(paper_ready)   # v0.73: the site hands paper jobs only to a box that can render them
     # v0.75: whether the camera gateway answered recently (the site offers live view of the RTSPS printers only while it
@@ -2023,7 +2024,7 @@ def run(
                         vp_connects=vp_connects,
                         slicer_ready=slicer_ready,
                         slicer_caps=SLICER_CAPS.value,
-                        checker=check_lane.CHECKER.value if checker_ready else None,
+                        checker=check_lane.heartbeat_checker(not check_lock.locked()) if checker_ready else None,
                         paper_ready=paper_lane.paper_ready(),
                         camera_gateway=GATEWAY.available(),
                         camera_live_stats=live_views.stats(),
@@ -2117,9 +2118,11 @@ def run(
                                 check_lane.run_checks(
                                     items,
                                     SPOOL_DIR,
-                                    getter=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential, max_bytes=check_lane.MAX_CHECK_BYTES),
-                                    post_json=lambda path, body: post_json(cfg.file_url(path), body, bearer=credential, timeout=60.0),
-                                    post_bytes=lambda path, data: post_bytes(cfg.file_url(path), data, bearer=credential, timeout=120.0),
+                                    # every stage gets what is left of the check's one deadline (checks.py run_checks)
+                                    getter=lambda path, dest, sec: get_to_file(cfg.file_url(path), dest, bearer=credential, max_bytes=check_lane.MAX_CHECK_BYTES,
+                                                                               max_seconds=float(sec), timeout=min(60.0, float(sec))),
+                                    post_json=lambda path, body, sec: post_json(cfg.file_url(path), body, bearer=credential, timeout=float(sec)),
+                                    post_bytes=lambda path, data, sec: post_bytes(cfg.file_url(path), data, bearer=credential, timeout=float(sec)),
                                 )
                             finally:
                                 check_lock.release()

@@ -1,23 +1,80 @@
 #!/bin/sh
-# run-check <job id>: one member file check for the hub, in the locked-down ps-checker container (checker/Dockerfile).
+# run-check <job id> [seconds]: one member file check for the hub, in the locked-down ps-checker container (checker/Dockerfile).
 # Installed root:root 0755 at /opt/ps-checker/run-check by oes-pool-deploy scripts/install-checker.py; the hub's service user may run
-# exactly this through sudo. The id names <spool>/<id>/.check, which must be a real directory owned by the hub's user (no symlink
-# anywhere on the way); the container sees only that directory, as that user, with no network, a read-only root, 2 GB of memory,
-# 2 CPUs, 64 processes and 150 seconds. Exit 124 at the time limit, 137 when it was stopped for memory; otherwise the checker's own
-# /job/out/report.json says how the check went.
+# exactly this through sudo.
+#
+# The hub owns its spool, so nothing there is trusted (ChatGPT's review, 2026-10-22: the hub could swap the folder between a check and
+# the mount). The job is STAGED instead: a fresh directory under /var/lib/ps-checker/run, root's alone (0700), that the hub can neither
+# see nor swap. job.json and the one model.* file are read from <spool>/<id>/.check AS THE HUB'S USER (so it can hand over only what it
+# may read itself) and copied in, size-capped; the container sees only that staged job, as the hub's user, with no network, a read-only
+# root, 2 GB of memory, 2 CPUs and 64 processes; afterwards report.json, picture.png and model.stl are copied back out, only as regular
+# files (never a link), size-capped, and written AS THE HUB'S USER into <spool>/<id>/.check/out. The container is named, and on the time
+# limit (seconds, 5 to 150, default 150) or an interruption it is killed and removed, and the staged job deleted, every time.
+# Exit 124 at the time limit, 137 when it was stopped for memory, 2 for a job it refused; otherwise out/report.json says how it went.
 set -eu
 SPOOL=/var/lib/makeros-hub/spool
 HUB_USER=makeros-hub
-IMAGE=ps-checker:current
+STAGE=/var/lib/ps-checker/run
+# through sudo (the hub) always the installed image; root itself may name a candidate (install-checker.py proves one before it is current)
+if [ -n "${SUDO_USER:-}" ]; then IMAGE=ps-checker:current; else IMAGE=${PS_CHECKER_IMAGE:-ps-checker:current}; fi
 id="${1:-}"
+secs="${2:-150}"
 case "$id" in ""|*[!0-9a-f]*) echo "run-check: the job id is lowercase hex" >&2; exit 2 ;; esac
 [ "${#id}" -ge 8 ] && [ "${#id}" -le 64 ] || { echo "run-check: the job id is 8 to 64 characters" >&2; exit 2; }
+case "$secs" in ""|*[!0-9]*) echo "run-check: the seconds are a whole number" >&2; exit 2 ;; esac
+[ "$secs" -ge 5 ] && [ "$secs" -le 150 ] || { echo "run-check: the seconds are 5 to 150" >&2; exit 2; }
 dir="$SPOOL/$id/.check"
-real=$(realpath -e -- "$dir" 2>/dev/null) || { echo "run-check: no check job at $dir" >&2; exit 2; }
-[ "$real" = "$dir" ] || { echo "run-check: $dir is not a plain directory" >&2; exit 2; }
-[ -d "$real" ] || { echo "run-check: $dir is not a directory" >&2; exit 2; }
 uid=$(id -u "$HUB_USER"); gid=$(id -g "$HUB_USER")
-[ "$(stat -c %u "$real")" = "$uid" ] || { echo "run-check: $dir is not the hub's" >&2; exit 2; }
-exec timeout 150 docker run --rm --network none --read-only --tmpfs /tmp:size=64m,mode=1777 \
+as_hub() { setpriv --reuid="$uid" --regid="$gid" --clear-groups -- "$@"; }
+
+install -d -o root -g root -m 0700 "$STAGE"
+work=$(mktemp -d "$STAGE/$id.XXXXXX")
+name="ps-check-$id"
+pid=""
+cleanup() {
+  if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+  docker rm -f "$name" >/dev/null 2>&1 || true
+  rm -rf "$work"
+}
+trap cleanup EXIT
+trap 'cleanup; exit 143' INT TERM HUP
+
+as_hub test -d "$dir" || { echo "run-check: no check job at $dir" >&2; exit 2; }
+install -d -o root -g root -m 0755 "$work/job"
+install -d -o "$uid" -g "$gid" -m 0700 "$work/job/out"
+# copy_in <name> <cap>: read as the hub, at most cap bytes
+copy_in() {
+  as_hub head -c "$(($2 + 1))" -- "$dir/$1" > "$work/job/$1" || { echo "run-check: the hub cannot read $1" >&2; exit 2; }
+  [ "$(stat -c %s "$work/job/$1")" -le "$2" ] || { echo "run-check: $1 is over $2 bytes" >&2; exit 2; }
+  chmod 0644 "$work/job/$1"
+}
+copy_in job.json 65536
+models=0
+for m in model.stl model.obj model.3mf; do
+  if as_hub test -f "$dir/$m"; then copy_in "$m" 33554432; models=$((models + 1)); fi
+done
+[ "$models" -le 1 ] || { echo "run-check: one model file" >&2; exit 2; }
+
+started=$(date +%s)
+timeout -k 5 "$secs" docker run --rm --name "$name" --network none --read-only --tmpfs /tmp:size=64m,mode=1777 \
   --memory 2g --memory-swap 2g --cpus 2 --pids-limit 64 --security-opt no-new-privileges --cap-drop ALL \
-  --user "$uid:$gid" -e HOME=/tmp -v "$real":/job "$IMAGE"
+  --user "$uid:$gid" -e HOME=/tmp -v "$work/job":/job "$IMAGE" >/dev/null 2>&1 &
+pid=$!
+rc=0
+wait "$pid" || rc=$?
+pid=""
+docker rm -f "$name" >/dev/null 2>&1 || true   # a container that ignored the stop is killed and removed here
+[ $(($(date +%s) - started)) -lt "$secs" ] || rc=124
+
+# copy_out <name> <cap>: a regular file the container wrote, never a link, written into the hub's folder as the hub
+as_hub mkdir -p -- "$dir/out" || true
+copy_out() {
+  f="$work/job/out/$1"
+  if [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %s "$f")" -le "$2" ]; then
+    as_hub sh -c 'cat > "$1"' sh "$dir/out/$1" < "$f" || echo "run-check: could not write $1 back" >&2
+  fi
+}
+copy_out report.json 4194304
+copy_out picture.png 2000000
+copy_out model.stl 33554432
+exit "$rc"

@@ -1,4 +1,4 @@
-// ps-checker 2cabe0cfc2d0, format 1: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
+// ps-checker 96ea7bdbcfd9, format 1: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
 
 // src/checker/main.ts
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -1248,7 +1248,7 @@ function bounded(report) {
 }
 
 // src/checker/main.ts
-var CHECKER_VERSION = true ? "2cabe0cfc2d0" : "source";
+var CHECKER_VERSION = true ? "96ea7bdbcfd9" : "source";
 var JOB = process.env.PS_JOB_DIR ?? "/job";
 function readJob(raw) {
   if (!raw || typeof raw !== "object") return "job.json is not an object";

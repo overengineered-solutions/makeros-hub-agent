@@ -41,10 +41,14 @@ def _boxes_stl(*boxes) -> bytes:
     return bytes(out)
 
 
-def _flags() -> list[str]:
-    """run-check's docker run flags, read from the script itself, so this runs the container exactly as the box will."""
+def _flags(work: Path) -> list[str]:
+    """run-check's docker run flags, read from the script itself, so this runs the container exactly as the box will (the staging,
+    the copies as the hub's user and the cleanup are tests/test_run_check_box.py's, on a box)."""
     line = re.search(r"docker run (.*?)\"\$IMAGE\"", RUN_CHECK.read_text().replace("\\\n", " "), re.S).group(1)
-    return line.replace('"$uid:$gid"', f"{os.getuid()}:{os.getgid()}").split()
+    for var, value in (('"$uid:$gid"', f"{os.getuid()}:{os.getgid()}"), ('"$work/job"', str(work)), ('"$name"', f"ps-check-test-{os.getpid()}")):
+        assert var in line, var
+        line = line.replace(var, value)
+    return line.split()
 
 
 def _run(tmp_path, job: dict, model: bytes | None = None) -> tuple[dict, Path]:
@@ -53,7 +57,8 @@ def _run(tmp_path, job: dict, model: bytes | None = None) -> tuple[dict, Path]:
     (work / "job.json").write_text(json.dumps(job))
     if model is not None:
         (work / "model.stl").write_bytes(model)
-    cmd = ["docker", "run", *[f.replace('"$real"', str(work)) for f in _flags()], IMAGE]
+    (work / "out").mkdir()
+    cmd = ["docker", "run", *_flags(work), IMAGE]
     subprocess.run(cmd, check=True, capture_output=True, timeout=180)
     return json.loads((work / "out" / "report.json").read_text()), work / "out"
 

@@ -71,19 +71,26 @@ sh -n update.sh
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
 
-## Next candidate: members' file checks run on the shop box
+## 0.81.0 candidate: members' file checks run on the shop box
 
 Operator, 2026-10-22: "Let's go ahead and do the work to get it on the shop box instead of raising the linode cap". The
 site's Will it print? check no longer parses a mesh on the website; it queues the file and hands it here.
 
 - The heartbeat carries `checker` (`{format, version}` of the installed image, from a probe at start and every 15 minutes,
-  and from every check's own report), only while `/opt/ps-checker/run-check` is installed. The site hands checks
-  (`checks`, one a beat, each with an attempt token) only to a box whose checker format is at least its own.
+  and from every check's own report, plus `free`: whether the one check worker is idle), only while
+  `/opt/ps-checker/run-check` is installed. The site hands a check (`checks`, with an attempt token and the `seconds` the
+  hub has) only on a free beat, to a box whose checker format is at least its own; a free beat also tells the site that a
+  check it thought this box was running was lost, and it is queued again at once.
 - `makeros_hub/checks.py` fetches the file with the hub token into `<spool>/<id>/.check`, writes `job.json`, runs
-  `sudo -n /opt/ps-checker/run-check <id>` (root-owned, installed by oes-pool-deploy `scripts/install-checker.py`: no
-  network, read-only root, 2 GB, 2 CPUs, 64 processes, 150 s, as the hub's user), sends Print it's slicer copy when asked
-  and posts the report, then removes the folder. One check at a time; a busy site (its one upload slot taken) is waited for
-  2 s a try, up to a minute; anything the site refuses is dropped and its lease takes the check back.
+  `sudo -n /opt/ps-checker/run-check <id> <seconds>`, sends Print it's slicer copy when asked and posts the report, then
+  removes the folder. The fetch (and any wait for the site's one upload slot), the run and both posts share the check's one
+  deadline. A report carries the identity of the run that wrote it; a run that was stopped carries none. Outputs are read
+  only as regular files, never through a link. Anything the site refuses is dropped and the site takes the check back.
+- `checker/run-check` (root-owned, installed by oes-pool-deploy `scripts/install-checker.py`) never mounts the hub's
+  folder: it stages the job in `/var/lib/ps-checker/run` (root's alone), copies the inputs in and the outputs back as the
+  hub's user (so a swapped folder or a link reaches only what the hub could reach itself), runs a named container (no
+  network, read-only root, 2 GB, 2 CPUs, 64 processes) and kills and removes it at the deadline or on an interruption.
+  Through sudo it always runs `ps-checker:current`. `tests/test_run_check_box.py` runs it for real on a box.
 - `checker/` holds the container: Node 22 on Alpine and `check.mjs`, the site's own check code bundled by pstation
   `scripts/build-checker.mjs`. Its first line names the pstation commit and format; rebuild it there, never edit it here.
 
