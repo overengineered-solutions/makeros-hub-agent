@@ -1,4 +1,4 @@
-// ps-checker a6ac49397896, format 2: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
+// ps-checker 03e94c59d47b, format 3: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
 
 // src/checker/main.ts
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -226,6 +226,13 @@ function parse3mf(bytes) {
       if (!OBJECT_ID.test(id ?? "")) throw damaged();
       const body = m[2];
       const o = { id, name: cleanName(name ?? ""), comps: [] };
+      const metadata = Object.fromEntries([...body.matchAll(/<metadata\s+name=["'](ps:group|ps:colour)["']\s*>([^<]*)<\/metadata>/g)].map((m2) => [m2[1], m2[2].replace(/&(amp|lt|gt|quot|apos);/g, (_, e) => ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" })[e] ?? "")]));
+      if (metadata["ps:group"] !== void 0 || metadata["ps:colour"] !== void 0) {
+        const name2 = metadata["ps:group"]?.trim(), colorHex = metadata["ps:colour"];
+        if (!name2 || name2.length > 160 || !/^#[0-9a-f]{6}$/i.test(colorHex ?? ""))
+          throw new PrintabilityError("The model's group colours could not be read. Export it again from your design program.");
+        o.group = { name: name2, colorHex };
+      }
       const mesh = /<mesh\b[\s\S]*?<\/mesh>/.exec(body)?.[0];
       if (mesh) {
         o.verts = [];
@@ -251,13 +258,16 @@ function parse3mf(bytes) {
   if (items.some((it) => !OBJECT_ID.test(it.objectid ?? ""))) throw damaged();
   const out = [];
   const names = [], from = [], of = [];
+  const colours = [];
   let placed = 0;
-  const place = (key, m, depth, path, named) => {
+  const place = (key, m, depth, path, named, group) => {
     const o = objects.get(key);
     if (!o || depth > 8) return;
     if (++placed > MAX_PLACEMENTS) throw new PrintabilityError(`This 3MF places more than ${MAX_PLACEMENTS.toLocaleString("en-US")} objects, too many to check here.`);
     const here = `${path} > object ${o.id}`, name = o.name ?? named;
+    group = o.group ?? group;
     if (o.verts && o.tris) {
+      if (o.tris.length) colours.push({ ...group ?? { name: "Other objects", colorHex: "#FFFFFF" }, first: out.length / 9, count: o.tris.length / 3 });
       for (let i = 0; i < o.tris.length; i++) {
         const vi = o.tris[i];
         if (!(vi >= 0 && vi * 3 + 2 < o.verts.length)) throw new PrintabilityError("The 3MF refers to a vertex it does not have.");
@@ -269,16 +279,20 @@ function parse3mf(bytes) {
       names.push(name);
       from.push(here);
     }
-    for (const c of o.comps) place(`${c.path}#${c.id}`, compose(c.m, m), depth + 1, here, name);
+    for (const c of o.comps) place(`${c.path}#${c.id}`, compose(c.m, m), depth + 1, here, name, group);
   };
   items.forEach((it, i) => place(`${rootPath}#${it.objectid}`, matrix(it.transform), 0, `item ${i + 1}`, null));
+  if (new Set(colours.map((c) => JSON.stringify([c.name, c.colorHex.toUpperCase()]))).size > 128)
+    throw new PrintabilityError("This model has more than 128 colour groups. Merge some layers or send fewer objects.");
+  if (colours.length > 2e3 && Array.from(objects.values()).some((o) => o.group)) throw new PrintabilityError("This model has too many coloured objects. Send fewer objects at a time (up to 2,000).");
   if (!out.length) throw new PrintabilityError("The 3MF has no printable objects on its build plate.");
   return {
     kind: "3mf",
     positions: Float32Array.from(out),
     triangles: out.length / 9,
     ...stated ? { unit: stated } : {},
-    objects: { names, from, of: Uint32Array.from(of) }
+    objects: { names, from, of: Uint32Array.from(of) },
+    ...Array.from(objects.values()).some((o) => o.group) ? { colours } : {}
   };
 }
 function unzipModels(bytes) {
@@ -447,6 +461,7 @@ function analyze(mesh, models = Object.keys(PLATES), minWallMm = MIN_WALL_MM, st
     thin,
     grams,
     parts,
+    ...mesh.colours ? { colours: mesh.colours } : {},
     findings: [],
     marks
   };
@@ -1255,7 +1270,7 @@ function render(mesh, marks, width = 640, height = 480) {
 }
 
 // src/lib/check-job.ts
-var CHECKER_FORMAT = 2;
+var CHECKER_FORMAT = 3;
 var MAX_REPORT_CHARS = 6e5;
 function checkFile(input, stage = () => {
 }) {
@@ -1283,7 +1298,7 @@ function bounded(report) {
 }
 
 // src/checker/main.ts
-var CHECKER_VERSION = true ? "a6ac49397896" : "source";
+var CHECKER_VERSION = true ? "03e94c59d47b" : "source";
 var JOB = process.env.PS_JOB_DIR ?? "/job";
 function readJob(raw) {
   if (!raw || typeof raw !== "object") return "job.json is not an object";
