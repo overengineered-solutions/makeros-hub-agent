@@ -20,6 +20,7 @@ def _write_3mf_with_objects(path: Path, plate: int, objects: list[tuple[int, str
     )
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("Metadata/slice_info.config", slice_info)
+        zf.writestr(f"Metadata/plate_{plate}.gcode", "; sliced")   # a sliced plate holds its G-code (v0.80.1 checks it)
 
 
 class FakeAdapter:
@@ -114,6 +115,36 @@ class TestDispatchAssignments(unittest.TestCase):
 
         uploading = next(r for r in reports if r["state"] == "uploading")
         self.assertNotIn("objects", uploading)
+
+    def test_plate_the_file_does_not_hold_is_refused_before_the_printer_is_told(self):
+        # v0.80.1 (2026-10-22): an OrcaSlicer 2.4.2 single-plate export of plate 2 holds only plate_2.gcode; sent plate 1, the
+        # printer took the command, stopped on its screen and the hub reported start_not_observed two minutes later, six times
+        with tempfile.TemporaryDirectory() as d:
+            spool_file = Path(d) / "abcdef12" / "part.3mf"
+            spool_file.parent.mkdir()
+            _write_3mf_with_objects(spool_file, plate=2, objects=[])
+            manager = PrinterManager()
+            fake = FakeAdapter({"ok": True})
+            manager._adapters["p1"] = fake
+
+            refused = manager.dispatch_assignments([assignment(plate=1, assignmentSeq=4)], d)
+            self.assertEqual(refused, [{"queueJobId": "q1", "state": "held", "assignmentSeq": 4,
+                                        "reason": "plate_missing: the file has no plate 1; it holds plate 2"}])
+            self.assertEqual(fake.calls, [])   # nothing uploaded, no start published
+
+            # the plate it holds starts as before
+            self.assertEqual(manager.dispatch_assignments([assignment(plate=2, assignmentSeq=5)], d),
+                             [{"queueJobId": "q1", "state": "uploading", "assignmentSeq": 5}])
+            self.assertEqual(fake.calls[0][2]["plate"], 2)
+
+            # a zip with no sliced plate at all (an unsliced project) is refused too; a file that is not a zip is not this
+            # check's business (a Klipper .gcode): it goes on to the adapter
+            with zipfile.ZipFile(spool_file, "w") as zf:
+                zf.writestr("3D/3dmodel.model", "<model/>")
+            self.assertEqual(manager.dispatch_assignments([assignment(queueJobId="q2", plate=1)], d)[0]["reason"],
+                             "plate_missing: the file has no plate 1; it holds no sliced plate")
+            spool_file.write_bytes(b"G28\n")
+            self.assertEqual(manager.dispatch_assignments([assignment(queueJobId="q3", plate=1)], d)[0]["state"], "uploading")
 
     def test_file_missing_reports_held(self):
         with tempfile.TemporaryDirectory() as d:

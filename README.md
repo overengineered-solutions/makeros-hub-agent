@@ -93,6 +93,9 @@ site's Will it print? check no longer parses a mesh on the website; it queues th
   Through sudo it always runs `ps-checker:current`. `tests/test_run_check_box.py` runs it for real on a box.
 - `checker/` holds the container: Node 22 on Alpine and `check.mjs`, the site's own check code bundled by pstation
   `scripts/build-checker.mjs`. Its first line names the pstation commit and format; rebuild it there, never edit it here.
+- The plate guard of 0.80.1 (never released alone) ships here too (operator, 2026-10-22: "see if you can dive into her
+  files"): a printer is never told to start a plate its 3MF does not hold (`plate_missing`, `plate_unreadable`), and an
+  assignment that names no plate prints a one-plate file's own plate and is refused as `plate_unchosen` for a file with several.
 
 ## 0.72.0 candidate: the shop slices members' checked files itself
 
