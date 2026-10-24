@@ -1,4 +1,4 @@
-// ps-checker 1ea7f973b500, format 4: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
+// ps-checker d444bec7e29c, format 4: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
 
 // src/checker/main.ts
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -1217,7 +1217,7 @@ function findingsFor(r) {
       id: "in-the-air",
       level: "warn",
       title: air.length === 1 ? "A part starts in the air" : `${air.length} parts start in the air`,
-      detail: `${upper(first.words)} starts ${mm(first.mm)} above ${first.over}${air.length > 1 ? `; ${air.length - 1} more ${air.length === 2 ? "part also starts" : "parts also start"} in air` : ""}; without support, their first layers have nothing to rest on.`
+      detail: `${upper(first.words)} starts ${mm(first.mm)} above ${first.over}${air.length > 1 ? `; ${air.length - 1} more ${air.length === 2 ? "part also starts" : "parts also start"} in air` : ""}; without support, ${air.length > 1 ? "their" : "its"} first layers have nothing to rest on.`
     });
   }
   if (r.parts.count > 1 && !r.parts.judged) f.push({ id: "parts-unchecked", level: "warn", title: "Could not check every part", detail: "The check could not tell whether every piece has something underneath it; the risk is unknown." });
@@ -1324,7 +1324,7 @@ function bounded(report) {
 }
 
 // src/checker/main.ts
-var CHECKER_VERSION = true ? "1ea7f973b500" : "source";
+var CHECKER_VERSION = true ? "d444bec7e29c" : "source";
 var JOB = process.env.PS_JOB_DIR ?? "/job";
 function readJob(raw) {
   if (!raw || typeof raw !== "object") return "job.json is not an object";
