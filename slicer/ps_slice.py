@@ -835,19 +835,36 @@ def run(job_dir: str | None = None) -> dict:
     set_model_id(sliced, model_id)
     result = {"ok": True, "filament": filament_name, "process": PROCESS.format(sfx=sfx), "settings": effective_settings(process),
               **summarize(sliced), **caps(processes, machines)}
+    with open(os.path.join(out, "result.json"), encoding="utf-8") as fh:
+        result["warnings"] = plate_warnings(json.load(fh))
     if prepared:
         result["prepare"] = prepared
         # Orca 2.4.2 reports these as text in result.json. A prepared file with disappearing or floating regions is not approved.
-        log_path = os.path.join(out, "result.json")
-        if os.path.exists(log_path):
-            warnings = json.dumps(json.load(open(log_path, encoding="utf-8"))).lower()
-            if any(w in warnings for w in ("floating regions", "floating cantilever", "empty layers", "too thin")):
-                raise SliceError("The slice still has missing or floating parts. Pick a bigger scale or fix it in your model.")
+        warnings = " ".join(w["message"] for w in result["warnings"]).lower()
+        if any(w in warnings for w in ("floating regions", "floating cantilever", "empty layers", "too thin")):
+            raise SliceError("The slice still has missing or floating parts. Pick a bigger scale or fix it in your model.")
     if result["plates"] != 1:
         raise SliceError(f"the part does not fit one plate (the slicer made {result['plates']}); scale it down or split it")
     if result["grams"] <= 0:
         raise SliceError("the slicer reported no filament for this part")
     return result
+
+
+def plate_warnings(raw: object) -> list[dict]:
+    """Orca's per-plate warning_message, before our summary replaces result.json."""
+    plates = raw.get("sliced_plates") if isinstance(raw, dict) else None
+    if not isinstance(plates, list) or not plates or len(plates) > 16:
+        raise SliceError("the slicer did not report its plate warnings; check the file again")
+    warnings = []
+    for p in plates:
+        if (not isinstance(p, dict) or type(p.get("id")) is not int or not 1 <= p["id"] <= 16
+                or not isinstance(p.get("warning_message"), str) or len(p["warning_message"]) > 4000):
+            raise SliceError("the slicer's plate warnings could not be read; check the file again")
+        message = p["warning_message"].replace("\x00", "").strip()
+        if message:
+            warnings.append({"plate": p["id"], "message": message})
+    print(f"Orca plate warnings: processed={len(plates)}, expected={len(plates)}, warnings={len(warnings)}", file=sys.stderr)
+    return warnings
 
 
 def selftest() -> None:
@@ -918,7 +935,14 @@ def main(argv: list[str]) -> int:
         result = run()
     except (SliceError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         reason = str(exc) if isinstance(exc, SliceError) else "the slicer stopped before it finished"
-        result = {"ok": False, "error": reason, **caps()}   # a refusal still says what this image takes
+        result = {"ok": False, "error": reason, **caps()}
+        orca_result = os.path.join(out, "result.json")
+        if os.path.exists(orca_result):
+            try:
+                with open(orca_result, encoding="utf-8") as fh:
+                    result["warnings"] = plate_warnings(json.load(fh))
+            except (OSError, ValueError, SliceError) as warning_error:
+                print(f"Could not read Orca warnings: {warning_error}", file=sys.stderr)
         prepare_path = os.path.join(out, "prepare.json")
         if os.path.exists(prepare_path):
             result["prepare"] = json.load(open(prepare_path, encoding="utf-8"))

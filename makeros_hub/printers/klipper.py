@@ -1791,6 +1791,7 @@ class KlipperJobTracker:
         # without this the cycle is silently elided and prior print time
         # bleeds into the new one — a billing dispute waiting to happen.
         self._last_print_duration: Optional[float] = None
+        self._last_observed_at: Optional[float] = None
 
     def observe(self, status: dict[str, Any], now: float) -> None:
         """Feed one poll's `status` dict (Moonraker's `result.status` shape)
@@ -1835,23 +1836,23 @@ class KlipperJobTracker:
                 # needs_review path catches zero-gram / null-times).
                 self._emit_recovered(filename, state, now, print_stats)
         else:
-            if state in _TERMINAL_DONE_STATES:
-                self._close("done", now)
-            elif state in _TERMINAL_FAILED_STATES:
-                # Moonraker, unlike Bambu, says which: 'cancelled' is a person stopping it (the cloud's evidence-only
-                # cancelled lane, member text "cancelled at the printer"); 'error' is a failure.
-                self._close("cancelled" if state == "cancelled" else "failed", now)
-            elif state in _ACTIVE_STATES:
-                # Hidden-cycle detection (adversarial review HIGH #2): a
-                # full print→complete→printing or printing→cancelled→printing
-                # cycle inside ONE poll window would otherwise be silently
-                # joined into one job (or misclassified). Klipper resets
-                # print_duration on every new print, so if the current
-                # duration is LOWER than what we last saw, a fresh print
-                # started in between. Close the prior — as 'done' when the
-                # filename matches (most common: re-print of the same file
-                # after success) and 'cancelled' when it differs (abort +
-                # restart with a different file) — and open a new one.
+            # After a polling gap, only the same running start can re-establish proof for a later screen cancel.
+            if self._last_observed_at is not None and now - self._last_observed_at > STALE_SEC:
+                same_start = (print_start is not None and self._active.get("printStart") is not None
+                              and abs(print_start - self._active["printStart"]) <= RESUME_START_SLACK_SEC)
+                self._active["cancelUnproven"] = not same_start
+            if state in _TERMINAL_DONE_STATES.union(_TERMINAL_FAILED_STATES):
+                # A terminal for a different file, a restarted run, or a run ended while we were down cannot prove this print's end.
+                same = (filename is not None and filename == self._active.get("name")
+                        and not self._active.get("endUnproven")
+                        and (state != "cancelled" or not self._active.get("cancelUnproven")
+                             and self._last_print_duration is not None and print_duration is not None)
+                        and (self._last_print_duration is None or print_duration is not None
+                             and print_duration + 1 >= self._last_print_duration))
+                reason = {"complete": "completed", "cancelled": "cancelled", "error": "error"}.get(state, "lost") if same else "lost"
+                self._close({"completed": "done", "cancelled": "cancelled", "error": "failed", "lost": "cancelled"}[reason], now, reason)
+            elif state in _ACTIVE_STATES or state == "paused":
+                # A duration reset proves a new run, never how the old one ended.
                 duration_reset = (
                     self._last_print_duration is not None
                     and print_duration is not None
@@ -1863,11 +1864,7 @@ class KlipperJobTracker:
                     and filename != self._active["name"]
                 )
                 if duration_reset:
-                    # If the filename also changed, the prior print was
-                    # explicitly aborted (cancel + new file). If it's the
-                    # same file, the operator re-printed it after the prior
-                    # one finished — close as 'done', not 'cancelled'.
-                    self._close("cancelled" if filename_changed else "done", now)
+                    self._close("cancelled", now)
                     self._open(filename, now, print_start)
                 elif filename_changed:
                     # Filename swap without a duration reset — we missed
@@ -1877,10 +1874,6 @@ class KlipperJobTracker:
                 elif filename and not self._active.get("name"):
                     self._active["name"] = filename
                     self._save()
-            elif state == "paused":
-                # Paused doesn't open or close; just remember the state for
-                # the next observe call.
-                pass
             elif state == "standby":
                 # Missed the real ending. Treat as cancelled — same
                 # convention as the Bambu tracker.
@@ -1892,6 +1885,7 @@ class KlipperJobTracker:
             self._last_print_duration = print_duration
 
         self._last_state = state
+        self._last_observed_at = now
 
     def pending(self) -> list[dict]:
         return list(self._pending)
@@ -1941,13 +1935,14 @@ class KlipperJobTracker:
                     and abs(saved["printStart"] - print_start) <= RESUME_START_SLACK_SEC)
         else:
             # It ended while the hub was down and the printer still shows it: close it under its own key (observe's normal
-            # branch does, from this state). ponytail: a same-file re-print that ALSO finished while the hub was down is
-            # booked under the saved key. Standby (reset, filename gone) is never adopted: its outcome is unknown, and the
+            # branch does, as lost: a same-file re-print could ALSO have ended while the hub was down, so its ending is not
+            # proof about the saved run. Standby (reset, filename gone) is never adopted: its outcome is unknown, and the
             # queue's outcome_unknown_after_restart covers that, not an invented "cancelled".
             same = state in _TERMINAL_DONE_STATES.union(_TERMINAL_FAILED_STATES)
         if same:
             self._active = {"key": saved["key"], "name": saved["name"], "printStart": saved["printStart"],
-                            "startedAt": now - (_wall(now) - saved["startedWall"])}
+                            "startedAt": now - (_wall(now) - saved["startedWall"]),
+                            "endUnproven": state not in ("printing", "paused")}
             if state not in ("printing", "paused") and saved["printStart"] is not None and total is not None:
                 # it ended at its start + the frozen total_duration, not when the hub came back
                 ended = now - (_wall(now) - (saved["printStart"] + total))
@@ -1981,7 +1976,7 @@ class KlipperJobTracker:
         }
         self._save()   # a restart mid-print must find this key again
 
-    def _close(self, status: str, now: float) -> None:
+    def _close(self, status: str, now: float, end_reason: str = "lost") -> None:
         if self._active is None:
             return
         now = self._active.get("endedAt", now)
@@ -1989,6 +1984,7 @@ class KlipperJobTracker:
             "jobKey": self._active["key"],
             "printerId": self.printer_id,
             "status": status,
+            "endReason": end_reason,
             "startedAt": _iso(self._active["startedAt"]),
             "endedAt": _iso(now),
             "printTimeSeconds": max(0, int(now - self._active["startedAt"])),
@@ -2038,6 +2034,7 @@ class KlipperJobTracker:
             "jobKey": _job_key(self.printer_id, filename, started_at),
             "printerId": self.printer_id,
             "status": status_out,
+            "endReason": "completed" if status_out == "done" else "error" if status_out == "failed" else "lost",
             "startedAt": _iso(started_at),
             "endedAt": _iso(now),
             "printTimeSeconds": print_time_seconds,

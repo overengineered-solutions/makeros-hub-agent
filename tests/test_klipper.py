@@ -762,19 +762,15 @@ class TestKlipperJobTrackerCycleElision(unittest.TestCase):
             }
         }
 
-    def test_print_cycle_within_one_window_same_file_closes_as_done(self):
-        # Operator hits "print again" — same file restarts inside one poll
-        # window. We never see 'complete' between the two 'printing' samples,
-        # but print_duration drops from ~1800 → ~3, which IS the reset edge.
-        # The prior print closes as 'done' (not 'cancelled'), then a fresh
-        # job opens.
+    def test_print_cycle_within_one_window_same_file_has_a_lost_ending(self):
+        # Same-file restart proves a new run, but says nothing about how the old one ended.
         t = self._t()
         t.observe(self._printing("rocket.gcode", 1800.0), 0.0)
         t.observe(self._printing("rocket.gcode", 3.0), 5.0)
-        # One terminal: the prior print, closed as done.
         pending = t.pending()
         self.assertEqual(len(pending), 1)
-        self.assertEqual(pending[0]["status"], "done")
+        self.assertEqual(pending[0]["status"], "cancelled")
+        self.assertEqual(pending[0]["endReason"], "lost")
         self.assertEqual(pending[0]["filename"], "rocket.gcode")
 
     def test_print_cycle_within_one_window_different_file_closes_as_cancelled(self):

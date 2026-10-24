@@ -1,0 +1,49 @@
+{
+  "filename": "bracket.3mf",
+  "samples": [
+    {
+      "state": "printing",
+      "duration": 7200,
+      "now": 100
+    },
+    {
+      "state": "paused",
+      "duration": 0,
+      "now": 105
+    },
+    {
+      "state": "cancelled",
+      "duration": 0,
+      "now": 110
+    }
+  ],
+  "terminal": [
+    {
+      "jobKey": "fp_42e6725f69dfe96474752d4e",
+      "status": "cancelled",
+      "endReason": "lost",
+      "filename": "bracket.3mf"
+    },
+    {
+      "jobKey": "fp_987aa956ae64338724a25c36",
+      "status": "cancelled",
+      "endReason": "cancelled",
+      "filename": "bracket.3mf"
+    }
+  ],
+  "queue": [
+    {
+      "queueJobId": "00000000-0000-4000-8000-000000000001",
+      "state": "printing",
+      "assignmentSeq": 1,
+      "printerJobKey": "fp_42e6725f69dfe96474752d4e"
+    },
+    {
+      "queueJobId": "00000000-0000-4000-8000-000000000001",
+      "state": "held",
+      "printerJobKey": "fp_42e6725f69dfe96474752d4e",
+      "assignmentSeq": 1,
+      "reason": "outcome_unknown"
+    }
+  ]
+}
