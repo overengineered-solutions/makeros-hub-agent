@@ -76,7 +76,7 @@ class TestSliceUploads(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             m = PrinterManager()
             ok = {"ok": True, "grams": 3.68, "seconds": 1174, "supportUsed": False, "filament": "Bambu PLA Basic @BBL A1M",
-                  "process": "0.20mm Standard @BBL A1M", "modelId": "N1", "plates": 1}
+                  "process": "0.20mm Standard @BBL A1M", "modelId": "N1", "plates": 1, "warnings": [{"plate": 1, "message": "floating regions"}]}
             self.assertEqual(m.fetch_uploads([fetch()], d, getter=self.getter(), reporter=self.reporter, slice_runner=self.runner(d, ok)), 1)
             [body] = self.reports
             self.assertEqual(body["sha256"], hashlib.sha256(MESH).hexdigest())   # the cloud stored the mesh's sha
@@ -84,10 +84,12 @@ class TestSliceUploads(unittest.TestCase):
             self.assertEqual(body["estGrams"], 4)
             self.assertEqual(body["requiredFilaments"][0].get("trayInfoIdx"), "GFA00")
             self.assertEqual(body["slice"]["grams"], 3.68)
+            self.assertEqual(body["slice"]["warnings"], ok["warnings"])
             self.assertEqual((Path(d) / "abcdef1234567890" / "cube.3mf").read_bytes(), sliced_plate())
             # the report was lost: next beat the finished plate is reported again without downloading or slicing again
             self.assertEqual(m.fetch_uploads([fetch()], d, getter=self.getter(), reporter=self.reporter, slice_runner=self.runner(d, ok)), 1)
             self.assertEqual((len(self.runs), len(self.downloads), len(self.reports)), (1, 1, 2))
+            self.assertEqual(self.reports[-1]["slice"]["warnings"], ok["warnings"])
 
     def test_a_slice_the_slicer_refuses_is_reported_with_its_sentence_and_leaves_no_plate(self):
         with tempfile.TemporaryDirectory() as d:

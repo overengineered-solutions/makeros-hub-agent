@@ -762,7 +762,7 @@ class PrinterManager:
                 if model_id:
                     body["printerModelId"] = model_id   # the cloud refuses a file sliced for another printer (audit)
                 if sliced is not None:
-                    body["slice"] = {k: sliced.get(k) for k in ("grams", "seconds", "supportUsed", "filament", "process", "settings", "prepare")}
+                    body["slice"] = {k: sliced.get(k) for k in ("grams", "seconds", "supportUsed", "filament", "process", "settings", "prepare", "warnings") if k in sliced}
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
                 if grams:
                     body["estGrams"] = int(math.ceil(sum(grams)))
@@ -807,7 +807,7 @@ class PrinterManager:
             if reasons:
                 dest.unlink(missing_ok=True)
                 reporter({"queueJobId": job_id, "sha256": sha, "sliceError": " ".join(reasons)[:300],
-                          **({"slice": {"prepare": prepared}} if isinstance(prepared, dict) else {})})
+                          **({"slice": {k: result[k] for k in ("prepare", "warnings") if k in result}} if any(k in result for k in ("prepare", "warnings")) else {})})
                 return False
             result_path.write_text(json.dumps(result), encoding="utf-8")
             return True
@@ -857,7 +857,7 @@ class PrinterManager:
                 ("the shop's slicer is not available right now" if rc == -1 else "the slicer stopped before it finished")
             log.warning("slice upload %s: not sliced (rc %s): %s", job_id, rc, reason)
             reporter({"queueJobId": job_id, "sha256": sha, "sliceError": reason[:300],
-                      **({"slice": {"prepare": result["prepare"]}} if isinstance(result, dict) and "prepare" in result else {})})
+                      **({"slice": {k: result[k] for k in ("prepare", "warnings") if k in result}} if isinstance(result, dict) and any(k in result for k in ("prepare", "warnings")) else {})})
             return None
         if not checked(result):
             return None

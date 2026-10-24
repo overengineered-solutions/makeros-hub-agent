@@ -371,8 +371,8 @@ class TestDurability(KlipperCase):
         self.poll(reborn)                         # the printer still shows A finished
         self.fake.state, self.fake.filename, self.fake.duration = "printing", "makeros/b_other.gcode", 0.0
         self.poll(reborn)                         # then B begins, and the replacement saves its state
-        self.assertEqual([j["status"] for j in reborn.pending_jobs()], ["done"])
-        self.assertEqual([j["status"] for j in self.make().pending_jobs()], ["done"])   # and on disk
+        self.assertEqual([j["endReason"] for j in reborn.pending_jobs()], ["lost"])
+        self.assertEqual([j["endReason"] for j in self.make().pending_jobs()], ["lost"])   # and on disk
 
     def test_a_restarted_adapter_rehydrates_the_dispatch_and_the_terminal_jobs(self):
         self.start()
@@ -414,11 +414,10 @@ class TestDurability(KlipperCase):
         self.fake.state, self.fake.duration = "complete", 3600.0
         reborn = self.make()
         self.poll(reborn)
-        self.assertEqual([(j["jobKey"], j["status"]) for j in reborn.pending_jobs()], [(key, "done")])
+        self.assertEqual([(j["jobKey"], j["status"], j["endReason"]) for j in reborn.pending_jobs()], [(key, "cancelled", "lost")])
 
-    def test_a_print_that_finished_while_the_hub_was_down_completes_its_queue_job_exactly_once(self):
-        # v0.69 audit: the whole chain after a mid-print restart — one terminal under the key the site already holds, one
-        # 'completed' for the right queue job, and nothing on any later restart onto the still-complete printer
+    def test_a_print_that_ended_while_the_hub_was_down_is_reported_lost_once(self):
+        # A terminal reached during downtime cannot prove which run of the same file it ended. Keep the key, fail closed.
         self.start()
         self.poll()
         (printing,) = self.adapter.collect_queue_progress()
@@ -426,9 +425,9 @@ class TestDurability(KlipperCase):
         self.fake.state, self.fake.duration = "complete", 3600.0
         reborn = self.make()
         self.poll(reborn)
-        self.assertEqual([(j["jobKey"], j["status"]) for j in reborn.pending_jobs()], [(key, "done")])
+        self.assertEqual([(j["jobKey"], j["status"], j["endReason"]) for j in reborn.pending_jobs()], [(key, "cancelled", "lost")])
         self.assertEqual(reborn.collect_queue_progress(),
-                         [{"queueJobId": JOB, "state": "completed", "printerJobKey": key, "assignmentSeq": 3}])
+                         [{"queueJobId": JOB, "state": "held", "reason": "print_cancelled", "printerJobKey": key, "assignmentSeq": 3}])
         reborn.ack_jobs([key])
         for _ in range(2):
             again = self.make()
@@ -445,7 +444,7 @@ class TestDurability(KlipperCase):
         reborn = self.make(pid="k9")
         self.poll(reborn)
         (job,) = reborn.pending_jobs()
-        self.assertEqual((job["jobKey"], job["status"]), ("fp_saved", "done"))
+        self.assertEqual((job["jobKey"], job["status"], job["endReason"]), ("fp_saved", "cancelled", "lost"))
         self.assertAlmostEqual(job["printTimeSeconds"], 600, delta=2)
         self.assertEqual(job["endedAt"], time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 3000)))
 
@@ -479,7 +478,7 @@ class TestDurability(KlipperCase):
         self.fake.duration = 1800.0   # the same file printed again while the hub was down: that IS a new print
         reborn = self.make()
         self.poll(reborn)
-        self.assertEqual([j["status"] for j in reborn.pending_jobs()], ["done"])
+        self.assertEqual([j["endReason"] for j in reborn.pending_jobs()], ["lost"])
 
 
 class TestManagerKlipper(KlipperCase):

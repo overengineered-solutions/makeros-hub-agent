@@ -25,6 +25,7 @@ import json
 import logging
 from pathlib import Path
 import os
+import re
 import ssl
 import threading
 import time
@@ -123,6 +124,10 @@ class BambuAdapter:
         self._version_logged = False
         self._version_asked_at = 0.0
         self._version_asks = 0
+        self._firmware_version = None
+        self._lan_commands = "unknown"
+        self._lan_probe = None
+        self._lan_probe_at = 0.0
         self._device_logged = False
         self._refill_asked_at = 0.0
         self._refill_asks = 0
@@ -189,6 +194,12 @@ class BambuAdapter:
             self._connected_at_ms = int(time.time() * 1000)
             self._state_seen = False
             self._refill_asks = 0
+            self._version_logged = False
+            self._version_asks = 1
+            self._version_asked_at = time.monotonic()
+            self._firmware_version = None
+            self._lan_commands = "unknown"
+            self._lan_probe = None
             # v0.69: which print the printer is on must come from THIS connection's reports, never the cached ones
             cached = self._data.get("print")
             if isinstance(cached, dict):
@@ -198,6 +209,7 @@ class BambuAdapter:
         client.subscribe(self._report_topic, qos=0)
         client.publish(self._request_topic, PUSHALL)
         client.publish(self._request_topic, GET_VERSION)
+        self._probe_lan_commands()
         log.info("bambu %s connected; subscribed + pushall sent", self.printer_id)
 
     def _on_message(self, _client, _userdata, msg):
@@ -208,7 +220,25 @@ class BambuAdapter:
             return
         if not isinstance(doc, dict):
             return
+        version_changed = False
         with self._lock:
+            info = doc.get("info")
+            if isinstance(info, dict) and info.get("command") == "get_version":
+                modules = info.get("module")
+                if isinstance(modules, list):
+                    versions = {m["sw_ver"] for m in modules if isinstance(m, dict) and m.get("name") == "ota"
+                                and isinstance(m.get("sw_ver"), str) and re.fullmatch(r"[A-Za-z0-9_.+-]{1,80}", m["sw_ver"])}
+                    if len(versions) == 1:
+                        version = versions.pop()
+                        version_changed = self._firmware_version is not None and version != self._firmware_version
+                        self._firmware_version = version
+            reply = doc.get("print")
+            if (isinstance(reply, dict) and reply.get("command") == "gcode_line" and self._lan_probe is not None
+                    and reply.get("sequence_id") == self._lan_probe and time.monotonic() - self._lan_probe_at <= 30):
+                result = reply.get("result")
+                if isinstance(result, str) and result.lower() in ("success", "fail"):
+                    self._lan_commands = "accepted" if result.lower() == "success" else "rejected"
+                    self._lan_probe = None
             bambu_parse.merge_report(self._data, doc)
             self._last_report_at = time.monotonic()
             report = doc.get("print")
@@ -230,6 +260,8 @@ class BambuAdapter:
                     self.printer_id,
                     json.dumps(bambu_parse.summarize_shape(self._data)),
                 )
+        if version_changed:
+            self._probe_lan_commands()
         # The printer's OWN get_version modules, once per connection. The virtual printers answer get_version from a
         # module list captured field-for-field from a real A1 mini, and every other model reuses it — which is why only
         # the A1 mini VP connects in OrcaSlicer; an H2D or P2S VP presents A1 mini hardware and Orca refuses the device
@@ -269,6 +301,8 @@ class BambuAdapter:
         # degrades to offline if reports go stale.
         with self._lock:
             self._state_seen = False
+            self._lan_commands = "unknown"
+            self._lan_probe = None
         log.info("bambu %s disconnected — will reconnect", self.printer_id)
 
     def request_version_if_missing(self) -> None:
@@ -280,6 +314,11 @@ class BambuAdapter:
         costs nothing; it stops the moment a module list is captured, and gives up after a few tries rather than
         pinging a printer that never answers.
         """
+        # Recheck once an hour too: firmware may change without the hub restarting.
+        if time.monotonic() - self._version_asked_at >= 3600:
+            self._version_logged = False
+            self._version_asks = 0
+            self._probe_lan_commands()
         if self._version_logged or self._version_asks >= 5:
             return
         now = time.monotonic()
@@ -294,6 +333,21 @@ class BambuAdapter:
             client.publish(self._request_topic, GET_VERSION)
         except Exception as exc:  # noqa: BLE001 — a version probe must never disturb the poll
             log.debug("bambu %s: get_version re-ask failed: %s", self.printer_id, exc)
+
+    def _probe_lan_commands(self) -> None:
+        """M105 only reads temperatures. Publishing it is not proof: require its own success/fail reply."""
+        client = self._client
+        if client is None:
+            return
+        with self._lock:
+            self._lan_probe = str(int.from_bytes(os.urandom(4), "big"))
+            self._lan_probe_at = time.monotonic()
+            self._lan_commands = "unknown"
+            seq = self._lan_probe
+        try:
+            client.publish(self._request_topic, json.dumps({"print": {"command": "gcode_line", "sequence_id": seq, "param": "M105\n"}}))
+        except Exception as exc:  # noqa: BLE001 — a read-only probe must not interrupt printing
+            log.warning("bambu %s: LAN command check failed: %s", self.printer_id, exc)
 
     def ensure_auto_refill(self) -> None:
         """Keep AMS filament backup on, so a spool that runs out mid-print carries on from an identical spool in the AMS
@@ -334,6 +388,8 @@ class BambuAdapter:
             started = self._started
             data = copy.deepcopy(self._data)  # MQTT merges in place; the reading must match the captured timestamp.
             connected_at_ms = self._connected_at_ms
+            firmware = self._firmware_version
+            lan_commands = self._lan_commands
 
         if connack == "fail":
             conn_state, reason = "error", err
@@ -350,6 +406,9 @@ class BambuAdapter:
         out = bambu_parse.normalize_status(
             self.printer_id, data, connection_state=conn_state, error_reason=reason, model=self.model
         )
+        if firmware:
+            out["firmwareVersion"] = firmware
+        out["lanCommands"] = lan_commands if conn_state == "connected" else "unknown"
         if connected_at_ms is not None:
             out["mqttConnectedAtMs"] = connected_at_ms   # omitted until the first connect (the DTO's absent-key rule)
         if sampled is not None:
