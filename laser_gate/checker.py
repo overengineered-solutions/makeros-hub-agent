@@ -267,6 +267,9 @@ def job_bytes(body):
             continue
         if k == (0xDA, 0x01) and len(p) == 12 and p[:2] == b"\x06\x20" and data[t.end:t.end + 1] in (b"\xe7", b"\xd7"):
             continue  # recorded VisiCut travel-length scratch write, never sent
+        if k == END and visicut:
+            out += bytes(k)
+            break  # D7 has no parameters; even low-byte padding belongs to the discarded tail
         if ALLOWED.get(k) != len(p):
             return data, 0  # unchanged: check() names the unrecognised command or wrong length
         out += data[t.off:t.end]

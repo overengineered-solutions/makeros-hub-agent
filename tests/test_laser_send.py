@@ -67,6 +67,7 @@ class LaserSend(unittest.TestCase):
     def test_only_recorded_visicut_padding_is_dropped_and_never_transmitted(self):
         p = visicut()
         self.assertEqual(job_bytes(swizzle(p + b"\xd8\x2a")), job_bytes(swizzle(p)))
+        self.assertEqual(job_bytes(swizzle(p + b"\x00" * 100)), job_bytes(swizzle(p)))
         self.assertEqual(self.verdict(fx.square_plain() + b"\xd8\x2a")["verdict"], "refused")
 
     def test_profile_boundary_and_receipt(self):
