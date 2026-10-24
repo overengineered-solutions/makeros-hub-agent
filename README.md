@@ -71,6 +71,21 @@ sh -n update.sh
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
 
+## 0.84.0 candidate: cut to fit, or separate named floors and roof
+
+(operator, 2026-10-23: "auto cutting to fit printers ... auto separation by floor and roof ... nicely fitting joints and tabs")
+The existing prepare step searches regular axis-aligned grids for the fewest safe pieces (including removable rectangular
+pegs), or separates touching Floor/Level/Storey/Story/Roof layers with locating tabs. It refuses open solids, disconnected
+pieces, ambiguous layer heights and cuts without material around and behind both sockets. At most 12 body pieces and 32
+pieces including connectors. Each piece is placed on a cut face, checked separately, and sliced separately by Orca.
+The site supplies each printer pool's conservative clearance (0.2 mm per side initially; tolerance board 87346139).
+
+The site needs migration 0219 and both agent >=0.84.0 and the image's `splitVersion: 1`. A proposal reports the full set;
+after the member approves the exploded view and each piece's price, the site creates ordinary jobs in one transaction.
+Each carries its piece index and geometry hash, and is reproduced and checked before dispatch. A changed mesh is refused;
+changed slicing settings require approval again. No new installer files, dependencies, paid services or plugin controls.
+Physical fit and a student-building pilot remain necessary; no tolerance test was printed by this change.
+
 ## 0.83.0 candidate: “Have PStation fix it”
 
 The site's `prepare` choice runs inside ps-slicer before OrcaSlicer, at the chosen print size: whole-model bed placement,

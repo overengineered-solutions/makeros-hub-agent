@@ -94,6 +94,205 @@ class SliceError(Exception):
     pass
 
 
+def cut_model(original, request, wall):
+    """Closed-solid cuts and keyed dowels, using the BOSL2/Prusa/Orca shape vocabulary (no copied code)."""
+    import itertools
+    import numpy as np
+    import trimesh
+    from manifold3d import Manifold, Mesh, OpType
+
+    REFUSAL = "We could not cut this model safely with joints. Pick a smaller scale, separate it in your design program, or ask at the desk."
+    MAX_BODIES, MAX_PIECES = 12, 32
+
+    def solid(mesh):
+        mesh = mesh.copy()
+        mesh.merge_vertices()
+        if not mesh.is_volume or not np.isfinite(mesh.vertices).all():
+            raise SliceError("Cutting needs closed solids. Close the surfaces in your design program and send it again.")
+        result = Manifold(Mesh(np.asarray(mesh.vertices, dtype=np.float32), np.asarray(mesh.faces, dtype=np.uint32)))
+        if result.status().name != "NoError" or result.is_empty():
+            raise SliceError(REFUSAL)
+        return result
+
+
+    def mesh_of(value):
+        data = value.to_mesh()
+        return trimesh.Trimesh(np.array(data.vert_properties)[:, :3], np.array(data.tri_verts), process=False)
+
+
+    def box(lo, hi):
+        return Manifold.cube(tuple(np.asarray(hi) - lo)).translate(tuple(lo))
+
+
+    def one_body(value):
+        return value.status().name == "NoError" and value.volume() > 0.1 and sum(p.volume() > 0 for p in value.decompose()) == 1
+
+
+    def floor_planes(original, layers):
+        end, grouped = 0, {}
+        for layer in layers:
+            if layer["first"] != end or layer["count"] <= 0:
+                raise SliceError("The layer names no longer match the model. Send it again from your design program.")
+            end += layer["count"]
+            points = original.triangles[layer["first"]:end].reshape(-1, 3)
+            if not len(points):
+                raise SliceError(REFUSAL)
+            grouped.setdefault(layer["name"], []).append(points)
+        if end != len(original.faces) or not 2 <= len(grouped) <= MAX_BODIES:
+            raise SliceError("Separate the floors and roof into named layers in your design program, then send it again.")
+        levels = []
+        for name, arrays in grouped.items():
+            if not re.search(r"\b(floor|level|storey|story|roof)\b", name, re.I):
+                raise SliceError("Name each building layer Floor, Level or Roof, then send it again to separate them.")
+            points = np.concatenate(arrays)
+            levels.append((float(points[:, 2].min()), float(points[:, 2].max()), name))
+        levels.sort()
+        if any(abs(a[1] - b[0]) > 0.01 or a[0] >= b[0] for a, b in zip(levels, levels[1:])):
+            raise SliceError("The floor layers overlap in height or have gaps. Put each floor and the roof in its own touching layer, then send it again.")
+        return [x[0] for x in levels[1:]], [x[2] for x in levels]
+
+
+    def orient(value, faces, bed):
+        """Only a plane cut may be the bed face; keep its socket opening flat on the bed."""
+        mesh = mesh_of(value)
+        for axis, sign in faces:
+            normal = np.eye(3)[axis] * sign
+            rotation = trimesh.geometry.align_vectors(normal, [0, 0, -1])
+            candidate = mesh.copy()
+            candidate.apply_transform(rotation)
+            for turn in (False, True):
+                placed = candidate.copy()
+                if turn:
+                    placed.apply_transform(trimesh.transformations.rotation_matrix(math.pi / 2, [0, 0, 1]))
+                if np.all(placed.extents <= np.asarray(bed) + 1e-5):
+                    placed.apply_translation(-placed.bounds[0])
+                    return placed
+        raise SliceError(REFUSAL)
+
+
+    def join(a, b, axis, plane, clearance, wall):
+        """A rectangular dowel resists rotation; its two sockets have clearance on every side and at both ends."""
+        transverse = [i for i in range(3) if i != axis]
+        bounds_a, bounds_b = np.array(a.bounding_box()).reshape(2, 3), np.array(b.bounding_box()).reshape(2, 3)
+        lo, hi = np.maximum(bounds_a[0], bounds_b[0]), np.minimum(bounds_a[1], bounds_b[1])
+        half = np.zeros(3)
+        half[axis], half[transverse[0]], half[transverse[1]] = 2, 1.5, 2.5
+        margin = half + clearance + wall
+        # Deterministic grid, including section vertices: a socket must have real material all around and behind it.
+        points = [np.linspace(lo[k] + margin[k], hi[k] - margin[k], 9) for k in transverse]
+        if any(hi[k] - lo[k] < margin[k] * 2 for k in transverse):
+            raise SliceError(REFUSAL)
+        for u, v in itertools.product(*points):
+            centre = np.zeros(3)
+            centre[axis], centre[transverse[0]], centre[transverse[1]] = plane, u, v
+            guard_lo, guard_hi = centre - margin, centre + margin
+            left_hi, right_lo = guard_hi.copy(), guard_lo.copy()
+            left_hi[axis], right_lo[axis] = plane, plane
+            if (box(guard_lo, left_hi) - a).volume() > 1e-4 or (box(right_lo, guard_hi) - b).volume() > 1e-4:
+                continue
+            socket = box(centre - half - clearance, centre + half + clearance)
+            left, right = a - socket, b - socket
+            if not one_body(left) or not one_body(right):
+                continue
+            peg = box(centre - half, centre + half)
+            # No interference in the assembled position, and the full socket fits inside the protected material.
+            if (peg ^ left).volume() > 1e-5 or (peg ^ right).volume() > 1e-5:
+                raise SliceError(REFUSAL)
+            return left, right, peg, {"axis": axis, "plane": float(plane), "centre": centre.tolist(),
+                                      "pegSize": (half * 2).tolist(), "socketSize": (half * 2 + 2 * clearance).tolist()}
+        raise SliceError(REFUSAL)
+
+
+    # Keep sub-millimetre sockets precise even when a CAD model sits far from its world origin.
+    original = original.copy()
+    original.apply_translation(-original.bounds[0])
+    # Do not heal a hole or infer which nested shell was meant to be solid while cutting.
+    bounds = original.bounds
+    bed = request["bed"]
+    clearance = request["clearance"]
+    names = None
+    if request["mode"] == "floors":
+        heights, names = floor_planes(original, request["layers"])
+        solids = []
+        for layer in request["layers"]:
+            triangles = original.triangles[layer["first"]:layer["first"] + layer["count"]]
+            part = trimesh.Trimesh(vertices=triangles.reshape(-1, 3), faces=np.arange(len(triangles) * 3).reshape(-1, 3), process=True)
+            solids.append(solid(part))
+        original_solid = Manifold.batch_boolean(solids, OpType.Add)
+        plans = [[[], [], heights]]
+    else:
+        original_solid = solid(original)
+        if any(all(size <= limit for size, limit in zip(order, bed)) for order in itertools.permutations(original.extents)):
+            raise SliceError("This model fits in one piece. Keep your original, or separate its named floors and roof.")
+        # shortcut: fewest pieces among axis-aligned regular grids, at most 12 bodies; irregular/angled cuts need a later planner.
+        plans = []
+        for count in range(2, MAX_BODIES + 1):
+            for nx in range(1, count + 1):
+                for ny in range(1, count // nx + 1):
+                    if count % (nx * ny):
+                        continue
+                    cells = (nx, ny, count // nx // ny)
+                    size = original.extents / cells
+                    if not any(np.all(np.asarray(order) <= bed) for order in itertools.permutations(size)):
+                        continue
+                    plans.append([np.linspace(bounds[0, k], bounds[1, k], cells[k] + 1)[1:-1].tolist() for k in range(3)])
+        plans.sort(key=lambda p: math.prod(len(c) + 1 for c in p) + sum(len(p[k]) * math.prod(len(p[j]) + 1 for j in range(3) if j != k) for k in range(3)))
+    if not one_body(original_solid):
+        raise SliceError(REFUSAL)
+    for planes in plans:
+        cuts = [[bounds[0, k], *planes[k], bounds[1, k]] for k in range(3)]
+        cells = list(itertools.product(*(range(len(c) - 1) for c in cuts)))
+        bodies, faces, pegs, joints = {}, {}, [], []
+        try:
+            for cell in cells:
+                value = original_solid
+                faces[cell] = []
+                for axis, n in enumerate(cell):
+                    normal = np.eye(3)[axis].tolist()
+                    if n:
+                        value = value.split_by_plane(normal, cuts[axis][n])[0]
+                        faces[cell].append((axis, -1))
+                    if n < len(cuts[axis]) - 2:
+                        value = value.split_by_plane(normal, cuts[axis][n + 1])[1]
+                        faces[cell].append((axis, 1))
+                if not one_body(value):
+                    raise SliceError(REFUSAL)
+                bodies[cell] = value
+            for cell in cells:
+                for axis in range(3):
+                    neighbour = tuple(n + (i == axis) for i, n in enumerate(cell))
+                    if neighbour not in bodies:
+                        continue
+                    a, b, peg, joint = join(bodies[cell], bodies[neighbour], axis, cuts[axis][cell[axis] + 1], clearance, wall)
+                    bodies[cell], bodies[neighbour] = a, b
+                    joints.append({**joint, "pieces": [cells.index(cell), cells.index(neighbour)], "peg": len(cells) + len(pegs)})
+                    pegs.append(peg)
+            if not joints or len(bodies) + len(pegs) > MAX_PIECES:
+                raise SliceError(REFUSAL)
+            placed = [orient(bodies[c], faces[c], bed) for c in cells]
+            for peg in pegs:
+                placed.append(orient(peg, [(0, -1), (1, -1), (2, -1)], bed))
+            assembled = [mesh_of(bodies[c]) for c in cells] + [mesh_of(p) for p in pegs]
+            exploded = []
+            centre = original.centroid
+            for i, m in enumerate(assembled):
+                p = m.copy()
+                direction = p.centroid - centre
+                if names:
+                    level = i if i < len(cells) else joints[i - len(cells)]["pieces"][0] + 0.5
+                        direction = np.array([0, 0, level * 8.0])
+                else:
+                    direction = direction * 0.25
+                p.apply_translation(direction)
+                exploded.append(p)
+            labels = (names or [f"Piece {i + 1}" for i in range(len(cells))]) + [f"Locating {'tab' if names else 'peg'} {i + 1}" for i in range(len(pegs))]
+            print(f"split: processed={len(placed)}, expected={len(cells) + len(pegs)}, joints={len(joints)}", flush=True)
+            return placed, exploded, labels, joints
+        except SliceError:
+            continue
+    raise SliceError(REFUSAL)
+
+
 # These imports stay inside prepare_model: install-slicer.py's local preflight is stdlib-only; member geometry runs only
 # in the container, whose Dockerfile pins the permissive kernels (operator, 2026-10-23: "Have PStation fix it").
 def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: float) -> dict:
@@ -172,6 +371,28 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
             basis = np.array([right, -np.cross(view, right), view])
         changes.append({"fix": fix, "words": words, "before": before, "after": after, "unit": unit, "default": default,
                         "beforeImage": picture(old, old_marks, bounds, basis, edges or {}), "afterImage": picture(new, new_marks, bounds, basis, {})})
+
+    if request.get("split"):
+        placed, exploded, labels, joints = cut_model(original, request["split"], min_wall)
+        pieces = []
+        for i, part in enumerate(placed):
+            data = part.export(file_type="stl")
+            path = os.path.join(os.path.dirname(dst), f"piece-{i}.stl")
+            with open(path, "wb") as fh:
+                fh.write(data)
+            pieces.append({"index": i, "name": labels[i], "sha256": hashlib.sha256(data).hexdigest(), "size": measure([part])["size"]})
+        digest = hashlib.sha256("".join(p["sha256"] for p in pieces).encode()).hexdigest()
+        connector = "tab" if request["split"]["mode"] == "floors" else "peg"
+        before_view = original.copy()
+        before_view.apply_translation(-before_view.bounds[0])
+        record("split", f"Separated into {len(placed)} pieces, including {len(joints)} locating {connector}(s), with {request['split']['clearance']:.2f} mm clearance on each side. Push the {connector}s into the matching sockets to assemble; pull the pieces apart to remove them.",
+               1, len(placed), "parts", [before_view], exploded)
+        result = {"version": 1, "checked": False, "inputSha256": hashlib.sha256(open(src, "rb").read()).hexdigest(), "sha256": digest,
+                  "settings": {**request, "minWall": min_wall, "scale": scale}, "before": measure([original]), "after": measure(placed),
+                  "changes": changes, "blocked": [], "pieces": pieces, "joints": joints}
+        if len(json.dumps(result)) > 450_000:
+            raise SliceError("There are too many pieces to preview safely. Send a smaller selection from your model.")
+        return result
 
     before = measure(parts)
     start = [p.copy() for p in parts]
@@ -463,17 +684,39 @@ def read_spec(raw: dict) -> dict:
     if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not SCALE_MIN <= float(scale) <= SCALE_MAX:
         raise SliceError("the size change is outside what the slicer accepts")
     prepare = raw.get("prepare")
-    if prepare is not None and (not isinstance(prepare, dict) or set(prepare) != {"version", "moveLargeGaps", "thicken"} or
+    if prepare is not None and (not isinstance(prepare, dict) or set(prepare) not in ({"version", "moveLargeGaps", "thicken"}, {"version", "moveLargeGaps", "thicken", "split"}) or
                                 type(prepare["version"]) is not int or prepare["version"] != 1 or
                                 any(type(prepare[k]) is not bool for k in ("moveLargeGaps", "thicken"))):
         raise SliceError("the model fix choices are not readable; check the file again")
+    if prepare and "split" in prepare:
+        split = prepare["split"]
+        if (not isinstance(split, dict) or set(split) != {"mode", "bed", "clearance", "layers"} or split["mode"] not in ("fit", "floors") or
+                not isinstance(split["bed"], list) or len(split["bed"]) != 3 or
+                any(type(n) not in (int, float) or not math.isfinite(n) or not 10 <= n <= 1000 for n in split["bed"]) or
+                type(split["clearance"]) not in (int, float) or not 0.05 <= split["clearance"] <= 0.5 or
+                not isinstance(split["layers"], list) or len(split["layers"]) > 2000):
+            raise SliceError("The cutting choices are not readable. Check the file again.")
+        end = 0
+        for layer in split["layers"]:
+            if (not isinstance(layer, dict) or set(layer) != {"name", "first", "count"} or not isinstance(layer["name"], str) or
+                    not 1 <= len(layer["name"]) <= 160 or type(layer["first"]) is not int or layer["first"] != end or
+                    type(layer["count"]) is not int or not 0 < layer["count"] <= 300000):
+                raise SliceError("The floor layers do not match the model. Send it again from your design program.")
+            end += layer["count"]
+        if end > 300000 or (split["mode"] == "fit" and split["layers"]):
+            raise SliceError("The cutting choices are not readable. Check the file again.")
+    piece = raw.get("piece")
+    if piece is not None and (not prepare or not prepare.get("split") or not isinstance(piece, dict) or set(piece) != {"index", "sha256"} or
+                              type(piece["index"]) is not int or not 0 <= piece["index"] < 32 or
+                              not isinstance(piece["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", piece["sha256"])):
+        raise SliceError("The requested piece does not match its approved model. Check the file again.")
     result = {
         "mesh": mesh, "model": model, "type": ftype,
         "color": color if isinstance(color, str) and HEX_RE.match(color) else None,
         "tray": tray if isinstance(tray, str) and TRAY_RE.match(tray) else None,
         "stated": stated,
         "orient": fixes["orient"], "brim": fixes["brim"], "supports": fixes["supports"],
-        "scale": float(scale), "nozzle": nozzle if model in TWO_NOZZLES else None, "prepare": prepare,
+        "piece": piece, "scale": float(scale), "nozzle": nozzle if model in TWO_NOZZLES else None, "prepare": prepare,
     }
     if "colours" in raw:
         # Preparation can reorder or replace triangles, invalidating the checked colour ranges.
@@ -623,7 +866,7 @@ def caps(processes: dict | None = None, machines: dict | None = None) -> dict:
     model the outer wall line width of the process it slices with, so the site's minimum wall is two of this image's lines.
     Read from the image, so a box whose agent and image differ reports the image. Never raises: a preset that does not read
     leaves its model out."""
-    out: dict = {"scaleMin": SCALE_MIN, "scaleMax": SCALE_MAX, "lineWidth": {}, "prepareVersion": 1, "colours": True}
+    out: dict = {"scaleMin": SCALE_MIN, "scaleMax": SCALE_MAX, "lineWidth": {}, "prepareVersion": 1, "splitVersion": 1, "colours": True}
     try:
         processes = load_index("process") if processes is None else processes
         machines = load_index("machine") if machines is None else machines
@@ -823,31 +1066,58 @@ def run(job_dir: str | None = None) -> dict:
         assembled = os.path.join(work, "colours.3mf")
         colour_3mf(mesh, assembled, spec["colours"]["parts"])
         mesh = assembled
-    args = orca_args(spec, paths, out, mesh)
-    p = subprocess.run(args, capture_output=True, text=True, timeout=540, env={**os.environ, "HOME": "/tmp"})
-    sliced = os.path.join(out, "sliced.3mf")
-    if p.returncode != 0 or not os.path.exists(sliced):
-        code = re.search(r"return (-?\d+)", p.stdout + p.stderr)
-        if code and code.group(1) == "-50":   # OrcaSlicer: an object outside the plate after arranging
-            raise SliceError("the part does not fit on this printer's bed; choose a larger printer or scale it down")
-        tail = (p.stdout + p.stderr).strip().splitlines()[-3:]
-        raise SliceError("the slicer could not slice this part" + (f" ({' / '.join(tail)[:300]})" if tail else ""))
-    set_model_id(sliced, model_id)
-    result = {"ok": True, "filament": filament_name, "process": PROCESS.format(sfx=sfx), "settings": effective_settings(process),
-              **summarize(sliced), **caps(processes, machines)}
+    def slice_one(mesh, out):
+        args = orca_args(spec, paths, out, mesh)
+        p = subprocess.run(args, capture_output=True, text=True, timeout=540, env={**os.environ, "HOME": "/tmp"})
+        sliced = os.path.join(out, "sliced.3mf")
+        if p.returncode != 0 or not os.path.exists(sliced):
+            code = re.search(r"return (-?\d+)", p.stdout + p.stderr)
+            if code and code.group(1) == "-50":   # OrcaSlicer: an object outside the plate after arranging
+                raise SliceError("the part does not fit on this printer's bed; choose a larger printer or scale it down")
+            tail = (p.stdout + p.stderr).strip().splitlines()[-3:]
+            raise SliceError("the slicer could not slice this part" + (f" ({' / '.join(tail)[:300]})" if tail else ""))
+        set_model_id(sliced, model_id)
+        result = {"ok": True, "filament": filament_name, "process": PROCESS.format(sfx=sfx), "settings": effective_settings(process),
+                  **summarize(sliced), **caps(processes, machines)}
+        if prepared:
+            # Orca 2.4.2 reports these as text in result.json. A prepared file with disappearing or floating regions is not approved.
+            log_path = os.path.join(out, "result.json")
+            if os.path.exists(log_path):
+                warnings = json.dumps(json.load(open(log_path, encoding="utf-8"))).lower()
+                if any(w in warnings for w in ("floating regions", "floating cantilever", "empty layers", "too thin")):
+                    raise SliceError("The slice still has missing or floating parts. Pick a bigger scale or fix it in your model.")
+        if result["plates"] != 1:
+            raise SliceError(f"the part does not fit one plate (the slicer made {result['plates']}); scale it down or split it")
+        if result["grams"] <= 0:
+            raise SliceError("the slicer reported no filament for this part")
+        return result
+
+    if prepared and prepared.get("pieces"):
+        import shutil
+        pieces = prepared["pieces"]
+        selected = spec.get("piece")
+        if selected and (selected["index"] >= len(pieces) or pieces[selected["index"]]["sha256"] != selected["sha256"]):
+            raise SliceError("The cut changed since you approved it. Check the model again before printing.")
+        summaries = []
+        for piece in ([pieces[selected["index"]]] if selected else pieces):
+            i = piece["index"]
+            folder = os.path.join(out, f"piece-{i}")
+            os.makedirs(folder, exist_ok=True)
+            # The cut face is already down; Orca must never turn it onto a peg socket's side.
+            spec["orient"] = False
+            summary = slice_one(os.path.join(work, f"piece-{i}.stl"), folder)
+            summaries.append({**summary, "index": i})
+        shutil.copyfile(os.path.join(out, f"piece-{summaries[0]['index']}", "sliced.3mf"), os.path.join(out, "sliced.3mf"))
+        result = {**summaries[0], "prepare": prepared}
+        if not selected:
+            result["pieces"] = summaries
+        print(f"slice pieces: processed={len(summaries)}, expected={1 if selected else len(pieces)}", flush=True)
+        return result
+    result = slice_one(mesh, out)
     if prepared:
         result["prepare"] = prepared
-        # Orca 2.4.2 reports these as text in result.json. A prepared file with disappearing or floating regions is not approved.
-        log_path = os.path.join(out, "result.json")
-        if os.path.exists(log_path):
-            warnings = json.dumps(json.load(open(log_path, encoding="utf-8"))).lower()
-            if any(w in warnings for w in ("floating regions", "floating cantilever", "empty layers", "too thin")):
-                raise SliceError("The slice still has missing or floating parts. Pick a bigger scale or fix it in your model.")
-    if result["plates"] != 1:
-        raise SliceError(f"the part does not fit one plate (the slicer made {result['plates']}); scale it down or split it")
-    if result["grams"] <= 0:
-        raise SliceError("the slicer reported no filament for this part")
     return result
+
 
 
 def selftest() -> None:
@@ -911,6 +1181,9 @@ def main(argv: list[str]) -> int:
             assert not got["blocked"] and {c["fix"] for c in got["changes"]} >= {"walls", "bed", "merge"}, got["blocked"]
             after = trimesh.load_mesh(dst)
             assert after.is_volume and after.bounds[0, 2] == 0 and after.volume > base.volume + wall.volume
+        pieces, _, _, joints = cut_model(trimesh.creation.box(extents=[300, 20, 20]),
+            {"mode": "fit", "bed": [177.5, 177.5, 180], "clearance": 0.2, "layers": []}, 0.84)
+        assert len(pieces) == 3 and len(joints) == 1 and all(p.is_volume for p in pieces)
         print("prepare selftest ok")
         return 0
     out = os.path.join(JOB, "out")

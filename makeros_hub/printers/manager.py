@@ -79,6 +79,7 @@ def parse_slicer_caps(result) -> dict | None:
     return {"scaleMin": float(lo), "scaleMax": float(hi),
             **({"colours": True} if result.get("colours") is True else {}),
             **({"prepareVersion": 1} if type(result.get("prepareVersion")) is int and result["prepareVersion"] == 1 else {}),
+            **({"splitVersion": 1} if type(result.get("splitVersion")) is int and result["splitVersion"] == 1 else {}),
             "lineWidth": {k: float(v) for k, v in list(widths.items())[:16] if isinstance(k, str) and 0 < len(k) <= 40 and num(v) and 0 < v <= 5}}
 
 
@@ -142,6 +143,8 @@ def slice_spec_of(spec: dict) -> dict:
         out["nozzle"] = spec["nozzle"]
     if "prepare" in spec:
         out["prepare"] = spec["prepare"]   # preserve malformed choices too: the container must refuse, never silently omit a fix
+    if "piece" in spec:
+        out["piece"] = spec["piece"]
     return out
 
 
@@ -766,6 +769,25 @@ class PrinterManager:
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
                 if grams:
                     body["estGrams"] = int(math.ceil(sum(grams)))
+                if sliced is not None and "pieces" in sliced:
+                    pieces = sliced["pieces"]
+                    if not isinstance(pieces, list) or not 2 <= len(pieces) <= 32:
+                        raise ValueError("unreadable cut-piece slices")
+                    summaries = []
+                    for i, piece in enumerate(pieces):
+                        if not isinstance(piece, dict) or piece.get("index") != i:
+                            raise ValueError("cut-piece order changed")
+                        plate_file = dest_dir / ".slice" / "out" / f"piece-{i}" / "sliced.3mf"
+                        used = parse_required_filaments(plate_file, 1)
+                        weights = [f.get("usedG") for f in used]
+                        if not used or any(type(g) not in (int, float) or not math.isfinite(g) or g <= 0 for g in weights):
+                            raise ValueError("a cut piece has no measured filament")
+                        summaries.append({**{k: piece.get(k) for k in ("index", "supportUsed", "filament", "process", "settings")},
+                                          "grams": math.ceil(sum(weights)), "modelId": parse_printer_model_id(plate_file),
+                                          "requiredFilaments": [_vp_submit_filament(f) for f in used]})
+                    body["slice"]["pieces"] = summaries
+                    body["estGrams"] = sum(p["grams"] for p in summaries)
+                    log.info("cut-piece reports: processed=%d, expected=%d", len(summaries), len(pieces))
                 resp = reporter(body)
                 ok = getattr(resp, "status", None) == 200 and isinstance(getattr(resp, "body", None), dict) and resp.body.get("ok") is True
                 if ok:
@@ -802,7 +824,23 @@ class PrinterManager:
             if not isinstance(prepared, dict) or not isinstance(prepared.get("blocked"), list):
                 reasons = ["The shop did not report the model fixes. Check the file again."]
             else:
-                reasons = prepared["blocked"] or check_prepared_model(dest_dir.parent, work / "work" / mesh_name, prepared, spec)
+                reasons = prepared["blocked"]
+                if not reasons and spec.get("prepare", {}).get("split"):
+                    pieces = prepared.get("pieces")
+                    if not isinstance(pieces, list) or not 2 <= len(pieces) <= 32:
+                        reasons = ["The shop did not report every cut piece. Check the model again."]
+                    else:
+                        indices = [spec["piece"]["index"]] if spec.get("piece") else range(len(pieces))
+                        for i in indices:
+                            if i >= len(pieces) or pieces[i].get("index") != i:
+                                reasons = ["The cut pieces no longer match the model. Check it again."]
+                                break
+                            check = {"sha256": pieces[i].get("sha256"), "settings": prepared.get("settings")}
+                            reasons += check_prepared_model(dest_dir.parent, work / "work" / f"piece-{i}.stl", check, {**spec, "fixes": {**spec.get("fixes", {}), "orient": False}})
+                        log.info("cut-piece checks: processed=%d, expected=%d", len(indices), len(indices))
+                    prepared["checked"] = not reasons
+                elif not reasons:
+                    reasons = check_prepared_model(dest_dir.parent, work / "work" / mesh_name, prepared, spec)
                 prepared["blocked"] = reasons
             if reasons:
                 dest.unlink(missing_ok=True)
