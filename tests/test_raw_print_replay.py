@@ -168,3 +168,43 @@ class TestUsedGrams(unittest.TestCase):
         job2 = CapturedJob(member_id="m", filename="a.3mf", file_path=Path("/tmp/a.3mf"), sha256="0" * 64, size=1, ams_mapping=[0],
                            use_ams=True, required_filaments=[{"slot": 0, "material": "PLA"}], submitted_at=datetime(2026, 8, 30, tzinfo=timezone.utc), submission_uid="u2")
         self.assertNotIn("estGrams", build_vp_submit_body(job2, model="A1 mini"))
+
+
+class TestQueueDuration(unittest.TestCase):
+    def test_selected_plate_prediction_survives_capture_outbox_and_submit(self):
+        import zipfile
+        from makeros_hub.vprinter.capture import UploadRecord, ProjectFileIntent, assemble_captured_job
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'part.3mf'
+            with zipfile.ZipFile(path, 'w') as archive:
+                archive.writestr('Metadata/slice_info.config', '<config>'
+                    '<plate><metadata key="index" value="1"/><metadata key="prediction" value="90000"/></plate>'
+                    '<plate><metadata key="index" value="2"/><metadata key="prediction" value="1800.5"/></plate></config>')
+                archive.writestr('Metadata/plate_1.gcode', '; synthetic plate 1')
+                archive.writestr('Metadata/plate_2.gcode', '; synthetic plate 2')
+            upload = UploadRecord('member', 'part.3mf', path, '0' * 64, path.stat().st_size)
+            intent = ProjectFileIntent('member', 'part.3mf', [], None, False, None, {}, plate=2)
+            job = assemble_captured_job(upload, intent)
+            restored = from_record(json.loads(json.dumps(to_record(job))))
+            self.assertEqual(build_vp_submit_body(restored, model='P2S')['estSeconds'], 1801)
+
+    def test_missing_ambiguous_or_invalid_predictions_cannot_buy_a_head_start(self):
+        import zipfile
+        from makeros_hub.vprinter.capture import parse_plate_seconds
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'part.3mf'
+            for value in ['0', '-1', 'NaN', 'Infinity', 'true', '10000001', '1e3', '']:
+                with self.subTest(value=value):
+                    with zipfile.ZipFile(path, 'w') as archive:
+                        archive.writestr('Metadata/slice_info.config', '<config><plate><metadata key="index" value="2"/>'
+                            f'<metadata key="prediction" value="{value}"/></plate></config>')
+                    self.assertIsNone(parse_plate_seconds(path, 2))
+            for content in ['<config><plate><metadata key="index" value="1"/><metadata key="prediction" value="1200"/></plate></config>',
+                            '<config><plate><metadata key="index" value="2"/><metadata key="prediction" value="1200"/>'
+                            '<metadata key="prediction" value="1800"/></plate></config>', 'broken xml']:
+                with zipfile.ZipFile(path, 'w') as archive:
+                    archive.writestr('Metadata/slice_info.config', content)
+                self.assertIsNone(parse_plate_seconds(path, 2))
+                self.assertIsNone(parse_plate_seconds(path, None))
+            path.unlink()
+            self.assertIsNone(parse_plate_seconds(path, 2))
