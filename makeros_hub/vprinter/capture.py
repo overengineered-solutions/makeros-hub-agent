@@ -425,6 +425,9 @@ def build_vp_submit_body(job: CapturedJob, *, model: str) -> dict[str, Any]:
     grams = [item.get("usedG") for item in job.required_filaments if isinstance(item.get("usedG"), (int, float)) and not isinstance(item.get("usedG"), bool)]
     if grams:
         body["estGrams"] = int(math.ceil(sum(grams)))
+    seconds = parse_plate_seconds(job.file_path, job.plate)
+    if seconds is not None:
+        body["estSeconds"] = seconds
     if job.plate is not None:
         body["plate"] = job.plate
     # Additive (cloud-side double-Send dedupe on member + VP + sha + plate + mapping): the mapping exactly
@@ -563,6 +566,27 @@ def parse_printer_model_id(path: Path) -> str | None:
             value = str(attrs.get("value") or element.text or "").strip()
             return value[:16] if re.fullmatch(r"[A-Za-z0-9-]{1,16}", value) else None
     return None
+
+
+def parse_plate_seconds(path: Path, plate: int | None) -> int | None:
+    """Only the selected plate's prediction can give this print a queue head start."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            info = archive.getinfo(SLICE_INFO_PATH)
+            if info.file_size > MAX_SLICE_INFO_BYTES:
+                return None
+            root = ElementTree.fromstring(archive.read(info))
+    except (KeyError, OSError, zipfile.BadZipFile, ElementTree.ParseError):
+        return None
+    scope = _plate_element(root, plate)
+    if scope is None:
+        return None
+    values = [m.get("value", "") for m in scope.iter()
+              if _strip_ns(m.tag).lower() == "metadata" and m.get("key") == "prediction"]
+    if len(values) != 1 or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", values[0]):
+        return None
+    seconds = float(values[0])
+    return math.ceil(seconds) if 0 < seconds <= 10_000_000 else None
 
 
 def parse_required_filaments(path: Path, plate: int | None = None) -> list[dict[str, Any]]:
