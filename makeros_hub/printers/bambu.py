@@ -315,7 +315,7 @@ class BambuAdapter:
         pinging a printer that never answers.
         """
         # Recheck once an hour too: firmware may change without the hub restarting.
-        if time.monotonic() - self._version_asked_at >= 3600:
+        if self._version_asked_at and time.monotonic() - self._version_asked_at >= 3600:
             self._version_logged = False
             self._version_asks = 0
             self._probe_lan_commands()

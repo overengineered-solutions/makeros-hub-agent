@@ -84,7 +84,7 @@ def test_observed_klipper_end_is_durable_and_keeps_the_print_key(tmp_path, state
     t = KlipperJobTracker("test", path)
     observe(t, "printing")
     key = t.active_key()
-    observe(t, state, duration=200, now=200)
+    observe(t, state, duration=105, now=105)
     assert t.pending()[0]["status"] == status
     assert t.pending()[0]["endReason"] == reason
     assert t.pending()[0]["jobKey"] == key
@@ -108,3 +108,38 @@ def test_restart_onto_same_named_terminal_does_not_prove_it_is_the_saved_run(tmp
     t = KlipperJobTracker("test", path)
     observe(t, "cancelled")
     assert t.pending()[0]["endReason"] == "lost"
+
+
+@pytest.mark.parametrize("missing", ["before", "after", "gap", "gap_then_printing"])
+def test_klipper_cancellation_without_continuous_run_evidence_is_lost(missing):
+    t = KlipperJobTracker("test")
+    observe(t, "printing", duration=None if missing == "before" else 100)
+    if missing == "gap_then_printing":
+        observe(t, "printing", duration=200, now=200)
+    observe(t, "cancelled", duration=None if missing == "after" else 205,
+            now=205 if missing.startswith("gap") else 105)
+    assert t.pending()[0]["endReason"] == "lost"
+
+
+def test_klipper_still_running_with_the_same_start_reestablishes_run_identity():
+    t = KlipperJobTracker("test")
+    with mock.patch("makeros_hub.printers.klipper._wall", side_effect=lambda now: now + 1000):
+        for state, now in [("printing", 100), ("printing", 200), ("cancelled", 205)]:
+            t.observe({"print_stats": {"state": state, "filename": "synthetic.gcode",
+                                       "print_duration": now, "total_duration": now}}, now)
+    assert t.pending()[0]["endReason"] == "cancelled"
+
+
+def test_firmware_and_lan_are_rechecked_after_an_hour(tmp_path, monkeypatch):
+    monkeypatch.setattr(bambu, "TERMINAL_JOBS_DIR", tmp_path)
+    monkeypatch.setattr(bambu, "QUEUE_PROGRESS_DIR", tmp_path)
+    a = bambu.BambuAdapter(printer_id="test-hour", host="127.0.0.1", serial="SYNTHETIC", access_code="synthetic", model="A1 Mini")
+    a._client = mock.Mock()
+    a._version_logged = True
+    a._version_asked_at = 10
+    with mock.patch.object(bambu.time, "monotonic", return_value=3610):
+        a.request_version_if_missing()
+        assert a._client.publish.call_count == 2
+        a.request_version_if_missing()
+        assert a._client.publish.call_count == 2
+    assert a.status()["lanCommands"] == "unknown"

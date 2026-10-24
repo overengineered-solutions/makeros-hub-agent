@@ -427,7 +427,7 @@ class TestDurability(KlipperCase):
         self.poll(reborn)
         self.assertEqual([(j["jobKey"], j["status"], j["endReason"]) for j in reborn.pending_jobs()], [(key, "cancelled", "lost")])
         self.assertEqual(reborn.collect_queue_progress(),
-                         [{"queueJobId": JOB, "state": "held", "reason": "print_cancelled", "printerJobKey": key, "assignmentSeq": 3}])
+                         [{"queueJobId": JOB, "state": "held", "reason": "outcome_unknown", "printerJobKey": key, "assignmentSeq": 3}])
         reborn.ack_jobs([key])
         for _ in range(2):
             again = self.make()
@@ -478,7 +478,7 @@ class TestDurability(KlipperCase):
         self.fake.duration = 1800.0   # the same file printed again while the hub was down: that IS a new print
         reborn = self.make()
         self.poll(reborn)
-        self.assertEqual([j["endReason"] for j in reborn.pending_jobs()], ["lost"])
+        self.assertEqual([j["status"] for j in reborn.pending_jobs()], ["done"])
 
 
 class TestManagerKlipper(KlipperCase):

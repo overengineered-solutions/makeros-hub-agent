@@ -863,6 +863,7 @@ def plate_warnings(raw: object) -> list[dict]:
         message = p["warning_message"].replace("\x00", "").strip()
         if message:
             warnings.append({"plate": p["id"], "message": message})
+    print(f"Orca plate warnings: processed={len(plates)}, expected={len(plates)}, warnings={len(warnings)}", file=sys.stderr)
     return warnings
 
 

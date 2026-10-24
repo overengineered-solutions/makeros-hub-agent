@@ -1791,6 +1791,7 @@ class KlipperJobTracker:
         # without this the cycle is silently elided and prior print time
         # bleeds into the new one — a billing dispute waiting to happen.
         self._last_print_duration: Optional[float] = None
+        self._last_observed_at: Optional[float] = None
 
     def observe(self, status: dict[str, Any], now: float) -> None:
         """Feed one poll's `status` dict (Moonraker's `result.status` shape)
@@ -1835,10 +1836,17 @@ class KlipperJobTracker:
                 # needs_review path catches zero-gram / null-times).
                 self._emit_recovered(filename, state, now, print_stats)
         else:
+            # After a polling gap, only the same running start can re-establish proof for a later screen cancel.
+            if self._last_observed_at is not None and now - self._last_observed_at > STALE_SEC:
+                same_start = (print_start is not None and self._active.get("printStart") is not None
+                              and abs(print_start - self._active["printStart"]) <= RESUME_START_SLACK_SEC)
+                self._active["cancelUnproven"] = not same_start
             if state in _TERMINAL_DONE_STATES.union(_TERMINAL_FAILED_STATES):
                 # A terminal for a different file, a restarted run, or a run ended while we were down cannot prove this print's end.
                 same = (filename is not None and filename == self._active.get("name")
-                        and not self._active.get("recoveredTerminal")
+                        and not self._active.get("endUnproven")
+                        and (state != "cancelled" or not self._active.get("cancelUnproven")
+                             and self._last_print_duration is not None and print_duration is not None)
                         and (self._last_print_duration is None or print_duration is not None
                              and print_duration + 1 >= self._last_print_duration))
                 reason = {"complete": "completed", "cancelled": "cancelled", "error": "error"}.get(state, "lost") if same else "lost"
@@ -1881,6 +1889,7 @@ class KlipperJobTracker:
             self._last_print_duration = print_duration
 
         self._last_state = state
+        self._last_observed_at = now
 
     def pending(self) -> list[dict]:
         return list(self._pending)
@@ -1937,7 +1946,7 @@ class KlipperJobTracker:
         if same:
             self._active = {"key": saved["key"], "name": saved["name"], "printStart": saved["printStart"],
                             "startedAt": now - (_wall(now) - saved["startedWall"]),
-                            "recoveredTerminal": state not in ("printing", "paused")}
+                            "endUnproven": state not in ("printing", "paused")}
             if state not in ("printing", "paused") and saved["printStart"] is not None and total is not None:
                 # it ended at its start + the frozen total_duration, not when the hub came back
                 ended = now - (_wall(now) - (saved["printStart"] + total))

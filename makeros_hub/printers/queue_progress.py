@@ -246,7 +246,7 @@ class QueueProgressTracker:
                 **_seq_of(dispatch),
             }
             if status != "done":
-                report["reason"] = f"print_{status}"
+                report["reason"] = "outcome_unknown" if job.get("endReason") == "lost" else f"print_{status}"
             # The cloud's transition map is strict: uploading→completed is NOT
             # allowed (only uploading→printing→completed), but uploading→held IS.
             # So ONLY a 'completed' outcome we reach without ever having observed
