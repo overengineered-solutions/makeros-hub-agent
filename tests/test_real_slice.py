@@ -191,7 +191,7 @@ def test_layer_colours_keep_both_spools_presets_and_h2d_nozzles(tmp_path, model)
     result, _ = _slice(tmp_path, _boxes_stl((0, 0, 0, 20, 20, 10), (20, 0, 0, 40, 20, 10)),
                        scale=0.5, model=model, nozzle="right" if model == "H2D" else None, colours=colours)
     assert result["ok"] and result["plates"] == 1, result
-    assert result["prepareVersion"] == 1 and result["colours"] is True
+    assert result["prepareVersion"] == 2 and result["colours"] is True
     assert "Bambu PLA Basic" in result["filament"] and "Generic PLA" in result["filament"]
     used = parse_required_filaments(tmp_path / "job/out/sliced.3mf", 1)
     assert len(used) == 2

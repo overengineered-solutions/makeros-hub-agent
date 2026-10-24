@@ -65,7 +65,7 @@ class LayerColours(unittest.TestCase):
     def test_capability_is_explicit_in_the_image(self):
         # Empty indexes deliberately cannot provide widths, but still exercise the protocol shape.
         self.assertTrue(ps.caps({}, {})['colours'])
-        self.assertEqual(ps.caps({}, {})['prepareVersion'], 1)
+        self.assertEqual(ps.caps({}, {})['prepareVersion'], 2)
 
     def test_hub_forwards_both_choices_and_slicer_refuses_the_unsafe_combination(self):
         raw = job()
