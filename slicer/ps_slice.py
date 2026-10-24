@@ -1152,8 +1152,12 @@ def run(job_dir: str | None = None) -> dict:
                 if sliced_now:
                     print(f"slice pieces: processed={len(summaries)}, expected={len(pieces)}; continuing next pass", flush=True)
                     return {"ok": False, "pending": True, "completed": len(summaries), **caps(processes, machines)}
-                summary = {**slice_one(os.path.join(work, f"piece-{i}.stl"), folder), "index": i,
-                           "fileSha256": hashlib.sha256(open(plate, "rb").read()).hexdigest()}
+                try:
+                    summary = {**slice_one(os.path.join(work, f"piece-{i}.stl"), folder), "index": i,
+                               "fileSha256": hashlib.sha256(open(plate, "rb").read()).hexdigest()}
+                except (SliceError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                    exc.orca_result = os.path.join(folder, "result.json")
+                    raise
                 saved["pieces"] = [p for p in saved["pieces"] if p.get("index") != i] + [summary]
                 persist()
                 sliced_now = True
@@ -1259,7 +1263,7 @@ def main(argv: list[str]) -> int:
     except (SliceError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         reason = str(exc) if isinstance(exc, SliceError) else "the slicer stopped before it finished"
         result = {"ok": False, "error": reason, **caps()}
-        orca_result = os.path.join(out, "result.json")
+        orca_result = getattr(exc, "orca_result", os.path.join(out, "result.json"))
         if os.path.exists(orca_result):
             try:
                 with open(orca_result, encoding="utf-8") as fh:

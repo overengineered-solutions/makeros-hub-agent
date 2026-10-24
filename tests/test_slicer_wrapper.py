@@ -247,12 +247,13 @@ def test_slow_group_resumes_within_each_runner_deadline_and_verifies_saved_files
             pieces.append(dict(index=i, sha256=hashlib.sha256(data).hexdigest()))
         return dict(blocked=[], pieces=pieces)
     monkeypatch.setattr(ps, "prepare_model", prepare)
+    warning = "Synthetic warning"
     def slow_orca(args, **kwargs):
         # Simulated clock: two individually valid 310 s slices exceed the real runner's 600 s aggregate limit.
         assert kwargs["timeout"] == 540
         elapsed.append(310)
         out = Path(args[args.index("--outputdir") + 1])
-        (out / "result.json").write_text(json.dumps({"sliced_plates": [{"id": 1, "warning_message": "Synthetic warning"}]}))
+        (out / "result.json").write_text(json.dumps({"sliced_plates": [{"id": 1, "warning_message": warning}]}))
         with zipfile.ZipFile(out / "sliced.3mf", "w") as z:
             z.writestr("Metadata/slice_info.config", '<config><plate><metadata key="printer_model_id" value="N1"/><filament id="1" used_g="4"/></plate></config>')
             z.writestr("Metadata/plate_1.gcode", "; synthetic")
@@ -270,6 +271,7 @@ def test_slow_group_resumes_within_each_runner_deadline_and_verifies_saved_files
         assert result.get("pending", False) == (n == 0)
     assert sum(elapsed) == 620 and len(prepared) == 1
     assert len(result["pieces"]) == 2 and result["ok"]
+    assert all(p["warnings"] == [{"plate": 1, "message": warning}] for p in result["pieces"])
     # An unchanged retry does no work; a corrupt cached plate is sliced again, never trusted.
     assert ps.run(str(tmp_path))["ok"] and len(elapsed) == 2
     (tmp_path / "out/piece-1/sliced.3mf").write_bytes(b"corrupted")
@@ -282,3 +284,7 @@ def test_slow_group_resumes_within_each_runner_deadline_and_verifies_saved_files
     assert ps.run(str(tmp_path))["pending"] and len(prepared) == 3
     (tmp_path / "job.json").write_text(json.dumps(raw | {"scale": 1.5}))
     assert ps.run(str(tmp_path))["pending"] and len(prepared) == 4
+    warning = "floating regions"
+    assert ps.main(["ps_slice.py"]) == 3
+    refused = json.loads((tmp_path / "out/result.json").read_text())
+    assert refused["warnings"] == [{"plate": 1, "message": warning}]

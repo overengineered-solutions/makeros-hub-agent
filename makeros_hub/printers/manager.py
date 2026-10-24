@@ -782,7 +782,7 @@ class PrinterManager:
                         weights = [f.get("usedG") for f in used]
                         if not used or any(type(g) not in (int, float) or not math.isfinite(g) or g <= 0 for g in weights):
                             raise ValueError("a cut piece has no measured filament")
-                        summaries.append({**{k: piece.get(k) for k in ("index", "supportUsed", "filament", "process", "settings")},
+                        summaries.append({**{k: piece.get(k) for k in ("index", "seconds", "warnings", "supportUsed", "filament", "process", "settings") if k in piece},
                                           "grams": math.ceil(sum(weights)), "modelId": parse_printer_model_id(plate_file),
                                           "requiredFilaments": [_vp_submit_filament(f) for f in used]})
                     body["slice"]["pieces"] = summaries

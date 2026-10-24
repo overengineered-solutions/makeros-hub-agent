@@ -325,7 +325,8 @@ def test_cut_group_checks_every_mesh_and_reports_every_slice_before_approval(tmp
         spec = json.loads((work / "job.json").read_text())
         result = dict(ok=True, prepare=proposal)
         if "piece" not in spec:
-            result["pieces"] = [dict(ok=True, index=i, supportUsed=False, process="synthetic", filament="synthetic", settings={},
+            result["pieces"] = [dict(ok=True, index=i, supportUsed=False, process="synthetic", filament="synthetic", settings={}, seconds=60 * (i + 1),
+                                     warnings=[dict(plate=1, message=f"Synthetic piece {i} warning")],
                                      fileSha256=hashlib.sha256(sliced_plate()).hexdigest()) for i in range(3)]
         (work / "out/result.json").write_text(json.dumps(result))
         return 0
@@ -333,6 +334,8 @@ def test_cut_group_checks_every_mesh_and_reports_every_slice_before_approval(tmp
     assert manager.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 1
     assert len(rechecks) == 3 and reports[-1]["estGrams"] == 12
     assert [p["grams"] for p in reports[-1]["slice"]["pieces"]] == [4, 4, 4]
+    assert [p["seconds"] for p in reports[-1]["slice"]["pieces"]] == [60, 120, 180]
+    assert [p["warnings"][0]["message"] for p in reports[-1]["slice"]["pieces"]] == [f"Synthetic piece {i} warning" for i in range(3)]
     assert reports[-1]["slice"]["prepare"]["checked"] is True
     child = fetch(submissionUid="abcd1234abcd1234", preparedFrom=sent["submissionUid"],
                   slice=sent["slice"] | {"piece": {k: geometry[1][k] for k in ("index", "sha256")}})
@@ -340,6 +343,8 @@ def test_cut_group_checks_every_mesh_and_reports_every_slice_before_approval(tmp
         raise AssertionError("the verified quote already sliced this piece")
     assert manager.fetch_uploads([child], tmp_path, getter=get, reporter=report, slice_runner=no_slice) == 1
     assert rechecks[-1] == MESH + b"1" and "pieces" not in reports[-1]["slice"]
+    assert reports[-1]["slice"]["warnings"] == [dict(plate=1, message="Synthetic piece 1 warning")]
+    assert reports[-1]["slice"]["seconds"] == 120
     # A corrupt cached plate cannot reach dispatch: the worker falls back to preparing the piece.
     (tmp_path / sent["submissionUid"] / ".slice/out/piece-1/sliced.3mf").write_bytes(b"corrupted")
     child["submissionUid"] = "abcd1234abcd5678"
