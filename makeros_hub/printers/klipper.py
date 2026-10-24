@@ -1851,7 +1851,7 @@ class KlipperJobTracker:
                              and print_duration + 1 >= self._last_print_duration))
                 reason = {"complete": "completed", "cancelled": "cancelled", "error": "error"}.get(state, "lost") if same else "lost"
                 self._close({"completed": "done", "cancelled": "cancelled", "error": "failed", "lost": "cancelled"}[reason], now, reason)
-            elif state in _ACTIVE_STATES:
+            elif state in _ACTIVE_STATES or state == "paused":
                 # A duration reset proves a new run, never how the old one ended.
                 duration_reset = (
                     self._last_print_duration is not None
@@ -1874,10 +1874,6 @@ class KlipperJobTracker:
                 elif filename and not self._active.get("name"):
                     self._active["name"] = filename
                     self._save()
-            elif state == "paused":
-                # Paused doesn't open or close; just remember the state for
-                # the next observe call.
-                pass
             elif state == "standby":
                 # Missed the real ending. Treat as cancelled — same
                 # convention as the Bambu tracker.

@@ -1,9 +1,10 @@
 import json
+from pathlib import Path
 from unittest import mock
 
 import pytest
 
-from makeros_hub.printers import bambu
+from makeros_hub.printers import bambu, klipper
 from makeros_hub.printers.klipper import KlipperJobTracker
 from test_slicer_wrapper import ps
 
@@ -128,6 +129,49 @@ def test_klipper_still_running_with_the_same_start_reestablishes_run_identity():
             t.observe({"print_stats": {"state": state, "filename": "synthetic.gcode",
                                        "print_duration": now, "total_duration": now}}, now)
     assert t.pending()[0]["endReason"] == "cancelled"
+
+
+@pytest.mark.parametrize("name,duration", [("synthetic.gcode", 0), ("replacement.gcode", 7200)])
+def test_replacement_first_seen_paused_closes_the_old_run_as_lost(tmp_path, name, duration):
+    path = tmp_path / "terminal.json"
+    t = KlipperJobTracker("test", path)
+    observe(t, "printing", duration=7200)
+    old_key = t.active_key()
+    observe(t, "paused", name=name, duration=duration, now=105)
+    replacement = t.active_key()
+    assert replacement != old_key
+    observe(t, "cancelled", name=name, duration=duration, now=110)
+    assert [(j["jobKey"], j["endReason"]) for j in t.pending()] == [(old_key, "lost"), (replacement, "cancelled")]
+    assert KlipperJobTracker("test", path).pending() == t.pending()
+
+
+def test_pausing_the_same_run_keeps_its_key_and_cancellation_proof():
+    t = KlipperJobTracker("test")
+    observe(t, "printing", duration=7200)
+    key = t.active_key()
+    observe(t, "paused", duration=7200, now=105)
+    assert t.active_key() == key
+    assert t.pending() == []
+    observe(t, "cancelled", duration=7200, now=110)
+    assert [(j["jobKey"], j["endReason"]) for j in t.pending()] == [(key, "cancelled")]
+
+
+def test_paused_replacement_reports_match_the_site_billing_fixture(tmp_path, monkeypatch):
+    # Mirrored in pstation test/fixtures; stop-billing.test.ts replays these reports through the real billing routes.
+    fixture = json.loads((Path(__file__).parent / "fixtures/klipper-paused-replacement.json").read_text())
+    monkeypatch.setattr(klipper, "TERMINAL_JOBS_DIR", tmp_path / "terminal")
+    monkeypatch.setattr(klipper, "QUEUE_PROGRESS_DIR", tmp_path / "queue")
+    a = klipper.KlipperAdapter("synthetic-printer", "http://127.0.0.1:1")
+    with mock.patch.object(klipper.time, "monotonic", return_value=95):
+        assert a._record_dispatch(fixture["queue"][0]["queueJobId"], fixture["filename"], 1)
+    queue = []
+    for sample in fixture["samples"]:
+        with mock.patch.object(klipper.time, "monotonic", return_value=sample["now"]):
+            a._record_poll({"print_stats": {"state": sample["state"], "filename": fixture["filename"], "print_duration": sample["duration"]}})
+            queue.extend(a.collect_queue_progress())
+    terminal = [{k: v for k, v in r.items() if k not in ("startedAt", "endedAt", "printTimeSeconds", "printerId")} for r in a.pending_jobs()]
+    assert terminal == fixture["terminal"]
+    assert queue == fixture["queue"]
 
 
 def test_firmware_and_lan_are_rechecked_after_an_hour(tmp_path, monkeypatch):
