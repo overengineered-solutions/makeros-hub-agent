@@ -545,7 +545,7 @@ class KlipperAdapter:
             log.warning("klipper %s: start of %s refused: %s", self.printer_id, uploaded, detail)
             self._diag("klipper", f"print start for {queue_job_id[:8]} refused: {detail}")
             self._discard_dispatch(queue_job_id)
-            return {"ok": False, "reason": "start_command_failed"}
+            return {"ok": False, "reason": "start_refused", "startEvidence": self._start_evidence("refused", str(exc.code))}
         except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:
             # The command may have reached klippy (no answer, or a broken one): keep the dispatch and let telemetry decide
             # (RUNNING → printing; nothing within the start timeout → start_not_observed). Never a second start on top of a
@@ -561,7 +561,10 @@ class KlipperAdapter:
         if not (isinstance(parsed, dict) and parsed.get("result") == "ok"):
             self._diag("klipper", f"print start for {queue_job_id[:8]} answered without ok")
             self._discard_dispatch(queue_job_id)
-            return {"ok": False, "reason": "start_command_failed"}
+            return {"ok": False, "reason": "start_refused", "startEvidence": self._start_evidence("refused", "not_ok")}
+        with self._lock:
+            self._queue_progress.command_reply(queue_job_id, "accepted")
+            self._save_queue_progress()
         log.info("klipper %s: started %s for %s", self.printer_id, uploaded, queue_job_id)
         return {"ok": True}
 
@@ -598,7 +601,7 @@ class KlipperAdapter:
         with self._lock:
             self._queue_progress.record_dispatch(
                 queue_job_id, self._job_tracker.pending(), task_name=task_name,
-                active_key=self._job_tracker.active_key(), assignment_seq=assignment_seq,
+                active_key=self._job_tracker.active_key(), assignment_seq=assignment_seq, start_sequence=queue_job_id,
             )
             if self._save_queue_progress():
                 return True
@@ -661,6 +664,15 @@ class KlipperAdapter:
             raise ValueError("upload answered without item.path")
         return path
 
+    def _start_evidence(self, reply="unconfirmed", code=None) -> dict:
+        with self._lock:
+            stats = self._data.get("print_stats", {})
+            last = self._last_poll_ok_at
+            return {"started": stats.get("state") in ("printing", "paused"),
+                    "gcodeState": _GCODE_STATE_MAP.get(stats.get("state")),
+                    "sampledAt": int((time.time() - (time.monotonic() - last)) * 1000) if last is not None else None,
+                    "commandReply": reply, **({"replyCode": code} if code else {})}
+
     def collect_queue_progress(self, on_report=None) -> list[dict]:
         """Drain queue-status reports inferred from observed print_stats. `on_report` receives each report BEFORE the
         popped dispatch state is persisted (the agent writes it to the durable outbox there); a report that could not be
@@ -681,6 +693,10 @@ class KlipperAdapter:
                 gcode_state = "IDLE"
             reports = self._queue_progress.collect(self._job_tracker.pending(), gcode_state)
             for report in reports:
+                if report.get("reason") == "start_not_observed":
+                    report["startEvidence"] = {"started": raw_state in ("printing", "paused"), "gcodeState": _GCODE_STATE_MAP.get(raw_state),
+                        "sampledAt": int((time.time() - (time.monotonic() - last)) * 1000) if last is not None else None,
+                        **next((d.get("startReply", {"commandReply": "unconfirmed"}) for d in before["dispatches"] if d["queueJobId"] == report["queueJobId"]), {"commandReply": "unconfirmed"})}
                 task = task_names.get(report.get("queueJobId"))
                 # only a DURABLE key: a key a restart cannot find again would make the cloud refuse the real terminal
                 # (hub_job_ref set to another key); without one the cloud's time-window match still finds the print
@@ -1184,6 +1200,11 @@ class KlipperAdapter:
             was_first = self._last_poll_ok_at is None
             self._data = data
             self._last_poll_ok_at = time.monotonic()
+            stats = data.get("print_stats", {})
+            pending = self._queue_progress.to_state()["dispatches"]
+            if pending and _job_filename(stats) == pending[0].get("taskName"):
+                self._queue_progress.observe_running(_GCODE_STATE_MAP.get(stats.get("state")))
+            self._save_queue_progress()
             self._last_error_reason = None
             self._consecutive_failures = 0
             # Feed the job tracker every successful poll. Pure helper —
@@ -1850,7 +1871,7 @@ class KlipperJobTracker:
                         and (self._last_print_duration is None or print_duration is not None
                              and print_duration + 1 >= self._last_print_duration))
                 reason = {"complete": "completed", "cancelled": "cancelled", "error": "error"}.get(state, "lost") if same else "lost"
-                self._close({"completed": "done", "cancelled": "cancelled", "error": "failed", "lost": "cancelled"}[reason], now, reason)
+                self._close({"completed": "done", "cancelled": "cancelled", "error": "failed", "lost": "cancelled"}[reason], now, reason, _klipper_failure(print_stats) if reason == "error" else None)
             elif state in _ACTIVE_STATES or state == "paused":
                 # A duration reset proves a new run, never how the old one ended.
                 duration_reset = (
@@ -1976,7 +1997,7 @@ class KlipperJobTracker:
         }
         self._save()   # a restart mid-print must find this key again
 
-    def _close(self, status: str, now: float, end_reason: str = "lost") -> None:
+    def _close(self, status: str, now: float, end_reason: str = "lost", failure: dict | None = None) -> None:
         if self._active is None:
             return
         now = self._active.get("endedAt", now)
@@ -1985,6 +2006,7 @@ class KlipperJobTracker:
             "printerId": self.printer_id,
             "status": status,
             "endReason": end_reason,
+            **({"failure": failure or {"kind": "cancelled" if end_reason == "cancelled" else "lost" if end_reason == "lost" else "error"}} if status != "done" else {}),
             "startedAt": _iso(self._active["startedAt"]),
             "endedAt": _iso(now),
             "printTimeSeconds": max(0, int(now - self._active["startedAt"])),
@@ -2034,6 +2056,7 @@ class KlipperJobTracker:
             "jobKey": _job_key(self.printer_id, filename, started_at),
             "printerId": self.printer_id,
             "status": status_out,
+            **({"failure": _klipper_failure(print_stats) if status_out == "failed" else {"kind": "lost"}} if status_out != "done" else {}),
             "endReason": "completed" if status_out == "done" else "error" if status_out == "failed" else "lost",
             "startedAt": _iso(started_at),
             "endedAt": _iso(now),
@@ -2088,3 +2111,15 @@ def _iso(monotonic_ts: float) -> str:
     wall = _wall(monotonic_ts)
     # 2026-06-16T22:30:00Z shape.
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall))
+
+
+def _klipper_failure(stats: dict) -> dict:
+    # No raw message on the wire: Klipper can quote a filename or the member's G-code in it.
+    message = str(stats.get("message", "")).lower()
+    if message.startswith(("heater ", "adc out of range")):
+        return {"kind": "heater"}
+    if message.startswith(("no trigger on", "endstop ", "probe triggered")):
+        return {"kind": "homing"}
+    if message.startswith(("mcu ", "lost communication with mcu")):
+        return {"kind": "controller"}
+    return {"kind": "error"}

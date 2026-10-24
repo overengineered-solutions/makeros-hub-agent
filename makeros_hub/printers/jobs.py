@@ -268,6 +268,7 @@ class JobTracker:
                               **({"notDispatched": True} if a.get("notDispatched") is True else {}),
                               **({"taskKey": a["taskKey"]} if isinstance(a.get("taskKey"), str) else {}),
                               "named": a.get("named") is not False,
+                              **({"failure": a["failure"]} if isinstance(a.get("failure"), dict) else {}),
                               **({"noId": True} if a.get("noId") is True else {})}
         self._active_saved = json.dumps(self._state(), sort_keys=True)
 
@@ -345,7 +346,7 @@ class JobTracker:
             **({"notDispatched": True} if self._mark_next else {}),
         }
 
-    def _close(self, status: str, now: float) -> None:
+    def _close(self, status: str, now: float, failure: dict | None = None) -> None:
         if self._active is None:
             return
         a, self._active = self._active, None   # cleared first: the one save below holds the job AND no running print
@@ -366,6 +367,8 @@ class JobTracker:
             "startedAt": _iso(a["startedAt"]),
             "endedAt": _iso(end),
         }
+        if failure:
+            job["failure"] = failure if failure.get("printError") or failure.get("hms") else a.get("failure", failure)
         if not unseen or eta is not None:
             job["printTimeSeconds"] = max(0, int(end - a["startedAt"]))
         if a["name"]:
@@ -430,6 +433,8 @@ class JobTracker:
             "status": "done" if state == _TERMINAL_DONE else "failed",
             "endedAt": _iso(now),
         }
+        if state == _TERMINAL_FAILED:
+            job["failure"] = _failure(merged)
         name = _job_name(merged)
         if name:
             job["filename"] = name
@@ -529,10 +534,13 @@ class JobTracker:
                 # for hours after a print never re-emit.
                 self._emit_recovered(merged, state, now)
         else:
+            observed_fault = _failure(merged)
+            if observed_fault.get("printError") or observed_fault.get("hms"):
+                self._active["failure"] = observed_fault
             if state == _TERMINAL_DONE:
                 self._close("done", now)
             elif state == _TERMINAL_FAILED:
-                self._close("failed", now)
+                self._close("failed", now, _failure(merged))
             elif state == _ACTIVE:
                 # Same job still running (another print was split off above): refresh identity bits that arrived late
                 # (task_id often lands after the first RUNNING frame), but never reopen/re-time it.
@@ -596,3 +604,11 @@ class JobTracker:
         self._pending = [j for j in self._pending if j["jobKey"] not in keys]
         if len(self._pending) != before:
             self._save_pending()
+
+
+def _failure(merged: dict) -> dict:
+    from .bambu_parse import build_hms
+    p = merged.get("print", {})
+    code = p.get("print_error")
+    return {"kind": "error", "hms": build_hms(p) or [],
+            **({"printError": code} if isinstance(code, int) and not isinstance(code, bool) and 0 <= code <= 0xffffffff else {})}

@@ -1226,7 +1226,10 @@ class PrinterManager:
                     log.warning("uploading report for %s not durable — guard left unset for recovery", queue_job_id)
                 reserved.add(printer_id)
             else:
-                emit(held(result.get("reason", "start_failed")))
+                refusal = held(result.get("reason", "start_failed"))
+                if isinstance(result.get("startEvidence"), dict):
+                    refusal["startEvidence"] = result["startEvidence"]
+                emit(refusal)
         return reports
 
     def collect_queue_progress(self, on_report=None) -> list[dict]:

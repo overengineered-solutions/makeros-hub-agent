@@ -36,6 +36,7 @@ REQ_PLA = [{"slot": 1, "type": "PLA", "color": "FFFFFF"}]
 def adapter():
     a = bambu_module.BambuAdapter(printer_id="p1", host="127.0.0.1", serial="S1", access_code="x", model="A1 mini")
     a._client = FakeClient(); a._connack = "ok"; a._data = RAW_STATE; a._last_report_at = time.monotonic()
+    a._last_status_at = a._last_report_at
     a._state_seen = True   # the printer reported its state on this connection
     return a
 

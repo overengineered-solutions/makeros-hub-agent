@@ -1216,7 +1216,7 @@ class TestRestartMidDispatchNeverStartsTwice(_Dispatch):
         self.assertEqual((b._client.published, self.upload.call_count), ([], 1))
         b._queue_progress._start_timeout_sec = 0           # it never started: held for a human, never started again
         self.assertEqual(b.collect_queue_progress(),
-                         [{"queueJobId": "q1", "state": "held", "reason": "start_not_observed", "assignmentSeq": 7}])
+                         [{"queueJobId": "q1", "state": "held", "reason": "outcome_unknown_after_restart", "assignmentSeq": 7}])
 
     def test_died_after_the_start_left_before_any_report_or_guard_was_durable(self):
         m = PrinterManager()

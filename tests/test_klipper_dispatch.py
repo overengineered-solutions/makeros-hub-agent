@@ -201,7 +201,9 @@ class TestStartPrint(KlipperCase):
 
     def test_a_refused_start_forgets_the_dispatch(self):
         self.fake.start_status, self.fake.start_body = 400, {"error": {"message": "Printer is busy"}}
-        self.assertEqual(self.start(), {"ok": False, "reason": "start_command_failed"})
+        result = self.start()
+        self.assertEqual((result["ok"], result["reason"]), (False, "start_refused"))
+        self.assertEqual(result["startEvidence"]["commandReply"], "refused")
         self.assertEqual(self.adapter.pending_queue_jobs(), [])
 
     def test_an_unanswered_start_keeps_the_dispatch_for_telemetry(self):
@@ -273,8 +275,11 @@ class TestCollectQueueProgress(KlipperCase):
         self.start()
         self.adapter._queue_progress._start_timeout_sec = 0
         self.poll()
-        self.assertEqual(self.adapter.collect_queue_progress(),
-                         [{"queueJobId": JOB, "state": "held", "reason": "start_not_observed", "assignmentSeq": 3}])
+        (report,) = self.adapter.collect_queue_progress()
+        evidence = report.pop("startEvidence")
+        self.assertEqual(evidence["commandReply"], "accepted")
+        self.assertIsInstance(evidence["sampledAt"], int)
+        self.assertEqual(report, {"queueJobId": JOB, "state": "held", "reason": "start_not_observed", "assignmentSeq": 3})
 
     def test_another_file_running_is_never_this_jobs_print(self):
         # the start never reached klippy; a member starts a walk-up print at the screen inside the start window
@@ -284,8 +289,11 @@ class TestCollectQueueProgress(KlipperCase):
         self.poll()
         self.assertEqual(self.adapter.collect_queue_progress(), [])
         self.adapter._queue_progress._start_timeout_sec = 0
-        self.assertEqual(self.adapter.collect_queue_progress(),
-                         [{"queueJobId": JOB, "state": "held", "reason": "start_not_observed", "assignmentSeq": 3}])
+        (report,) = self.adapter.collect_queue_progress()
+        evidence = report.pop("startEvidence")
+        self.assertEqual(evidence["commandReply"], "accepted")
+        self.assertIsInstance(evidence["sampledAt"], int)
+        self.assertEqual(report, {"queueJobId": JOB, "state": "held", "reason": "start_not_observed", "assignmentSeq": 3})
 
     def test_the_printing_report_never_carries_another_prints_key(self):
         # ours runs and finishes between two beats, then a walk-up print starts before the next collect: the synthesized
@@ -427,7 +435,7 @@ class TestDurability(KlipperCase):
         self.poll(reborn)
         self.assertEqual([(j["jobKey"], j["status"], j["endReason"]) for j in reborn.pending_jobs()], [(key, "cancelled", "lost")])
         self.assertEqual(reborn.collect_queue_progress(),
-                         [{"queueJobId": JOB, "state": "held", "reason": "outcome_unknown", "printerJobKey": key, "assignmentSeq": 3}])
+                         [{"queueJobId": JOB, "state": "held", "reason": "outcome_unknown", "printerJobKey": key, "assignmentSeq": 3, "failure": {"kind": "lost"}}])
         reborn.ack_jobs([key])
         for _ in range(2):
             again = self.make()

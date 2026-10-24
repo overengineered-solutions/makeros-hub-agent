@@ -22,13 +22,19 @@
       "jobKey": "fp_42e6725f69dfe96474752d4e",
       "status": "cancelled",
       "endReason": "lost",
-      "filename": "bracket.3mf"
+      "filename": "bracket.3mf",
+      "failure": {
+        "kind": "lost"
+      }
     },
     {
       "jobKey": "fp_987aa956ae64338724a25c36",
       "status": "cancelled",
       "endReason": "cancelled",
-      "filename": "bracket.3mf"
+      "filename": "bracket.3mf",
+      "failure": {
+        "kind": "cancelled"
+      }
     }
   ],
   "queue": [
@@ -43,7 +49,10 @@
       "state": "held",
       "printerJobKey": "fp_42e6725f69dfe96474752d4e",
       "assignmentSeq": 1,
-      "reason": "outcome_unknown"
+      "reason": "outcome_unknown",
+      "failure": {
+        "kind": "lost"
+      }
     }
   ]
 }

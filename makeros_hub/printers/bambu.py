@@ -239,6 +239,11 @@ class BambuAdapter:
                 if isinstance(result, str) and result.lower() in ("success", "fail"):
                     self._lan_commands = "accepted" if result.lower() == "success" else "rejected"
                     self._lan_probe = None
+            if isinstance(reply, dict) and reply.get("command") == "project_file" and isinstance(reply.get("result"), str) and reply["result"].lower() in ("success", "fail"):
+                code = str(reply.get("reason", ""))
+                self._queue_progress.command_reply(str(reply.get("sequence_id")), "accepted" if reply["result"].lower() == "success" else "refused",
+                                                   code if re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", code) else None)
+                self._save_queue_progress()
             bambu_parse.merge_report(self._data, doc)
             self._last_report_at = time.monotonic()
             report = doc.get("print")
@@ -251,6 +256,8 @@ class BambuAdapter:
             # a gcode_state: a get_version answer ahead of the pushall must not feed the cached state to the tracker
             # (codex review of 61c12f8: it spent the reconnect judgement on a stale IDLE).
             if self._state_seen:
+                self._queue_progress.observe_running(self._data.get("print", {}).get("gcode_state"))
+                self._save_queue_progress()
                 self._jobs.observe(self._data, time.time())
             if not self._shape_logged:
                 self._shape_logged = True
@@ -556,7 +563,7 @@ class BambuAdapter:
             with self._lock:
                 self._queue_progress.record_dispatch(
                     queue_job_id, self._jobs.pending(), task_name=task_name, active_key=self._jobs.active_key(),
-                    assignment_seq=assignment_seq,
+                    assignment_seq=assignment_seq, start_sequence=str(payload["print"]["sequence_id"]),
                 )
                 if not self._save_queue_progress():
                     # Durable state is the invariant (codex v0.54 r2): a print we cannot track across a restart is a
@@ -772,12 +779,24 @@ class BambuAdapter:
         with self._lock:
             print_obj = self._data.get("print") if isinstance(self._data.get("print"), dict) else {}
             # None until the first report after (re)start: silence is not idle (codex v0.54 #1)
-            observed = self._last_report_at is not None
+            observed = self._state_seen and self._last_status_at is not None and time.monotonic() - self._last_status_at <= STALE_SEC
             before = self._queue_progress.to_state()
             reports = self._queue_progress.collect(
                 self._jobs.pending(),
                 print_obj.get("gcode_state") if observed else None,
             )
+            for report in reports:
+                d = next((d for d in before["dispatches"] if d["queueJobId"] == report["queueJobId"]), {})
+                if report.get("reason") in ("start_not_observed", "start_refused"):
+                    sampled = self._last_status_at
+                    report["startEvidence"] = {
+                        "started": bool(d.get("reported_printing") or d.get("sawRunning")),
+                        "gcodeState": print_obj.get("gcode_state"),
+                        "sampledAt": int((time.time() - (time.monotonic() - sampled)) * 1000) if sampled is not None else None,
+                        **d.get("startReply", {"commandReply": "unconfirmed"}),
+                        "hms": bambu_parse.build_hms(print_obj) or [],
+                        **({"printError": print_obj["print_error"]} if isinstance(print_obj.get("print_error"), int) and 0 <= print_obj["print_error"] <= 0xffffffff else {}),
+                    }
             if callable(on_report):
                 for i, report in enumerate(reports):
                     try:

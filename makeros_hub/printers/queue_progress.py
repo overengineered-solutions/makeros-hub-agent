@@ -118,6 +118,9 @@ class QueueProgressTracker:
                     "reported_printing": bool(d["reported_printing"]),
                     "baselineKeys": sorted(d["baselineKeys"]),
                     "taskName": d.get("taskName"),
+                    "startReply": d.get("startReply", {"commandReply": "unconfirmed"}),
+                    "startSequence": d.get("startSequence"),
+                    "sawRunning": bool(d.get("sawRunning")),
                 }
                 for d in self._dispatches
             ],
@@ -146,6 +149,9 @@ class QueueProgressTracker:
                     "baselineKeys": {k for k in _list(d.get("baselineKeys")) if isinstance(k, str)},
                     "taskName": d.get("taskName") if isinstance(d.get("taskName"), str) else None,
                     **({"assignmentSeq": d["assignmentSeq"]} if isinstance(d.get("assignmentSeq"), int) and not isinstance(d.get("assignmentSeq"), bool) else {}),
+                    "startReply": d.get("startReply") if isinstance(d.get("startReply"), dict) else {"commandReply": "unconfirmed"},
+                    "startSequence": d.get("startSequence"),
+                    "sawRunning": bool(d.get("sawRunning")),
                     "rehydrated_monotonic": now,
                 }
             )
@@ -160,6 +166,7 @@ class QueueProgressTracker:
         task_name: str | None = None,
         active_key: str | None = None,
         assignment_seq: int | None = None,
+        start_sequence: str | None = None,
     ) -> None:
         """`active_key` = the job the printer was ALREADY running when we dispatched (JobTracker.active_key()); it can
         never be ours. `task_name` = the subtask name we sent; a recovered terminal with a different filename is not ours."""
@@ -173,10 +180,23 @@ class QueueProgressTracker:
                 "started_monotonic": time.monotonic() if now is None else now,
                 "dispatched_wall": time.time(),
                 "reported_printing": False,
+                "startSequence": start_sequence,
+                "startReply": {"commandReply": "unconfirmed"},
+                "sawRunning": False,
                 "baselineKeys": baseline,
                 "taskName": task_name if isinstance(task_name, str) and task_name else None,
             }
         )
+
+    def observe_running(self, state: Any) -> None:
+        # A RUNNING frame between heartbeats still forbids a retry, even if its terminal cannot be matched.
+        if self._dispatches and _gcode_state(state) in _ACTIVE_GCODE_STATES:
+            self._dispatches[0]["sawRunning"] = True
+
+    def command_reply(self, sequence: str, result: str, code: str | None = None) -> None:
+        for d in self._dispatches:
+            if d.get("startSequence") == sequence:
+                d["startReply"] = {"commandReply": result, **({"replyCode": code} if code else {})}
 
     def pending_queue_job_ids(self) -> list[str]:
         """Queue jobs dispatched to this printer whose outcome is not yet known (v0.58: the adapter's in-flight guard)."""
@@ -245,6 +265,8 @@ class QueueProgressTracker:
                 "printerJobKey": job_key,
                 **_seq_of(dispatch),
             }
+            if isinstance(job.get("failure"), dict):
+                report["failure"] = job["failure"]
             if status != "done":
                 report["reason"] = "outcome_unknown" if job.get("endReason") == "lost" else f"print_{status}"
             # The cloud's transition map is strict: uploading→completed is NOT
@@ -267,7 +289,7 @@ class QueueProgressTracker:
         # original dispatch time: the box may have been down for hours while the printer worked.
         if "rehydrated_monotonic" in dispatch and "observed_monotonic" not in dispatch:
             dispatch["observed_monotonic"] = now
-        if state in _ACTIVE_GCODE_STATES and not dispatch["reported_printing"]:
+        if (state in _ACTIVE_GCODE_STATES or dispatch.get("sawRunning")) and not dispatch["reported_printing"]:
             dispatch["reported_printing"] = True
             return [{"queueJobId": dispatch["queueJobId"], "state": "printing", **_seq_of(dispatch)}]
 
@@ -282,7 +304,7 @@ class QueueProgressTracker:
                 {
                     "queueJobId": dispatch["queueJobId"],
                     "state": "held",
-                    "reason": "start_not_observed",
+                    "reason": "outcome_unknown_after_restart" if "rehydrated_monotonic" in dispatch else ("start_refused" if dispatch.get("startReply", {}).get("commandReply") == "refused" else "start_not_observed"),
                     **_seq_of(dispatch),
                 }
             ]
