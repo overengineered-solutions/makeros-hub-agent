@@ -47,6 +47,7 @@ def test_bambu_terminal_keeps_fault_and_hms_with_the_print_through_restart(tmp_p
     fault = {"print": {**active["print"], "gcode_state": "PAUSE", "print_error": 0x03008008,
                        "hms": [{"attr": 50332160, "code": 65545}]}}
     j.observe(fault, 1010)
+    j = JobTracker("synthetic-printer", "synthetic-serial", state_path=path)
     j.observe({"print": {**active["print"], "gcode_state": "FAILED", "print_error": 0}}, 1020)
     again = JobTracker("synthetic-printer", "synthetic-serial", state_path=path)
     (done,) = again.pending()
