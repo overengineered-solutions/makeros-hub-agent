@@ -12,6 +12,7 @@ Wire facts (MeerK40t ruida driver, jnweiger/ruida-laser protocol.md, kkaempf/rui
 """
 import hashlib
 import itertools
+import math
 import re
 from array import array
 from collections.abc import Sequence
@@ -60,6 +61,8 @@ ALLOWED = {
     (0xA8,): 10, (0xA9,): 4, (0xAA,): 2, (0xAB,): 2,
     # power, laser 1: min, max (2); layer min, max: layer(1) + power(2). Every other C6 needs a sample AND a cap rule.
     (0xC6, 0x01): 2, (0xC6, 0x02): 2, (0xC6, 0x31): 3, (0xC6, 0x32): 3,
+    # VisiCut 2.1 commands recorded in pstation docs/laser-software-decision-2026-10-14.md.
+    (0xC6, 0x60): 7, (0xCA, 0x41): 2, (0xCA, 0x03): 1, (0xCA, 0x10): 1,
     # speed: speed(5); layer speed: layer(1) + speed(5)
     (0xC9, 0x02): 5, (0xC9, 0x04): 6,
     # layer: work mode / layer end (1); layer number (1); layer colour: layer(1) + colour(5); max layer (1)
@@ -101,11 +104,7 @@ NEVER = {
     (0xA5,): "panel key",
     (0xCC,): "ack", (0xCD,): "error", (0xCE,): "keep-alive", (0xCF,): "nak",
 }
-# A trailing DA 01 06 20 ... (a scratch-setting write some writers append) is refused like any DA, until the operator
-# decides after seeing samples (contract C10).
-
-# Leading client-envelope command keys to drop before checking (a client's own E8 02 / E7 01, if samples carry one).
-ENVELOPE_STRIP = ()
+# job_bytes drops the recorded VisiCut scratch tail and client envelope; neither reaches check's allowlist or the wire.
 
 # Repeat and array commands may carry only their do-nothing values (check step 14): check() walks one copy of the path,
 # once, so a count above one would run passes or copies (possibly off the bed) that nothing here looked at. Research
@@ -234,21 +233,120 @@ def pct(p):
 POWER_STEP = 100 / 16383  # one 14-bit power step, in percent
 
 
+def valid_profile(value):
+    return isinstance(value, list) and 1 <= len(value) <= 3 and all(
+        isinstance(o, dict) and set(o) == {"speed", "min", "max"}
+        and all(type(v) in (int, float) and math.isfinite(v) for v in o.values())
+        and 1 <= o["speed"] <= 1000 and 0 < o["min"] <= o["max"] <= 100 for o in value)
+
+
+def enc35(v):
+    if not 0 <= v < 2**31:
+        raise ValueError("negative or wrapped coordinates; do not use Set startpoint")
+    return bytes((v >> n) & 127 for n in (28, 21, 14, 7, 0))
+
+
 def job_bytes(body):
-    """Unswizzled job with any ENVELOPE_STRIP lead-in removed -> (data, offset of data in the file)."""
-    data, cut = unswizzle(body), 0
-    for m in _SPAN.finditer(data):  # lazily: this stops at the first command that isn't envelope
-        if _tok(data, m.start(), m.end()).key not in ENVELOPE_STRIP:
+    """Strict VisiCut import, then back-right translation; no scratch write or client envelope can reach the wire."""
+    data = unswizzle(body)
+    tokens = tokenize(data)
+    out = bytearray()
+    visicut = b"\xda\x01\x06\x20" in data
+    header = False
+    envelope_seen = False
+    skip_name = False
+    for t in tokens:
+        k, p = t.key, data[t.ps:t.end]
+        if skip_name:
+            if k != (0xE7, 0x01) or not 1 <= len(p) <= 129 or p[-1] != 0 or 0 in p[:-1]:
+                raise ValueError("damaged file name in the transfer header; export again")
+            skip_name = False
+            continue
+        if k == (0xE8, 0x02) and not header and not envelope_seen and not p:
+            envelope_seen = skip_name = True
+            continue
+        if k == (0xDA, 0x01) and len(p) == 12 and p[:2] == b"\x06\x20" and data[t.end:t.end + 1] in (b"\xe7", b"\xd7"):
+            continue  # recorded VisiCut travel-length scratch write, never sent
+        if k == END and visicut:
+            out += bytes(k)
+            break  # D7 has no parameters; even low-byte padding belongs to the discarded tail
+        if ALLOWED.get(k) != len(p):
+            return data, 0  # unchanged: check() names the unrecognised command or wrong length
+        out += data[t.off:t.end]
+        header |= k == START
+        if k == END:
+            if t.end != len(data) and not visicut:
+                return data, 0  # legacy files still refuse arbitrary bytes after D7
             break
-        cut = m.end()
-    return data[cut:], cut
+    if skip_name:
+        raise ValueError("incomplete transfer header; export again")
+    data = bytes(out)
+    mode = None
+    for t in tokenize(data):
+        if t.key in ((0xD8, 0x10), (0xD8, 0x11), (0xD8, 0x12)):
+            if mode is not None:
+                raise ValueError("multiple reference modes; set Position to Current position and export again")
+            mode = t.key
+    if mode is None:
+        return data, 0
+    if mode == (0xD8, 0x10) and b"\xe6\x01" in data:
+        return data, 0
+    if mode != (0xD8, 0x12) or b"\xe6\x01" in data:
+        raise ValueError("set Position to Current position and export again")
+    # Walk every travel and laser-on segment, including raster travel, with bounded per-layer boxes.
+    pos, bounds, part, boxes = None, None, 0, {}
+    for t in tokenize(data):
+        k, p = t.key, data[t.ps:t.end]
+        if k == (0xCA, 0x02):
+            part = p[0]
+        if k[0] not in MOVES:
+            continue
+        if k[0] in (0x88, 0xA8):
+            point = (u35(p[:5]), u35(p[5:]))
+        elif pos is None:
+            raise ValueError("relative motion before a position; export again")
+        elif k[0] in (0x89, 0xA9):
+            point = (pos[0] + s14(p[:2]), pos[1] + s14(p[2:]))
+        elif k[0] in (0x8A, 0xAA):
+            point = (pos[0] + s14(p), pos[1])
+        else:
+            point = (pos[0], pos[1] + s14(p))
+        if min(point) < 0 or max(point) >= 2**31:
+            raise ValueError("negative or wrapped coordinates; do not use Set startpoint")
+        if k[0] in CUTS and pos is None:
+            raise ValueError("cut before a travel position; export again")
+        points = (pos, point) if pos is not None else (point,)
+        for x, y in points:
+            bounds = [x, y, x, y] if bounds is None else [min(bounds[0], x), min(bounds[1], y), max(bounds[2], x), max(bounds[3], y)]
+            box = boxes.get(part, [x, y, x, y])
+            boxes[part] = [min(box[0], x), min(box[1], y), max(box[2], x), max(box[3], y)]
+        pos = point
+    if bounds is None:
+        raise ValueError("there is nothing to cut or score")
+    x0, y0, x1, y1 = bounds
+    result = bytearray()
+    for t in tokenize(data):
+        k, p = t.key, data[t.ps:t.end]
+        if k[0] in (0x88, 0xA8):
+            p = enc35(u35(p[:5]) - x0) + enc35(u35(p[5:]) - y0)
+        elif k in BOUNDS:
+            lo = k in ((0xE7, 0x03), (0xE7, 0x50))
+            p = enc35(0 if lo else x1 - x0) + enc35(0 if lo else y1 - y0)
+        elif k in ((0xE7, 0x52), (0xE7, 0x53), (0xE7, 0x61), (0xE7, 0x62)):
+            if p[0] not in boxes:
+                raise ValueError("a layer has a frame but no path; export again")
+            box = boxes[p[0]]
+            lo = k in ((0xE7, 0x52), (0xE7, 0x61))
+            p = p[:1] + enc35(box[0 if lo else 2] - x0) + enc35(box[1 if lo else 3] - y0)
+        result += bytes(k) + p
+    return bytes(result), 0
 
 
 def _mm(um):
     return round(um / 1000, 1)
 
 
-def check(body, max_power_pct, cfg):
+def check(body, max_power_pct, cfg, profile=None):
     """-> {"verdict": "checked", ...} or {"verdict": "refused", "code", "reason", "offset", ...}.
 
     cfg needs max_file_bytes, packet_max_bytes, min_power_pct (0 = not calibrated: the minimum is skipped here; the
@@ -258,7 +356,14 @@ def check(body, max_power_pct, cfg):
     def refuse(code, reason, offset=None):
         return {"verdict": "refused", "code": code, "reason": reason, "offset": offset, "sha256": sha, "sizeBytes": size}
 
-    data, base = job_bytes(body)
+    if size > cfg.max_file_bytes:
+        return refuse("too_large", f"the file is {size} bytes; the limit is {cfg.max_file_bytes}")
+    if profile is not None and not valid_profile(profile):
+        return refuse("bad_profile", "the tested material settings are missing or invalid; ask staff")
+    try:
+        data, base = job_bytes(body)
+    except ValueError as exc:
+        return refuse("damaged", str(exc))
     toks = tokenize(data)
     at = lambda t: base + t.off  # noqa: E731
 
@@ -292,6 +397,8 @@ def check(body, max_power_pct, cfg):
     if start_i is None or start_i > move_i:
         return refuse("no_header_marker", "the header has no D8 00")
     # 7. header_too_long: envelope + header (through D8 00) is store's first packet
+    if profile is not None and not any(t.key in ((0xD8, 0x10), (0xD8, 0x12)) for t in toks):
+        return refuse("reference_mode", "the file has no explicit reference mode; export again")
     header = ENVELOPE_LEN + toks[start_i].end
     if header > cfg.packet_max_bytes:
         return refuse("header_too_long", f"the header is {header} bytes; it has to fit in one "
@@ -313,6 +420,7 @@ def check(body, max_power_pct, cfg):
     by_layer = {}  # layer -> the result's summary
     have = {}      # layer -> the settings it has had so far: "max power", "min power", "speed"
     layer, any_max, any_cut = 0, False, False
+    actual = {}
     for t in toks:
         p, k = data[t.ps:t.end], t.key
         if k == (0xCA, 0x02):
@@ -335,6 +443,7 @@ def check(body, max_power_pct, cfg):
             f, pick = ("maxPowerPct", max) if is_max else ("minPowerPct", min)
             e[f] = round(v, 1) if e[f] is None else pick(e[f], round(v, 1))
             have.setdefault(n, set()).add("max power" if is_max else "min power")
+            actual.setdefault(n, {})["max" if is_max else "min"] = v
         elif k in SPEEDS:
             v = u35(p)
             # 12. speed_out_of_range
@@ -343,11 +452,24 @@ def check(body, max_power_pct, cfg):
                                  f"{lo:g}–{hi:g} mm/s", at(t)))
             e["speedMmS"] = round(v / 1000, 1) if e["speedMmS"] is None else max(e["speedMmS"], round(v / 1000, 1))
             have.setdefault(n, set()).add("speed")
+            actual.setdefault(n, {})["speed"] = v / 1000
+        elif k == (0xC6, 0x60) and (p[1] != 0 or not 5000 <= u35(p[-5:]) <= 20000):
+            return refuse("frequency", "frequency must be 5000–20000 Hz", at(t))
+        elif profile is not None and ((k == (0xCA, 0x41) and p[1] != 0) or (k == (0xCA, 0x01) and p[0] not in (0, 0x13))):
+            return refuse("engraving_not_ready", "filled engraving is not in this pilot; use cut or score", at(t))
+        elif k == (0xCA, 0x03) and p != b"\x0f" or k == (0xCA, 0x10) and p != b"\x00":
+            return refuse("work_mode", "export with the shop's VisiCut vector settings", at(t))
         elif k[0] in CUTS:
             any_cut = True
             # 12b. settings_missing: a cut on a layer with no power or speed set before it would run at whatever the
             #      controller last held, which nothing here checked.
             missing = [w for w in ("max power", "min power", "speed") if w not in have.get(layer, ())]
+            values = actual.get(layer, {})
+            if profile is not None and not missing and not any(
+                    abs(values["speed"] - o["speed"]) <= 0.001 and abs(values["min"] - o["min"]) <= POWER_STEP
+                    and abs(values["max"] - o["max"]) <= POWER_STEP for o in profile):
+                first.setdefault("profile_mismatch", ("the file's speed or power differs from the selected material; "
+                                                      "download its settings and export again", at(t)))
             if missing:
                 first.setdefault("settings_missing", (f"layer {layer + 1} cuts at byte {at(t)} with no "
                                  f"{' or '.join(missing)} setting before it", at(t)))
@@ -355,23 +477,32 @@ def check(body, max_power_pct, cfg):
     if cfg.min_power_pct > 0 and any_cut and not any_max:
         first.setdefault("power_under_min", (f"layer 1 power 0.0% is under the {cfg.min_power_pct:.1f}% minimum "
                                              "(below it the exhaust fans don't start)", None))
-    for code in ("power_over_cap", "power_under_min", "speed_out_of_range", "settings_missing"):
+    for code in ("power_over_cap", "power_under_min", "speed_out_of_range", "settings_missing", "profile_mismatch"):
         if code in first:
             return refuse(code, *first[code])
+    if not any_cut:
+        return refuse("nothing_to_cut", "there is nothing to cut or score")
+    if len(by_layer) > 64 or any(n > 63 for n in by_layer):
+        return refuse("too_many_layers", "use at most 64 layers")
     # 13. out_of_bed. Every head position (moves and cuts; relative steps accumulate from the last absolute point, or
     #     from 0,0 before one) and every E7 03/07/50/51 bound must lie in [0, bed]. Every point inside the bed means the
     #     overall extent fits too. ponytail: with "current position" reference mode (D8 12) the controller adds the
     #     head's position at Start, which no file check can see; the controller's own soft limits cover that case.
     w, h = (round(v * 1000) for v in cfg.bed_mm)
     x = y = 0
-    cut = None  # [min_x, min_y, max_x, max_y] of cutting segments
+    extent = None  # full motion, including travel; this is the size a member must frame on their sheet
     for t in toks:
         p, op = data[t.ps:t.end], t.key[0]
-        if t.key in BOUNDS:
+        if t.key in BOUNDS or t.key in ((0xE7, 0x52), (0xE7, 0x53), (0xE7, 0x61), (0xE7, 0x62)):
+            if len(p) == 11:
+                p = p[1:]
+            if max(u35(p[:5]), u35(p[5:])) >= 2**31:
+                return refuse("out_of_bed", "negative or wrapped frame coordinates; export again", at(t))
             px, py = s32(p[0:5]), s32(p[5:10])
         elif op in MOVES:
-            ox, oy = x, y
             if op in (0x88, 0xA8):
+                if max(u35(p[:5]), u35(p[5:])) >= 2**31:
+                    return refuse("out_of_bed", "negative or wrapped coordinates; export again", at(t))
                 x, y = s32(p[0:5]), s32(p[5:10])
             elif op in (0x89, 0xA9):
                 x, y = x + s14(p[0:2]), y + s14(p[2:4])
@@ -379,9 +510,7 @@ def check(body, max_power_pct, cfg):
                 x += s14(p)
             else:
                 y += s14(p)
-            if op in CUTS:
-                cut = cut or [ox, oy, ox, oy]
-                cut[:] = [min(cut[0], ox, x), min(cut[1], oy, y), max(cut[2], ox, x), max(cut[3], oy, y)]
+            extent = [x, y, x, y] if extent is None else [min(extent[0], x), min(extent[1], y), max(extent[2], x), max(extent[3], y)]
             px, py = x, y
         else:
             continue
@@ -398,9 +527,9 @@ def check(body, max_power_pct, cfg):
                               f"{', '.join(map(str, got))}; only {', '.join(map(str, want))} (one copy, run once) is "
                               "allowed", at(t))
 
-    cut = cut or [0, 0, 0, 0]
-    return {"verdict": "checked", "sha256": sha, "sizeBytes": size, "maxPowerPct": cap,
-            "widthMm": _mm(cut[2] - cut[0]), "heightMm": _mm(cut[3] - cut[1]),
+    extent = extent or [0, 0, 0, 0]
+    return {"verdict": "checked", "checkVersion": 1, "preparedSha256": hashlib.sha256(swizzle(data)).hexdigest(), "sha256": sha, "sizeBytes": size, "maxPowerPct": cap,
+            "widthMm": _mm(extent[2] - extent[0]), "heightMm": _mm(extent[3] - extent[1]),
             "layers": [by_layer[n] for n in sorted(by_layer)][:64]}
 
 

@@ -355,7 +355,7 @@ def _int_or_none(v):
 def _gate_reading(body: dict) -> dict:
     seen = body.get("seenAt")
     moving = body.get("moving")
-    return {"moving": moving if isinstance(moving, bool) else None, "statusWord": _int_or_none(body.get("statusWord")),
+    return {"idle": body.get("idle") if type(body.get("idle")) is bool else None, "moving": moving if isinstance(moving, bool) else None, "statusWord": _int_or_none(body.get("statusWord")),
             "fileCount": _int_or_none(body.get("fileCount")),
             "seenAt": seen if isinstance(seen, str) and _ISO_RE.fullmatch(seen) else None}
 
@@ -642,14 +642,20 @@ class LaserHub:
                 return {**base, "verdict": "refused", "code": "sha_mismatch",
                         "reason": "the file didn't arrive at the shop intact; upload it again"}
             return {**base, "verdict": "retry", "detail": f.detail}
+        query = {"maxPowerPct": offer["maxPowerPct"]}
+        if "profile" in offer:
+            query["profile"] = json.dumps(offer["profile"], separators=(",", ":"))
         try:
-            status, body = request("POST", f"{self.cfg.gate_url}/check?maxPowerPct={offer['maxPowerPct']}", body=data,
+            status, body = request("POST", f"{self.cfg.gate_url}/check?{urlencode(query)}", body=data,
                                    headers={**auth, "Content-Type": "application/octet-stream"}, timeout=CHECK_TIMEOUT_S)
         except Unreachable:
             return {**base, "verdict": "retry", "detail": "gate_unreachable"}
         if status == 200 and body.get("verdict") == "checked":
-            keys = ("sizeBytes", "maxPowerPct", "widthMm", "heightMm", "layers")
-            return {**base, "verdict": "checked", "result": {k: body.get(k) for k in keys}}
+            if "profile" in offer and (not _checked(body) or body.get("sha256") != offer["sha256"] or body.get("sizeBytes") != offer["sizeBytes"]):
+                log.error("laser: gate returned an invalid material check")
+                return {**base, "verdict": "retry", "detail": "bad_gate_response"}
+            keys = ("checkVersion", "preparedSha256", "sizeBytes", "maxPowerPct", "widthMm", "heightMm", "layers")
+            return {**base, "verdict": "checked", "result": {k: body[k] for k in keys if k in body}}
         if status == 200 and body.get("verdict") == "refused":
             out = {**base, "verdict": "refused", "reason": str(body.get("reason") or "the gate refused this file")[:300]}
             if isinstance(body.get("code"), str):
@@ -758,13 +764,24 @@ class LaserHub:
         auth = self._gate_auth()
         if auth is None:
             return "gate_not_configured"
-        query = urlencode({"name": load["code"], "maxPowerPct": load["maxPowerPct"], "sha256": load["sha256"]})
+        # Leave a second for the HTTP reply before the hub gives up waiting.
+        expires = min(expires, time.time() + STORE_TIMEOUT_S - 1)
+        query = {"name": load["code"], "maxPowerPct": load["maxPowerPct"], "sha256": load["sha256"],
+                 "expiresAt": f"{expires:.6f}"}
+        if "profile" in load:
+            query.update(profile=json.dumps(load["profile"], separators=(",", ":")), preparedSha256=load["preparedSha256"])
+        query = urlencode(query)
         try:
             status, body = request("POST", f"{self.cfg.gate_url}/store?{query}", body=data,
                                    headers={**auth, "Content-Type": "application/octet-stream"}, timeout=STORE_TIMEOUT_S)
         except Unreachable:
             return "gate_unreachable"
         if status == 200 and body.get("ok") is True:
+            if "profile" in load and (body.get("preparedSha256") != load["preparedSha256"] or body.get("name") != load["code"]
+                                     or type(body.get("fileCountBefore")) is not int or type(body.get("fileCountAfter")) is not int
+                                     or body["fileCountAfter"] != body["fileCountBefore"] + 1):
+                log.error("laser: gate returned an invalid store acknowledgement")
+                return "no_result"
             return None
         if body.get("error") == "refused":
             return f"gate:refused: {body.get('reason') or ''}"[:200]
@@ -811,6 +828,23 @@ def parse_instant(value) -> float | None:
     return dt.timestamp() if dt.tzinfo is not None else None
 
 
+def _valid_profile(value):
+    return isinstance(value, list) and 1 <= len(value) <= 3 and all(
+        isinstance(o, dict) and set(o) == {"speed", "min", "max"} and all(_finite(v) for v in o.values())
+        and 1 <= o["speed"] <= 1000 and 0 < o["min"] <= o["max"] <= 100 for o in value)
+
+
+def _checked(body):
+    layers = body.get("layers")
+    return (type(body.get("checkVersion")) is int and body["checkVersion"] == 1 and isinstance(body.get("preparedSha256"), str)
+            and _SHA_RE.fullmatch(body["preparedSha256"]) and _finite(body.get("widthMm"))
+            and 0 <= body["widthMm"] <= 1000 and _finite(body.get("heightMm")) and 0 <= body["heightMm"] <= 600
+            and isinstance(layers, list) and 1 <= len(layers) <= 64
+            and all(isinstance(l, dict) and type(l.get("index")) is int and 0 <= l["index"] < 64
+                    and all(_finite(l.get(k)) for k in ("minPowerPct", "maxPowerPct", "speedMmS"))
+                    and 0 < l["minPowerPct"] <= l["maxPowerPct"] <= 100 and 1 <= l["speedMmS"] <= 1000 for l in layers))
+
+
 def _valid_offer(o, lasers) -> dict | None:
     if not isinstance(o, dict):
         return None
@@ -822,7 +856,10 @@ def _valid_offer(o, lasers) -> dict | None:
             and 1 <= size <= LASER_FILE_MAX_BYTES and type(cap) is int and 1 <= cap <= 100):
         log.warning("laser: skipping a malformed check offer")
         return None
-    return {"fileId": fid, "machineId": mid, "path": path, "sha256": sha, "sizeBytes": size, "maxPowerPct": cap}
+    if "profile" in o and not _valid_profile(o["profile"]):
+        log.warning("laser: skipping a malformed material profile")
+        return None
+    return {**({"profile": o["profile"]} if "profile" in o else {}), "fileId": fid, "machineId": mid, "path": path, "sha256": sha, "sizeBytes": size, "maxPowerPct": cap}
 
 
 def _valid_load(p: dict) -> dict | None:
@@ -832,7 +869,10 @@ def _valid_load(p: dict) -> dict | None:
             and 1 <= size <= LASER_FILE_MAX_BYTES and isinstance(code, str) and _CODE_RE.fullmatch(code)
             and type(cap) is int and 1 <= cap <= 100):
         return None
-    return {"fileId": fid, "path": p["path"], "sha256": sha, "sizeBytes": size, "code": code, "maxPowerPct": cap}
+    if "profile" in p and (not _valid_profile(p["profile"]) or not isinstance(p.get("preparedSha256"), str)
+                           or not _SHA_RE.fullmatch(p["preparedSha256"])):
+        return None
+    return {**({"profile": p["profile"], "preparedSha256": p["preparedSha256"]} if "profile" in p else {}), "fileId": fid, "path": p["path"], "sha256": sha, "sizeBytes": size, "code": code, "maxPowerPct": cap}
 
 
 class _PushHandler(BaseHTTPRequestHandler):

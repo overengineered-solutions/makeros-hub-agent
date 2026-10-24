@@ -626,15 +626,20 @@ class H6Load(Base):
         hub = self.hub(gate.url, fetcher=self.fetcher(wait=release))
         m = PrinterManager(laser=hub)
         started = time.monotonic()
+        params = load_params(expiresAt=iso_in(30))
         reports = m.dispatch_commands([{"requestId": "L1", "printerId": LASER_ID, "command": "laser_load",
-                                        "params": load_params()}])
+                                        "params": params}])
         self.assertEqual(reports, [])
         self.assertLess(time.monotonic() - started, 1)
         self.assertEqual(hub.take_command_results(), [])
         release.set()
         self.assertEqual(self.result(hub), [{"requestId": "L1", "command": "laser_load", "status": "ok"}])
         call = gate.calls[0]
-        self.assertEqual(call["path"], f"/store?name=AB1234&maxPowerPct=60&sha256={SHA}")
+        self.assertTrue(call["path"].startswith(f"/store?name=AB1234&maxPowerPct=60&sha256={SHA}&expiresAt="))
+        expires = float(call["path"].split("expiresAt=")[1])
+        self.assertGreater(expires, time.time())
+        self.assertEqual(expires, laser.parse_instant(params["expiresAt"]))
+        self.assertLessEqual(expires, time.time() + laser.STORE_TIMEOUT_S - 1)
         self.assertEqual(call["body"], BODY)
         self.assertEqual(call["headers"]["Authorization"], f"Bearer {GATE_TOKEN}")
         self.assertEqual(m.dispatch_commands([{"requestId": "L1", "printerId": LASER_ID, "command": "laser_load",
@@ -747,6 +752,17 @@ class H7Checks(Base):
         self.assertTrue(self.wait_for(lambda: len(hub.report(poll=False).file_checks) >= n and not hub._checking))
         return hub.report(poll=False).file_checks
 
+    def test_material_check_needs_a_complete_receipt_for_this_file(self):
+        gate = self.gate({("POST", "/check"): (200, CHECKED)})
+        hub = self.hub(gate.url, fetcher=self.fetcher())
+        o = offer(profile=[{"speed": 20, "min": 20, "max": 30}])
+        self.assertEqual(hub.check_one(o)["verdict"], "retry")
+        good = {**CHECKED, "checkVersion": 1, "preparedSha256": "a" * 64}
+        gate.routes[("POST", "/check")] = (200, good)
+        self.assertEqual(hub.check_one(o)["result"]["preparedSha256"], "a" * 64)
+        gate.routes[("POST", "/check")] = (200, {**good, "sha256": "0" * 64})
+        self.assertEqual(hub.check_one(o)["verdict"], "retry")
+
     def test_checked_and_refused_come_through(self):
         gate = self.gate({("POST", "/check"): (200, CHECKED)})
         hub = self.hub(gate.url, fetcher=self.fetcher())
@@ -815,13 +831,13 @@ class H8GateStatus(Base):
     def test_mapping(self):
         gate = self.gate({("GET", "/status"): (200, self.STATUS)})
         hub = self.hub(gate.url)
-        self.assertEqual(hub.poll_gate(), ("up", None, {"moving": True, "statusWord": 0x8000, "fileCount": 5,
+        self.assertEqual(hub.poll_gate(), ("up", None, {"idle": None, "moving": True, "statusWord": 0x8000, "fileCount": 5,
                                                          "seenAt": "2026-10-14T20:00:00Z"}))
         self.assertEqual(gate.calls[0]["headers"]["Authorization"], f"Bearer {GATE_TOKEN}")
         gate.routes[("GET", "/status")] = (200, {**self.STATUS, "controller": "down", "statusWord": None, "moving": None,
                                                  "fileCount": None})
         self.assertEqual(hub.poll_gate(), ("down", "controller_unreachable",
-                                           {"moving": None, "statusWord": None, "fileCount": None, "seenAt": "2026-10-14T20:00:00Z"}))
+                                           {"idle": None, "moving": None, "statusWord": None, "fileCount": None, "seenAt": "2026-10-14T20:00:00Z"}))
         gate.routes[("GET", "/status")] = (401, {"error": "unauthorized"})
         self.assertEqual(hub.poll_gate(), ("down", "gate_unauthorized", None))
         gate.routes[("GET", "/status")] = (500, None)

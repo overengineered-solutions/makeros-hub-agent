@@ -1,6 +1,6 @@
 # /etc/laser-gate/config.toml (root:laser-gate 0640). install.sh writes this on its first run; edit, then re-run it.
 # Every key is required to be one of these; an unknown key means the gate refuses to start.
-# Until T0, T1 and T5 are done the gate is inert for storing: store_enabled = false, file_count_addr = "",
+# Until T0, T1, T4 and T5 are done the gate is inert for storing: store_enabled = false, file_count_addr = "",
 # min_power_pct = 0. /status works from the start; /check works once min_power_pct is set.
 
 listen = "127.0.0.1:7650"      # the one HTTP listener. Shop box: loopback. A Pi: its shop-LAN address. Never 0.0.0.0.
@@ -11,6 +11,13 @@ bind_ip = "10.0.3.1"           # this host's static address on the laser-only NI
 ack_timeout_s = 0.5            # T2 sets this
 store_enabled = false          # a person flips this during T1, and only for and after T1
 file_count_addr = ""           # T0: hex address of the controller's stored-file count, e.g. "0x0123"; empty = /store refuses
+# T0: verify E8 01 read-by-index replies and the capacity on THIS controller before filling these in.
+names_verified = false
+max_stored_files = 0           # 0 holds stores; never guess the memory capacity
+# T4: identify a mask/value that matches idle but NOT running or paused, including the moving bit.
+# Zero is deliberately unconfigured. A mask containing only the moving bit is refused.
+idle_status_mask = 0
+idle_status_value = 0
 min_power_pct = 0              # T5: lowest power that reads >= 2.3 A on the plug; 0 = /check answers not_calibrated
 max_power_pct = 100            # absolute ceiling; a request's maxPowerPct is clamped under it
 bed_mm = [1000, 600]           # controller travel (pstation migration 0126)

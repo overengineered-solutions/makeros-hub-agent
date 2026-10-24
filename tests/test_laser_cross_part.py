@@ -70,7 +70,8 @@ def pstation_accepts_check(c):
     assert c["verdict"] in {"checked", "refused", "retry"}
     if c["verdict"] == "checked":
         assert isinstance(c["result"], dict)
-        assert set(c["result"]) == {"sizeBytes", "maxPowerPct", "widthMm", "heightMm", "layers"}
+        assert set(c["result"]) == {"checkVersion", "preparedSha256", "sizeBytes", "maxPowerPct", "widthMm", "heightMm", "layers"}
+        assert laser._checked(c["result"])
     if c["verdict"] == "refused":
         assert isinstance(c["reason"], str) and c["reason"].strip() and len(c["reason"]) <= 300
         assert isinstance(c.get("code"), str)
@@ -85,7 +86,7 @@ class GateHubPstation(unittest.TestCase):
         for name, value in ((laser.GATE_TOKEN_FILE, fx.TOKEN), (laser.PUSH_TOKEN_FILE, PUSH_TOKEN)):
             (self.secrets / name).write_text(value)
             (self.secrets / name).chmod(0o600)
-        self.fake = fx.FakeController(status=0)
+        self.fake = fx.FakeController()
         self.addCleanup(self.fake.close)
         self.gate = fx.gate_for(self.fake)
         self.addCleanup(self.fake.assert_clean, self.gate.reads)   # every datagram the gate sent passed its guard
@@ -107,7 +108,7 @@ class GateHubPstation(unittest.TestCase):
         path = laser.LASER_FILE_PATH + file_id
         self.files[path] = data
         return {"fileId": file_id, "machineId": LASER_ID, "path": path, "sha256": hashlib.sha256(data).hexdigest(),
-                "sizeBytes": len(data), "maxPowerPct": cap}
+                "sizeBytes": len(data), "maxPowerPct": cap, "profile": [{"speed": 20, "min": 20, "max": 30}]}
 
     def wait(self, predicate):
         deadline = time.monotonic() + 10
@@ -145,7 +146,8 @@ class GateHubPstation(unittest.TestCase):
         expires = (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
         manager = PrinterManager(laser=self.hub)
         params = {"expiresAt": expires, "fileId": FILE_ID, "path": o["path"], "sha256": o["sha256"],
-                  "sizeBytes": o["sizeBytes"], "code": "MD0042", "maxPowerPct": 50}
+                  "sizeBytes": o["sizeBytes"], "code": "MD0042", "maxPowerPct": 50,
+                  "profile": o["profile"], "preparedSha256": checked["result"]["preparedSha256"]}
         self.assertEqual(manager.dispatch_commands([{"requestId": "22222222-0000-4000-8000-000000000001",
                                                      "printerId": LASER_ID, "command": "laser_load", "params": params}]), [])
         self.wait(lambda: not self.hub._load_running)
@@ -159,7 +161,8 @@ class GateHubPstation(unittest.TestCase):
         o = self.offer(fx.square())
         expires = (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
         params = {"expiresAt": expires, "fileId": FILE_ID, "path": o["path"], "sha256": o["sha256"],
-                  "sizeBytes": o["sizeBytes"], "code": "MD0043", "maxPowerPct": 50}
+                  "sizeBytes": o["sizeBytes"], "code": "MD0043", "maxPowerPct": 50,
+                  "profile": o["profile"], "preparedSha256": o["sha256"]}
         self.assertIsNone(self.hub.dispatch("r1", LASER_ID, "laser_load", params))
         self.wait(lambda: not self.hub._load_running)
         self.assertEqual(self.hub.take_command_results()[0]["detail"], "gate:head_moving")

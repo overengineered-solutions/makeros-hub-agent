@@ -97,7 +97,7 @@ class Http(ServerBase):
         self.assertEqual(code, 200)
         self.assertEqual({k: s[k] for k in ("gateVersion", "controller", "statusWord", "moving", "fileCount",
                                             "storeEnabled", "calibrated", "busy")},
-                         {"gateVersion": "0.1.0", "controller": "up", "statusWord": 0x08000000, "moving": False,
+                         {"gateVersion": "0.2.0", "controller": "up", "statusWord": 0x08000000, "moving": False,
                           "fileCount": 12, "storeEnabled": True, "calibrated": {"minPowerPct": True, "fileCountAddr": True},
                           "busy": False})
         self.assertRegex(s["seenAt"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")

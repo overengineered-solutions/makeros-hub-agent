@@ -9,4 +9,4 @@ this package, so it is written in words here.)
 
 Stdlib only, Python >= 3.11. Design: pstation docs/laser-control-plan-2026-10-14.md; install: docs/laser-gate.md.
 """
-__version__ = "0.1.0"
+__version__ = "0.2.0"
