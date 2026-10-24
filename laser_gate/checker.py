@@ -283,7 +283,7 @@ def job_bytes(body):
         return data, 0
     if modes == [(0xD8, 0x10)] and b"\xe6\x01" in data:
         return data, 0
-    if modes != [(0xD8, 0x12)]:
+    if modes != [(0xD8, 0x12)] or b"\xe6\x01" in data:
         raise ValueError("set Position to Current position and export again")
     # Walk every travel and laser-on segment, including raster travel, with bounded per-layer boxes.
     pos, bounds, part, boxes = None, None, 0, {}
@@ -389,6 +389,8 @@ def check(body, max_power_pct, cfg, profile=None):
     if start_i is None or start_i > move_i:
         return refuse("no_header_marker", "the header has no D8 00")
     # 7. header_too_long: envelope + header (through D8 00) is store's first packet
+    if profile is not None and not any(t.key in ((0xD8, 0x10), (0xD8, 0x12)) for t in toks):
+        return refuse("reference_mode", "the file has no explicit reference mode; export again")
     header = ENVELOPE_LEN + toks[start_i].end
     if header > cfg.packet_max_bytes:
         return refuse("header_too_long", f"the header is {header} bytes; it has to fit in one "

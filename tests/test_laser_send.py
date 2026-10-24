@@ -59,6 +59,7 @@ class LaserSend(unittest.TestCase):
 
     def test_empty_oversized_negative_and_repeated_modes_refuse(self):
         for p in (visicut().replace(b"\xa8", b"\x88"), visicut().replace(b"\xd8\x12", b"\xd8\x12\xd8\x12"),
+                  visicut().replace(b"\xd8\x12", b""), visicut().replace(b"\xd8\x12", b"\xd8\x12\xe6\x01"),
                   visicut().replace(b"\x88" + fx.xy(900, 10), b"\x88" + fx.xy(-1, 10))):
             self.assertEqual(self.verdict(p)["verdict"], "refused")
         self.assertEqual(self.verdict(fx.square_plain(size=1001).replace(b"\xd8\x10\xe6\x01", b"\xd8\x12"))["code"], "out_of_bed")

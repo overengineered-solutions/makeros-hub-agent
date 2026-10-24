@@ -161,7 +161,8 @@ class GateHubPstation(unittest.TestCase):
         o = self.offer(fx.square())
         expires = (datetime.now(timezone.utc) + timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
         params = {"expiresAt": expires, "fileId": FILE_ID, "path": o["path"], "sha256": o["sha256"],
-                  "sizeBytes": o["sizeBytes"], "code": "MD0043", "maxPowerPct": 50}
+                  "sizeBytes": o["sizeBytes"], "code": "MD0043", "maxPowerPct": 50,
+                  "profile": o["profile"], "preparedSha256": o["sha256"]}
         self.assertIsNone(self.hub.dispatch("r1", LASER_ID, "laser_load", params))
         self.wait(lambda: not self.hub._load_running)
         self.assertEqual(self.hub.take_command_results()[0]["detail"], "gate:head_moving")

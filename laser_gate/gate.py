@@ -239,6 +239,7 @@ class Controller:
                 log.warning("panel names processed=%d, expected=%d", len(names), count)
                 return None
             names.append(name)
+        log.info("panel names processed=%d, expected=%d", len(names), count)
         return names
 
     def read(self, sock, addr):
@@ -512,16 +513,16 @@ class Handler(BaseHTTPRequestHandler):
                       ("sha256", SHA_RE.fullmatch(p.get("sha256", "")))):
             if not ok:
                 return 400, {"error": "bad_request", "detail": k}
+        profile = _profile(p)
+        prepared = p.get("preparedSha256")
+        if profile is None or not SHA_RE.fullmatch(prepared or ""):
+            return 400, {"error": "bad_request", "detail": "profile/preparedSha256"}
         n, _ = self._length(gate)
         if n is None:
             return None, {"error": "length"}
         body = self._body(n)
         if body is None:
             return 400, {"error": "bad_request", "detail": "body shorter than Content-Length"}
-        profile = _profile(p)
-        prepared = p.get("preparedSha256")
-        if ("profile" in p or prepared is not None) and (profile is None or not SHA_RE.fullmatch(prepared or "")):
-            return 400, {"error": "bad_request", "detail": "profile/preparedSha256"}
         return gate.store(body, p["name"], _power(p["maxPowerPct"]), p["sha256"], profile, prepared)
 
     def __getattr__(self, name):

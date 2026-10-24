@@ -218,7 +218,8 @@ To check one file by hand (no network): `python3 -m laser_gate check FILE.rd --m
 ## File-export pilot, gate 0.2.0 / hub 0.84.0 (2026-10-23)
 
 The site supplies `profile` (a bounded JSON list of tested speed/min/max triples) to `/check`, and the same
-profile plus `preparedSha256` to `/store`. The new check receipt has `checkVersion: 1`. The hub validates the
+profile plus `preparedSha256` to `/store`, which refuses a request missing either, including an older hub's request.
+The new check receipt has `checkVersion: 1`. The hub validates the
 receipt; an older gate cannot silently satisfy it. The checker strips the recorded VisiCut client envelope and
 travel-length scratch write, translates current-position jobs to their back-right corner, and rebuilds the frames.
 It checks every laser-on segment's effective settings against the selected material. Unknown commands, wrong

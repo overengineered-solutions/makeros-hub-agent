@@ -1,10 +1,12 @@
 """Laser gate store and never-send guard, contract G8-G11. The controller is a fake UDP socket on 127.0.0.1 with
 ephemeral ports; nothing binds 50200 or 40200 and nothing leaves loopback."""
 import hashlib
+import json
 import threading
 import time
 import unittest
 from unittest import mock
+from urllib.parse import urlencode
 
 import laser_gate_fixtures as fx
 from laser_gate.checker import envelope, plan_packets, swizzle, unswizzle
@@ -138,7 +140,8 @@ class HttpStoreRefusals(StoreBase):
         return srv.call("POST", "/store?" + query, body)
 
     def q(self, body, name="MD0412", cap="80"):
-        return f"name={name}&maxPowerPct={cap}&sha256={sha(body)}"
+        return f"name={name}&maxPowerPct={cap}&sha256={sha(body)}&" + urlencode({
+            "profile": json.dumps([{"speed": 20, "min": 20, "max": 30}]), "preparedSha256": sha(body)})
 
     def test_g10_store_disabled_sends_nothing(self):
         fake, body = self.fake(), fx.square()
@@ -163,8 +166,10 @@ class HttpStoreRefusals(StoreBase):
                               (self.q(body) + "&start=1", "query")):
             with self.subTest(query=query):
                 self.assertEqual(self.post(gate, query, body), (400, {"error": "bad_request", "detail": detail}))
-        self.assertEqual(self.post(gate, f"name=MD0412&maxPowerPct=80&sha256={'0' * 64}", body),
+        self.assertEqual(self.post(gate, self.q(body).replace(f"sha256={sha(body)}", f"sha256={'0' * 64}"), body),
                          (400, {"error": "sha_mismatch"}))
+        self.assertEqual(self.post(gate, f"name=MD0412&maxPowerPct=80&sha256={sha(body)}", body),
+                         (400, {"error": "bad_request", "detail": "profile/preparedSha256"}))
         self.assertEqual(fake.got, [])
 
     def test_store_over_http_happy_path(self):
