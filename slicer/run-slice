@@ -3,7 +3,7 @@
 # Installed root:root 0755 at /opt/ps-slicer/run-slice by oes-pool-deploy scripts/install-slicer.py; the hub's service
 # user may run exactly this through sudo. The id names <spool>/<id>/.slice, which must be a real directory owned by the
 # hub's user (no symlink anywhere on the way); the container sees only that directory, as that user, with no network, a
-# read-only root, 3 GB of memory, 4 CPUs, 1024 processes and ten minutes.
+# read-only root, 3 GB of memory, 4 CPUs, 1024 processes and ten minutes per piece. Group quotes resume from pieces.json.
 set -eu
 SPOOL=/var/lib/makeros-hub/spool
 HUB_USER=makeros-hub

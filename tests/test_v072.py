@@ -289,3 +289,94 @@ def test_prepare_round_trip_refusal_and_cache_binds_choices(tmp_path, monkeypatc
     assert m.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=refuse) == 0
     assert reports[-1]["slice"]["prepare"] == proposal
     assert reports[-1]["sliceError"] == "Pick a bigger scale."
+
+
+def test_cut_group_checks_every_mesh_and_reports_every_slice_before_approval(tmp_path, monkeypatch):
+    from makeros_hub import checks
+    manager = PrinterManager()
+    reports, rechecks = [], []
+    request = dict(version=1, thicken=False, moveLargeGaps=False, split=dict(mode="fit", clearance=.2, bed=[177.5, 177.5, 180], layers=[]))
+    geometry = [dict(index=i, name=f"Piece {i + 1}", sha256=hashlib.sha256(MESH + str(i).encode()).hexdigest(), size=[20, 20, 20]) for i in range(3)]
+    proposal = dict(version=1, checked=False, sha256=hashlib.sha256("".join(p["sha256"] for p in geometry).encode()).hexdigest(),
+                    settings=dict(minWall=.84), changes=[], blocked=[], pieces=geometry)
+    def get(path, dest):
+        Path(dest).write_bytes(MESH)
+        return hashlib.sha256(MESH).hexdigest(), len(MESH)
+    def report(body):
+        reports.append(body)
+        return _Resp()
+    def recheck(uid):
+        work = tmp_path / uid / ".check"
+        rechecks.append((work / "model.stl").read_bytes())
+        (work / "out").mkdir()
+        (work / "out/report.json").write_text(json.dumps(dict(format=2, version="synthetic", ok=True,
+            report=dict(findings=[dict(id="looks-good", level="ok", title="Looks printable")]))))
+        return 0
+    monkeypatch.setattr(checks, "run_check_job", recheck)
+    def runner(uid):
+        work = tmp_path / uid / ".slice"
+        (work / "work").mkdir()
+        (work / "out").mkdir()
+        for i in range(3):
+            (work / f"work/piece-{i}.stl").write_bytes(MESH + str(i).encode())
+            (work / f"out/piece-{i}").mkdir()
+            (work / f"out/piece-{i}/sliced.3mf").write_bytes(sliced_plate())
+        (work / "out/sliced.3mf").write_bytes(sliced_plate())
+        spec = json.loads((work / "job.json").read_text())
+        result = dict(ok=True, prepare=proposal)
+        if "piece" not in spec:
+            result["pieces"] = [dict(ok=True, index=i, supportUsed=False, process="synthetic", filament="synthetic", settings={},
+                                     fileSha256=hashlib.sha256(sliced_plate()).hexdigest()) for i in range(3)]
+        (work / "out/result.json").write_text(json.dumps(result))
+        return 0
+    sent = fetch(slice=SPEC | {"prepare": request})
+    assert manager.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 1
+    assert len(rechecks) == 3 and reports[-1]["estGrams"] == 12
+    assert [p["grams"] for p in reports[-1]["slice"]["pieces"]] == [4, 4, 4]
+    assert reports[-1]["slice"]["prepare"]["checked"] is True
+    child = fetch(submissionUid="abcd1234abcd1234", preparedFrom=sent["submissionUid"],
+                  slice=sent["slice"] | {"piece": {k: geometry[1][k] for k in ("index", "sha256")}})
+    def no_slice(uid):
+        raise AssertionError("the verified quote already sliced this piece")
+    assert manager.fetch_uploads([child], tmp_path, getter=get, reporter=report, slice_runner=no_slice) == 1
+    assert rechecks[-1] == MESH + b"1" and "pieces" not in reports[-1]["slice"]
+    # A corrupt cached plate cannot reach dispatch: the worker falls back to preparing the piece.
+    (tmp_path / sent["submissionUid"] / ".slice/out/piece-1/sliced.3mf").write_bytes(b"corrupted")
+    child["submissionUid"] = "abcd1234abcd5678"
+    assert manager.fetch_uploads([child], tmp_path, getter=get, reporter=report, slice_runner=runner) == 1
+    # A missing candidate on a cache hit withholds the entire offer.
+    (tmp_path / sent["submissionUid"] / ".slice/work/piece-1.stl").unlink()
+    assert manager.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 0
+    assert "could not check" in reports[-1]["sliceError"]
+    rechecks.clear()
+    sent["slice"]["piece"] = {k: geometry[1][k] for k in ("index", "sha256")}
+    assert manager.fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 1
+    assert rechecks == [MESH + b"1"] and "pieces" not in reports[-1]["slice"]
+    assert slice_spec_of(sent["slice"])["piece"] == sent["slice"]["piece"]
+    assert parse_slicer_caps(dict(scaleMin=.001, scaleMax=1000, splitVersion=1))["splitVersion"] == 1
+    assert "splitVersion" not in parse_slicer_caps(dict(scaleMin=.001, scaleMax=1000, splitVersion=True))
+
+
+def test_partial_group_quote_survives_worker_restart_and_reports_bounded_progress(tmp_path):
+    sent = fetch(slice=SPEC | {"prepare": {"split": {"mode": "fit"}}})
+    reports, calls = [], []
+    def get(path, dest):
+        Path(dest).write_bytes(MESH)
+        return hashlib.sha256(MESH).hexdigest(), len(MESH)
+    def report(body):
+        reports.append(body)
+        return _Resp()
+    def runner(uid):
+        out = tmp_path / uid / ".slice/out"
+        out.mkdir(exist_ok=True)
+        marker = out / "saved-piece"
+        if calls:
+            assert marker.read_text() == "kept across worker restart"
+        marker.write_text("kept across worker restart")
+        calls.append(uid)
+        (out / "result.json").write_text(json.dumps(dict(ok=False, pending=True, completed=len(calls))))
+        return 0
+    for _ in range(2):
+        assert PrinterManager().fetch_uploads([sent], tmp_path, getter=get, reporter=report, slice_runner=runner) == 0
+    assert [r["fetchProgress"] for r in reports] == [0, 1, 0, 2]
+    assert not any("sliceError" in r for r in reports)

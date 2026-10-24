@@ -79,6 +79,7 @@ def parse_slicer_caps(result) -> dict | None:
     return {"scaleMin": float(lo), "scaleMax": float(hi),
             **({"colours": True} if result.get("colours") is True else {}),
             **({"prepareVersion": 1} if type(result.get("prepareVersion")) is int and result["prepareVersion"] == 1 else {}),
+            **({"splitVersion": 1} if type(result.get("splitVersion")) is int and result["splitVersion"] == 1 else {}),
             "lineWidth": {k: float(v) for k, v in list(widths.items())[:16] if isinstance(k, str) and 0 < len(k) <= 40 and num(v) and 0 < v <= 5}}
 
 
@@ -142,6 +143,8 @@ def slice_spec_of(spec: dict) -> dict:
         out["nozzle"] = spec["nozzle"]
     if "prepare" in spec:
         out["prepare"] = spec["prepare"]   # preserve malformed choices too: the container must refuse, never silently omit a fix
+    if "piece" in spec:
+        out["piece"] = spec["piece"]
     return out
 
 
@@ -766,6 +769,25 @@ class PrinterManager:
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
                 if grams:
                     body["estGrams"] = int(math.ceil(sum(grams)))
+                if sliced is not None and "pieces" in sliced:
+                    pieces = sliced["pieces"]
+                    if not isinstance(pieces, list) or not 2 <= len(pieces) <= 32:
+                        raise ValueError("unreadable cut-piece slices")
+                    summaries = []
+                    for i, piece in enumerate(pieces):
+                        if not isinstance(piece, dict) or piece.get("index") != i:
+                            raise ValueError("cut-piece order changed")
+                        plate_file = dest_dir / ".slice" / "out" / f"piece-{i}" / "sliced.3mf"
+                        used = parse_required_filaments(plate_file, 1)
+                        weights = [f.get("usedG") for f in used]
+                        if not used or any(type(g) not in (int, float) or not math.isfinite(g) or g <= 0 for g in weights):
+                            raise ValueError("a cut piece has no measured filament")
+                        summaries.append({**{k: piece.get(k) for k in ("index", "supportUsed", "filament", "process", "settings")},
+                                          "grams": math.ceil(sum(weights)), "modelId": parse_printer_model_id(plate_file),
+                                          "requiredFilaments": [_vp_submit_filament(f) for f in used]})
+                    body["slice"]["pieces"] = summaries
+                    body["estGrams"] = sum(p["grams"] for p in summaries)
+                    log.info("cut-piece reports: processed=%d, expected=%d", len(summaries), len(pieces))
                 resp = reporter(body)
                 ok = getattr(resp, "status", None) == 200 and isinstance(getattr(resp, "body", None), dict) and resp.body.get("ok") is True
                 if ok:
@@ -802,7 +824,27 @@ class PrinterManager:
             if not isinstance(prepared, dict) or not isinstance(prepared.get("blocked"), list):
                 reasons = ["The shop did not report the model fixes. Check the file again."]
             else:
-                reasons = prepared["blocked"] or check_prepared_model(dest_dir.parent, work / "work" / mesh_name, prepared, spec)
+                reasons = prepared["blocked"]
+                if not reasons and spec.get("prepare", {}).get("split"):
+                    pieces = prepared.get("pieces")
+                    if not isinstance(pieces, list) or not 2 <= len(pieces) <= 32:
+                        reasons = ["The shop did not report every cut piece. Check the model again."]
+                    else:
+                        indices = [spec["piece"]["index"]] if spec.get("piece") else range(len(pieces))
+                        processed = 0
+                        for i in indices:
+                            if i >= len(pieces) or pieces[i].get("index") != i:
+                                reasons = ["The cut pieces no longer match the model. Check it again."]
+                                break
+                            check = {"sha256": pieces[i].get("sha256"), "settings": prepared.get("settings")}
+                            reasons += check_prepared_model(dest_dir.parent, work / "work" / f"piece-{i}.stl", check, {**spec, "fixes": {**spec.get("fixes", {}), "orient": False}})
+                            processed += 1
+                            if not spec.get("piece") and not reasons:
+                                reporter({"queueJobId": job_id, "sha256": sha, "fetchProgress": 32 + processed})
+                        log.info("cut-piece checks: processed=%d, expected=%d", processed, len(indices))
+                    prepared["checked"] = not reasons
+                elif not reasons:
+                    reasons = check_prepared_model(dest_dir.parent, work / "work" / mesh_name, prepared, spec)
                 prepared["blocked"] = reasons
             if reasons:
                 dest.unlink(missing_ok=True)
@@ -812,33 +854,64 @@ class PrinterManager:
             result_path.write_text(json.dumps(result), encoding="utf-8")
             return True
 
-        if dest.exists() and result_path.exists() and mesh.exists() and stream_sha(mesh) == sha:
+        same = False
+        if result_path.exists() and mesh.exists() and stream_sha(mesh) == sha:
             try:
                 done = json.loads(result_path.read_text(encoding="utf-8"))
                 same = json.loads((work / "job.json").read_text(encoding="utf-8")) == {**slice_spec_of(spec), "mesh": mesh_name}
-                if isinstance(done, dict) and done.get("ok") and same:
+                if dest.exists() and isinstance(done, dict) and done.get("ok") and same:
                     return done if checked(done) else None
+                same = same and isinstance(done, dict) and done.get("pending") is True
             except (OSError, ValueError):
-                pass
-        if work.is_symlink():
-            work.unlink()
-        elif work.exists():
-            shutil.rmtree(work)
-        dest.unlink(missing_ok=True)
-        work.mkdir(mode=0o700)
-        tmp = work / f".{mesh_name}.fetch.tmp"
-        got = None
-        try:
-            got, _size = getter(path, tmp)
-        finally:
+                same = False
+        if not same:
+            if work.is_symlink():
+                work.unlink()
+            elif work.exists():
+                shutil.rmtree(work)
+            dest.unlink(missing_ok=True)
+            work.mkdir(mode=0o700)
+            tmp = work / f".{mesh_name}.fetch.tmp"
+            got = None
+            try:
+                got, _size = getter(path, tmp)
+            finally:
+                if got != sha:
+                    tmp.unlink(missing_ok=True)
             if got != sha:
-                tmp.unlink(missing_ok=True)
-        if got != sha:
-            log.error("slice upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], str(got)[:12])
-            reporter({"queueJobId": job_id, "sha256": got})
-            return None
-        os.replace(tmp, mesh)
-        (work / "job.json").write_text(json.dumps({**slice_spec_of(spec), "mesh": mesh_name}), encoding="utf-8")
+                log.error("slice upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], str(got)[:12])
+                reporter({"queueJobId": job_id, "sha256": got})
+                return None
+            os.replace(tmp, mesh)
+            (work / "job.json").write_text(json.dumps({**slice_spec_of(spec), "mesh": mesh_name}), encoding="utf-8")
+        if spec.get("prepare", {}).get("split"):
+            reporter({"queueJobId": job_id, "sha256": sha, "fetchProgress": 0})
+        parent_uid, choice = f.get("preparedFrom"), spec.get("piece")
+        if choice and isinstance(parent_uid, str) and _SUBMISSION_UID_RE.fullmatch(parent_uid) and parent_uid != uid:
+            parent = dest_dir.parent / parent_uid / ".slice"
+            try:
+                original = json.loads((parent / "job.json").read_text())
+                result = json.loads((parent / "out/result.json").read_text())
+                i = choice["index"]
+                prepared = result["prepare"]
+                piece = result["pieces"][i]
+                plate = parent / f"out/piece-{i}/sliced.3mf"
+                expected = {**slice_spec_of(spec), "mesh": mesh_name}
+                expected.pop("piece", None)
+                if (original == expected and stream_sha(parent / mesh_name) == sha and result.get("ok") is True
+                        and prepared["pieces"][i]["sha256"] == choice["sha256"]
+                        and piece.get("fileSha256") and stream_sha(plate) == piece["fileSha256"]):
+                    (work / "work").mkdir(exist_ok=True)
+                    (work / "out").mkdir(exist_ok=True)
+                    shutil.copyfile(parent / f"work/piece-{i}.stl", work / f"work/piece-{i}.stl")
+                    result = {**piece, "prepare": prepared}
+                    if not checked(result):
+                        return None
+                    shutil.copyfile(plate, work / "out/sliced.3mf")
+                    os.replace(work / "out/sliced.3mf", dest)
+                    return result
+            except (OSError, ValueError, KeyError, IndexError, TypeError):
+                log.info("slice upload %s: prepared piece unavailable; preparing it again", job_id)
         started = time.monotonic()
         try:
             rc = runner(uid)
@@ -851,6 +924,10 @@ class PrinterManager:
         except (OSError, ValueError):
             result = {}
         SLICER_CAPS.seen(result)   # every slice says what the image that ran it takes (step 2): a rolled-back image shows at once
+        if (isinstance(result, dict) and result.get("pending") is True and spec.get("prepare", {}).get("split")
+                and not spec.get("piece") and type(result.get("completed")) is int and 1 <= result["completed"] < 32):
+            reporter({"queueJobId": job_id, "sha256": sha, "fetchProgress": result["completed"]})
+            return None
         sliced_file = work / "out" / "sliced.3mf"
         if not (isinstance(result, dict) and result.get("ok") and sliced_file.exists()):
             reason = result.get("error") if isinstance(result, dict) and isinstance(result.get("error"), str) else \

@@ -1,6 +1,7 @@
 """slicer/ps_slice.py, the wrapper inside the ps-slicer container: its pure parts, without the slicer binary."""
 
 import importlib.util
+import hashlib
 import io
 import json
 import struct
@@ -207,7 +208,7 @@ def test_a_probe_is_answered_with_what_this_image_slices_and_slices_nothing(tmp_
     job = tmp_path / "job"
     job.mkdir()
     (job / "job.json").write_text(json.dumps({"probe": True}))
-    assert ps.run(str(job)) == {"ok": True, "probe": True, "scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42, "P2S": 0.42}, "prepareVersion": 1, "colours": True}
+    assert ps.run(str(job)) == {"ok": True, "probe": True, "scaleMin": 0.001, "scaleMax": 1000.0, "lineWidth": {"A1 Mini": 0.42, "P2S": 0.42}, "prepareVersion": 1, "splitVersion": 1, "colours": True}
     assert not (job / "work").exists()
 
 
@@ -224,3 +225,60 @@ def test_the_settings_reported_are_the_ones_this_slice_used():
     process = {"layer_height": "0.2", "wall_loops": "2", "sparse_infill_pattern": "crosshatch", "sparse_infill_density": "15%", "brim_type": "auto_brim"}
     process.update(ps.shop_process(ps.read_spec(SPEC)))
     assert ps.effective_settings(process) == {"layer_height": "0.2", "wall_loops": "2", "sparse_infill_pattern": "rectilinear", "sparse_infill_density": "15%"}
+
+
+def test_slow_group_resumes_within_each_runner_deadline_and_verifies_saved_files(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    machine, suffix = ps.MODELS["A1 Mini"]
+    profiles = {"machine": {machine: {"name": machine, "printer_model": "mini"}, "mini": {"model_id": "N1"}},
+                "process": {ps.PROCESS.format(sfx=suffix): {"name": ps.PROCESS.format(sfx=suffix), "outer_wall_line_width": "0.42"}},
+                "filament": {"Synthetic PLA": {"name": "Synthetic PLA"}}}
+    monkeypatch.setattr(ps, "load_index", lambda kind: profiles[kind])
+    monkeypatch.setattr(ps, "pick_filament", lambda *args: "Synthetic PLA")
+    monkeypatch.setattr(ps, "caps", lambda *args: {"splitVersion": 1})
+    monkeypatch.setattr(ps, "JOB", str(tmp_path))
+    prepared, elapsed = [], []
+    def prepare(src, dst, *args):
+        prepared.append(src)
+        pieces = []
+        for i in range(2):
+            data = f"synthetic piece {i}".encode()
+            (Path(dst).parent / f"piece-{i}.stl").write_bytes(data)
+            pieces.append(dict(index=i, sha256=hashlib.sha256(data).hexdigest()))
+        return dict(blocked=[], pieces=pieces)
+    monkeypatch.setattr(ps, "prepare_model", prepare)
+    def slow_orca(args, **kwargs):
+        # Simulated clock: two individually valid 310 s slices exceed the real runner's 600 s aggregate limit.
+        assert kwargs["timeout"] == 540
+        elapsed.append(310)
+        out = Path(args[args.index("--outputdir") + 1])
+        (out / "result.json").write_text(json.dumps({"sliced_plates": [{"id": 1, "warning_message": "Synthetic warning"}]}))
+        with zipfile.ZipFile(out / "sliced.3mf", "w") as z:
+            z.writestr("Metadata/slice_info.config", '<config><plate><metadata key="printer_model_id" value="N1"/><filament id="1" used_g="4"/></plate></config>')
+            z.writestr("Metadata/plate_1.gcode", "; synthetic")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(ps.subprocess, "run", slow_orca)
+    raw = SPEC | {"prepare": dict(version=1, thicken=False, moveLargeGaps=False,
+                                  split=dict(mode="fit", bed=[177.5, 177.5, 180], clearance=.2, layers=[]))}
+    (tmp_path / "part.stl").write_bytes(b"synthetic original")
+    (tmp_path / "job.json").write_text(json.dumps(raw))
+    for n in range(2):
+        before = sum(elapsed)
+        assert ps.main(["ps_slice.py"]) == 0
+        assert sum(elapsed) - before == 310 < 600
+        result = json.loads((tmp_path / "out/result.json").read_text())
+        assert result.get("pending", False) == (n == 0)
+    assert sum(elapsed) == 620 and len(prepared) == 1
+    assert len(result["pieces"]) == 2 and result["ok"]
+    # An unchanged retry does no work; a corrupt cached plate is sliced again, never trusted.
+    assert ps.run(str(tmp_path))["ok"] and len(elapsed) == 2
+    (tmp_path / "out/piece-1/sliced.3mf").write_bytes(b"corrupted")
+    assert ps.run(str(tmp_path))["ok"] and len(elapsed) == 3
+    (tmp_path / "work/piece-0.stl").write_bytes(b"corrupted")
+    assert ps.run(str(tmp_path))["pending"] and len(prepared) == 2
+    checkpoint = tmp_path / "out/pieces.json"
+    saved = json.loads(checkpoint.read_text())
+    checkpoint.write_text(json.dumps(saved | {"pieces": "unreadable"}))
+    assert ps.run(str(tmp_path))["pending"] and len(prepared) == 3
+    (tmp_path / "job.json").write_text(json.dumps(raw | {"scale": 1.5}))
+    assert ps.run(str(tmp_path))["pending"] and len(prepared) == 4
