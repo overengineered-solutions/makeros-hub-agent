@@ -43,7 +43,7 @@ class HappyPath(StoreBase):
         self.assertEqual(code, 200, out)
         jobs = fake.jobs()
         self.assertEqual(out, {"ok": True, "name": "MD0412", "fileCountBefore": 5, "fileCountAfter": 6,
-                               "packets": len(jobs), "bytes": sum(map(len, jobs))})
+                               "packets": len(jobs), "bytes": sum(map(len, jobs)), "preparedSha256": sha(swizzle(plain))})
         self.assertGreaterEqual(len(jobs), 3)
         self.assertEqual(jobs[0], envelope("MD0412") + plain[:fx.header_end(plain)])
         self.assertEqual(b"".join(jobs)[len(envelope("MD0412")):], plain)  # nothing added, dropped or reordered

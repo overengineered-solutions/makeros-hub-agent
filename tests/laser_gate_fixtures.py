@@ -104,6 +104,8 @@ class FakeController:
         self.sock.settimeout(0.05)
         self.port = self.sock.getsockname()[1]
         self.mem = {0x0200: status, FILE_COUNT: count}
+        self.names = [f"OLD{i:05d}" for i in range(count)]
+        self.storing = None
         self.step, self.drop, self.nak, self.spoof_from, self.ack_delay = step, set(), set(), None, 0.0
         self.got, self.log, self.job_packets, self.bad_frames = [], [], 0, 0
         self._stop = threading.Event()
@@ -114,7 +116,7 @@ class FakeController:
         self.drop, self.nak, self.job_packets = set(), set(), 0
 
     def jobs(self):
-        return [p for p in self.got if not p.startswith(b"\xDA\x00")]
+        return [p for p in self.got if not p.startswith((b"\xDA\x00", b"\xE8\x01"))]
 
     def _send(self, raw, addr, sock=None):
         (sock or self.sock).sendto(raw, addr)
@@ -136,6 +138,14 @@ class FakeController:
                 self._send(ACK, addr)
                 self._send(swizzle(b"\xDA\x01" + payload[2:4] + e35(self.mem.get(u14(payload[2:4]), 0))), addr)
                 continue
+            if payload.startswith(b"\xe8\x01"):
+                index = u14(payload[2:4]) - 1
+                self._send(ACK, addr)
+                if 0 <= index < len(self.names):
+                    self._send(swizzle(payload + self.names[index].encode() + b"\x00"), addr)
+                continue
+            if payload.startswith(b"\xe8\x02\xe7\x01"):
+                self.storing = payload[4:10].decode()
             self.job_packets += 1
             k = self.job_packets
             if k in self.drop:
@@ -149,6 +159,7 @@ class FakeController:
             self._send(swizzle(b"\xCF") if k in self.nak else ACK, addr)
             if k not in self.nak and payload.endswith(b"\xD7"):
                 self.mem[FILE_COUNT] += self.step
+                self.names.append(self.storing)
 
     def close(self):
         self._stop.set()
@@ -164,7 +175,8 @@ class FakeController:
 
 def gate_for(fake, **over):
     cfg = dict(controller_ip="127.0.0.1", bind_ip="127.0.0.1", ack_timeout_s=0.2, store_enabled=True,
-               file_count_addr=f"{FILE_COUNT:04X}", min_power_pct=10.0)
+               file_count_addr=f"{FILE_COUNT:04X}", min_power_pct=10.0, names_verified=True, max_stored_files=128,
+               idle_status_mask=(1 << 27) | (1 << 16) | (1 << 15), idle_status_value=1 << 27)
     cfg.update(over)
     return Gate(Config(**cfg), TOKEN, send_port=fake.port if fake else _closed_udp_port(), recv_port=0)
 

@@ -61,9 +61,10 @@ class CommandAllowlist(unittest.TestCase):
         v = refused(fx.insert_before(fx.square_plain(), 0x88, b"\xD9\x10\x02" + fx.e35(0) * 2)[0])
         self.assertIn("(jog/rapid move)", v["reason"])
 
-    def test_a_scratch_setting_tail_is_refused(self):
+    def test_only_the_recorded_scratch_write_is_stripped(self):
         plain = fx.square_plain()
-        v = refused(plain[:-1] + b"\xDA\x01\x06\x20" + fx.e35(0) * 2 + b"\xD7")
+        self.assertEqual(check(swizzle(plain[:-1] + b"\xDA\x01\x06\x20" + fx.e35(0) * 2 + b"\xD7"), 80, CFG)["verdict"], "checked")
+        v = refused(plain[:-1] + b"\xDA\x01\x06\x21" + fx.e35(0) * 2 + b"\xD7")
         self.assertEqual(v["code"], "command_not_allowed")
         self.assertIn("DA 01", v["reason"])
 
@@ -157,6 +158,8 @@ class Limits(unittest.TestCase):
         plain = fx.square_plain(at=(990, 10), size=11)
         for op in (b"\xE7\x07", b"\xE7\x51"):
             plain = plain.replace(op + fx.xy(1001, 21), op + fx.xy(1000, 21))
+        for op in (b"\xE7\x53\x00", b"\xE7\x62\x00"):
+            plain = plain.replace(op + fx.xy(1001, 21), op + fx.xy(1000, 21))
         v = refused(plain)
         self.assertEqual(v["code"], "out_of_bed")
         self.assertEqual(v["reason"], "a path leaves the bed (1001.0, 10.0 mm is outside 1000.0 × 600.0 mm)")
@@ -220,7 +223,7 @@ class Memory(unittest.TestCase):
         code = ("import re, sys; sys.path.insert(0, 'tests'); import laser_gate_fixtures as fx;"
                 "from laser_gate.checker import check, swizzle; from laser_gate.gate import Config;"
                 "p = fx.square_plain(); h = p.index(b'\\xD8\\x00') + 2;"
-                "v = check(swizzle(p[:h] + b'\\xF0' * (1 << 20) + b'\\xD7'), 100, Config());"
+                "v = check(swizzle(p[:h] + b'\\xF0' * (1 << 20) + p[h:]), 100, Config());"
                 "kb = int(re.search(r'VmHWM:\\s+(\\d+) kB', open('/proc/self/status').read()).group(1));"
                 "print(v['verdict'], kb // 1024)")
         r = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], capture_output=True,

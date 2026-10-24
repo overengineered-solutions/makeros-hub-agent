@@ -747,6 +747,17 @@ class H7Checks(Base):
         self.assertTrue(self.wait_for(lambda: len(hub.report(poll=False).file_checks) >= n and not hub._checking))
         return hub.report(poll=False).file_checks
 
+    def test_material_check_needs_a_complete_receipt_for_this_file(self):
+        gate = self.gate({("POST", "/check"): (200, CHECKED)})
+        hub = self.hub(gate.url, fetcher=self.fetcher())
+        o = offer(profile=[{"speed": 20, "min": 20, "max": 30}])
+        self.assertEqual(hub.check_one(o)["verdict"], "retry")
+        good = {**CHECKED, "checkVersion": 1, "preparedSha256": "a" * 64}
+        gate.routes[("POST", "/check")] = (200, good)
+        self.assertEqual(hub.check_one(o)["result"]["preparedSha256"], "a" * 64)
+        gate.routes[("POST", "/check")] = (200, {**good, "sha256": "0" * 64})
+        self.assertEqual(hub.check_one(o)["verdict"], "retry")
+
     def test_checked_and_refused_come_through(self):
         gate = self.gate({("POST", "/check"): (200, CHECKED)})
         hub = self.hub(gate.url, fetcher=self.fetcher())
@@ -815,13 +826,13 @@ class H8GateStatus(Base):
     def test_mapping(self):
         gate = self.gate({("GET", "/status"): (200, self.STATUS)})
         hub = self.hub(gate.url)
-        self.assertEqual(hub.poll_gate(), ("up", None, {"moving": True, "statusWord": 0x8000, "fileCount": 5,
+        self.assertEqual(hub.poll_gate(), ("up", None, {"idle": None, "moving": True, "statusWord": 0x8000, "fileCount": 5,
                                                          "seenAt": "2026-10-14T20:00:00Z"}))
         self.assertEqual(gate.calls[0]["headers"]["Authorization"], f"Bearer {GATE_TOKEN}")
         gate.routes[("GET", "/status")] = (200, {**self.STATUS, "controller": "down", "statusWord": None, "moving": None,
                                                  "fileCount": None})
         self.assertEqual(hub.poll_gate(), ("down", "controller_unreachable",
-                                           {"moving": None, "statusWord": None, "fileCount": None, "seenAt": "2026-10-14T20:00:00Z"}))
+                                           {"idle": None, "moving": None, "statusWord": None, "fileCount": None, "seenAt": "2026-10-14T20:00:00Z"}))
         gate.routes[("GET", "/status")] = (401, {"error": "unauthorized"})
         self.assertEqual(hub.poll_gate(), ("down", "gate_unauthorized", None))
         gate.routes[("GET", "/status")] = (500, None)

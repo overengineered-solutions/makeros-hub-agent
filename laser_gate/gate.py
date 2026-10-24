@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .checker import (ALLOWED, NAME_RE, START, check, enc14, op_str, plan_packets, swizzle, tokenize, u14, u35,
-                      unswizzle)
+                      unswizzle, valid_profile)
 
 log = logging.getLogger("laser_gate")
 
@@ -54,6 +54,10 @@ class Config:
     ack_timeout_s: float = 0.5
     store_enabled: bool = False
     file_count_addr: str = ""
+    idle_status_mask: int = 0
+    idle_status_value: int = 0
+    names_verified: bool = False
+    max_stored_files: int = 0
     min_power_pct: float = 0.0
     max_power_pct: float = 100.0
     bed_mm: tuple = (1000, 600)
@@ -110,6 +114,13 @@ def validate(raw):
         raise ConfigError("file_count_addr must be empty or a hex address 0000-3FFF")
     if not (1 <= cfg.max_power_pct <= 100 and 0 <= cfg.min_power_pct <= cfg.max_power_pct):
         raise ConfigError("need 0 <= min_power_pct <= max_power_pct <= 100 and max_power_pct >= 1")
+    if not 0 <= cfg.idle_status_mask < 2**35 or not 0 <= cfg.idle_status_value < 2**35 or cfg.idle_status_value & ~cfg.idle_status_mask:
+        raise ConfigError("idle status mask/value must be 35-bit words, with value inside mask")
+    if cfg.idle_status_mask and (not cfg.idle_status_mask & (1 << MOVING_BIT) or cfg.idle_status_mask == 1 << MOVING_BIT
+                                or cfg.idle_status_value & (1 << MOVING_BIT)):
+        raise ConfigError("idle status must prove more than a stationary head (T4)")
+    if not 0 <= cfg.max_stored_files <= 512:
+        raise ConfigError("max_stored_files must be 0 (unverified) or 1..512")
     if not 0 < cfg.ack_timeout_s <= 10:
         raise ConfigError("ack_timeout_s must be in (0, 10]")
     if not cfg.speed_mm_s[0] < cfg.speed_mm_s[1]:
@@ -152,6 +163,9 @@ def guard(payload, reads):
     """The never-send guard. Raises unless every command in this (unswizzled) datagram is an ALLOWED job command with
     its exact length, a DA 00 read of an address in `reads`, or the gate's own envelope at the very start. The header
     marker D8 00 may only travel in a datagram that starts with the envelope (store's first packet)."""
+    # Standalone, bounded read-by-index only; never accepted in an uploaded job or a store packet.
+    if len(payload) == 4 and payload[:2] == b"\xe8\x01" and all(b < 128 for b in payload[2:]) and 1 <= u14(payload[2:]) <= 512:
+        return
     m = ENVELOPE_RE.match(payload)
     body = payload[m.end():] if m else payload
     if not body:
@@ -207,6 +221,26 @@ class Controller:
     def acked(self, sock):
         return self.recv(sock) == ACK
 
+    def name(self, sock, index):
+        query = b"\xe8\x01" + enc14(index)
+        self.send(sock, query)
+        if not self.acked(sock):
+            return None
+        reply = unswizzle(self.recv(sock) or b"")
+        if not 6 <= len(reply) <= 13 or reply[:4] != query or reply[-1:] != b"\x00" or any(b < 32 or b > 126 for b in reply[4:-1]):
+            return None
+        return reply[4:-1].decode("ascii").upper()
+
+    def names(self, sock, count):
+        names = []
+        for i in range(1, count + 1):
+            name = self.name(sock, i)
+            if name is None or name in names:
+                log.warning("panel names processed=%d, expected=%d", len(names), count)
+                return None
+            names.append(name)
+        return names
+
     def read(self, sock, addr):
         """DA 00 read -> 35-bit value, or None on any miss."""
         self.send(sock, b"\xDA\x00" + enc14(addr))
@@ -236,9 +270,16 @@ class Gate:
     def calibration_gap(self, for_store):
         if for_store and self.cfg.file_count is None:
             return "file_count_addr is not set (T0)"
+        if for_store and (not self.cfg.names_verified or not self.cfg.max_stored_files):
+            return "panel name reads and capacity are not verified (T0)"
+        if for_store and not self.cfg.idle_status_mask:
+            return "idle/running/paused status is not verified (T4)"
         if self.cfg.min_power_pct <= 0:
             return "min_power_pct is not set (T5)"
         return None
+
+    def idle(self, word):
+        return None if word is None or not self.cfg.idle_status_mask else word & self.cfg.idle_status_mask == self.cfg.idle_status_value
 
     # /status
     def status(self):
@@ -247,7 +288,7 @@ class Gate:
                 self._poll()
             finally:
                 self._io_lock.release()
-        return {"gateVersion": __version__, **self._last, "storeEnabled": self.cfg.store_enabled,
+        return {"gateVersion": __version__, **self._last, "idle": self.idle(self._last["statusWord"]), "storeEnabled": self.cfg.store_enabled,
                 "calibrated": {"minPowerPct": self.cfg.min_power_pct > 0, "fileCountAddr": self.cfg.file_count is not None},
                 "busy": self._store_lock.locked()}
 
@@ -268,16 +309,18 @@ class Gate:
 
     # /store steps 4-10. The HTTP layer runs steps 1-3 (enabled, calibrated, params) before it reads the body; 1 and 2
     # are repeated here so no other caller can skip them.
-    def store(self, body, name, max_power_pct, sha256):
+    def store(self, body, name, max_power_pct, sha256, profile=None, prepared_sha=None):
         if not self.cfg.store_enabled:
             return 503, {"error": "store_disabled"}
         if self.calibration_gap(for_store=True):
             return 503, {"error": "not_calibrated", "detail": self.calibration_gap(for_store=True)}
         if hashlib.sha256(body).hexdigest() != sha256:
             return 400, {"error": "sha_mismatch"}
-        v = check(body, max_power_pct, self.cfg)
+        v = check(body, max_power_pct, self.cfg, profile)
         if v["verdict"] != "checked":
             return 422, {"error": "refused", "code": v["code"], "reason": v["reason"], "offset": v["offset"]}
+        if prepared_sha is not None and v["preparedSha256"] != prepared_sha:
+            return 409, {"error": "prepared_mismatch"}
         packets = plan_packets(body, name, self.cfg.packet_max_bytes)
         for p in packets:  # every packet passes the guard before the first one is sent
             guard(p, self.reads)
@@ -285,7 +328,10 @@ class Gate:
             return 409, {"error": "busy"}
         try:
             with self._io_lock:
-                return self._transfer(packets, name)
+                code, result = self._transfer(packets, name)
+                if code == 200:
+                    result["preparedSha256"] = v["preparedSha256"]
+                return code, result
         finally:
             self._store_lock.release()
 
@@ -298,9 +344,21 @@ class Gate:
                     return 502, {"error": "controller_unreachable"}
                 if sw >> MOVING_BIT & 1:
                     return 409, {"error": "head_moving"}
+                if self.idle(sw) is not True:
+                    return 409, {"error": "not_idle"}
                 before = self.ctl.read(s, fc)
                 if before is None:
                     return 502, {"error": "controller_unreachable"}
+                if before >= self.cfg.max_stored_files:
+                    return 409, {"error": "memory_full"}
+                names = self.ctl.names(s, before)
+                if names is None:
+                    return 502, {"error": "name_unverified"}
+                if name in names:
+                    return 409, {"error": "name_taken"}
+                # A laptop or panel action while names were read makes this observation stale.
+                if self.ctl.read(s, fc) != before or self.idle(self.ctl.read(s, STATUS_ADDR)) is not True:
+                    return 409, {"error": "not_idle"}
                 for k, p in enumerate(packets, 1):
                     self.ctl.send(s, p)
                     if not self.ctl.acked(s):
@@ -310,6 +368,9 @@ class Gate:
                 while True:
                     after = self.ctl.read(s, fc)
                     if after == before + 1:
+                        stored = self.ctl.names(s, after)
+                        if stored is None or sorted(stored) != sorted([*names, name]):
+                            return 502, {"error": "name_unverified"}
                         return 200, {"ok": True, "name": name, "fileCountBefore": before, "fileCountAfter": after,
                                      "packets": n, "bytes": sum(map(len, packets))}
                     if (after is not None and after != before) or time.monotonic() >= deadline:
@@ -329,6 +390,17 @@ def _params(query, names):
     if set(q) - set(names) or any(len(v) != 1 for v in q.values()):
         return None
     return {k: v[0] for k, v in q.items()}
+
+
+def _profile(params):
+    raw = (params or {}).get("profile")
+    if not isinstance(raw, str) or len(raw) > 1024:
+        return None
+    try:
+        value = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    return value if valid_profile(value) else None
 
 
 def _power(v):
@@ -396,16 +468,19 @@ class Handler(BaseHTTPRequestHandler):
         n, _ = self._length(gate)
         if n is None:
             return
-        p = _params(query, ["maxPowerPct"])
+        p = _params(query, ["maxPowerPct", "profile"])
         cap = _power(p.get("maxPowerPct")) if p is not None else None
         if cap is None:
             return self._reply(400, {"error": "bad_request", "detail": "maxPowerPct"})
+        profile = _profile(p)
+        if p is not None and "profile" in p and profile is None:
+            return self._reply(400, {"error": "bad_request", "detail": "profile"})
         if gate.cfg.min_power_pct <= 0:
             return self._reply(503, {"error": "not_calibrated", "detail": "min_power_pct is not set (T5)"})
         body = self._body(n)
         if body is None:
             return self._reply(400, {"error": "bad_request", "detail": "body shorter than Content-Length"})
-        v = check(body, cap, gate.cfg)
+        v = check(body, cap, gate.cfg, profile)
         if v["verdict"] != "checked":
             log.info("check refused sha=%s code=%s offset=%s", v["sha256"][:12], v["code"], v["offset"])
         return self._reply(200, v)
@@ -413,7 +488,7 @@ class Handler(BaseHTTPRequestHandler):
     def _store(self, gate, query):
         """One log line per /store: name, sha256[:12], bytes, packets, result."""
         code, out = self._store_result(gate, query)
-        p = _params(query, ["name", "maxPowerPct", "sha256"]) or {}
+        p = _params(query, ["name", "maxPowerPct", "sha256", "profile", "preparedSha256"]) or {}
         name = p.get("name") if NAME_RE.fullmatch(p.get("name", "")) else "-"  # only validated values reach the log
         sha = p.get("sha256", "")[:12] if SHA_RE.fullmatch(p.get("sha256", "")) else "-"
         size = self.headers.get("Content-Length", "")
@@ -430,7 +505,7 @@ class Handler(BaseHTTPRequestHandler):
         gap = gate.calibration_gap(for_store=True)
         if gap:
             return 503, {"error": "not_calibrated", "detail": gap}
-        p = _params(query, ["name", "maxPowerPct", "sha256"])
+        p = _params(query, ["name", "maxPowerPct", "sha256", "profile", "preparedSha256"])
         if p is None:
             return 400, {"error": "bad_request", "detail": "query"}
         for k, ok in (("name", NAME_RE.fullmatch(p.get("name", ""))), ("maxPowerPct", _power(p.get("maxPowerPct"))),
@@ -443,7 +518,11 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body(n)
         if body is None:
             return 400, {"error": "bad_request", "detail": "body shorter than Content-Length"}
-        return gate.store(body, p["name"], _power(p["maxPowerPct"]), p["sha256"])
+        profile = _profile(p)
+        prepared = p.get("preparedSha256")
+        if ("profile" in p or prepared is not None) and (profile is None or not SHA_RE.fullmatch(prepared or "")):
+            return 400, {"error": "bad_request", "detail": "profile/preparedSha256"}
+        return gate.store(body, p["name"], _power(p["maxPowerPct"]), p["sha256"], profile, prepared)
 
     def __getattr__(self, name):
         # Every method (TRACE, CONNECT, made-up ones too) takes the same path: peer, token, route, method. Without this,
