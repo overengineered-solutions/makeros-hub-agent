@@ -202,6 +202,19 @@ class Limits(unittest.TestCase):
 
 
 class Memory(unittest.TestCase):
+    def test_maximum_size_repeated_modes_fit_the_units_memory(self):
+        code = ("import re; from laser_gate.checker import check, swizzle; from laser_gate.gate import Config;"
+                "p = b'\\xd8\\x00' + b'\\xd8\\x12' * ((4194304 - 4) // 2) + b'\\xeb\\xd7';"
+                "assert len(p) == 4194304; v = check(swizzle(p), 80, Config(min_power_pct=10.0));"
+                "kb = int(re.search(r'VmHWM:\\s+(\\d+) kB', open('/proc/self/status').read()).group(1));"
+                "print(v['verdict'], kb // 1024)")
+        r = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1], capture_output=True,
+                           text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        verdict, mb = r.stdout.split()
+        self.assertEqual(verdict, "refused")
+        self.assertLess(int(mb), 64)
+
     def test_a_flood_of_power_commands_fits_the_units_memory(self):
         # codex review of release-0.68.0: 2 MiB of C6 02 took ~212 MiB when every power command was kept
         code = ("import re, sys; sys.path.insert(0, 'tests'); import laser_gate_fixtures as fx;"

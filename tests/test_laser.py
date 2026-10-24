@@ -626,15 +626,20 @@ class H6Load(Base):
         hub = self.hub(gate.url, fetcher=self.fetcher(wait=release))
         m = PrinterManager(laser=hub)
         started = time.monotonic()
+        params = load_params(expiresAt=iso_in(30))
         reports = m.dispatch_commands([{"requestId": "L1", "printerId": LASER_ID, "command": "laser_load",
-                                        "params": load_params()}])
+                                        "params": params}])
         self.assertEqual(reports, [])
         self.assertLess(time.monotonic() - started, 1)
         self.assertEqual(hub.take_command_results(), [])
         release.set()
         self.assertEqual(self.result(hub), [{"requestId": "L1", "command": "laser_load", "status": "ok"}])
         call = gate.calls[0]
-        self.assertEqual(call["path"], f"/store?name=AB1234&maxPowerPct=60&sha256={SHA}")
+        self.assertTrue(call["path"].startswith(f"/store?name=AB1234&maxPowerPct=60&sha256={SHA}&expiresAt="))
+        expires = float(call["path"].split("expiresAt=")[1])
+        self.assertGreater(expires, time.time())
+        self.assertEqual(expires, laser.parse_instant(params["expiresAt"]))
+        self.assertLessEqual(expires, time.time() + laser.STORE_TIMEOUT_S - 1)
         self.assertEqual(call["body"], BODY)
         self.assertEqual(call["headers"]["Authorization"], f"Bearer {GATE_TOKEN}")
         self.assertEqual(m.dispatch_commands([{"requestId": "L1", "printerId": LASER_ID, "command": "laser_load",

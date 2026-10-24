@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 
 import laser_gate_fixtures as fx
 from laser_gate.checker import envelope, plan_packets, swizzle, unswizzle
-from laser_gate.gate import ACK, Controller, GuardError, guard
+from laser_gate.gate import ACK, Controller, GuardError, StoreExpired, guard
 
 LONG = dict(extra_cuts=700)  # about 2.4 kB: 4 packets at 1000 bytes
 
@@ -32,7 +32,7 @@ class StoreBase(unittest.TestCase):
         return g
 
     def store(self, gate, body, name="MD0412", cap=100):
-        return gate.store(body, name, cap, sha(body))
+        return gate.store(body, name, cap, sha(body), expires=time.time() + 120)
 
 
 class HappyPath(StoreBase):
@@ -60,6 +60,87 @@ class HappyPath(StoreBase):
 
 
 class Aborts(StoreBase):
+    def test_reply_wait_is_bounded_by_the_whole_request(self):
+        ctl = self.gate(None).ctl
+        sock = mock.Mock()
+        with mock.patch("laser_gate.gate.time.monotonic", return_value=1000.0):
+            sock.recvfrom.return_value = (ACK, (ctl.ip, 1234))
+            self.assertEqual(ctl.recv(sock, 1000.05), ACK)
+            self.assertAlmostEqual(sock.settimeout.call_args.args[0], 0.05)
+        with mock.patch("laser_gate.gate.time.monotonic", return_value=1000.05):
+            with self.assertRaises(StoreExpired):
+                ctl.send(sock, b"\xda\x00\x04\x00", 1000.05)
+        sock.sendto.assert_not_called()
+
+    def test_waiting_for_status_io_cannot_outlive_expiry(self):
+        fake = self.fake()
+        gate = self.gate(fake)
+        gate._io_lock.acquire()
+        try:
+            started = time.monotonic()
+            self.assertEqual(gate.store(fx.square(), "MD0412", 80, sha(fx.square()), expires=time.time() + 0.1),
+                             (409, {"error": "expired"}))
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertFalse(gate._store_lock.locked())
+            self.assertEqual(fake.got, [])
+        finally:
+            gate._io_lock.release()
+
+    def test_slow_names_expire_before_any_job_bytes(self):
+        fake = self.fake()
+        gate = self.gate(fake)
+        now = [1000.0]
+        original = gate.ctl.name
+
+        def slow_name(sock, index, deadline=None):
+            name = original(sock, index, deadline)
+            now[0] += 25  # successful replies, but the whole scan exceeds the 120-second request
+            return name
+
+        with mock.patch("laser_gate.gate.time.monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(gate.ctl, "name", side_effect=slow_name):
+            self.assertEqual(self.store(gate, fx.square()), (409, {"error": "expired"}))
+        self.assertEqual(fake.jobs(), [])
+
+    def test_expiry_after_final_idle_read_is_checked_at_first_write(self):
+        fake = self.fake()
+        gate = self.gate(fake)
+        now = [1000.0]
+        original = gate.ctl.read
+        idle_reads = 0
+
+        def late_read(sock, addr, deadline=None):
+            nonlocal idle_reads
+            value = original(sock, addr, deadline)
+            if addr == 0x0200:
+                idle_reads += 1
+                if idle_reads == 2:
+                    now[0] += 121
+            return value
+
+        with mock.patch("laser_gate.gate.time.monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(gate.ctl, "read", side_effect=late_read):
+            self.assertEqual(self.store(gate, fx.square()), (409, {"error": "expired"}))
+        self.assertEqual(fake.jobs(), [])
+
+    def test_expiry_during_transfer_stops_without_retry(self):
+        fake = self.fake()
+        gate = self.gate(fake)
+        now = [1000.0]
+        original = gate.ctl.send
+
+        def slow_send(sock, payload, deadline=None):
+            original(sock, payload, deadline)
+            if payload.startswith(b"\xe8\x02"):
+                now[0] += 121
+
+        with mock.patch("laser_gate.gate.time.monotonic", side_effect=lambda: now[0]), \
+                mock.patch.object(gate.ctl, "send", side_effect=slow_send):
+            code, result = self.store(gate, swizzle(fx.square_plain(**LONG)))
+        self.assertEqual((code, result["error"]), (502, "transfer_aborted"))
+        time.sleep(0.05)
+        self.assertEqual(len(fake.jobs()), 1)
+
     def test_g9_a_missing_ack_aborts_and_nothing_more_is_sent(self):
         body = swizzle(fx.square_plain(**LONG))
         for which in ("first", "middle", "last"):
@@ -107,7 +188,7 @@ class Aborts(StoreBase):
         fake = self.fake()
         gate = self.gate(fake)
         body = fx.square()
-        self.assertEqual(gate.store(body, "MD0412", 100, "0" * 64), (400, {"error": "sha_mismatch"}))
+        self.assertEqual(gate.store(body, "MD0412", 100, "0" * 64, expires=time.time() + 120), (400, {"error": "sha_mismatch"}))
         bad = swizzle(fx.insert_before(fx.square_plain(), 0x88, b"\xD8\x01")[0])
         code, out = self.store(gate, bad)
         self.assertEqual((code, out["error"], out["code"]), (422, "refused", "command_not_allowed"))
@@ -141,7 +222,7 @@ class HttpStoreRefusals(StoreBase):
 
     def q(self, body, name="MD0412", cap="80"):
         return f"name={name}&maxPowerPct={cap}&sha256={sha(body)}&" + urlencode({
-            "profile": json.dumps([{"speed": 20, "min": 20, "max": 30}]), "preparedSha256": sha(body)})
+            "profile": json.dumps([{"speed": 20, "min": 20, "max": 30}]), "preparedSha256": sha(body), "expiresAt": f"{time.time() + 120:.6f}"})
 
     def test_g10_store_disabled_sends_nothing(self):
         fake, body = self.fake(), fx.square()
@@ -177,6 +258,18 @@ class HttpStoreRefusals(StoreBase):
         code, out = self.post(self.gate(fake), self.q(body), body)
         self.assertEqual((code, out["ok"], out["fileCountAfter"]), (200, True, 6))
 
+    def test_http_expiry_is_required_and_expired_requests_send_nothing(self):
+        fake, body = self.fake(), fx.square()
+        gate = self.gate(fake)
+        query = self.q(body).split("&expiresAt=")[0]
+        for value in ("", "&expiresAt=NaN", "&expiresAt=inf", "&expiresAt=-1"):
+            self.assertEqual(self.post(gate, query + value, body),
+                             (400, {"error": "bad_request", "detail": "expiresAt"}))
+        self.assertEqual(self.post(gate, query + "&expiresAt=1", body), (409, {"error": "expired"}))
+        self.assertEqual(gate.store(body, "MD0412", 80, sha(body)),
+                         (400, {"error": "bad_request", "detail": "expiresAt"}))
+        self.assertEqual(fake.got, [])
+
 
 class Guard(unittest.TestCase):
     READS = frozenset({0x0200, fx.FILE_COUNT})
@@ -208,7 +301,7 @@ class Guard(unittest.TestCase):
         self.addCleanup(fake.close)
         fake.drop, fake.spoof_from = {1}, "127.0.0.2"
         gate = fx.gate_for(fake)
-        code, out = gate.store(fx.square(), "MD0412", 100, sha(fx.square()))
+        code, out = gate.store(fx.square(), "MD0412", 100, sha(fx.square()), expires=time.time() + 120)
         self.assertEqual((code, out["error"], out["packet"]), (502, "transfer_aborted", 1))
         self.assertTrue(any(kind == "sent" for kind, _, d in fake.log if d == ACK))  # the spoofed ACK did go out
 

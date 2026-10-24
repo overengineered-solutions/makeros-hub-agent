@@ -764,7 +764,10 @@ class LaserHub:
         auth = self._gate_auth()
         if auth is None:
             return "gate_not_configured"
-        query = {"name": load["code"], "maxPowerPct": load["maxPowerPct"], "sha256": load["sha256"]}
+        # Leave a second for the HTTP reply before the hub gives up waiting.
+        expires = min(expires, time.time() + STORE_TIMEOUT_S - 1)
+        query = {"name": load["code"], "maxPowerPct": load["maxPowerPct"], "sha256": load["sha256"],
+                 "expiresAt": f"{expires:.6f}"}
         if "profile" in load:
             query.update(profile=json.dumps(load["profile"], separators=(",", ":")), preparedSha256=load["preparedSha256"])
         query = urlencode(query)

@@ -1,6 +1,7 @@
 """v0.84: synthetic VisiCut vector exports, exact material profiles and store-only delivery."""
 import hashlib
 import json
+import time
 import unittest
 from dataclasses import replace
 from urllib.parse import urlencode
@@ -100,16 +101,16 @@ class LaserSend(unittest.TestCase):
         body = swizzle(visicut())
         sha = hashlib.sha256(body).hexdigest()
         prepared = self.verdict(visicut())["preparedSha256"]
-        self.assertEqual(g.store(body, "PS0123", 80, sha, PROFILE, "0" * 64)[1]["error"], "prepared_mismatch")
+        self.assertEqual(g.store(body, "PS0123", 80, sha, PROFILE, "0" * 64, expires=time.time() + 120)[1]["error"], "prepared_mismatch")
         self.assertFalse(fake.jobs())
-        code, result = g.store(body, "PS0123", 80, sha, PROFILE, prepared)
+        code, result = g.store(body, "PS0123", 80, sha, PROFILE, prepared, expires=time.time() + 120)
         self.assertEqual(code, 200, result)
         self.assertEqual(result["preparedSha256"], prepared)
         before = len(fake.jobs())
-        self.assertEqual(g.store(body, "PS0123", 80, sha, PROFILE, prepared)[1]["error"], "name_taken")
+        self.assertEqual(g.store(body, "PS0123", 80, sha, PROFILE, prepared, expires=time.time() + 120)[1]["error"], "name_taken")
         self.assertEqual(len(fake.jobs()), before)
         fake.mem[0x0200] |= 1 << 16
-        self.assertEqual(g.store(body, "PS0124", 80, sha, PROFILE, prepared)[1]["error"], "not_idle")
+        self.assertEqual(g.store(body, "PS0124", 80, sha, PROFILE, prepared, expires=time.time() + 120)[1]["error"], "not_idle")
         self.assertEqual(len(fake.jobs()), before)
         fake.assert_clean(g.reads)
 
@@ -119,10 +120,10 @@ class LaserSend(unittest.TestCase):
         g = fx.gate_for(fake, max_stored_files=2)
         body = fx.square()
         args = (body, "PS0123", 80, hashlib.sha256(body).hexdigest())
-        self.assertEqual(g.store(*args)[1]["error"], "memory_full")
+        self.assertEqual(g.store(*args, expires=time.time() + 120)[1]["error"], "memory_full")
         g.cfg = replace(g.cfg, max_stored_files=3)
         fake.names.clear()
-        self.assertEqual(g.store(*args)[1]["error"], "name_unverified")
+        self.assertEqual(g.store(*args, expires=time.time() + 120)[1]["error"], "name_unverified")
         self.assertFalse(fake.jobs())
 
     def test_http_profile_protocol_fails_closed(self):

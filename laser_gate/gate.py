@@ -11,6 +11,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import os
 import re
 import socket
@@ -40,6 +41,17 @@ class ConfigError(Exception):
 
 class GuardError(Exception):
     pass
+
+
+class StoreExpired(Exception):
+    pass
+
+
+def remaining(deadline):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise StoreExpired()
+    return left
 
 
 # --- config ----------------------------------------------------------------------------------------------------------
@@ -201,40 +213,56 @@ class Controller:
             raise
         return s
 
-    def send(self, sock, payload):
+    def send(self, sock, payload, deadline=None):
         """The ONLY function that writes to the controller."""
         guard(payload, self.reads)
-        sock.sendto(frame(swizzle(payload)), (self.ip, self.send_port))
+        data = frame(swizzle(payload))
+        if deadline is not None:
+            sock.settimeout(remaining(deadline))
+        sock.sendto(data, (self.ip, self.send_port))
 
-    def recv(self, sock):
-        deadline = time.monotonic() + self.ack_timeout_s
-        while (left := deadline - time.monotonic()) > 0:
+    def recv(self, sock, deadline=None):
+        until = time.monotonic() + self.ack_timeout_s
+        if deadline is not None:
+            remaining(deadline)
+            until = min(until, deadline)
+        while (left := until - time.monotonic()) > 0:
             sock.settimeout(left)
             try:
                 data, (src, _port) = sock.recvfrom(2048)
             except OSError:  # timeout, or ICMP port-unreachable surfacing as ECONNREFUSED
+                if deadline is not None:
+                    remaining(deadline)
                 return None
+            if deadline is not None:
+                remaining(deadline)
             if src == self.ip:
                 return data
+        if deadline is not None:
+            remaining(deadline)
         return None
 
-    def acked(self, sock):
-        return self.recv(sock) == ACK
+    def acked(self, sock, deadline=None):
+        return self.recv(sock, deadline) == ACK
 
-    def name(self, sock, index):
+    def name(self, sock, index, deadline=None):
         query = b"\xe8\x01" + enc14(index)
-        self.send(sock, query)
-        if not self.acked(sock):
+        self.send(sock, query, deadline)
+        if not self.acked(sock, deadline):
             return None
-        reply = unswizzle(self.recv(sock) or b"")
+        reply = unswizzle(self.recv(sock, deadline) or b"")
         if not 6 <= len(reply) <= 13 or reply[:4] != query or reply[-1:] != b"\x00" or any(b < 32 or b > 126 for b in reply[4:-1]):
             return None
         return reply[4:-1].decode("ascii").upper()
 
-    def names(self, sock, count):
+    def names(self, sock, count, deadline=None):
         names = []
         for i in range(1, count + 1):
-            name = self.name(sock, i)
+            try:
+                name = self.name(sock, i, deadline)
+            except StoreExpired:
+                log.warning("panel names processed=%d, expected=%d: expired", len(names), count)
+                raise
             if name is None or name in names:
                 log.warning("panel names processed=%d, expected=%d", len(names), count)
                 return None
@@ -242,12 +270,12 @@ class Controller:
         log.info("panel names processed=%d, expected=%d", len(names), count)
         return names
 
-    def read(self, sock, addr):
+    def read(self, sock, addr, deadline=None):
         """DA 00 read -> 35-bit value, or None on any miss."""
-        self.send(sock, b"\xDA\x00" + enc14(addr))
-        if not self.acked(sock):
+        self.send(sock, b"\xDA\x00" + enc14(addr), deadline)
+        if not self.acked(sock, deadline):
             return None
-        reply = self.recv(sock)
+        reply = self.recv(sock, deadline)
         d = unswizzle(reply or b"")
         if len(d) < 9 or d[:4] != b"\xDA\x01" + enc14(addr):
             return None
@@ -310,11 +338,16 @@ class Gate:
 
     # /store steps 4-10. The HTTP layer runs steps 1-3 (enabled, calibrated, params) before it reads the body; 1 and 2
     # are repeated here so no other caller can skip them.
-    def store(self, body, name, max_power_pct, sha256, profile=None, prepared_sha=None):
+    def store(self, body, name, max_power_pct, sha256, profile=None, prepared_sha=None, *, expires=None):
         if not self.cfg.store_enabled:
             return 503, {"error": "store_disabled"}
         if self.calibration_gap(for_store=True):
             return 503, {"error": "not_calibrated", "detail": self.calibration_gap(for_store=True)}
+        if type(expires) not in (int, float) or not math.isfinite(expires):
+            return 400, {"error": "bad_request", "detail": "expiresAt"}
+        deadline = time.monotonic() + min(120, expires - time.time())
+        if deadline <= time.monotonic():
+            return 409, {"error": "expired"}
         if hashlib.sha256(body).hexdigest() != sha256:
             return 400, {"error": "sha_mismatch"}
         v = check(body, max_power_pct, self.cfg, profile)
@@ -328,55 +361,65 @@ class Gate:
         if not self._store_lock.acquire(blocking=False):
             return 409, {"error": "busy"}
         try:
-            with self._io_lock:
-                code, result = self._transfer(packets, name)
+            if not self._io_lock.acquire(timeout=remaining(deadline)):
+                raise StoreExpired()
+            try:
+                code, result = self._transfer(packets, name, deadline)
                 if code == 200:
                     result["preparedSha256"] = v["preparedSha256"]
                 return code, result
+            finally:
+                self._io_lock.release()
+        except StoreExpired:
+            return 409, {"error": "expired"}
         finally:
             self._store_lock.release()
 
-    def _transfer(self, packets, name):
+    def _transfer(self, packets, name, deadline):
         fc, n = self.cfg.file_count, len(packets)
+        sent = 0
         try:
             with self.ctl.open() as s:
-                sw = self.ctl.read(s, STATUS_ADDR)
+                sw = self.ctl.read(s, STATUS_ADDR, deadline)
                 if sw is None:
                     return 502, {"error": "controller_unreachable"}
                 if sw >> MOVING_BIT & 1:
                     return 409, {"error": "head_moving"}
                 if self.idle(sw) is not True:
                     return 409, {"error": "not_idle"}
-                before = self.ctl.read(s, fc)
+                before = self.ctl.read(s, fc, deadline)
                 if before is None:
                     return 502, {"error": "controller_unreachable"}
                 if before >= self.cfg.max_stored_files:
                     return 409, {"error": "memory_full"}
-                names = self.ctl.names(s, before)
+                names = self.ctl.names(s, before, deadline)
                 if names is None:
                     return 502, {"error": "name_unverified"}
                 if name in names:
                     return 409, {"error": "name_taken"}
                 # A laptop or panel action while names were read makes this observation stale.
-                if self.ctl.read(s, fc) != before or self.idle(self.ctl.read(s, STATUS_ADDR)) is not True:
+                if self.ctl.read(s, fc, deadline) != before or self.idle(self.ctl.read(s, STATUS_ADDR, deadline)) is not True:
                     return 409, {"error": "not_idle"}
                 for k, p in enumerate(packets, 1):
-                    self.ctl.send(s, p)
-                    if not self.ctl.acked(s):
+                    self.ctl.send(s, p, deadline)
+                    sent = k
+                    if not self.ctl.acked(s, deadline):
                         # Nothing more is sent: there is no cleanup command, and a transfer is never resumed.
                         return 502, {"error": "transfer_aborted", "packet": k, "packets": n}
-                deadline, after = time.monotonic() + 3.0, None
+                confirm_until, after = min(deadline, time.monotonic() + 3.0), None
                 while True:
-                    after = self.ctl.read(s, fc)
+                    after = self.ctl.read(s, fc, deadline)
                     if after == before + 1:
-                        stored = self.ctl.names(s, after)
+                        stored = self.ctl.names(s, after, deadline)
                         if stored is None or sorted(stored) != sorted([*names, name]):
                             return 502, {"error": "name_unverified"}
                         return 200, {"ok": True, "name": name, "fileCountBefore": before, "fileCountAfter": after,
                                      "packets": n, "bytes": sum(map(len, packets))}
-                    if (after is not None and after != before) or time.monotonic() >= deadline:
+                    if (after is not None and after != before) or time.monotonic() >= confirm_until:
                         return 502, {"error": "count_mismatch", "before": before, "after": after}
-                    time.sleep(0.2)
+                    time.sleep(min(0.2, remaining(deadline)))
+        except StoreExpired:
+            return (502, {"error": "transfer_aborted", "packet": sent, "packets": n}) if sent else (409, {"error": "expired"})
         except OSError:
             return 502, {"error": "controller_unreachable"}
 
@@ -489,7 +532,7 @@ class Handler(BaseHTTPRequestHandler):
     def _store(self, gate, query):
         """One log line per /store: name, sha256[:12], bytes, packets, result."""
         code, out = self._store_result(gate, query)
-        p = _params(query, ["name", "maxPowerPct", "sha256", "profile", "preparedSha256"]) or {}
+        p = _params(query, ["name", "maxPowerPct", "sha256", "profile", "preparedSha256", "expiresAt"]) or {}
         name = p.get("name") if NAME_RE.fullmatch(p.get("name", "")) else "-"  # only validated values reach the log
         sha = p.get("sha256", "")[:12] if SHA_RE.fullmatch(p.get("sha256", "")) else "-"
         size = self.headers.get("Content-Length", "")
@@ -506,7 +549,7 @@ class Handler(BaseHTTPRequestHandler):
         gap = gate.calibration_gap(for_store=True)
         if gap:
             return 503, {"error": "not_calibrated", "detail": gap}
-        p = _params(query, ["name", "maxPowerPct", "sha256", "profile", "preparedSha256"])
+        p = _params(query, ["name", "maxPowerPct", "sha256", "profile", "preparedSha256", "expiresAt"])
         if p is None:
             return 400, {"error": "bad_request", "detail": "query"}
         for k, ok in (("name", NAME_RE.fullmatch(p.get("name", ""))), ("maxPowerPct", _power(p.get("maxPowerPct"))),
@@ -517,13 +560,19 @@ class Handler(BaseHTTPRequestHandler):
         prepared = p.get("preparedSha256")
         if profile is None or not SHA_RE.fullmatch(prepared or ""):
             return 400, {"error": "bad_request", "detail": "profile/preparedSha256"}
+        expiry = p.get("expiresAt", "")
+        if not re.fullmatch(r"[0-9]{1,12}(\.[0-9]{1,6})?", expiry):
+            return 400, {"error": "bad_request", "detail": "expiresAt"}
+        expires = float(expiry)
+        if expires <= time.time():
+            return 409, {"error": "expired"}
         n, _ = self._length(gate)
         if n is None:
             return None, {"error": "length"}
         body = self._body(n)
         if body is None:
             return 400, {"error": "bad_request", "detail": "body shorter than Content-Length"}
-        return gate.store(body, p["name"], _power(p["maxPowerPct"]), p["sha256"], profile, prepared)
+        return gate.store(body, p["name"], _power(p["maxPowerPct"]), p["sha256"], profile, prepared, expires=expires)
 
     def __getattr__(self, name):
         # Every method (TRACE, CONNECT, made-up ones too) takes the same path: peer, token, route, method. Without this,

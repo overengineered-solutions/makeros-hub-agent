@@ -281,12 +281,17 @@ def job_bytes(body):
     if skip_name:
         raise ValueError("incomplete transfer header; export again")
     data = bytes(out)
-    modes = [t.key for t in tokenize(data) if t.key in ((0xD8, 0x10), (0xD8, 0x11), (0xD8, 0x12))]
-    if not modes:
+    mode = None
+    for t in tokenize(data):
+        if t.key in ((0xD8, 0x10), (0xD8, 0x11), (0xD8, 0x12)):
+            if mode is not None:
+                raise ValueError("multiple reference modes; set Position to Current position and export again")
+            mode = t.key
+    if mode is None:
         return data, 0
-    if modes == [(0xD8, 0x10)] and b"\xe6\x01" in data:
+    if mode == (0xD8, 0x10) and b"\xe6\x01" in data:
         return data, 0
-    if modes != [(0xD8, 0x12)] or b"\xe6\x01" in data:
+    if mode != (0xD8, 0x12) or b"\xe6\x01" in data:
         raise ValueError("set Position to Current position and export again")
     # Walk every travel and laser-on segment, including raster travel, with bounded per-layer boxes.
     pos, bounds, part, boxes = None, None, 0, {}

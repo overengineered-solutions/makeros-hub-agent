@@ -20,12 +20,16 @@ to one controller address, over a NIC or VLAN that is cabled only to the laser.
 | Endpoint | What it does |
 |---|---|
 | `POST /check?maxPowerPct=N&profile=…` | Checks an `.rd` file and never contacts the controller. The answer is `checked` (with the motion extent, layers and prepared hash) or `refused` with a plain reason. |
-| `POST /store?name=PS0412&maxPowerPct=N&sha256=…&profile=…&preparedSha256=…` | Checks the same material profile and prepared bytes again, then stores them under that name. |
+| `POST /store?name=PS0412&maxPowerPct=N&sha256=…&profile=…&preparedSha256=…&expiresAt=…` | Checks the same material profile and prepared bytes again, then stores them under that name before the expiry (Unix seconds). |
 | `GET /status` | Reads the status word and stored-file count; `idle` is unknown until T4 is recorded. |
 
 A file at the 4 MiB limit takes about 4 s to check on a desktop, and about 10 s in the worst case (all one-byte
 commands), more on a Pi, in under 64 MB. `/store` checks the file again before it sends. The hub's timeouts for
 both calls must allow for that: it waits 60 s for `/check` and 120 s for `/store`.
+The hub passes the earlier of the member request's expiry and one second before its HTTP timeout. The gate requires
+that expiry and uses one monotonic deadline (at most 120 seconds) across preparation, waiting for I/O, name scans,
+transfer and confirmation. It checks immediately before every datagram and bounds each reply wait by the remaining
+time. Expiry before job bytes means `expired`; after any job bytes it means `transfer_aborted`, an unconfirmed load.
 
 How a store works:
 - It requires affirmative idle evidence and free memory, and refuses an occupied or unverifiable name.
