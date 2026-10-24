@@ -839,6 +839,8 @@ class PrinterManager:
                             check = {"sha256": pieces[i].get("sha256"), "settings": prepared.get("settings")}
                             reasons += check_prepared_model(dest_dir.parent, work / "work" / f"piece-{i}.stl", check, {**spec, "fixes": {**spec.get("fixes", {}), "orient": False}})
                             processed += 1
+                            if not spec.get("piece") and not reasons:
+                                reporter({"queueJobId": job_id, "sha256": sha, "fetchProgress": 32 + processed})
                         log.info("cut-piece checks: processed=%d, expected=%d", processed, len(indices))
                     prepared["checked"] = not reasons
                 elif not reasons:
@@ -852,33 +854,64 @@ class PrinterManager:
             result_path.write_text(json.dumps(result), encoding="utf-8")
             return True
 
-        if dest.exists() and result_path.exists() and mesh.exists() and stream_sha(mesh) == sha:
+        same = False
+        if result_path.exists() and mesh.exists() and stream_sha(mesh) == sha:
             try:
                 done = json.loads(result_path.read_text(encoding="utf-8"))
                 same = json.loads((work / "job.json").read_text(encoding="utf-8")) == {**slice_spec_of(spec), "mesh": mesh_name}
-                if isinstance(done, dict) and done.get("ok") and same:
+                if dest.exists() and isinstance(done, dict) and done.get("ok") and same:
                     return done if checked(done) else None
+                same = same and isinstance(done, dict) and done.get("pending") is True
             except (OSError, ValueError):
-                pass
-        if work.is_symlink():
-            work.unlink()
-        elif work.exists():
-            shutil.rmtree(work)
-        dest.unlink(missing_ok=True)
-        work.mkdir(mode=0o700)
-        tmp = work / f".{mesh_name}.fetch.tmp"
-        got = None
-        try:
-            got, _size = getter(path, tmp)
-        finally:
+                same = False
+        if not same:
+            if work.is_symlink():
+                work.unlink()
+            elif work.exists():
+                shutil.rmtree(work)
+            dest.unlink(missing_ok=True)
+            work.mkdir(mode=0o700)
+            tmp = work / f".{mesh_name}.fetch.tmp"
+            got = None
+            try:
+                got, _size = getter(path, tmp)
+            finally:
+                if got != sha:
+                    tmp.unlink(missing_ok=True)
             if got != sha:
-                tmp.unlink(missing_ok=True)
-        if got != sha:
-            log.error("slice upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], str(got)[:12])
-            reporter({"queueJobId": job_id, "sha256": got})
-            return None
-        os.replace(tmp, mesh)
-        (work / "job.json").write_text(json.dumps({**slice_spec_of(spec), "mesh": mesh_name}), encoding="utf-8")
+                log.error("slice upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], str(got)[:12])
+                reporter({"queueJobId": job_id, "sha256": got})
+                return None
+            os.replace(tmp, mesh)
+            (work / "job.json").write_text(json.dumps({**slice_spec_of(spec), "mesh": mesh_name}), encoding="utf-8")
+        if spec.get("prepare", {}).get("split"):
+            reporter({"queueJobId": job_id, "sha256": sha, "fetchProgress": 0})
+        parent_uid, choice = f.get("preparedFrom"), spec.get("piece")
+        if choice and isinstance(parent_uid, str) and _SUBMISSION_UID_RE.fullmatch(parent_uid) and parent_uid != uid:
+            parent = dest_dir.parent / parent_uid / ".slice"
+            try:
+                original = json.loads((parent / "job.json").read_text())
+                result = json.loads((parent / "out/result.json").read_text())
+                i = choice["index"]
+                prepared = result["prepare"]
+                piece = result["pieces"][i]
+                plate = parent / f"out/piece-{i}/sliced.3mf"
+                expected = {**slice_spec_of(spec), "mesh": mesh_name}
+                expected.pop("piece", None)
+                if (original == expected and stream_sha(parent / mesh_name) == sha and result.get("ok") is True
+                        and prepared["pieces"][i]["sha256"] == choice["sha256"]
+                        and piece.get("fileSha256") and stream_sha(plate) == piece["fileSha256"]):
+                    (work / "work").mkdir(exist_ok=True)
+                    (work / "out").mkdir(exist_ok=True)
+                    shutil.copyfile(parent / f"work/piece-{i}.stl", work / f"work/piece-{i}.stl")
+                    result = {**piece, "prepare": prepared}
+                    if not checked(result):
+                        return None
+                    shutil.copyfile(plate, work / "out/sliced.3mf")
+                    os.replace(work / "out/sliced.3mf", dest)
+                    return result
+            except (OSError, ValueError, KeyError, IndexError, TypeError):
+                log.info("slice upload %s: prepared piece unavailable; preparing it again", job_id)
         started = time.monotonic()
         try:
             rc = runner(uid)
@@ -891,6 +924,10 @@ class PrinterManager:
         except (OSError, ValueError):
             result = {}
         SLICER_CAPS.seen(result)   # every slice says what the image that ran it takes (step 2): a rolled-back image shows at once
+        if (isinstance(result, dict) and result.get("pending") is True and spec.get("prepare", {}).get("split")
+                and not spec.get("piece") and type(result.get("completed")) is int and 1 <= result["completed"] < 32):
+            reporter({"queueJobId": job_id, "sha256": sha, "fetchProgress": result["completed"]})
+            return None
         sliced_file = work / "out" / "sliced.3mf"
         if not (isinstance(result, dict) and result.get("ok") and sliced_file.exists()):
             reason = result.get("error") if isinstance(result, dict) and isinstance(result.get("error"), str) else \

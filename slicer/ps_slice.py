@@ -1052,11 +1052,35 @@ def run(job_dir: str | None = None) -> dict:
     paths["filament"] = ";".join(paths["filament" + str(i)] for i in range(len(presets)))
     mesh = os.path.join(work, spec["mesh"])
     prepared = None
+    checkpoint = os.path.join(out, "pieces.json")
+    saved = {}
+    if spec["prepare"] and spec["prepare"].get("split"):
+        import hashlib
+        key = hashlib.sha256(json.dumps([{k: v for k, v in raw.items() if k != "piece"}, machine, process, presets], sort_keys=True).encode()
+                             + open(os.path.join(job_dir, spec["mesh"]), "rb").read()).hexdigest()
+        try:
+            saved = json.load(open(checkpoint, encoding="utf-8"))
+            if (not isinstance(saved, dict) or saved.get("key") != key or not isinstance(saved.get("pieces"), list)
+                    or len(saved["pieces"]) > 32 or any(not isinstance(p, dict) or type(p.get("index")) is not int
+                        or not 0 <= p["index"] < 32 or p.get("ok") is not True
+                        or not isinstance(p.get("fileSha256"), str) or not re.fullmatch(r"[a-f0-9]{64}", p["fileSha256"])
+                        for p in saved["pieces"])):
+                saved = {}
+            candidate = saved.get("prepare", {})
+            if isinstance(candidate.get("pieces"), list) and 2 <= len(candidate["pieces"]) <= 32 and all(p["index"] == i
+                                               and hashlib.sha256(open(os.path.join(work, f"piece-{i}.stl"), "rb").read()).hexdigest() == p["sha256"]
+                                               for i, p in enumerate(candidate["pieces"])):
+                prepared = candidate
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            saved = {}
+        if not prepared:
+            saved = {"key": key, "pieces": []}
     if spec["prepare"]:
         width = line_width(process, machine)
         if width is None:
             raise SliceError("the printer's extrusion width is unknown, so its walls cannot be fixed safely")
-        prepared = prepare_model(os.path.join(job_dir, spec["mesh"]), mesh, spec["prepare"], width * 2, spec["scale"])
+        if prepared is None:
+            prepared = prepare_model(os.path.join(job_dir, spec["mesh"]), mesh, spec["prepare"], width * 2, spec["scale"])
         # Persist the offer even when the geometry or slicer refuses it; no refused mesh goes to Orca.
         with open(os.path.join(out, "prepare.json"), "w", encoding="utf-8") as fh:
             json.dump(prepared, fh)
@@ -1097,18 +1121,43 @@ def run(job_dir: str | None = None) -> dict:
     if prepared and prepared.get("pieces"):
         import shutil
         pieces = prepared["pieces"]
+        saved["prepare"] = prepared
+        def persist():
+            with open(checkpoint + ".tmp", "w", encoding="utf-8") as fh:
+                json.dump(saved, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(checkpoint + ".tmp", checkpoint)
+        persist()
         selected = spec.get("piece")
         if selected and (selected["index"] >= len(pieces) or pieces[selected["index"]]["sha256"] != selected["sha256"]):
             raise SliceError("The cut changed since you approved it. Check the model again before printing.")
         summaries = []
+        sliced_now = False
         for piece in ([pieces[selected["index"]]] if selected else pieces):
             i = piece["index"]
             folder = os.path.join(out, f"piece-{i}")
             os.makedirs(folder, exist_ok=True)
             # The cut face is already down; Orca must never turn it onto a peg socket's side.
             spec["orient"] = False
-            summary = slice_one(os.path.join(work, f"piece-{i}.stl"), folder)
-            summaries.append({**summary, "index": i})
+            plate = os.path.join(folder, "sliced.3mf")
+            summary = next((p for p in saved["pieces"] if p.get("index") == i), None)
+            if summary:
+                try:
+                    if hashlib.sha256(open(plate, "rb").read()).hexdigest() != summary.get("fileSha256"):
+                        summary = None
+                except OSError:
+                    summary = None
+            if summary is None:
+                if sliced_now:
+                    print(f"slice pieces: processed={len(summaries)}, expected={len(pieces)}; continuing next pass", flush=True)
+                    return {"ok": False, "pending": True, "completed": len(summaries), **caps(processes, machines)}
+                summary = {**slice_one(os.path.join(work, f"piece-{i}.stl"), folder), "index": i,
+                           "fileSha256": hashlib.sha256(open(plate, "rb").read()).hexdigest()}
+                saved["pieces"] = [p for p in saved["pieces"] if p.get("index") != i] + [summary]
+                persist()
+                sliced_now = True
+            summaries.append(summary)
         shutil.copyfile(os.path.join(out, f"piece-{summaries[0]['index']}", "sliced.3mf"), os.path.join(out, "sliced.3mf"))
         result = {**summaries[0], "prepare": prepared}
         if not selected:
@@ -1201,7 +1250,7 @@ def main(argv: list[str]) -> int:
     with open(os.path.join(out, "result.json"), "w", encoding="utf-8") as fh:
         json.dump(result, fh)
     print(json.dumps({k: v for k, v in result.items() if k != "prepare"}))
-    return 0 if result.get("ok") else 3
+    return 0 if result.get("ok") or result.get("pending") else 3
 
 
 if __name__ == "__main__":

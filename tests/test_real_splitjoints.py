@@ -33,8 +33,11 @@ def test_slices_every_piece_then_only_the_exact_approved_piece(tmp_path, mode):
     command += [IMAGE]
     def run():
         (job / "job.json").write_text(json.dumps(spec))
-        result = subprocess.run(command, capture_output=True, timeout=600)
-        answer = json.loads((job / "out/result.json").read_text())
+        for _ in range(32):
+            result = subprocess.run(command, capture_output=True, timeout=600)
+            answer = json.loads((job / "out/result.json").read_text())
+            if not answer.get("pending"):
+                break
         assert result.returncode == 0 and answer.get("ok"), (answer, result.stderr.decode()[-1000:])
         return answer
     group = run()

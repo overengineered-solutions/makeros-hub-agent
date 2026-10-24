@@ -82,7 +82,10 @@ The site supplies each printer pool's conservative clearance (0.2 mm per side in
 
 The site needs migration 0219 and both agent >=0.84.0 and the image's `splitVersion: 1`. A proposal reports the full set;
 after the member approves the exploded view and each piece's price, the site creates ordinary jobs in one transaction.
-Each carries its piece index and geometry hash, and is reproduced and checked before dispatch. A changed mesh is refused;
+Each carries its piece index and geometry hash, and is checked before dispatch. Quotes persist verified geometry and plates,
+slice at most one new piece per worker pass, and report bounded progress through slicing and checking. The ten-minute runner
+and 540-second Orca limits still apply per pass. Children reuse the matching quoted plate and recheck its geometry; missing
+or mismatched cached files are prepared again. A changed mesh is refused;
 changed slicing settings require approval again. No new installer files, dependencies, paid services or plugin controls.
 Physical fit and a student-building pilot remain necessary; no tolerance test was printed by this change.
 
