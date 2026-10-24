@@ -831,13 +831,15 @@ class PrinterManager:
                         reasons = ["The shop did not report every cut piece. Check the model again."]
                     else:
                         indices = [spec["piece"]["index"]] if spec.get("piece") else range(len(pieces))
+                        processed = 0
                         for i in indices:
                             if i >= len(pieces) or pieces[i].get("index") != i:
                                 reasons = ["The cut pieces no longer match the model. Check it again."]
                                 break
                             check = {"sha256": pieces[i].get("sha256"), "settings": prepared.get("settings")}
                             reasons += check_prepared_model(dest_dir.parent, work / "work" / f"piece-{i}.stl", check, {**spec, "fixes": {**spec.get("fixes", {}), "orient": False}})
-                        log.info("cut-piece checks: processed=%d, expected=%d", len(indices), len(indices))
+                            processed += 1
+                        log.info("cut-piece checks: processed=%d, expected=%d", processed, len(indices))
                     prepared["checked"] = not reasons
                 elif not reasons:
                     reasons = check_prepared_model(dest_dir.parent, work / "work" / mesh_name, prepared, spec)

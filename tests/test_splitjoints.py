@@ -99,6 +99,9 @@ def test_wire_rejects_unbounded_and_invalid_choices():
             ps.read_spec(raw | {"prepare": dict(version=1, thicken=False, moveLargeGaps=False, split=split)})
     good = raw | {"prepare": dict(version=1, thicken=False, moveLargeGaps=False, split=request())}
     assert ps.read_spec(good)["prepare"]["split"]["clearance"] == .2
+    for fix in ("thicken", "moveLargeGaps"):
+        with pytest.raises(ps.SliceError):
+            ps.read_spec(good | {"prepare": good["prepare"] | {fix: True}})
     with pytest.raises(ps.SliceError):
         ps.read_spec(good | {"piece": dict(index=-1, sha256="a" * 64)})
 

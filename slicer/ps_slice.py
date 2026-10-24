@@ -178,7 +178,7 @@ def cut_model(original, request, wall):
         half = np.zeros(3)
         half[axis], half[transverse[0]], half[transverse[1]] = 2, 1.5, 2.5
         margin = half + clearance + wall
-        # Deterministic grid, including section vertices: a socket must have real material all around and behind it.
+        # A socket must have real material all around and behind it.
         points = [np.linspace(lo[k] + margin[k], hi[k] - margin[k], 9) for k in transverse]
         if any(hi[k] - lo[k] < margin[k] * 2 for k in transverse):
             raise SliceError(REFUSAL)
@@ -280,7 +280,7 @@ def cut_model(original, request, wall):
                 direction = p.centroid - centre
                 if names:
                     level = i if i < len(cells) else joints[i - len(cells)]["pieces"][0] + 0.5
-                        direction = np.array([0, 0, level * 8.0])
+                    direction = np.array([0, 0, level * 8.0])
                 else:
                     direction = direction * 0.25
                 p.apply_translation(direction)
@@ -689,6 +689,8 @@ def read_spec(raw: dict) -> dict:
                                 any(type(prepare[k]) is not bool for k in ("moveLargeGaps", "thicken"))):
         raise SliceError("the model fix choices are not readable; check the file again")
     if prepare and "split" in prepare:
+        if prepare["thicken"] or prepare["moveLargeGaps"]:
+            raise SliceError("Cutting needs the original closed solids. Turn off wall thickening and moving pieces, then try again.")
         split = prepare["split"]
         if (not isinstance(split, dict) or set(split) != {"mode", "bed", "clearance", "layers"} or split["mode"] not in ("fit", "floors") or
                 not isinstance(split["bed"], list) or len(split["bed"]) != 3 or
