@@ -98,6 +98,25 @@ class TestFetchUploads(unittest.TestCase):
             self.assertEqual(reports, [{"queueJobId": "11111111-2222-4333-8444-555555555555", "sha256": hashlib.sha256(b"not the file").hexdigest()}])
             self.assertEqual(list((Path(d) / "abcdef1234567890").iterdir()), [])
 
+    def test_every_fetch_reply_names_the_revision_it_answered(self):
+        data = three_mf()
+        reports = []
+        def getter(path, dest):
+            Path(dest).write_bytes(data)
+            return hashlib.sha256(data).hexdigest(), len(data)
+        with tempfile.TemporaryDirectory() as d:
+            manager = PrinterManager()
+            fetch = dict(self._fetch(data), assignmentSeq=7)
+            reporter = lambda b: (reports.append(b), _Resp())[1]
+            self.assertEqual(manager.fetch_uploads([fetch], d, getter=getter, reporter=reporter), 1)
+            self.assertEqual(reports[-1]["assignmentSeq"], 7)
+            def refused(*args, reporter, **kwargs):
+                reporter({"queueJobId": fetch["queueJobId"], "sliceError": "synthetic refusal"})
+            with mock.patch.object(manager, "_slice_upload", side_effect=refused):
+                manager.fetch_uploads([dict(fetch, slice={})], d, getter=getter, reporter=reporter)
+            self.assertEqual(reports[-1]["assignmentSeq"], 7)
+            self.assertEqual(reports[-1]["sliceError"], "synthetic refusal")
+
     def test_malformed_or_foreign_entries_are_skipped_and_one_per_beat(self):
         data = three_mf()
         got = []

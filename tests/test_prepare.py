@@ -270,7 +270,7 @@ def test_failed_wall_is_cleared_only_after_thickening_passes_the_same_checker(tm
     assert not any(f["level"] == "fail" for f in after["report"]["findings"])
 
 
-def test_failed_cone_bed_contact_survives_preparation_until_orient_selected(tmp_path, monkeypatch):
+def test_cone_bed_contact_is_advice_with_or_without_orientation(tmp_path, monkeypatch):
     from makeros_hub import checks
     cone = trimesh.creation.cone(radius=10, height=20, sections=64)
     cone.apply_transform(trimesh.transformations.rotation_matrix(np.pi, [1, 0, 0]))
@@ -289,8 +289,6 @@ def test_failed_cone_bed_contact_survives_preparation_until_orient_selected(tmp_
     for orient in [False, True]:
         blocked = checks.check_prepared_model(spool, tmp_path / "prepared.stl", report,
             {"model": "A1 Mini", "fixes": {"orient": orient}})
-        assert bool(blocked) is not orient
-        assert report["checked"] is orient
-        if not orient:
-            assert any("barely touches the bed" in b for b in blocked)
+        assert not blocked
+        assert report["checked"] is True
     assert not list(spool.iterdir())

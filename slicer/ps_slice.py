@@ -295,6 +295,102 @@ def cut_model(original, request, wall):
 
 # These imports stay inside prepare_model: install-slicer.py's local preflight is stdlib-only; member geometry runs only
 # in the container, whose Dockerfile pins the permissive kernels (operator, 2026-10-23: "Have PStation fix it").
+def join_touching(original):
+    """Union closed shells; add a 0.02 mm weld only along an exactly shared edge."""
+    import numpy as np
+    import trimesh
+    from manifold3d import Manifold, Mesh, OpType
+
+    def solid(p):
+        m = Manifold(Mesh(np.asarray(p.vertices, dtype=np.float32), np.asarray(p.faces, dtype=np.uint32)))
+        if m.status().name != "NoError" or m.is_empty():
+            raise SliceError("Joining could not keep the shape safely; the original will be sliced instead.")
+        return m
+
+    def mesh(m):
+        d = m.to_mesh()
+        return trimesh.Trimesh(np.array(d.vert_properties)[:, :3], np.array(d.tri_verts), process=False)
+
+    original = original.copy()
+    # Exact opposite faces shared by adjacent solids are inside faces, not zero-thickness model parts.
+    pairs = trimesh.grouping.group_rows(np.sort(original.faces, axis=1), require_count=2)
+    if len(pairs):
+        opposite = np.einsum("ij,ij->i", original.face_normals[pairs[:, 0]], original.face_normals[pairs[:, 1]]) < -0.999999
+        keep = np.ones(len(original.faces), dtype=bool)
+        keep[pairs[opposite].ravel()] = False
+        original.update_faces(keep)
+    parts = list(original.split(only_watertight=False, repair=False))
+    if not 0 < len(parts) <= 128:
+        raise SliceError("There are too many pieces to join safely; the original will be sliced instead.")
+    # Shared faces can use opposite diagonals, so split() leaves two open shells and their flat caps.
+    flat = [p for p in parts if len(p.faces) and not p.is_watertight and
+            np.max(np.abs((p.vertices - p.vertices[0]) @ p.face_normals[0])) < 1e-6]
+    if sum(len(p.faces) for p in flat) > 2048:
+        raise SliceError("There are too many inside faces to check safely; the original will be sliced instead.")
+    def wafer(tri, normal):
+        return Manifold.hull_points(np.vstack([tri + normal * 0.001, tri - normal * 0.001]))
+    if flat:
+        cover = Manifold.batch_boolean([wafer(t, n) for p in flat for t, n in zip(p.triangles, p.face_normals)], OpType.Add)
+        for p in parts:
+            if p.is_watertight or any(p is q for q in flat):
+                continue
+            count = len(p.faces)
+            repaired = p.copy()
+            if not trimesh.repair.fill_holes(repaired) or not repaired.is_volume:
+                continue
+            if any((wafer(t, n) - cover).volume() > 1e-7 for t, n in zip(repaired.triangles[count:], repaired.face_normals[count:])):
+                continue
+            p.faces = repaired.faces
+    closed = [p for p in parts if p.is_volume]
+    other = [p for p in parts if not p.is_volume]
+    if not closed or any(not p.is_watertight and min(p.extents) > 1e-6 for p in other):
+        raise SliceError("Joining needs closed pieces; the original will be sliced instead.")
+    # Inward shells may be cavities. Never fill or reinterpret them as overlapping solids.
+    if any(p.is_watertight and p.volume < -1e-6 for p in other):
+        raise SliceError("Joining could change an inside space; the original will be sliced instead.")
+    bodies = [solid(p) for p in closed]
+    base = Manifold.batch_boolean(bodies, OpType.Add)
+    if base.status().name != "NoError":
+        raise SliceError("Joining could not keep the shape safely; the original will be sliced instead.")
+    if sum(len(p.faces) for p in other) > 2048:
+        raise SliceError("There are too many inside faces to check safely; the original will be sliced instead.")
+    for p in other:
+        for tri, normal in zip(p.triangles, p.face_normals):
+            probe = Manifold.hull_points(np.vstack([tri + normal * 0.001, tri - normal * 0.001]))
+            if probe.is_empty() or (probe - base).volume() > 1e-7:
+                raise SliceError("An open face may be part of the shape; the original will be sliced instead.")
+    # Match actual shared edges, never nearby bounding boxes: close but separate parts stay separate.
+    edges = {}
+    for i, p in enumerate(closed):
+        for edge in p.edges_unique:
+            points = p.vertices[edge]
+            key = tuple(sorted(tuple(float(x) for x in v) for v in points))
+            edges.setdefault(key, set()).add(i)
+    additions = []
+    cube = np.array([[x, y, z] for x in (-0.01, 0.01) for y in (-0.01, 0.01) for z in (-0.01, 0.01)])
+    for edge, owners in edges.items():
+        if len(owners) < 2:
+            continue
+        ids = sorted(owners)
+        pair = Manifold.batch_boolean([bodies[i] for i in ids], OpType.Add)
+        if len(pair.decompose()) == 1:
+            continue
+        weld = Manifold.hull_points(np.vstack([np.array(v) + cube for v in edge]))
+        if any((weld ^ b).volume() > 1e-8 for i, b in enumerate(bodies) if i not in owners):
+            raise SliceError("A weld could touch another piece; the original will be sliced instead.")
+        additions.append(weld)
+    candidate = Manifold.batch_boolean([base, *additions], OpType.Add)
+    out = mesh(candidate)
+    # Every added point is within sqrt(3)*0.01 mm of a real shared edge; no original volume is removed.
+    if candidate.status().name != "NoError" or not out.is_volume or (base - candidate).volume() > 1e-6 or \
+            np.any(out.bounds[0] < original.bounds[0] - 0.02) or np.any(out.bounds[1] > original.bounds[1] + 0.02):
+        raise SliceError("Joining could not keep the shape safely; the original will be sliced instead.")
+    if additions and len(candidate.decompose()) >= len(base.decompose()):
+        raise SliceError("The pieces could not be welded safely; the original will be sliced instead.")
+    print(f"join: processed={len(parts)}, expected={len(parts)}, welds={len(additions)}", flush=True)
+    return out, bool(additions)
+
+
 def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: float) -> dict:
     import base64
     import hashlib
@@ -312,6 +408,8 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
     opening = "Thickening this wall would close the window beside it. Pick a bigger scale or fix it in your model."
     exact = "Thickening this wall would change a room size, the footprint or a connecting face. Pick a bigger scale or fix it in your model."
     changes, blocked = [], []
+    selected = request.get("selected")
+    enabled = lambda fix: selected is None or fix in selected
     original = trimesh.load_mesh(src, file_type="stl", process=False)
     if not 0 < len(original.faces) <= 300_000 or not np.isfinite(original.vertices).all():
         raise SliceError(broken)
@@ -351,7 +449,7 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
         im.save(out, format="PNG", optimize=True)
         return base64.b64encode(out.getvalue()).decode("ascii")
 
-    def record(fix, words, before, after, unit, old, new, marked=None, default=True, face_marks=None, edges=None):
+    def record(fix, words, before, after, unit, old, new, marked=None, default=False, face_marks=None, edges=None):
         bounds = np.array([np.minimum(trimesh.util.concatenate(old).bounds[0], trimesh.util.concatenate(new).bounds[0]),
                            np.maximum(trimesh.util.concatenate(old).bounds[1], trimesh.util.concatenate(new).bounds[1])])
         marks = {i: None for i in (range(max(len(old), len(new))) if marked is None else marked)}
@@ -395,6 +493,15 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
         return result
 
     before = measure(parts)
+    if selected and "join" in selected:
+        joined, welded = join_touching(original)
+        joined_parts = list(joined.split(only_watertight=False, repair=False))
+        if welded or len(parts) != len(joined_parts) or abs(original.area - joined.area) > 1e-6:
+            record("join", "Makes touching pieces one solid part; stronger where pieces touch; changes the shape by less than 0.05 mm." if welded else
+                   "Joins overlapping or touching pieces into solid parts and removes hidden faces without changing the outside shape.",
+                   len(parts), len(joined_parts), "parts", parts, joined_parts)
+        before["volume"] = round(abs(float(original.volume)), 6)
+        parts = joined_parts
     start = [p.copy() for p in parts]
     # A zero-height surface cannot be given an inside by a repair. Small holes: only planar triangles/quads <= 1 mm across.
     filled, hole_faces, hole_edges, inward, processed = 0, {}, {}, [], 0
@@ -406,6 +513,9 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
             continue
         edges = p.edges_sorted[trimesh.grouping.group_rows(p.edges_sorted, require_count=1)]
         if len(edges):
+            if not enabled("holes"):
+                blocked.append(broken)
+                continue
             graph = nx.from_edgelist(edges)
             loops = nx.cycle_basis(graph)
             if any(d != 2 for _, d in graph.degree) or not loops:
@@ -488,6 +598,8 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
         face_marks = {i: set(np.flatnonzero(np.any(patched[i].faces != p.faces, axis=1))) for i, p in enumerate(parts)}
         face_marks = {i: faces for i, faces in face_marks.items() if faces}
         flipped = sum(len(faces) for faces in face_marks.values())
+        if flipped and not enabled("faces"):
+            blocked.append(broken)
         if flipped:
             record("faces", f"Turned {flipped} inside-out or flipped face(s) the right way.", flipped, 0, "faces", patched, parts,
                    face_marks=(face_marks, face_marks))
@@ -497,7 +609,7 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
     if not blocked:
         old = [p.copy() for p in parts]
         bottom = min(float(p.bounds[0, 2]) for p in parts)
-        if abs(bottom) > 1e-5:
+        if abs(bottom) > 1e-5 and enabled("bed"):
             for p in parts:
                 p.apply_translation([0, 0, -bottom])
             record("bed", f"Moved the whole model {abs(bottom):.3f} mm {'down' if bottom > 0 else 'up'} to the bed.", bottom, 0, "mm", old, parts)
@@ -507,6 +619,8 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
         old = [p.copy() for p in parts]
         footprint = CrossSection(Manifold.batch_boolean([solid(p) for p in parts], OpType.Add).project().to_polygons())
         for i, world in enumerate(old):
+            if not request["thicken"] or not enabled("walls"):
+                continue
             vertical = world.face_normals[np.abs(world.face_normals[:, 2]) < 1e-6]
             normals = np.unique(np.round(vertical, 6), axis=0)
             normal = min(normals, key=lambda n: np.ptp(world.vertices @ n)) if 0 < len(normals) <= 32 else np.array([1., 0., 0.])
@@ -586,25 +700,28 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
             record("walls", f"Thickened wall {i + 1} from {width:.3f} to {min_wall:.3f} mm {'inward' if low or high else 'equally from its centre'}; added up to {addition if low or high else addition / 2:.3f} mm.",
                    width, min_wall, "mm", was, parts, [i])
 
-        was = [p.copy() for p in parts]
-        union = Manifold.batch_boolean([solid(p) for p in parts], OpType.Add)
-        if union.status().name != "NoError":
-            raise SliceError(broken)
-        shells = [mesh(m) for m in union.decompose()]
-        parts = [p for p in shells if p.volume > 0]
-        for cavity in (p for p in shells if p.volume < 0):
-            enclosing = [i for i, p in enumerate(parts) if np.all(p.bounds[0] < cavity.bounds[0]) and
-                         np.all(p.bounds[1] > cavity.bounds[1]) and p.contains(cavity.vertices).all()]
-            if not enclosing:
+        if enabled("merge"):
+            was = [p.copy() for p in parts]
+            union = Manifold.batch_boolean([solid(p) for p in parts], OpType.Add)
+            if union.status().name != "NoError":
                 raise SliceError(broken)
-            i = min(enclosing, key=lambda j: parts[j].volume)
-            parts[i] = trimesh.util.concatenate([parts[i], cavity])
-        if len(parts) < len(was) or sum(abs(p.volume) for p in was) - union.volume() > 1e-4:
-            record("merge", f"Merged overlapping or face-joined pieces: {len(was)} pieces became {len(parts)} solid(s).", len(was), len(parts), "parts", was, parts)
+            shells = [mesh(m) for m in union.decompose()]
+            parts = [p for p in shells if p.volume > 0]
+            for cavity in (p for p in shells if p.volume < 0):
+                enclosing = [i for i, p in enumerate(parts) if np.all(p.bounds[0] < cavity.bounds[0]) and
+                             np.all(p.bounds[1] > cavity.bounds[1]) and p.contains(cavity.vertices).all()]
+                if not enclosing:
+                    raise SliceError(broken)
+                i = min(enclosing, key=lambda j: parts[j].volume)
+                parts[i] = trimesh.util.concatenate([parts[i], cavity])
+            if len(parts) < len(was) or sum(abs(p.volume) for p in was) - union.volume() > 1e-4:
+                record("merge", f"Merged overlapping or face-joined pieces: {len(was)} pieces became {len(parts)} solid(s).", len(was), len(parts), "parts", was, parts)
 
         # Cast down from bottom faces, never a bounding box: a roof above an opening must not be put on an imaginary floor.
         parts.sort(key=lambda p: float(p.bounds[0, 2]))
         for i, p in enumerate(parts):
+            if not enabled("lower"):
+                continue
             if p.bounds[0, 2] <= 1e-5:
                 continue
             feet = p.vertices[np.isclose(p.vertices[:, 2], p.bounds[0, 2], atol=1e-5)]
@@ -635,7 +752,7 @@ def prepare_model(src: str, dst: str, request: dict, min_wall: float, scale: flo
                 blocked.append(f"Moving piece {i + 1} would run into another part. Fix its position in your model.")
                 continue
             parts[i] = moved
-            record("lower", f"Moved piece {i + 1} down {gap:.3f} mm onto the flat surface below it.", gap, 0, "mm", was, parts, [i], default=gap < 2)
+            record("lower", f"Moved piece {i + 1} down {gap:.3f} mm onto the flat surface below it.", gap, 0, "mm", was, parts, [i], default=False)
 
     result_mesh = trimesh.util.concatenate(parts)
     data = result_mesh.export(file_type="stl")
@@ -684,10 +801,13 @@ def read_spec(raw: dict) -> dict:
     if not isinstance(scale, (int, float)) or isinstance(scale, bool) or not SCALE_MIN <= float(scale) <= SCALE_MAX:
         raise SliceError("the size change is outside what the slicer accepts")
     prepare = raw.get("prepare")
-    if prepare is not None and (not isinstance(prepare, dict) or set(prepare) not in ({"version", "moveLargeGaps", "thicken"}, {"version", "moveLargeGaps", "thicken", "split"}) or
+    if prepare is not None and (not isinstance(prepare, dict) or (not {"version", "moveLargeGaps", "thicken"} <= set(prepare) or not set(prepare) <= {"version", "moveLargeGaps", "thicken", "split", "selected"}) or
                                 type(prepare["version"]) is not int or prepare["version"] != 1 or
                                 any(type(prepare[k]) is not bool for k in ("moveLargeGaps", "thicken"))):
         raise SliceError("the model fix choices are not readable; check the file again")
+    if prepare is not None and "selected" in prepare and (not isinstance(prepare["selected"], list) or
+            len(prepare["selected"]) > 8 or any(f not in ("bed", "lower", "merge", "faces", "holes", "walls", "join", "split") for f in prepare["selected"])):
+        raise SliceError("The chosen model fixes could not be read; choose them again.")
     if prepare and "split" in prepare:
         if prepare["thicken"] or prepare["moveLargeGaps"]:
             raise SliceError("Cutting needs the original closed solids. Turn off wall thickening and moving pieces, then try again.")
@@ -868,7 +988,7 @@ def caps(processes: dict | None = None, machines: dict | None = None) -> dict:
     model the outer wall line width of the process it slices with, so the site's minimum wall is two of this image's lines.
     Read from the image, so a box whose agent and image differ reports the image. Never raises: a preset that does not read
     leaves its model out."""
-    out: dict = {"scaleMin": SCALE_MIN, "scaleMax": SCALE_MAX, "lineWidth": {}, "prepareVersion": 1, "splitVersion": 1, "colours": True}
+    out: dict = {"scaleMin": SCALE_MIN, "scaleMax": SCALE_MAX, "lineWidth": {}, "prepareVersion": 2, "splitVersion": 1, "colours": True}
     try:
         processes = load_index("process") if processes is None else processes
         machines = load_index("machine") if machines is None else machines

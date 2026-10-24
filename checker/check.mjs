@@ -1,9 +1,38 @@
-// ps-checker 03e94c59d47b, format 3: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
+// ps-checker 1ea7f973b500, format 4: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
 
 // src/checker/main.ts
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
+
+// src/lib/print-findings.ts
+function findingImpact(f) {
+  if (["too-big", "no-first-layer", "in-the-air", "too-thin", "overhang", "tall-thin"].includes(f.id)) return "Likely to fail";
+  if (["shared-edges", "thin", "flipped", "small-first-layer", "warp", "parts-unchecked"].includes(f.id)) return "May weaken the part";
+  if (f.id === "open") return f.level === "fail" ? "Likely to fail" : "Usually fine";
+  return "Usually fine";
+}
+var FINDING_CHANGE = {
+  "units-small": "Changing units resizes the whole model; leave it if this size is right.",
+  "units-large": "Changing units resizes the whole model; leave it if this size is right.",
+  "too-big": "Scaling makes every detail smaller; cutting makes separate pieces to assemble.",
+  "turn-to-fit": "Turning changes the print direction and which face rests on the bed.",
+  open: "Repair fills small surface gaps; it may fill an opening you intended to keep.",
+  "shared-edges": "Joining makes it one solid part, stronger where pieces touch; changes the shape by less than 0.05 mm.",
+  inverted: "Flipping faces tells the slicer which side is outside; it does not change the shape.",
+  flipped: "Flipping faces corrects the inside and outside without changing the shape.",
+  "no-first-layer": "Turning puts a flatter side down; a brim or supports add plastic to remove afterward.",
+  "small-first-layer": "A brim adds a removable edge strip; turning changes the print direction.",
+  "better-side": "Turning puts more of the part on the bed and changes the print direction.",
+  "in-the-air": "Supports add plastic to remove afterward; lowering pieces changes their positions.",
+  "parts-unchecked": "Joining pieces in your design can make them easier to check, but changes how they come apart.",
+  warp: "A brim adds a removable edge strip to help hold the corners down.",
+  overhang: "Supports hold these areas up, then come off; they use more plastic and can leave marks.",
+  "too-thin": "Thickening adds plastic to the thin areas; scaling up enlarges every detail.",
+  thin: "Thickening adds plastic and strength, but can change openings and fit.",
+  "tall-thin": "A brim adds a removable edge strip; laying it down changes the print direction.",
+  "looks-good": "No fix is suggested."
+};
 
 // src/lib/printability.ts
 import { inflateRawSync } from "node:zlib";
@@ -1167,43 +1196,40 @@ var upper = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 function findingsFor(r) {
   const f = [];
   const [x, y, z] = r.size, longest = Math.max(x, y, z);
-  if (longest < 4) f.push({ id: "units-small", level: "warn", title: "It is tiny: maybe the wrong units", detail: `The whole part is ${mm(longest)} across. If it was drawn in inches it is ${mm(longest * 25.4)}; in centimetres ${mm(longest * 10)}. Scale it in your slicer if so.` });
-  if (longest > 1500) f.push({ id: "units-large", level: "warn", title: "It is huge: maybe the wrong units", detail: `The part is ${mm(longest)} across. If it was drawn in micrometres or tenths of a millimetre, scale it down.` });
+  if (longest < 4) f.push({ id: "units-small", level: "warn", title: "It is tiny: maybe the wrong units", detail: `The whole part is ${mm(longest)} across; check that this is the size you want.` });
+  if (longest > 1500) f.push({ id: "units-large", level: "warn", title: "It is huge: maybe the wrong units", detail: `The part is ${mm(longest)} across; check that its units are right.` });
   const anyFit = r.fits.some((p) => p.asIs || p.turned);
-  if (!anyFit) f.push({ id: "too-big", level: "fail", title: "Too big for any of our printers", detail: `At ${mm(x)} by ${mm(y)} by ${mm(z)} it needs splitting into pieces, or scaling down.` });
+  if (!anyFit) f.push({ id: "too-big", level: "fail", title: "Too big for any of our printers", detail: `At ${mm(x)} by ${mm(y)} by ${mm(z)}, it cannot fit any shop printer in one piece.` });
   else if (!r.fits.some((p) => p.asIs)) f.push({ id: "turn-to-fit", level: "warn", title: "Fits only if turned", detail: `It fits ${r.fits.filter((p) => p.turned).map((p) => p.model).join(", ")} once turned on its side.` });
   const c = r.closed;
-  if (c.boundaryEdges) f.push({ id: "open", level: c.boundaryEdges > r.triangles * 0.01 ? "fail" : "warn", title: "The surface is not closed", detail: `${c.boundaryEdges} open edge(s): gaps in the surface. A slicer can usually repair small gaps; large ones print as holes or not at all. Export it again as a solid, or run a repair.` });
-  if (c.nonManifoldEdges) f.push({ id: "shared-edges", level: "warn", title: "Pieces touch along an edge", detail: `${c.nonManifoldEdges} edge(s) are shared by more than two faces. That is not a hole: it usually means two pieces of the model meet along a line, or an inside face was left in. The slicer prints it, but the part can be weak where pieces only touch. Joining them into one solid in your design program fixes it.` });
-  if (c.inverted) f.push({ id: "inverted", level: "warn", title: "It is inside out", detail: "Every face points inward. Most slicers fix this on import; if yours shows it dark or empty, flip the normals." });
-  else if (c.flippedEdges) f.push({ id: "flipped", level: "warn", title: "Some faces are flipped", detail: `${c.flippedEdges} edge(s) join faces that point opposite ways. The slicer may leave holes there.` });
+  if (c.boundaryEdges) f.push({ id: "open", level: c.boundaryEdges > r.triangles * 0.01 ? "fail" : "warn", title: "The surface is not closed", detail: `${c.boundaryEdges} open edges leave gaps in the surface; small gaps often slice fine, but larger ones can leave holes or missing areas.` });
+  if (c.nonManifoldEdges) f.push({ id: "shared-edges", level: "warn", title: "Pieces touch along an edge", detail: "Pieces meet along a line, or hidden faces are left inside; this often slices fine, but a line-only joint can be weak." });
+  if (c.inverted) f.push({ id: "inverted", level: "warn", title: "It is inside out", detail: "The faces point inward; most slicers correct this automatically." });
+  else if (c.flippedEdges) f.push({ id: "flipped", level: "warn", title: "Some faces are flipped", detail: `${c.flippedEdges} edges meet faces pointing opposite ways; the slicer may leave holes there.` });
   const fl = r.firstLayer;
-  if (fl.contactMm2 < 1) f.push({ id: "no-first-layer", level: "fail", title: "It barely touches the bed", detail: `Only ${fl.contactMm2} mm² of the part sits flat on the bed: a point or an edge will not hold.${fl.bestSide ? ` Lay it on ${fl.bestSide} (${Math.round(fl.bestSideMm2)} mm²).` : " Add a flat base, a brim, or supports under it."}` });
-  else if (z > 10 && fl.contactMm2 < fl.footprintMm2 * 0.15) f.push({ id: "small-first-layer", level: "warn", title: "A small first layer", detail: `${Math.round(fl.contactMm2)} mm² on the bed under a part ${mm(z)} tall. Add a brim${fl.bestSide ? `, or lay it on ${fl.bestSide} (${Math.round(fl.bestSideMm2)} mm²)` : ""}.` });
+  if (fl.contactMm2 < 1) f.push({ id: "no-first-layer", level: "fail", title: "It barely touches the bed", detail: `Only ${fl.contactMm2} mm² touches the bed; the part is likely to come loose.` });
+  else if (z > 10 && fl.contactMm2 < fl.footprintMm2 * 0.15) f.push({ id: "small-first-layer", level: "warn", title: "A small first layer", detail: `Only ${Math.round(fl.contactMm2)} mm² holds a ${mm(z)}-tall part on the bed; it may come loose.` });
   else if (fl.bestSide) f.push({ id: "better-side", level: "ok", title: "A flatter side is available", detail: `Lying on ${fl.bestSide} puts ${Math.round(fl.bestSideMm2)} mm² on the bed instead of ${Math.round(fl.contactMm2)} mm².` });
   const air = r.parts.inTheAir;
   if (air.length) {
-    const alike = /* @__PURE__ */ new Map();
-    for (const a of air) alike.set(`${round1(a.mm)}|${a.over}`, [...alike.get(`${round1(a.mm)}|${a.over}`) ?? [], a]);
-    const said = [...alike.values()].slice(0, 4).map((g) => g.length === 1 ? `${upper(g[0].words)} starts ${mm(g[0].mm)} above ${g[0].over}` : `${g.length} parts start ${mm(g[0].mm)} above ${g[0].over} (${g.slice(0, 3).map((a) => a.words).join(", ")}${g.length > 3 ? " and more" : ""})`);
-    const resting = air.reduce((s, a) => s + a.resting, 0), them = air.length > 1 ? "them" : "it";
+    const first = air[0];
     f.push({
       id: "in-the-air",
       level: "warn",
       title: air.length === 1 ? "A part starts in the air" : `${air.length} parts start in the air`,
-      detail: `${said.join("; ")}${alike.size > 4 ? "; and others" : ""}.${resting ? ` ${resting} more part${resting > 1 ? "s rest" : " rests"} on ${them}.` : ""} Nothing holds ${them} up there: without supports the printer lays the first layers on air. Move ${them} down onto the bed or onto the part below in your design program, or turn on supports.`
+      detail: `${upper(first.words)} starts ${mm(first.mm)} above ${first.over}${air.length > 1 ? `; ${air.length - 1} more ${air.length === 2 ? "part also starts" : "parts also start"} in air` : ""}; without support, their first layers have nothing to rest on.`
     });
   }
-  if (r.parts.count > 1 && !r.parts.judged) f.push({ id: "parts-unchecked", level: "warn", title: "Could not check every part", detail: r.parts.count > MAX_PARTS ? `It has ${r.parts.count.toLocaleString("en-US")} separate parts, more than the ${MAX_PARTS.toLocaleString("en-US")} the check looks at one by one, so it did not check which of them would start in the air. Look over the parts in your design program, or join them into fewer solids.` : "Its parts meet in so many places that the check could not look at them all, so it did not check which of them would start in the air. Look over the parts in your design program." });
-  if (fl.baseMm[0] >= WARP_BASE_MM && fl.contactMm2 >= WARP_CONTACT_MM2) f.push({ id: "warp", level: "warn", title: "A big flat base: its corners may lift", detail: `${Math.round(fl.contactMm2 / 100)} cm² sits flat on the bed across ${mm(fl.baseMm[0])} by ${mm(fl.baseMm[1])}. As a big part cools it shrinks, and its corners can curl up off the bed. A brim holds them down; a closed printer (the P2S, X1C or H2D) keeps the air around it warm and still; rounded corners in the design help most.` });
-  if (r.overhangCm2 >= 0.5) f.push({ id: "overhang", level: "warn", title: "Needs supports", detail: `${r.overhangCm2} cm² hangs out over open air at less than ${SUPPORT_SLOPE_DEG} degrees from level, marked orange in the picture: our slicer holds that up with supports. Turn on supports, or turn the part so those faces point up.` });
+  if (r.parts.count > 1 && !r.parts.judged) f.push({ id: "parts-unchecked", level: "warn", title: "Could not check every part", detail: "The check could not tell whether every piece has something underneath it; the risk is unknown." });
+  if (fl.baseMm[0] >= WARP_BASE_MM && fl.contactMm2 >= WARP_CONTACT_MM2) f.push({ id: "warp", level: "warn", title: "A big flat base: its corners may lift", detail: `This large flat base may curl at the corners as it cools.` });
+  if (r.overhangCm2 >= 0.5) f.push({ id: "overhang", level: "warn", title: "Overhangs may sag", detail: `${r.overhangCm2} cm² hangs over air, marked orange; these areas are likely to sag or fail without support.` });
   const t = r.thin;
-  if (t.minMm !== null && t.under04Pct >= 0.5) f.push({ id: "too-thin", level: "fail", title: "Parts of it are too thin to print", detail: `About ${t.under04Pct}% of the sampled surface sits on a wall thinner than the printer can lay down (thinnest ${mm(t.minMm)}), marked red: under 0.4 mm side to side, one nozzle line, or 0.2 mm top to bottom, one layer. Those areas will be missing. Make walls at least ${+t.minWallMm.toFixed(2)} mm, two lines across, and flat parts at least ${mm(MIN_SLAB_MM)}.` });
-  else if (t.minMm !== null && t.under08Pct >= 1) f.push({ id: "thin", level: "warn", title: "Some walls are very thin", detail: `About ${t.under08Pct}% of the sampled surface sits on a thin wall (thinnest ${mm(t.minMm)}), marked red. It prints as one or two lines or layers and breaks easily.` });
+  if (t.minMm !== null && t.under04Pct >= 0.5) f.push({ id: "too-thin", level: "fail", title: "Parts of it are too thin to print", detail: `About ${t.under04Pct}% of the sampled surface is too thin for a nozzle line or layer, marked red; those details may be missing.` });
+  else if (t.minMm !== null && t.under08Pct >= 1) f.push({ id: "thin", level: "warn", title: "Some walls are very thin", detail: `About ${t.under08Pct}% of the sampled surface is thin, marked red; it may print but break easily.` });
   const base = Math.max(1, fl.contactMm2 > 0 ? fl.baseMm[1] : Math.min(x, y));
-  if (z > 30 && z / base > 8) f.push({ id: "tall-thin", level: "warn", title: "Tall and slender", detail: `${mm(z)} tall standing on ${mm(base)} across: it may wobble or snap while printing. Add a brim, print it lying down, or print several together.` });
-  if (!f.some((x2) => x2.level !== "ok")) f.unshift({ id: "looks-good", level: "ok", title: "Looks printable", detail: "This check found no problems. Small details may still be missed. A slice with our own settings gives the exact time and material." });
-  return f;
+  if (z > 30 && z / base > 8) f.push({ id: "tall-thin", level: "warn", title: "Tall and slender", detail: `${mm(z)} tall on a ${mm(base)}-wide base, it is likely to wobble or come loose while printing.` });
+  if (!f.some((x2) => x2.level !== "ok")) f.unshift({ id: "looks-good", level: "ok", title: "Looks printable", detail: "This check found no problems; small details can still be missed." });
+  return f.map((finding) => ({ ...finding, impact: findingImpact(finding), change: finding.id === "no-first-layer" && fl.bestSide ? `Laying it on ${fl.bestSide} gives it a flat base; this changes the print direction.` : FINDING_CHANGE[finding.id] }));
 }
 var COLORS = { 0: [120, 150, 190], 1: [70, 170, 110], 2: [235, 150, 50], 3: [220, 60, 60] };
 function render(mesh, marks, width = 640, height = 480) {
@@ -1270,7 +1296,7 @@ function render(mesh, marks, width = 640, height = 480) {
 }
 
 // src/lib/check-job.ts
-var CHECKER_FORMAT = 3;
+var CHECKER_FORMAT = 4;
 var MAX_REPORT_CHARS = 6e5;
 function checkFile(input, stage = () => {
 }) {
@@ -1298,7 +1324,7 @@ function bounded(report) {
 }
 
 // src/checker/main.ts
-var CHECKER_VERSION = true ? "03e94c59d47b" : "source";
+var CHECKER_VERSION = true ? "1ea7f973b500" : "source";
 var JOB = process.env.PS_JOB_DIR ?? "/job";
 function readJob(raw) {
   if (!raw || typeof raw !== "object") return "job.json is not an object";

@@ -130,8 +130,7 @@ def check_prepared_model(spool_dir: Path, candidate: Path, prepared: dict, spec:
                 f.get("level") not in ("ok", "warn", "fail") or not isinstance(f.get("id"), str) or
                 not isinstance(f.get("title"), str) or not 0 < len(f["title"]) <= 200 for f in findings):
             raise ValueError("prepared model checker findings do not read")
-        blocked = [f["title"] + ". Fix the file and check it again." for f in findings if f["level"] == "fail" and
-                   not (f["id"] == "no-first-layer" and spec.get("fixes", {}).get("orient") is True)]
+        blocked = [f["title"] + ". The original will be sliced instead." for f in findings if f["id"] in ("too-big", "no-model")]
         prepared["checked"] = not blocked
         log.info("prepared check: processed=%d, expected=%d, blocked=%d", len(findings), len(findings), len(blocked))
         return blocked

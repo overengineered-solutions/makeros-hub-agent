@@ -78,7 +78,7 @@ def parse_slicer_caps(result) -> dict | None:
     widths = result.get("lineWidth") if isinstance(result.get("lineWidth"), dict) else {}
     return {"scaleMin": float(lo), "scaleMax": float(hi),
             **({"colours": True} if result.get("colours") is True else {}),
-            **({"prepareVersion": 1} if type(result.get("prepareVersion")) is int and result["prepareVersion"] == 1 else {}),
+            **({"prepareVersion": result["prepareVersion"]} if type(result.get("prepareVersion")) is int and result["prepareVersion"] in (1, 2) else {}),
             **({"splitVersion": 1} if type(result.get("splitVersion")) is int and result["splitVersion"] == 1 else {}),
             "lineWidth": {k: float(v) for k, v in list(widths.items())[:16] if isinstance(k, str) and 0 < len(k) <= 40 and num(v) and 0 < v <= 5}}
 
@@ -723,12 +723,15 @@ class PrinterManager:
             dest_dir = base / uid
             dest = dest_dir / name
             tmp = dest_dir / f".{name}.fetch.tmp"
+            def report_fetch(body):
+                seq = f.get("assignmentSeq")
+                return reporter({**body, **({"assignmentSeq": seq} if type(seq) is int else {})})
             spec = f.get("slice")
             sliced: dict | None = None
             try:
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 if isinstance(spec, dict):
-                    sliced = self._slice_upload(f, spec, uid, dest_dir, dest, sha, path, getter=getter, reporter=reporter,
+                    sliced = self._slice_upload(f, spec, uid, dest_dir, dest, sha, path, getter=getter, reporter=report_fetch,
                                                 stream_sha=stream_sha, runner=slice_runner)
                     if sliced is None:
                         continue   # reported: a sha mismatch or a slice the member is told about
@@ -748,7 +751,7 @@ class PrinterManager:
                                 tmp.unlink(missing_ok=True)   # any failure or mismatch: no temp file survives
                         if got != sha:
                             log.error("web upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], got[:12])
-                            reporter({"queueJobId": job_id, "sha256": got})   # the cloud fails the job + tells the member
+                            report_fetch({"queueJobId": job_id, "sha256": got})   # the cloud fails the job + tells the member
                             continue
                         _os.replace(tmp, dest)
                 # Also on retry with an existing file: the prior rename may
@@ -788,7 +791,7 @@ class PrinterManager:
                     body["slice"]["pieces"] = summaries
                     body["estGrams"] = sum(p["grams"] for p in summaries)
                     log.info("cut-piece reports: processed=%d, expected=%d", len(summaries), len(pieces))
-                resp = reporter(body)
+                resp = report_fetch(body)
                 ok = getattr(resp, "status", None) == 200 and isinstance(getattr(resp, "body", None), dict) and resp.body.get("ok") is True
                 if ok:
                     done += 1

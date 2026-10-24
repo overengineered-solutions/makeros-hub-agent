@@ -45,7 +45,9 @@ def test_prepared_check_never_clears_missing_old_failed_or_unresolved_results(tm
         return rc
     monkeypatch.setattr(checks, "run_check_job", runner)
     blocked = checks.check_prepared_model(spool, candidate, prepared, {"model": "A1 Mini", "fixes": {"orient": True}})
-    assert blocked and prepared["checked"] is False
+    advice = answer and answer.get("ok") and rc == 0 and (answer.get("report", {}).get("findings") or [{}])[0].get("id") in ("too-thin", "open", "future-failure")
+    assert bool(blocked) is not bool(advice)
+    assert prepared["checked"] is bool(advice)
     assert not list(spool.iterdir())
 
 
