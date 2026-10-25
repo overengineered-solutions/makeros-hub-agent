@@ -506,6 +506,31 @@ class PrinterManager:
                           self._redact_printer_exception(e, self._access_code_for(pid)))
         return out
 
+    def screen_events(self) -> list[dict]:
+        return [e for a in self._adapters.values() if hasattr(a, "screen") for e in a.screen.pending()][:64]
+
+    def update_screens(self, body: dict, sent: list[dict]) -> None:
+        # Only adapters from config-down receive facts, never an address supplied in a heartbeat response.
+        facts, acks = body.get("screenFacts"), body.get("screenEventsAck", [])
+        if facts is not None and (not isinstance(facts, list) or any(not isinstance(f, dict) for f in facts)):
+            log.warning("screen facts response is malformed")
+            facts = None
+        if not isinstance(acks, list) or any(not isinstance(a, dict) for a in acks):
+            log.warning("screen event acknowledgement is malformed")
+            acks = []
+        for pid, adapter in self._adapters.items():
+            if not hasattr(adapter, "screen"):
+                continue
+            mine = [f for f in (facts or []) if f.get("printerId") == pid]
+            try:
+                adapter.screen.offer(mine[0] if len(mine) == 1 else None)
+            except ValueError:
+                adapter.screen.offer(None)
+                log.warning("screen %s: facts refused", pid)
+            ids = [e["id"] for e in sent if e["printerId"] == pid
+                   and any(a.get("printerId") == pid and a.get("id") == e["id"] for a in acks)]
+            adapter.screen.ack(ids)
+
     def camera_targets(self) -> list[dict]:
         """Per-printer camera-routing facts (vendor/model/host/accessCode/urls)
         for the camera capturer. One entry per configured printer; the capturer

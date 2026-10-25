@@ -777,6 +777,7 @@ def heartbeat_payload(
     paper_ready: bool | None = None,
     camera_gateway: bool | None = None,
     camera_live_stats: list[dict] | None = None,
+    screen_events: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -800,6 +801,8 @@ def heartbeat_payload(
         payload["probeResults"] = list(probe_results)[:64]
     if command_results:
         payload["commandResults"] = list(command_results)[:64]
+    if screen_events:
+        payload["screenEvents"] = list(screen_events)[:64]
     if camera_frames:
         payload["cameraFrames"] = list(camera_frames)[:32]
     if camera_failures:
@@ -2001,6 +2004,7 @@ def run(
                 vp_connects = VP_CONNECTS.snapshot(64)
                 slicer_ready = os.path.isfile(SLICE_RUNNER) and os.access(SLICE_RUNNER, os.X_OK)
                 checker_ready = check_lane.checker_installed()
+                screen_events = manager.screen_events()
                 resp = post_json(
                     cfg.heartbeat_url,
                     heartbeat_payload(
@@ -2028,6 +2032,7 @@ def run(
                         paper_ready=paper_lane.paper_ready(),
                         camera_gateway=GATEWAY.available(),
                         camera_live_stats=live_views.stats(),
+                        screen_events=screen_events,
                     ),
                     bearer=credential,
                     retries=3,
@@ -2035,6 +2040,10 @@ def run(
                 )
                 if resp.status == 200:
                     _validate_heartbeat(resp.body)
+                    try:
+                        manager.update_screens(resp.body, screen_events)
+                    except Exception as exc:  # a screen failure must not lose the print/command acknowledgements
+                        log.warning("screen response failed (%s); will retry", type(exc).__name__)
                     tailscale_state.mark_reported()
                     log.info("heartbeat status rows processed=%d, expected=%d", resp.body["applied"], len(statuses))
                     reported_probe_count = len(pending_probe_results)

@@ -43,6 +43,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from .gcode_meta import read_gcode_meta
+from .screen import ScreenLink
 from .queue_progress import QueueProgressTracker, _safe_file_component, write_json_durably
 
 log = logging.getLogger(__name__)
@@ -292,6 +293,7 @@ class KlipperAdapter:
     def __init__(self, printer_id: str, moonraker_url: str, diagnostics=None, *, model: Optional[str] = None):
         self.printer_id = printer_id
         self.moonraker_url = _normalize_base(moonraker_url)
+        self.screen = ScreenLink(printer_id, self.moonraker_url)
         # The cloud's machines.model. start_print refuses a G-code whose printer_model is not exactly this; the
         # status DTO never carries it (the `model` property below stays None).
         self._model = model
@@ -372,6 +374,8 @@ class KlipperAdapter:
                 pass
         # Each poller gets its own stop event (codex review of release-0.68.0): an old poller that outlived the join
         # above still sees ITS event set and records nothing, so two pollers never both write.
+        if self._stop.is_set():
+            self.screen = ScreenLink(self.printer_id, self.moonraker_url)
         self._stop = threading.Event()
         self._started = time.monotonic()
         self._consecutive_failures = 0
@@ -382,6 +386,7 @@ class KlipperAdapter:
         log.info("klipper adapter %s polling %s", self.printer_id, self.moonraker_url)
 
     def stop(self) -> None:
+        self.screen.stop()
         # Under the lock (codex review of release-0.68.0): a poll records under it and checks its event first, so once
         # stop() returns this adapter never records or saves again. The manager rescues its jobs after this and builds
         # the replacement on the same state file; a poll still in flight is dropped, and the replacement's first poll
