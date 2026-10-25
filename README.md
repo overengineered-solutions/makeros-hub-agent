@@ -64,12 +64,17 @@ Before accepting a production rollout, perform a small supervised canary: member
 ## Develop and verify
 
 ```sh
-python3 -m pytest -q    # tests/conftest.py gives each test its own state dirs; plain unittest discover does not
+./scripts/test.sh
 bash -n install.sh bootstrap.sh scripts/tailscale-setup.sh laser_gate/install.sh
 sh -n update.sh
 ```
 
 Tests use fake equipment and local sockets; NumPy enables the real YOLO preprocessing/decoding checks. The suite includes root-repository/downgrade checks, isolated staging failure recovery, HTTP redirect and acknowledgement rejection, multipart binary fidelity, spool durability, cross-member MQTT/FTPS behavior and printer dispatch recovery. Never point a test at live equipment.
+
+Use a Python environment with pytest installed (on the shop box, `source ~/.pyvenv/bin/activate`). `scripts/test.sh`
+runs from the repo root with `PYTHONPATH=.`, forwards pytest options (for example `-k klipper`), and returns pytest's exit
+status. Plain `unittest` skips `tests/conftest.py`'s state isolation and can read or write the box's persistent agent state.
+Real slicing tests require the ps-slicer Docker image; their prerequisite skips do not verify slicing.
 
 ## 0.84.0 candidate: cut to fit, or separate named floors and roof
 

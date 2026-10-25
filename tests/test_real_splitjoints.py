@@ -36,10 +36,12 @@ def test_slices_every_piece_then_only_the_exact_approved_piece(tmp_path, mode):
         (job / "job.json").write_text(json.dumps(spec))
         for _ in range(32):
             result = subprocess.run(command, capture_output=True, timeout=600)
+            assert result.returncode == 0, (result.returncode, result.stderr.decode(errors="replace")[-1000:])
+            assert (job / "out/result.json").is_file(), ("missing result.json", result.returncode, result.stderr.decode(errors="replace")[-1000:])
             answer = json.loads((job / "out/result.json").read_text())
             if not answer.get("pending"):
                 break
-        assert result.returncode == 0 and answer.get("ok"), (answer, result.stderr.decode()[-1000:])
+        assert answer.get("ok"), (answer, result.stderr.decode(errors="replace")[-1000:])
         return answer
     group = run()
     assert len(group["pieces"]) == len(group["prepare"]["pieces"]) == 3

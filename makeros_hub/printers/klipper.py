@@ -544,9 +544,9 @@ class KlipperAdapter:
             uploaded = self._upload(Path(local_path), remote)
         except Exception as exc:  # noqa: BLE001 — any failure: the file is not (provably) there
             detail = _http_detail(exc)
-            if _unanswered(exc) and self._landed(remote, Path(local_path).stat().st_size):
+            if _unanswered(exc) and self._landed(remote, Path(local_path)):
                 # The Giga's first queue upload, 2026-10-25: the file landed whole and nginx answered 504 after 60 s.
-                log.warning("klipper %s: upload of %s answered %s, but the file landed whole: starting it", self.printer_id, remote, detail)
+                log.warning("klipper %s: upload of %s answered %s, but the file contents match: rechecking before start", self.printer_id, remote, detail)
                 uploaded = remote
             else:
                 log.warning("klipper %s: upload of %s failed: %s", self.printer_id, remote, detail)
@@ -559,8 +559,9 @@ class KlipperAdapter:
             if not self._record_dispatch(queue_job_id, uploaded, assignment_seq):
                 return {"ok": False, "reason": "state_persist_failed"}
 
-        refusal = self._nozzle_refusal(meta)
+        refusal = self._nozzle_refusal(meta) or self._live_refusal()
         if refusal:
+            log.info("klipper %s: not starting %s — %s", self.printer_id, queue_job_id, refusal)
             self._discard_dispatch(queue_job_id)
             return {"ok": False, "reason": refusal}
         url = f"{self.moonraker_url}/printer/print/start?{urllib.parse.urlencode({'filename': uploaded})}"
@@ -733,15 +734,29 @@ class KlipperAdapter:
         except Exception as exc:  # noqa: BLE001
             log.warning("klipper %s: could not prepare %s: %s", self.printer_id, path, _classify_error(exc))
 
-    def _landed(self, remote: str, size: int) -> bool:
-        """After an unanswered upload: is the file there whole (Moonraker stores an upload under its name only once complete)?"""
+    def _landed(self, remote: str, local: Path) -> bool:
+        """Match metadata and read back SHA256 after an unanswered upload: Moonraker metadata exposes no content hash."""
         try:
+            size = local.stat().st_size
             url = f"{self.moonraker_url}/server/files/metadata?filename={urllib.parse.quote(remote, safe='')}"
             req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "makeros-hub-agent"})
             with urllib.request.urlopen(req, timeout=HTTP_GET_TIMEOUT_SEC) as resp:  # noqa: S310 - operator LAN URL
                 parsed = json.loads(resp.read(256 * 1024).decode("utf-8", errors="replace"))
             result = parsed.get("result") if isinstance(parsed, dict) else None
-            return isinstance(result, dict) and result.get("size") == size
+            if not (isinstance(result, dict) and result.get("filename") == remote and result.get("size") == size):
+                return False
+            with local.open("rb") as src:
+                expected = hashlib.file_digest(src, "sha256").digest()
+            url = f"{self.moonraker_url}/server/files/gcodes/{urllib.parse.quote(remote, safe='/')}"
+            req = urllib.request.Request(url, headers={"User-Agent": "makeros-hub-agent"})
+            digest, received = hashlib.sha256(), 0
+            with urllib.request.urlopen(req, timeout=HTTP_UPLOAD_TIMEOUT_SEC) as resp:  # noqa: S310 - operator LAN URL
+                for chunk in iter(lambda: resp.read(1 << 20), b""):
+                    received += len(chunk)
+                    if received > size:
+                        return False
+                    digest.update(chunk)
+            return received == size and digest.digest() == expected
         except Exception:  # noqa: BLE001 — not provably there
             return False
 
@@ -1418,12 +1433,12 @@ def _classify_error(err: BaseException) -> str:
 
 
 def _remote_path(queue_job_id: str, file_name: str) -> str:
-    """makeros/<job8>_<file>, at most REMOTE_PATH_MAX_CHARS, the extension kept (Moonraker only treats .gcode/.gco/.g
+    """makeros/<job>_<file>, at most REMOTE_PATH_MAX_CHARS, the extension kept (Moonraker only treats .gcode/.gco/.g
     as printable). Names are reduced to [A-Za-z0-9._-] so they are safe in a multipart header and a query string."""
     name = _UNSAFE_NAME.sub("_", PurePosixPath(file_name).name) or "print.gcode"
     suffix = PurePosixPath(name).suffix
     stem = name[: len(name) - len(suffix)] if suffix else name
-    prefix = f"{REMOTE_DIR}/{_UNSAFE_NAME.sub('_', queue_job_id[:8])}_"
+    prefix = f"{REMOTE_DIR}/{_UNSAFE_NAME.sub('_', queue_job_id)}_"
     return prefix + stem[: max(1, REMOTE_PATH_MAX_CHARS - len(prefix) - len(suffix))] + suffix
 
 

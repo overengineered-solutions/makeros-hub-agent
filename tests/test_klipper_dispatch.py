@@ -46,7 +46,9 @@ class FakeMoonraker:
         self.total = None             # a frozen total_duration (klippy freezes it when a print ends)
         self.start_raw = None         # bytes written verbatim as the start POST's reply (a broken answer)
         self.upload_status, self.upload_body = 201, None
-        self.dirs, self.made_dirs, self.stored = set(), [], {}   # gcodes/ folders; folders made; path -> size
+        self.dirs, self.made_dirs, self.stored = set(), [], {}   # gcodes/ folders; folders made; path -> bytes
+        self.upload_lands, self.after_upload, self.after_download = True, {}, {}
+        self.metadata, self.download_status, self.download_data = None, 200, None
         self.nozzle, self.nozzle_after_upload = .4, .4
         self.start_status, self.start_body, self.start_delay = 200, {"result": "ok"}, 0.0
         self.start_begins_printing = True
@@ -69,8 +71,22 @@ class FakeMoonraker:
                     return self._send(200 if q["path"][0] in outer.dirs else 404, {"result": {"dirs": [], "files": []}})
                 if url.path == "/server/files/metadata":
                     name = q["filename"][0]
-                    return self._send(200, {"result": {"filename": name, "size": outer.stored[name]}}) if name in outer.stored \
+                    return self._send(200, {"result": outer.metadata if outer.metadata is not None else
+                                           {"filename": name, "size": len(outer.stored[name])}}) if name in outer.stored \
                         else self._send(404, {"error": {"message": "Metadata not available"}})
+                if url.path.startswith("/server/files/gcodes/"):
+                    name = urllib.parse.unquote(url.path.removeprefix("/server/files/gcodes/"))
+                    if outer.download_status != 200 or name not in outer.stored:
+                        return self._send(outer.download_status if name in outer.stored else 404, {"error": {"message": "Not available"}})
+                    raw = outer.stored[name] if outer.download_data is None else outer.download_data
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    for key, value in outer.after_download.items():
+                        setattr(outer, key, value)
+                    self.wfile.write(raw)
+                    return
                 if not self.path.startswith("/printer/objects/query"):
                     return self._send(404, {"error": {"message": "Not Found"}})
                 outer.queries += 1
@@ -87,9 +103,11 @@ class FakeMoonraker:
                 if url.path == "/server/files/upload":
                     form = parse_multipart(body, boundary_from_content_type(self.headers.get("Content-Type")))
                     outer.uploads.append(form)
-                    if outer.upload_status in (201, 504):   # stored; a 504 is the proxy giving up on the reply, not the upload
-                        outer.stored[f"{form.fields.get('path')}/{form.file.filename}"] = len(form.file.data)
+                    if outer.upload_lands and outer.upload_status in (201, 504):
+                        outer.stored[f"{form.fields.get('path')}/{form.file.filename}"] = form.file.data
                     outer.nozzle = outer.nozzle_after_upload
+                    for key, value in outer.after_upload.items():
+                        setattr(outer, key, value)
                     stored = f"{form.fields.get('path')}/{form.file.filename}"
                     return self._send(outer.upload_status, outer.upload_body or {
                         "item": {"path": stored, "root": "gcodes", "size": len(form.file.data), "permissions": "rw"},
@@ -157,6 +175,21 @@ class KlipperCase(unittest.TestCase):
         (adapter or self.adapter)._record_poll(self.fake.status())
 
 
+class TestRemotePath(unittest.TestCase):
+    def test_jobs_sharing_a_prefix_have_distinct_paths(self):
+        other = JOB[:-1] + "2"
+        self.assertEqual(klipper._remote_path(JOB, "cube.gcode"), f"makeros/{JOB}_cube.gcode")
+        self.assertEqual(klipper._remote_path(other, "cube.gcode"), f"makeros/{other}_cube.gcode")
+        self.assertNotEqual(klipper._remote_path(JOB, "cube.gcode"), klipper._remote_path(other, "cube.gcode"))
+
+    def test_long_filenames_keep_the_full_job_id_and_extension(self):
+        remote = klipper._remote_path(JOB, "../" + "cube " * 100 + ".gcode")
+        self.assertLessEqual(len(remote), klipper.REMOTE_PATH_MAX_CHARS)
+        self.assertTrue(remote.startswith(f"makeros/{JOB}_"))
+        self.assertTrue(remote.endswith(".gcode"))
+        self.assertNotIn(" ", remote)
+
+
 class TestStartPrint(KlipperCase):
     def test_a_file_sliced_for_another_model_never_leaves_the_hub(self):
         for model in ("Sovol SV08", None):
@@ -202,6 +235,39 @@ class TestStartPrint(KlipperCase):
         self.assertFalse(out["ok"])
         self.assertTrue(out["reason"].startswith("printer_stale: "), out)
 
+    def test_a_printer_that_becomes_busy_during_upload_never_starts(self):
+        cases = [("hold", True, "printer_busy: heater_hold"), ("idle", "Printing", "printer_busy: klippy_busy"),
+                 ("state", "printing", "printer_busy: printing"), ("state", "paused", "printer_busy: printing"),
+                 ("state", "error", "printer_busy: klipper_error"), ("state", "unknown", "printer_busy: unknown"),
+                 ("klippy", "shutdown", "printer_busy: klippy_shutdown"), ("idle", None, "printer_stale: shape_mismatch")]
+        for status in (201, 504):
+            for key, value, reason in cases:
+                with self.subTest(status=status, key=key, value=value):
+                    self.fake.hold, self.fake.idle, self.fake.state, self.fake.klippy = None, "Ready", "standby", "ready"
+                    self.fake.upload_status, self.fake.after_upload = status, {key: value}
+                    self.fake.uploads.clear()
+                    self.assertEqual(self.start(), {"ok": False, "reason": reason})
+                    self.assertEqual(len(self.fake.uploads), 1)
+                    self.assertEqual(self.fake.starts, [])
+                    self.assertEqual(self.adapter.pending_queue_jobs(), [])
+                    self.assertEqual(self.make().pending_queue_jobs(), [])
+
+    def test_the_final_live_check_follows_the_nozzle_recheck(self):
+        check = self.adapter._nozzle_refusal
+        def recheck(meta):
+            reason = check(meta)
+            if self.fake.uploads:
+                self.fake.hold = True
+            return reason
+        for status in (201, 504):
+            with self.subTest(status=status):
+                self.fake.hold, self.fake.upload_status = None, status
+                self.fake.uploads.clear()
+                with mock.patch.object(self.adapter, "_nozzle_refusal", side_effect=recheck):
+                    self.assertEqual(self.start(), {"ok": False, "reason": "printer_busy: heater_hold"})
+                self.assertEqual(self.fake.starts, [])
+                self.assertEqual(self.adapter.pending_queue_jobs(), [])
+
     def test_happy_path_uploads_then_starts_explicitly(self):
         self.assertEqual(self.start(), {"ok": True})
         (form,) = self.fake.uploads
@@ -209,9 +275,9 @@ class TestStartPrint(KlipperCase):
         self.assertEqual(form.fields["path"], "makeros")
         self.assertEqual(form.fields["checksum"], hashlib.sha256(self.gcode).hexdigest())
         self.assertNotIn("print", form.fields)   # with print=true Moonraker may job-queue it or swallow a failed start
-        self.assertEqual(form.file.filename, "0123abcd_cube.gcode")
+        self.assertEqual(form.file.filename, f"{JOB}_cube.gcode")
         self.assertEqual(form.file.data, self.gcode)
-        self.assertEqual(self.fake.starts, ["makeros/0123abcd_cube.gcode"])
+        self.assertEqual(self.fake.starts, [f"makeros/{JOB}_cube.gcode"])
         self.assertEqual(self.adapter.pending_queue_jobs(), [{"queueJobId": JOB, "assignmentSeq": 3}])
 
     def test_the_start_names_the_path_moonraker_stored(self):
@@ -258,6 +324,46 @@ class TestStartPrint(KlipperCase):
         self.fake.upload_status, self.fake.upload_body = 504, {"error": {"message": "Gateway Time-out"}}
         self.assertEqual(self.start(), {"ok": True})
         self.assertEqual(len(self.fake.starts), 1)   # (a 500 from Moonraker itself stays a failure: test_a_refused_upload_forgets_the_dispatch)
+
+    def test_an_old_file_of_equal_size_is_not_a_recovered_upload(self):
+        old = self.gcode[:-1] + b"!"
+        self.assertEqual(len(old), len(self.gcode))
+        self.assertNotEqual(old, self.gcode)
+        self.fake.stored[klipper._remote_path(JOB, "cube.gcode")] = old
+        self.fake.upload_status, self.fake.upload_lands = 504, False
+        self.assertEqual(self.start(), {"ok": False, "reason": "upload_failed"})
+        self.assertEqual(self.fake.starts, [])
+        self.assertEqual(self.adapter.pending_queue_jobs(), [])
+        self.assertEqual(self.make().pending_queue_jobs(), [])
+
+    def test_a_hold_or_macro_during_upload_recovery_never_starts(self):
+        self.fake.upload_status = 504
+        for key, value, reason in (("hold", True, "printer_busy: heater_hold"), ("idle", "Printing", "printer_busy: klippy_busy")):
+            with self.subTest(key=key):
+                self.fake.hold, self.fake.idle, self.fake.after_download = None, "Ready", {key: value}
+                self.assertEqual(self.start(), {"ok": False, "reason": reason})
+                self.assertEqual(self.fake.starts, [])
+                self.assertEqual(self.adapter.pending_queue_jobs(), [])
+                self.assertEqual(self.make().pending_queue_jobs(), [])
+
+    def test_recovery_requires_matching_metadata(self):
+        self.fake.upload_status = 504
+        for metadata in ({"filename": "makeros/other.gcode", "size": len(self.gcode)},
+                         {"filename": klipper._remote_path(JOB, "cube.gcode"), "size": len(self.gcode) - 1}, {}):
+            with self.subTest(metadata=metadata):
+                self.fake.metadata = metadata
+                self.assertEqual(self.start(), {"ok": False, "reason": "upload_failed"})
+                self.assertEqual(self.fake.starts, [])
+                self.assertEqual(self.adapter.pending_queue_jobs(), [])
+
+    def test_recovery_requires_the_whole_file_to_be_read_back(self):
+        self.fake.upload_status = 504
+        for status, data in ((404, None), (200, self.gcode[:-1]), (200, self.gcode + b"!")):
+            with self.subTest(status=status, size=len(data) if data else None):
+                self.fake.download_status, self.fake.download_data = status, data
+                self.assertEqual(self.start(), {"ok": False, "reason": "upload_failed"})
+                self.assertEqual(self.fake.starts, [])
+                self.assertEqual(self.adapter.pending_queue_jobs(), [])
 
     def test_a_refused_start_forgets_the_dispatch(self):
         self.fake.start_status, self.fake.start_body = 400, {"error": {"message": "Printer is busy"}}
@@ -314,7 +420,7 @@ class TestCollectQueueProgress(KlipperCase):
         self.assertEqual(self.adapter.collect_queue_progress(),
                          [{"queueJobId": JOB, "state": "completed", "printerJobKey": key, "assignmentSeq": 3}])
         (job,) = self.adapter.pending_jobs()
-        self.assertEqual((job["jobKey"], job["status"], job["filename"]), (key, "done", "makeros/0123abcd_cube.gcode"))
+        self.assertEqual((job["jobKey"], job["status"], job["filename"]), (key, "done", f"makeros/{JOB}_cube.gcode"))
         self.assertEqual(self.adapter.pending_queue_jobs(), [])
 
     def test_a_cancel_or_an_error_is_held(self):
