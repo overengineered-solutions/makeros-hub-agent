@@ -134,6 +134,8 @@ def slice_spec_of(spec: dict) -> dict:
                  "filament": {**{k: fil.get(k) for k in ("type", "colorHex", "trayInfoIdx")},
                               **({"material": fil["material"]} if isinstance(fil.get("material"), str) and fil["material"].strip() else {})},
                  "fixes": {k: bool(fixes.get(k)) for k in ("orient", "brim", "supports") if k in fixes}}
+    if "nozzleDiameterMm" in spec:
+        out["nozzleDiameterMm"] = spec["nozzleDiameterMm"]
     if "colours" in spec:
         out["colours"] = spec["colours"]   # the slicer validates the complete object and spool map
     if isinstance(spec.get("scale"), (int, float)) and not isinstance(spec.get("scale"), bool):

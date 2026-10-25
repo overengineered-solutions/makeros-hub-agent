@@ -14,6 +14,7 @@ pytestmark = pytest.mark.skipif(not _image_present(), reason=f"docker image {IMA
 def test_slices_every_piece_then_only_the_exact_approved_piece(tmp_path, mode):
     job = tmp_path / "job"
     job.mkdir()
+    os.chmod(job, 0o777)
     layers = []
     if mode == "fit":
         data = _boxes_stl((0, 0, 0, 300, 20, 20))
@@ -21,7 +22,7 @@ def test_slices_every_piece_then_only_the_exact_approved_piece(tmp_path, mode):
         data = _boxes_stl((0, 0, 0, 30, 30, 10), (0, 0, 10, 30, 30, 20))
         layers = [dict(name="Floor 1", first=0, count=12), dict(name="Roof", first=12, count=12)]
     (job / "part.stl").write_bytes(data)
-    spec = dict(mesh="part.stl", model="A1 Mini", scale=1, filament=dict(type="PLA", colorHex="#FFFFFF", trayInfoIdx=None),
+    spec = dict(nozzleDiameterMm=.4, mesh="part.stl", model="A1 Mini", scale=1, filament=dict(type="PLA", colorHex="#FFFFFF", trayInfoIdx=None),
                 fixes=dict(orient=True, brim=False, supports=False),
                 prepare=dict(version=1, thicken=False, moveLargeGaps=False, split=dict(mode=mode, bed=[177.5, 177.5, 180], clearance=.2, layers=layers)))
     slicer = Path(__file__).resolve().parents[1] / "slicer"

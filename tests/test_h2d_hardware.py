@@ -32,7 +32,7 @@ def status(raw=None, connected=True):
                                         connection_state="connected" if connected else "offline")
 
 
-REQUIRED = [{"slot": 1, "type": "PLA", "color": "FFFFFF"}, {"slot": 2, "type": "PLA", "color": "FFFFFF"}]
+REQUIRED = [{"slot": 1, "type": "PLA", "color": "FFFFFF", "extruderId": 0, "nozzleDiameterMm": .4}, {"slot": 2, "type": "PLA", "color": "FFFFFF", "extruderId": 1, "nozzleDiameterMm": .4}]
 
 
 def command():

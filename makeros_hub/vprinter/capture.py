@@ -676,6 +676,9 @@ def parse_slice_info_config(raw: bytes | str, plate: int | None = None,
         used_g = _first_float(attrs, ("used_g", "weight", "used_grams"))
         if used_g is not None and used_g >= 0:
             item["usedG"] = round(used_g, 2)
+        diameter = _first_float(attrs, ("nozzle_diameter",))
+        if diameter is not None and 0 < diameter <= 2:
+            item["nozzleDiameterMm"] = diameter
         if tag == "filament" and "group_id" in attrs:
             grouped[slot] = (_first_int(attrs, ("group_id",)), _first_float(attrs, ("nozzle_diameter",)))
 
@@ -683,6 +686,16 @@ def parse_slice_info_config(raw: bytes | str, plate: int | None = None,
     # Bambu ids) — mixing the two bases produced phantom slot 0 entries (codex v0.56 r1), so they only seed an empty result.
     if not by_slot:
         _merge_array_metadata(scope, by_slot)   # plate-scoped when a plate was found (codex r3), else the whole file
+    sizes = []
+    for element in scope.iter():
+        if _strip_ns(element.tag).lower() == "metadata" and element.get("key") in {"nozzle_diameter", "nozzle_diameters"}:
+            try:
+                sizes.append([float(v) for v in re.split(r"[,;]", element.get("value", ""))])
+            except ValueError:
+                sizes.append([])
+    if len(sizes) == 1 and len(sizes[0]) == 1 and math.isfinite(sizes[0][0]) and 0 < sizes[0][0] <= 2:
+        for item in by_slot.values():
+            item.setdefault("nozzleDiameterMm", sizes[0][0])
     if physical_extruder_map is not None:
         _route_nozzles(scope, by_slot, grouped, physical_extruder_map)
 

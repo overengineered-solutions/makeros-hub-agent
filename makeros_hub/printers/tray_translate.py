@@ -280,6 +280,8 @@ def _dual_nozzle_requirements(command: dict, required: list[dict], nozzles: Any)
             diameter = wanted[0].get("diameter") if len(wanted) == 1 else None
         if type(eid) is not int or eid not in (0, 1):
             raise TrayTranslationError("unsupported_nozzle_mapping", "H2D filament nozzle is unknown; re-slice for the H2D in current OrcaSlicer and send again")
+        if req.get("extruderId") != eid or req.get("nozzleDiameterMm") != diameter:
+            raise TrayTranslationError("unsupported_nozzle_mapping", "the send routes a filament differently from the sliced file; slice it again")
         actual = [n for n in observed if isinstance(n, dict) and n.get("extruderId") == eid]
         if len(actual) != 1 or isinstance(diameter, bool) or diameter != actual[0].get("diameterMm"):
             raise TrayTranslationError("unsupported_nozzle_mapping", f"H2D nozzle {eid} diameter is missing or differs from the sliced job")

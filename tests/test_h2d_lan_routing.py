@@ -60,7 +60,7 @@ class TestPlateNozzles(unittest.TestCase):
                        SLICE_INFO.replace('<metadata key="filament_maps" value="1 2 2 2"/>', '')):
             self.assertNotIn("extruderId", self.required(slice_info=broken)[0])
         for project in (None, {"physical_extruder_map": ["0"]}, {"physical_extruder_map": [float("inf"), 0]}):   # one-extruder printers, a crafted file: nothing added
-            self.assertEqual({k for f in self.required(project=project) for k in f} & {"extruderId", "nozzleDiameterMm"}, set())
+            self.assertEqual({k for f in self.required(project=project) for k in f} & {"extruderId"}, set())
 
 
 class TestLanDispatch(unittest.TestCase):

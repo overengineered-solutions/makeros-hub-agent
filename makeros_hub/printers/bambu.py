@@ -35,6 +35,7 @@ import paho.mqtt.client as mqtt
 
 from . import bambu_parse, bambu_send, tray_translate
 from .jobs import JobTracker
+from .nozzles import nozzle_refusal
 from .manager import BUSY_GCODE_STATES   # manager imports this module lazily, so no import cycle
 _IDENTITY_KEYS = ("subtask_name", "gcode_file", "task_id", "subtask_id")   # which print the merged report describes
 from .queue_progress import QueueProgressTracker, _fsync_dir, _safe_file_component
@@ -508,8 +509,12 @@ class BambuAdapter:
         # Only when the cloud sent the job's requirements (older clouds / web uploads without them keep the replay).
         h2d = str(self.model or "").strip().upper() in {"H2D", "O1D"}
         original_command = payload["print"]
+        sliced_filaments = parse_required_filaments(Path(local_path), plate)
 
         def refresh_trays() -> str | None:
+            issue = nozzle_refusal(sliced_filaments, self.status(), require_report=h2d)
+            if issue:
+                return issue
             if not (h2d or "ams_mapping2" in original_command or original_command.get("use_ams") is True or isinstance(required_filaments, list)):
                 return None
             st = self.status()
@@ -533,14 +538,14 @@ class BambuAdapter:
                      before, payload["print"].get("ams_mapping"), payload["print"].get("ams_mapping2"))
             return None
 
-        refusal = refresh_trays()
-        if refusal:
-            return {"ok": False, "reason": refusal}
-
         # Every submission path converges here. The chosen virtual pool is not proof of the file's model.
         if not _sliced_model_matches(local_path, self.model):
             log.warning("bambu %s: refusing %s — sliced model missing or mismatched", self.printer_id, queue_job_id)
             return {"ok": False, "reason": "model_mismatch"}
+        refusal = refresh_trays()
+        if refusal:
+            return {"ok": False, "reason": refusal}
+
         refusal = _pla_only_refusal(local_path, plate, self.model)
         if refusal:
             log.warning("bambu %s: refusing %s — the plate is not PLA and this printer prints PLA only", self.printer_id, queue_job_id)

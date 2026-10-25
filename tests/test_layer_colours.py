@@ -16,7 +16,7 @@ spec.loader.exec_module(ps)
 
 def job():
     fs = [dict(type='PLA', material='PLA', colorHex=c, trayInfoIdx=None) for c in ('#FF0000', '#0000FF')]
-    return dict(mesh='model.stl', model='A1 Mini', filament=fs[0], scale=0.5,
+    return dict(nozzleDiameterMm=.4, mesh='model.stl', model='A1 Mini', filament=fs[0], scale=0.5,
                 fixes=dict(orient=False, brim=False, supports=False),
                 colours=dict(filaments=fs, parts=[dict(first=0, count=1, filament=0), dict(first=1, count=1, filament=1)]))
 

@@ -46,6 +46,7 @@ class FakeMoonraker:
         self.total = None             # a frozen total_duration (klippy freezes it when a print ends)
         self.start_raw = None         # bytes written verbatim as the start POST's reply (a broken answer)
         self.upload_status, self.upload_body = 201, None
+        self.nozzle, self.nozzle_after_upload = .4, .4
         self.start_status, self.start_body, self.start_delay = 200, {"result": "ok"}, 0.0
         self.start_begins_printing = True
         self.uploads, self.starts, self.queries = [], [], 0
@@ -73,6 +74,7 @@ class FakeMoonraker:
                 if url.path == "/server/files/upload":
                     form = parse_multipart(body, boundary_from_content_type(self.headers.get("Content-Type")))
                     outer.uploads.append(form)
+                    outer.nozzle = outer.nozzle_after_upload
                     stored = f"{form.fields.get('path')}/{form.file.filename}"
                     return self._send(outer.upload_status, outer.upload_body or {
                         "item": {"path": stored, "root": "gcodes", "size": len(form.file.data), "permissions": "rw"},
@@ -101,7 +103,7 @@ class FakeMoonraker:
     def status(self):
         total = self.total if self.total is not None else (
             time.time() - self.print_started_at if self.print_started_at is not None else 0.0)
-        out = {"webhooks": {"state": self.klippy},
+        out = {"configfile": {"settings": {"extruder": {"nozzle_diameter": self.nozzle}}}, "webhooks": {"state": self.klippy},
                "print_stats": {"state": self.state, "filename": self.filename, "print_duration": self.duration,
                                "total_duration": total}}
         if self.idle is not None:
@@ -122,7 +124,7 @@ class KlipperCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.spool = Path(tmp.name)
-        self.gcode = sv08_gcode().encode()
+        self.gcode = sv08_gcode().replace("; CONFIG_BLOCK_START", "; CONFIG_BLOCK_START\n; nozzle_diameter = 0.4").encode()
         (self.spool / UID).mkdir()
         self.file = self.spool / UID / "cube.gcode"
         self.file.write_bytes(self.gcode)
@@ -193,6 +195,15 @@ class TestStartPrint(KlipperCase):
         self.assertEqual(self.start(), {"ok": True})
         self.assertEqual(self.fake.starts, ["makeros/stored.gcode"])
         self.assertEqual(self.adapter._queue_progress.to_state()["dispatches"][0]["taskName"], "makeros/stored.gcode")
+
+    def test_a_nozzle_changed_during_upload_never_starts(self):
+        self.fake.nozzle_after_upload = .6
+        result = self.start()
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["reason"].startswith("nozzle_mismatch"), result)
+        self.assertEqual(len(self.fake.uploads), 1)
+        self.assertEqual(self.fake.starts, [])
+        self.assertEqual(self.adapter.pending_queue_jobs(), [])
 
     def test_nothing_is_uploaded_when_the_dispatch_cannot_be_persisted(self):
         with mock.patch.object(klipper, "write_json_durably", return_value=False):

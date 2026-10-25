@@ -54,7 +54,7 @@ def test_writes_the_model_code_and_summarizes_the_plate(tmp_path):
         ps.set_model_id(str(g), "N1")
 
 
-SPEC = {"mesh": "part.stl", "model": "A1 Mini", "filament": {"type": "PLA", "colorHex": "#FFFFFF", "trayInfoIdx": "GFA00"},
+SPEC = {"nozzleDiameterMm": 0.4, "mesh": "part.stl", "model": "A1 Mini", "filament": {"type": "PLA", "colorHex": "#FFFFFF", "trayInfoIdx": "GFA00"},
         "fixes": {"orient": True, "brim": False, "supports": False}, "scale": 1.0}
 PATHS = {"machine": "/job/work/machine.json", "process": "/job/work/process.json", "filament": "/job/work/filament.json"}
 
@@ -230,7 +230,7 @@ def test_the_settings_reported_are_the_ones_this_slice_used():
 def test_slow_group_resumes_within_each_runner_deadline_and_verifies_saved_files(tmp_path, monkeypatch):
     from types import SimpleNamespace
     machine, suffix = ps.MODELS["A1 Mini"]
-    profiles = {"machine": {machine: {"name": machine, "printer_model": "mini"}, "mini": {"model_id": "N1"}},
+    profiles = {"machine": {machine: {"name": machine, "printer_model": "mini", "nozzle_diameter": ["0.4"]}, "mini": {"model_id": "N1"}},
                 "process": {ps.PROCESS.format(sfx=suffix): {"name": ps.PROCESS.format(sfx=suffix), "outer_wall_line_width": "0.42"}},
                 "filament": {"Synthetic PLA": {"name": "Synthetic PLA"}}}
     monkeypatch.setattr(ps, "load_index", lambda kind: profiles[kind])
