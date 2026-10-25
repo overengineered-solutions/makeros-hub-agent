@@ -37,6 +37,7 @@ class _Server(http.server.ThreadingHTTPServer):
 class FakeMoonraker:
     def __init__(self):
         self.klippy = "ready"
+        self.hold = None             # gcode_macro _pstation_hold.active; None = the printer runs no hold
         self.idle = "Ready"          # idle_timeout.state: "Printing" while klippy runs commands (a macro, or a print)
         self.state = "standby"
         self.filename = ""
@@ -105,6 +106,8 @@ class FakeMoonraker:
                                "total_duration": total}}
         if self.idle is not None:
             out["idle_timeout"] = {"state": self.idle}
+        if self.hold is not None:
+            out["gcode_macro _pstation_hold"] = {"active": self.hold}
         return out
 
     def close(self):
@@ -157,6 +160,14 @@ class TestStartPrint(KlipperCase):
             with self.subTest(klippy=klippy, state=state, idle=idle):
                 self.fake.klippy, self.fake.state, self.fake.idle = klippy, state, idle
                 self.assertEqual(self.start(), {"ok": False, "reason": reason})
+        self.assertEqual(self.fake.uploads, [])
+
+    def test_a_held_printer_takes_no_new_print(self):
+        # a held bed under a stopped part; print_stats was reset to standby, so only the hold says no
+        for hold in (True, "yes"):
+            with self.subTest(hold=hold):
+                self.fake.hold = hold
+                self.assertEqual(self.start(), {"ok": False, "reason": "printer_busy: heater_hold"})
         self.assertEqual(self.fake.uploads, [])
         self.assertEqual(self.adapter.pending_queue_jobs(), [])
 

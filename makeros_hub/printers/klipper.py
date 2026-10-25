@@ -168,7 +168,7 @@ _GCODE_STATE_MAP = {
 # start_print's live check: is klippy up, is the printer between prints, and is klippy not busy running commands (a QGL /
 # bed mesh / heat-soak macro from the screen leaves print_stats at standby but idle_timeout at "Printing"; a start sent
 # then waits behind it on klippy's gcode mutex and our start POST times out)?
-_LIVE_QUERY = "webhooks=state&print_stats=state,filename&idle_timeout=state"
+_LIVE_QUERY = "webhooks=state&print_stats=state,filename&idle_timeout=state&gcode_macro%20_pstation_hold=active"
 _STARTABLE_STATES = frozenset({"standby", "complete", "cancelled"})
 _UNSAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -600,6 +600,11 @@ class KlipperAdapter:
             return "printer_stale: shape_mismatch"   # klippy always loads idle_timeout: without it we cannot rule out a macro
         if idle_state == "Printing":
             return "printer_busy: klippy_busy"
+        # A hold keeps a stopped print's bed hot until staff look (pstation-hold.cfg); a reset print_stats does not end it.
+        # Klipper leaves the object out on a printer without the hold.
+        hold = status.get(_HOLD)
+        if isinstance(hold, dict) and hold.get("active") is not False:
+            return "printer_busy: heater_hold"
         return None
 
     def _record_dispatch(self, queue_job_id: str, task_name: str, assignment_seq) -> bool:
