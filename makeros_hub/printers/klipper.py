@@ -259,6 +259,9 @@ LIFT_Z_MM = 10.0  # Home ends here, and an idle load or unload lifts here first 
 # value under them, and Klipper's own max_temp still refuses past the printer's limit.
 # ponytail: one table for every printer; make it per printer when one needs other numbers (the Giga's 1.0 mm nozzle).
 MATERIALS = {"PLA": (215, 60), "PETG": (240, 70)}
+# The shop's own OrcaSlicer printers (site setup 7, 2026-10-25): their files say printer_model "PS Giga" / "PS SV08 MAX";
+# each names exactly one fleet model, the same table as the site's fleetKlipperModel (src/lib/orca-klipper-models.ts).
+SHOP_MODEL_ALIASES = {"PS Giga": "Elegoo OrangeStorm Giga", "PS SV08 MAX": "Sovol SV08 MAX"}
 NOZZLE_STANDBY_C = 140
 # Load more waits for the heat: the nozzle set to a filament temperature, and within AT_TARGET_C of it (Sovol's
 # _CONTINUE_LOAD_FILAMENT checks only min_extrude_temp 150, so it would push PETG at 151 on its way to 240).
@@ -521,7 +524,8 @@ class KlipperAdapter:
         except OSError:
             meta = None
         sliced = (meta or {}).get("printerModel")
-        if not (self._model and sliced and sliced.strip() == self._model.strip()):
+        sliced = SHOP_MODEL_ALIASES.get(sliced.strip(), sliced.strip()) if sliced else sliced
+        if not (self._model and sliced and sliced == self._model.strip()):
             log.warning("klipper %s: refusing %s — sliced for %r, this printer is %r", self.printer_id, queue_job_id, sliced, self._model)
             return {"ok": False, "reason": "model_mismatch"}
 

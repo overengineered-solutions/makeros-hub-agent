@@ -164,6 +164,15 @@ class TestStartPrint(KlipperCase):
                 self.assertEqual(self.start(adapter=self.make(model=model)), {"ok": False, "reason": "model_mismatch"})
         self.assertEqual((self.fake.uploads, self.fake.queries), ([], 0))
 
+    def test_the_shop_printer_names_match_only_their_own_model(self):
+        # site setup 7: OrcaSlicer's "PS SV08 MAX" is the SV08 MAX; "PS Giga" is never an SV08
+        for name, ok in (("PS SV08 MAX", True), ("PS Giga", False)):
+            with self.subTest(name=name):
+                self.file.write_bytes(self.gcode.replace(b"printer_model = Sovol SV08 MAX", b"printer_model = " + name.encode()))
+                self.assertIn(b"printer_model = " + name.encode(), self.file.read_bytes())
+                result = self.start(adapter=self.make(pid="k-" + name.split()[-1]))
+                self.assertEqual(result.get("reason") != "model_mismatch", ok, result)
+
     def test_a_printer_that_is_not_between_prints_is_refused(self):
         cases = [("ready", "printing", "Ready", "printer_busy: printing"), ("ready", "paused", "Ready", "printer_busy: printing"),
                  ("ready", "error", "Ready", "printer_busy: klipper_error"),
