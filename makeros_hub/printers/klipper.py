@@ -98,6 +98,10 @@ CONNECT_TIMEOUT_SEC = 20.0
 # every METADATA_RETRY_SEC, so an unscanned or missing file costs one request a minute, never one per poll.
 METADATA_CACHE_MAX = 32
 METADATA_RETRY_SEC = 60.0
+# The installed nozzle comes from Klipper's parsed config, which is large (the SV08's: 215 KB on 2026-10-25), so it is read
+# on its own, every NOZZLE_REFRESH_SEC (60 s after a failed read), and again right before every start, never in the poll.
+NOZZLE_REFRESH_SEC = 600.0
+CONFIG_MAX_BYTES = 2 * 1024 * 1024
 # display_status.message is M117 text the start macro sets ("Bed soak 20 min before calibration"); the site shows it on
 # the card, so it is trimmed to a card's worth.
 DISPLAY_MESSAGE_MAX_CHARS = 120
@@ -123,7 +127,6 @@ BED_ZONES = ("heater_bed", "heater_generic heater_bed1", "heater_generic heater_
 _QUERY_OBJECTS = (
     "print_stats=state,filename,print_duration,total_duration,info,message"
     "&extruder=temperature,target"
-    "&configfile=settings"
     + "".join(f"&{urllib.parse.quote(zone)}=temperature,target" for zone in BED_ZONES)
     + "&virtual_sdcard=progress"
     "&display_status=progress,message"
@@ -297,6 +300,8 @@ class KlipperAdapter:
         # The cloud's machines.model. start_print refuses a G-code whose printer_model is not exactly this; the
         # status DTO never carries it (the `model` property below stays None).
         self._model = model
+        self._nozzles: dict[str, Any] = {}   # nozzle_hardware() of the last config read; {} until one succeeds
+        self._nozzles_next = 0.0
         self._lock = threading.Lock()
         self._data: dict[str, Any] = {}
         self._last_poll_ok_at: Optional[float] = None
@@ -417,10 +422,11 @@ class KlipperAdapter:
             metadata = self._metadata_for(data)
             proven = self._home_proven
             paused_at = self._pause["at"] if self._pause else None
+            nozzles = dict(self._nozzles)
 
         if last is not None:
             out = _build_status(self.printer_id, data, "connected" if (now - last) <= STALE_SEC else "offline",
-                                metadata=metadata)
+                                metadata=metadata, nozzles=nozzles)
             if not proven and "toolhead" in out:
                 # v0.79: "homed" is what a jog from the site may trust, so the screen says "Home first" exactly when
                 # the hub would refuse one (Klipper's homed_axes counts the SV08's guessed Z and the Giga's boot home).
@@ -579,7 +585,7 @@ class KlipperAdapter:
 
     def _nozzle_refusal(self, meta: dict | None) -> str | None:
         try:
-            hardware = nozzle_hardware(self._fetch_once("configfile=settings"))
+            hardware = nozzle_hardware(self._fetch_once("configfile=settings", limit=CONFIG_MAX_BYTES))
         except Exception as exc:  # A printer restart may have changed the config since the poll.
             log.warning("klipper %s: nozzle check failed: %s", self.printer_id, _classify_error(exc))
             return f"printer_stale: {_classify_error(exc)}"
@@ -1194,6 +1200,7 @@ class KlipperAdapter:
                     return   # stopped while this poll was in flight
                 self._after_poll(data)
                 self._refresh_metadata(data)   # Publish and date the reading before a metadata request can delay it.
+                self._refresh_nozzles()
                 # Adversarial review MED #14: explicit "connected" log on
                 # the first-poll-success transition so the cloud admin diag
                 # gets a clear event (mirrors the Bambu adapter's
@@ -1233,13 +1240,31 @@ class KlipperAdapter:
             self._job_tracker.observe(data, time.monotonic())
         return was_first
 
-    def _fetch_once(self, query: str = _QUERY_OBJECTS, *, timeout: float = HTTP_GET_TIMEOUT_SEC) -> dict[str, Any]:
+    def _refresh_nozzles(self) -> None:
+        """Poll thread; never raises. A failed read keeps the last good report (the config only changes on a restart)."""
+        now = time.monotonic()
+        if now < self._nozzles_next:
+            return
+        try:
+            nozzles = nozzle_hardware(self._fetch_once("configfile=settings", limit=CONFIG_MAX_BYTES))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("klipper %s: nozzle read failed: %s", self.printer_id, _classify_error(exc))
+            self._nozzles_next = now + METADATA_RETRY_SEC
+            return
+        with self._lock:
+            self._nozzles = nozzles
+        self._nozzles_next = now + NOZZLE_REFRESH_SEC
+
+    def _fetch_once(self, query: str = _QUERY_OBJECTS, *, timeout: float = HTTP_GET_TIMEOUT_SEC,
+                    limit: int = 64 * 1024) -> dict[str, Any]:
         url = f"{self.moonraker_url}/printer/objects/query?{query}"
         req = urllib.request.Request(
             url, headers={"Accept": "application/json", "User-Agent": "makeros-hub-agent"}
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator LAN URL
-            body = resp.read(64 * 1024)
+            body = resp.read(limit + 1)
+        if len(body) > limit:
+            raise ValueError("response too large")
         parsed = json.loads(body.decode("utf-8", errors="replace"))
         # Moonraker shape: { result: { status: { print_stats: {...}, ... } } }
         result = parsed.get("result") if isinstance(parsed, dict) else None
@@ -1398,6 +1423,7 @@ def _build_status(
     error_reason: Optional[str] = None,
     *,
     metadata: Optional[dict] = None,
+    nozzles: Optional[dict] = None,
 ) -> dict:
     """Pure: Moonraker status dict → the cloud's PrinterStatusDTO shape.
 
@@ -1417,7 +1443,7 @@ def _build_status(
         out["errorReason"] = error_reason
 
     if connection_state == "connected":
-        out.update(nozzle_hardware(status))
+        out.update(nozzles or {})   # nozzle_hardware() of the separate config read
         print_dur: Optional[float] = None
         state_raw: Any = None
         print_stats = status.get("print_stats")

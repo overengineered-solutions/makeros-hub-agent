@@ -13,10 +13,10 @@ from makeros_hub.printers.manager import slice_spec_of
 
 def test_klipper_reports_the_installed_nozzle_from_config_in_the_heartbeat():
     settings = {"configfile": {"settings": {"extruder": {"nozzle_diameter": 1.0}}}}
-    status = _build_status("synthetic-giga", settings, "connected")
+    status = _build_status("synthetic-giga", {}, "connected", nozzles=nozzle_hardware(settings))
     assert status["nozzles"] == [{"id": 0, "extruderId": 0, "diameterMm": 1.0}]
     assert heartbeat_payload(printers=[status])["printers"][0]["nozzles"] == status["nozzles"]
-    assert "nozzles" not in _build_status("synthetic-giga", settings, "offline")
+    assert "nozzles" not in _build_status("synthetic-giga", {}, "offline", nozzles=nozzle_hardware(settings))
     for value in [None, 0, -1, 3, True, "nan", "inf", "bad"]:
         assert nozzle_hardware({"configfile": {"settings": {"extruder": {"nozzle_diameter": value}}}}) == {}
     settings["configfile"]["settings"]["extruder1"] = {"nozzle_diameter": "0.6"}
@@ -76,3 +76,22 @@ def test_shop_slicing_requires_the_recorded_diameter_and_checks_the_stock_profil
     ps.verify_nozzle_profile({"nozzle_diameter": ["0.4", "0.4"]}, .4)
     with pytest.raises(ps.SliceError, match="differs"):
         ps.verify_nozzle_profile({"nozzle_diameter": ["0.4", "0.6"]}, .4)
+
+
+def test_the_poll_never_carries_the_large_config_and_the_nozzle_read_is_its_own():
+    # The SV08's configfile=settings was 215 KB on 2026-10-25: over the poll's 64 KB read, so every poll would have failed.
+    import threading
+    from makeros_hub.printers import klipper
+    assert "configfile" not in klipper._QUERY_OBJECTS
+    a = object.__new__(klipper.KlipperAdapter)
+    a.printer_id, a._lock, a._nozzles, a._nozzles_next = "synthetic-sv08", threading.Lock(), {}, 0.0
+    calls = []
+
+    def fetch(query, limit=0, **_):
+        calls.append((query, limit))
+        return {"configfile": {"settings": {"extruder": {"nozzle_diameter": 0.4}, "pad": "x" * 300_000}}}
+    a._fetch_once = fetch
+    a._refresh_nozzles()
+    a._refresh_nozzles()   # within NOZZLE_REFRESH_SEC: no second read
+    assert calls == [("configfile=settings", klipper.CONFIG_MAX_BYTES)]
+    assert a._nozzles["nozzles"] == [{"id": 0, "extruderId": 0, "diameterMm": 0.4}]
