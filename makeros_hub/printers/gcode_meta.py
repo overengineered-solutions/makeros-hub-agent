@@ -85,6 +85,9 @@ def read_gcode_meta(path) -> dict[str, Any] | None:
         stats.setdefault(key, value)
 
     model = config.get("printer_model", "").strip().strip('"').strip()[:MODEL_MAX_CHARS] or None
+    # One-extruder G-code only: a multi-extruder file needs an explicit physical map, never a guessed index.
+    nozzles = _numbers(config.get("nozzle_diameter") or stats.get("nozzle_diameter"))
+    diameter = nozzles[0] if len(nozzles) == 1 else None
     types = _list(config.get("filament_type"))
     colours = _list(config.get("filament_colour"))
     used_mm = _numbers(stats.get("filament used [mm]"))
@@ -95,6 +98,8 @@ def read_gcode_meta(path) -> dict[str, Any] | None:
     grams: list[float] = []
     for slot in slots:
         item: dict[str, Any] = {"slot": slot}
+        if diameter is not None and 0 < diameter <= 2:
+            item["nozzleDiameterMm"] = diameter
         if slot <= len(types) and types[slot - 1]:
             item["type"] = types[slot - 1]
         if slot <= len(colours) and normalize_color(colours[slot - 1]):

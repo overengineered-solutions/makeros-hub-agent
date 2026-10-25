@@ -54,7 +54,7 @@ def _slice(tmp_path: Path, stl: bytes, scale: float = 1.0, model: str = "A1 Mini
     job = tmp_path / "job"
     job.mkdir()
     (job / "part.stl").write_bytes(stl)
-    (job / "job.json").write_text(json.dumps({"mesh": "part.stl", "model": model, "scale": scale,
+    (job / "job.json").write_text(json.dumps({"nozzleDiameterMm": 0.4, "mesh": "part.stl", "model": model, "scale": scale,
                                               "filament": colours["filaments"][0] if colours else {"type": "PLA", "colorHex": "#FFFFFF", "trayInfoIdx": None},
                                               "fixes": {"orient": False, "brim": False, "supports": False, **fixes},
                                               **({"colours": colours} if colours else {}),

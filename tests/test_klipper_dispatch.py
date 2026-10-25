@@ -100,7 +100,7 @@ class FakeMoonraker:
     def status(self):
         total = self.total if self.total is not None else (
             time.time() - self.print_started_at if self.print_started_at is not None else 0.0)
-        out = {"webhooks": {"state": self.klippy},
+        out = {"configfile": {"settings": {"extruder": {"nozzle_diameter": .4}}}, "webhooks": {"state": self.klippy},
                "print_stats": {"state": self.state, "filename": self.filename, "print_duration": self.duration,
                                "total_duration": total}}
         if self.idle is not None:
@@ -119,7 +119,7 @@ class KlipperCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.spool = Path(tmp.name)
-        self.gcode = sv08_gcode().encode()
+        self.gcode = sv08_gcode().replace("; CONFIG_BLOCK_START", "; CONFIG_BLOCK_START\n; nozzle_diameter = 0.4").encode()
         (self.spool / UID).mkdir()
         self.file = self.spool / UID / "cube.gcode"
         self.file.write_bytes(self.gcode)

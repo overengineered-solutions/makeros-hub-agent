@@ -443,7 +443,14 @@ def build_nozzle_hardware(print_obj: dict) -> dict[str, Any]:
     A missing nozzle/binding is unknown, never a synthetic 0.4mm or a default right nozzle.
     """
     device = print_obj.get("device")
-    if not isinstance(device, dict):
+    if not isinstance(device, dict) or not isinstance(device.get("nozzle"), dict):
+        # Older single-extruder firmware reports the diameter at print.nozzle_diameter.
+        state = _to_int((device.get("extruder") or {}).get("state")) if isinstance(device, dict) and isinstance(device.get("extruder"), dict) else None
+        if state is not None and state & 15 == 2:
+            return {"extruderCount": 2}
+        diameter = _num(print_obj.get("nozzle_diameter"))
+        if diameter is not None and math.isfinite(diameter) and 0 < diameter <= 2:
+            return {"extruderCount": 1, "nozzles": [{"id": 0, "extruderId": 0, "diameterMm": diameter}]}
         return {}
     out: dict[str, Any] = {}
     extruders = device.get("extruder")
@@ -474,10 +481,10 @@ def build_nozzle_hardware(print_obj: dict) -> dict[str, Any]:
             continue
         if diameter is None or not math.isfinite(diameter) or not 0 < diameter <= 2:
             continue
-        if not isinstance(kind, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", kind):
-            continue
         seen.add(nid)
-        entry: dict[str, Any] = {"id": nid, "diameterMm": diameter, "type": kind}
+        entry: dict[str, Any] = {"id": nid, "diameterMm": diameter}
+        if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", kind):
+            entry["type"] = kind
         if len(bindings.get(nid, set())) == 1:
             entry["extruderId"] = next(iter(bindings[nid]))
         nozzles.append(entry)

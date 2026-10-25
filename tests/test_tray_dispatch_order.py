@@ -53,7 +53,7 @@ class TestDispatchOrder(unittest.TestCase):
                 path = Path(d) / "part.3mf"
                 metadata = f'<metadata key="printer_model_id" value="{model_id}"/>' if model_id else ""
                 with zipfile.ZipFile(path, "w") as archive:
-                    archive.writestr("Metadata/slice_info.config", f"<config><plate>{metadata}</plate></config>")
+                    archive.writestr("Metadata/slice_info.config", f'<config><plate>{metadata}<filament id="1" type="PLA" nozzle_diameter="0.4"/></plate></config>')
                 adapter = self._adapter(d)
                 result = adapter.start_print(path, "part.3mf")
                 self.assertEqual(result, {"ok": True} if allowed else {"ok": False, "reason": "model_mismatch"})
@@ -62,7 +62,7 @@ class TestDispatchOrder(unittest.TestCase):
 
     def test_refuses_before_upload_when_a_required_spool_is_missing(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_module, "parse_required_filaments", return_value=[{"slot": 1, "material": "PLA", "nozzleDiameterMm": .4}]), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5], queue_job_id="q1",
                               raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]},
@@ -76,7 +76,7 @@ class TestDispatchOrder(unittest.TestCase):
     def test_translates_then_uploads_then_publishes(self):
         import json
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_module, "parse_required_filaments", return_value=[{"slot": 1, "material": "PLA", "nozzleDiameterMm": .4}]), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5, 9], queue_job_id="q1",
                               raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5, 9], "ams_mapping2": [{"ams_id": 1, "slot_id": 1}, {"ams_id": 2, "slot_id": 1}]},
@@ -91,7 +91,7 @@ class TestDispatchOrder(unittest.TestCase):
 
     def test_stale_report_is_a_refusal_not_a_guess(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_module, "parse_required_filaments", return_value=[{"slot": 1, "material": "PLA", "nozzleDiameterMm": .4}]), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             a._last_report_at = time.monotonic() - 3600
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5], queue_job_id="q1",
@@ -107,7 +107,7 @@ class TestDispatchOrder(unittest.TestCase):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as d, \
                     mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
                     mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), \
-                    mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True):
+                    mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_module, "parse_required_filaments", return_value=[{"slot": 1, "material": "PLA", "nozzleDiameterMm": .4}]):
                 a = self._adapter(d)
                 a._data = copy.deepcopy(RAW_STATE)
 
@@ -151,7 +151,7 @@ class TestDispatchOrder(unittest.TestCase):
                     raw_print={"use_ams": True, "ams_mapping": [0], "ams_mapping2": [{"ams_id": 0, "slot_id": 0}]},
                     required_filaments=[{"slot": 1, "type": "PLA", "color": "FFFFFF"}], queue_job_id="q-h2d")
                 self.assertFalse(result["ok"])
-                self.assertTrue(result["reason"].startswith("unsupported_nozzle_mapping:"), result)
+                self.assertTrue(result["reason"].startswith(("model_mismatch", "nozzle_unknown:")), result)
                 upload.assert_not_called()
                 self.assertEqual(adapter._client.published, [])
                 self.assertEqual(adapter._queue_progress.to_state()["dispatches"], [])
@@ -159,7 +159,7 @@ class TestDispatchOrder(unittest.TestCase):
     def test_without_requirements_an_ams_print_is_refused_and_an_external_print_passes(self):
         import json
         with tempfile.TemporaryDirectory() as d, mock.patch.object(bambu_module, "QUEUE_PROGRESS_DIR", Path(d)), \
-                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_send, "upload_3mf") as up:
+                mock.patch.object(bambu_module, "TERMINAL_JOBS_DIR", Path(d)), mock.patch.object(bambu_module, "_sliced_model_matches", return_value=True), mock.patch.object(bambu_module, "parse_required_filaments", return_value=[{"slot": 1, "material": "PLA", "nozzleDiameterMm": .4}]), mock.patch.object(bambu_send, "upload_3mf") as up:
             a = self._adapter(d)
             r = a.start_print("/tmp/x.3mf", "x.3mf", plate=1, use_ams=True, ams_mapping=[5], queue_job_id="q1",
                               raw_print={"command": "project_file", "use_ams": True, "ams_mapping": [5]})

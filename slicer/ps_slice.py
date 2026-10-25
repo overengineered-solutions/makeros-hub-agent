@@ -778,6 +778,9 @@ def read_spec(raw: dict) -> dict:
         raise SliceError("the file name is not one the slicer accepts")
     if model not in MODELS:
         raise SliceError(f"automatic slicing is not set up for the {model} yet")
+    diameter = raw.get("nozzleDiameterMm")
+    if isinstance(diameter, bool) or not isinstance(diameter, (int, float)) or diameter != 0.4:
+        raise SliceError("the printer's recorded nozzle has no approved shop slicing profile; ask staff to check it")
     fil = raw.get("filament") or {}
     ftype = str(fil.get("type") or "").upper()
     if ftype not in TYPES:
@@ -838,7 +841,7 @@ def read_spec(raw: dict) -> dict:
         "tray": tray if isinstance(tray, str) and TRAY_RE.match(tray) else None,
         "stated": stated,
         "orient": fixes["orient"], "brim": fixes["brim"], "supports": fixes["supports"],
-        "piece": piece, "scale": float(scale), "nozzle": nozzle if model in TWO_NOZZLES else None, "prepare": prepare,
+        "piece": piece, "scale": float(scale), "nozzleDiameterMm": diameter, "nozzle": nozzle if model in TWO_NOZZLES else None, "prepare": prepare,
     }
     if "colours" in raw:
         # Preparation can reorder or replace triangles, invalidating the checked colour ranges.
@@ -854,7 +857,7 @@ def read_spec(raw: dict) -> dict:
         for f in fs:
             if not isinstance(f, dict) or not HEX_RE.fullmatch(str(f.get("colorHex", ""))):
                 raise SliceError("a layer's spool colour is missing")
-            child = read_spec({"mesh": mesh, "model": model, "filament": f, "nozzle": f.get("nozzle"), "fixes": fixes, "scale": scale})
+            child = read_spec({"nozzleDiameterMm": diameter, "mesh": mesh, "model": model, "filament": f, "nozzle": f.get("nozzle"), "fixes": fixes, "scale": scale})
             if child["type"] == "TPU" or not child["stated"]:
                 raise SliceError("layer colours need one stated material that can change through the AMS")
             checked.append(child)
@@ -1014,6 +1017,17 @@ def shop_process(spec: dict) -> dict[str, str]:
     return out
 
 
+def verify_nozzle_profile(machine: dict, diameter: float) -> None:
+    """The chosen stock profile must match the recorded hardware, including both extruders."""
+    values = machine.get("nozzle_diameter")
+    try:
+        valid = isinstance(values, list) and 1 <= len(values) <= 2 and all(float(n) == diameter for n in values)
+    except (TypeError, ValueError):
+        valid = False
+    if not valid:
+        raise SliceError("the slicer's nozzle profile differs from the printer's recorded nozzle; ask staff to check it")
+
+
 def nozzle_map(machine: dict, nozzle: str) -> dict:
     """The member's one filament on the nozzle the spec names (board 459044ef: "put the member's filament on the nozzle whose AMS
     has that spool (filament_map manual), so hub 0.77's plate routing reads it"). OrcaSlicer's manual map names a logical extruder
@@ -1138,6 +1152,7 @@ def run(job_dir: str | None = None) -> dict:
     machine_name, sfx = MODELS[spec["model"]]
     machines, processes, filaments = load_index("machine"), load_index("process"), load_index("filament")
     machine = flatten(machines, machine_name)
+    verify_nozzle_profile(machine, spec["nozzleDiameterMm"])
     vendor = machines.get(machine.get("printer_model", ""), {})
     model_id = vendor.get("model_id")
     if not model_id:
@@ -1312,7 +1327,7 @@ def plate_warnings(raw: object) -> list[dict]:
 
 
 def selftest() -> None:
-    ok = {"mesh": "part.stl", "model": "A1 Mini", "filament": {"type": "pla", "colorHex": "#F2754E", "trayInfoIdx": "GFA00"},
+    ok = {"nozzleDiameterMm": 0.4, "mesh": "part.stl", "model": "A1 Mini", "filament": {"type": "pla", "colorHex": "#F2754E", "trayInfoIdx": "GFA00"},
           "fixes": {"orient": True, "brim": False, "supports": False}}
     s = read_spec(ok)
     assert set(SHOP_PROCESS) == set(MODELS), "every model the auto path slices for needs its shop settings"

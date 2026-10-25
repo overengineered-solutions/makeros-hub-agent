@@ -43,6 +43,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
 from .gcode_meta import read_gcode_meta
+from .nozzles import nozzle_refusal
 from .queue_progress import QueueProgressTracker, _safe_file_component, write_json_durably
 
 log = logging.getLogger(__name__)
@@ -122,6 +123,7 @@ BED_ZONES = ("heater_bed", "heater_generic heater_bed1", "heater_generic heater_
 _QUERY_OBJECTS = (
     "print_stats=state,filename,print_duration,total_duration,info,message"
     "&extruder=temperature,target"
+    "&configfile=settings"
     + "".join(f"&{urllib.parse.quote(zone)}=temperature,target" for zone in BED_ZONES)
     + "&virtual_sdcard=progress"
     "&display_status=progress,message"
@@ -510,6 +512,9 @@ class KlipperAdapter:
             log.warning("klipper %s: refusing %s — sliced for %r, this printer is %r", self.printer_id, queue_job_id, sliced, self._model)
             return {"ok": False, "reason": "model_mismatch"}
 
+        refusal = self._nozzle_refusal(meta)
+        if refusal:
+            return {"ok": False, "reason": refusal}
         refusal = self._live_refusal()
         if refusal:
             log.info("klipper %s: not starting %s — %s", self.printer_id, queue_job_id, refusal)
@@ -567,6 +572,14 @@ class KlipperAdapter:
             self._save_queue_progress()
         log.info("klipper %s: started %s for %s", self.printer_id, uploaded, queue_job_id)
         return {"ok": True}
+
+    def _nozzle_refusal(self, meta: dict | None) -> str | None:
+        try:
+            hardware = nozzle_hardware(self._fetch_once("configfile=settings"))
+        except Exception as exc:  # A printer restart may have changed the config since the poll.
+            log.warning("klipper %s: nozzle check failed: %s", self.printer_id, _classify_error(exc))
+            return f"printer_stale: {_classify_error(exc)}"
+        return nozzle_refusal((meta or {}).get("requiredFilaments"), hardware, require_report=True)
 
     def _live_refusal(self) -> Optional[str]:
         """None when klippy is ready and the printer is between prints; else the held reason. A fresh query, not the
@@ -1355,6 +1368,25 @@ def _int(v: Any) -> Optional[int]:
     return None
 
 
+def nozzle_hardware(status: dict[str, Any]) -> dict[str, Any]:
+    """Installed nozzle from Klipper's parsed config, never the slicer's preset (operator, 2026-10-25)."""
+    settings = _obj(_obj(status, "configfile"), "settings")
+    extruders = [name for name in settings if name == "extruder" or re.fullmatch(r"extruder[0-9]+", name)]
+    if set(extruders) not in ({"extruder"}, {"extruder", "extruder1"}):
+        return {}
+    nozzles = []
+    for i, name in enumerate(["extruder", "extruder1"][:len(extruders)]):
+        value = _obj(settings, name).get("nozzle_diameter")
+        try:
+            diameter = float(value) if not isinstance(value, bool) else 0
+        except (TypeError, ValueError):
+            return {}
+        if not math.isfinite(diameter) or not 0 < diameter <= 2:
+            return {}
+        nozzles.append({"id": i, "extruderId": i, "diameterMm": diameter})
+    return {"extruderCount": len(nozzles), "nozzles": nozzles}
+
+
 def _build_status(
     printer_id: str,
     status: dict[str, Any],
@@ -1381,6 +1413,7 @@ def _build_status(
         out["errorReason"] = error_reason
 
     if connection_state == "connected":
+        out.update(nozzle_hardware(status))
         print_dur: Optional[float] = None
         state_raw: Any = None
         print_stats = status.get("print_stats")
