@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 
 log = logging.getLogger(__name__)
-REFRESH_SEC = 60.0  # screen state.LINK_LOST_SEC (180) / 3
+REFRESH_SEC = 45.0  # stays within LINK_LOST_SEC (180) / 3, including the poll and bounded HTTP work
 SITE_STALE_SEC = 90.0
 TIMEOUT_SEC = 2.0
 POLL_SEC = 5.0
@@ -177,7 +177,7 @@ class ScreenLink:
                     self._acked.discard(key)
             processed += 1
         if events:
-            log.info("screen %s events processed=%d, expected=%d", self.printer_id, processed, len(events))
+            (log.info if processed else log.warning)("screen %s events processed=%d, expected=%d", self.printer_id, processed, len(events))
 
     def _run(self):
         while not self._stop.is_set():

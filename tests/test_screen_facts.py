@@ -77,18 +77,18 @@ def moonraker():
     server.server_close()
 
 
-def test_write_changes_and_refreshes_at_sixty_seconds_without_masking_a_dead_site(moonraker):
+def test_write_changes_and_refreshes_within_sixty_seconds_without_masking_a_dead_site(moonraker):
     link, mr = moonraker
     with patch("makeros_hub.printers.screen.time.monotonic", return_value=100), patch("makeros_hub.printers.screen.time.time", return_value=1761400000):
         link.offer(FACTS)
         link._sync()
         link._sync()
     assert len(mr.writes) == 1 and mr.writes[0]["updated"] == 1761400000
-    with patch("makeros_hub.printers.screen.time.monotonic", return_value=159):
+    with patch("makeros_hub.printers.screen.time.monotonic", return_value=144):
         link.offer(FACTS)
         link._sync()
     assert len(mr.writes) == 1
-    with patch("makeros_hub.printers.screen.time.monotonic", return_value=160):
+    with patch("makeros_hub.printers.screen.time.monotonic", return_value=145):
         link._sync()
     assert len(mr.writes) == 2
     with patch("makeros_hub.printers.screen.time.monotonic", return_value=161):
