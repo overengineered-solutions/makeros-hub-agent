@@ -18,7 +18,7 @@ import urllib.request
 log = logging.getLogger(__name__)
 REFRESH_SEC = 45.0  # stays within LINK_LOST_SEC (180) / 3, including the poll and bounded HTTP work
 SITE_STALE_SEC = 90.0
-TIMEOUT_SEC = 2.0
+TIMEOUT_SEC = 5.0   # the SV08's Moonraker answers slowly at times (URLError every few minutes at 2 s, 2026-10-25)
 POLL_SEC = 5.0
 EVENT_ID = re.compile(r"\d{1,16}-[a-f0-9]{6}\Z")
 GUID = re.compile(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\Z")

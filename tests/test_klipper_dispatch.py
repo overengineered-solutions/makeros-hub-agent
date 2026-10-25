@@ -46,6 +46,7 @@ class FakeMoonraker:
         self.total = None             # a frozen total_duration (klippy freezes it when a print ends)
         self.start_raw = None         # bytes written verbatim as the start POST's reply (a broken answer)
         self.upload_status, self.upload_body = 201, None
+        self.dirs, self.made_dirs, self.stored = set(), [], {}   # gcodes/ folders; folders made; path -> size
         self.nozzle, self.nozzle_after_upload = .4, .4
         self.start_status, self.start_body, self.start_delay = 200, {"result": "ok"}, 0.0
         self.start_begins_printing = True
@@ -62,6 +63,14 @@ class FakeMoonraker:
                 self.wfile.write(raw)
 
             def do_GET(self):
+                url = urllib.parse.urlsplit(self.path)
+                q = urllib.parse.parse_qs(url.query)
+                if url.path == "/server/files/directory":
+                    return self._send(200 if q["path"][0] in outer.dirs else 404, {"result": {"dirs": [], "files": []}})
+                if url.path == "/server/files/metadata":
+                    name = q["filename"][0]
+                    return self._send(200, {"result": {"filename": name, "size": outer.stored[name]}}) if name in outer.stored \
+                        else self._send(404, {"error": {"message": "Metadata not available"}})
                 if not self.path.startswith("/printer/objects/query"):
                     return self._send(404, {"error": {"message": "Not Found"}})
                 outer.queries += 1
@@ -71,9 +80,15 @@ class FakeMoonraker:
                 url = urllib.parse.urlsplit(self.path)
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length) if length else b""
+                if url.path == "/server/files/directory":
+                    path = json.loads(body)["path"]
+                    outer.dirs.add(path); outer.made_dirs.append(path)
+                    return self._send(200, {"result": {"item": {"path": path, "root": "gcodes"}, "action": "create_dir"}})
                 if url.path == "/server/files/upload":
                     form = parse_multipart(body, boundary_from_content_type(self.headers.get("Content-Type")))
                     outer.uploads.append(form)
+                    if outer.upload_status in (201, 504):   # stored; a 504 is the proxy giving up on the reply, not the upload
+                        outer.stored[f"{form.fields.get('path')}/{form.file.filename}"] = len(form.file.data)
                     outer.nozzle = outer.nozzle_after_upload
                     stored = f"{form.fields.get('path')}/{form.file.filename}"
                     return self._send(outer.upload_status, outer.upload_body or {
@@ -220,6 +235,20 @@ class TestStartPrint(KlipperCase):
                 self.assertEqual(self.adapter.pending_queue_jobs(), [])
         self.assertEqual(self.fake.starts, [])
         self.assertIn("HTTP 403 File is loaded", self.diag.record.call_args_list[0].args[1])
+
+    def test_the_queue_folder_is_made_once_before_the_first_upload(self):   # the Giga's first queue upload, 2026-10-25
+        self.assertEqual(self.start(), {"ok": True})
+        folder = "gcodes/" + self.fake.uploads[0].fields.get("path")
+        self.assertEqual(self.fake.made_dirs, [folder])
+        self.adapter._dirs_ready.clear()                     # a new adapter (hub restart) on a printer that has it: no remake
+        self.fake.state = "standby"
+        self.adapter._ensure_dir(self.fake.uploads[0].fields.get("path"))
+        self.assertEqual(self.fake.made_dirs, [folder])
+
+    def test_an_unanswered_upload_that_landed_whole_still_starts(self):
+        self.fake.upload_status, self.fake.upload_body = 504, {"error": {"message": "Gateway Time-out"}}
+        self.assertEqual(self.start(), {"ok": True})
+        self.assertEqual(len(self.fake.starts), 1)   # (a 500 from Moonraker itself stays a failure: test_a_refused_upload_forgets_the_dispatch)
 
     def test_a_refused_start_forgets_the_dispatch(self):
         self.fake.start_status, self.fake.start_body = 400, {"error": {"message": "Printer is busy"}}

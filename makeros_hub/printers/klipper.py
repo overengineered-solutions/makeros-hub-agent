@@ -39,6 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
+from socket import timeout as socket_timeout
 from pathlib import Path, PurePosixPath
 from typing import Any, Optional
 
@@ -303,6 +304,7 @@ class KlipperAdapter:
         # status DTO never carries it (the `model` property below stays None).
         self._model = model
         self._nozzles: dict[str, Any] = {}   # nozzle_hardware() of the last config read; {} until one succeeds
+        self._dirs_ready: set[str] = set()   # gcodes/ folders this adapter has seen or made (_ensure_dir)
         self._nozzles_next = 0.0
         self._lock = threading.Lock()
         self._data: dict[str, Any] = {}
@@ -538,10 +540,15 @@ class KlipperAdapter:
             uploaded = self._upload(Path(local_path), remote)
         except Exception as exc:  # noqa: BLE001 — any failure: the file is not (provably) there
             detail = _http_detail(exc)
-            log.warning("klipper %s: upload of %s failed: %s", self.printer_id, remote, detail)
-            self._diag("klipper", f"upload for {queue_job_id[:8]} failed: {detail}")
-            self._discard_dispatch(queue_job_id)
-            return {"ok": False, "reason": "upload_failed"}
+            if _unanswered(exc) and self._landed(remote, Path(local_path).stat().st_size):
+                # The Giga's first queue upload, 2026-10-25: the file landed whole and nginx answered 504 after 60 s.
+                log.warning("klipper %s: upload of %s answered %s, but the file landed whole: starting it", self.printer_id, remote, detail)
+                uploaded = remote
+            else:
+                log.warning("klipper %s: upload of %s failed: %s", self.printer_id, remote, detail)
+                self._diag("klipper", f"upload for {queue_job_id[:8]} failed: {detail}")
+                self._discard_dispatch(queue_job_id)
+                return {"ok": False, "reason": "upload_failed"}
         if uploaded != remote:
             # Moonraker names the file it stored; print_stats.filename will be that name, so the dispatch must be too.
             self._discard_dispatch(queue_job_id)
@@ -653,6 +660,7 @@ class KlipperAdapter:
         relative to the gcodes root (item.path). `print` is deliberately NOT sent: with it Moonraker swallows a failed
         start, or silently job-queues the file to start later (file_manager._finish_gcode_upload)."""
         directory, _, name = remote.rpartition("/")
+        self._ensure_dir(directory)
         digest = hashlib.sha256()
         with local.open("rb") as fh:
             for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -696,6 +704,42 @@ class KlipperAdapter:
         if not isinstance(path, str) or not path:
             raise ValueError("upload answered without item.path")
         return path
+
+    def _ensure_dir(self, directory: str) -> None:
+        """Make gcodes/<directory> before the first upload into it: an upload that has Moonraker create the folder can go
+        unanswered (the Giga's first queue upload, 2026-10-25). Once per adapter; a failure here only logs, the upload tries."""
+        if not directory or directory in self._dirs_ready:
+            return
+        path = f"gcodes/{directory}"
+        headers = {"Accept": "application/json", "User-Agent": "makeros-hub-agent"}
+        try:
+            try:
+                q = urllib.parse.urlencode({"path": path})
+                urllib.request.urlopen(urllib.request.Request(f"{self.moonraker_url}/server/files/directory?{q}", headers=headers),
+                                       timeout=HTTP_GET_TIMEOUT_SEC).close()  # noqa: S310 - operator LAN URL
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    raise
+                body = json.dumps({"path": path}).encode()
+                req = urllib.request.Request(f"{self.moonraker_url}/server/files/directory", data=body, method="POST",
+                                             headers={**headers, "Content-Type": "application/json"})
+                urllib.request.urlopen(req, timeout=HTTP_CONTROL_TIMEOUT_SEC).close()  # noqa: S310 - operator LAN URL
+                log.info("klipper %s: made the folder %s", self.printer_id, path)
+            self._dirs_ready.add(directory)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("klipper %s: could not prepare %s: %s", self.printer_id, path, _classify_error(exc))
+
+    def _landed(self, remote: str, size: int) -> bool:
+        """After an unanswered upload: is the file there whole (Moonraker stores an upload under its name only once complete)?"""
+        try:
+            url = f"{self.moonraker_url}/server/files/metadata?filename={urllib.parse.quote(remote, safe='')}"
+            req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": "makeros-hub-agent"})
+            with urllib.request.urlopen(req, timeout=HTTP_GET_TIMEOUT_SEC) as resp:  # noqa: S310 - operator LAN URL
+                parsed = json.loads(resp.read(256 * 1024).decode("utf-8", errors="replace"))
+            result = parsed.get("result") if isinstance(parsed, dict) else None
+            return isinstance(result, dict) and result.get("size") == size
+        except Exception:  # noqa: BLE001 — not provably there
+            return False
 
     def _start_evidence(self, reply="unconfirmed", code=None) -> dict:
         with self._lock:
@@ -1405,6 +1449,14 @@ def _int(v: Any) -> Optional[int]:
     if isinstance(v, float) and v.is_integer():
         return int(v)
     return None
+
+
+def _unanswered(exc: Exception) -> bool:
+    """A reply that never came (a timeout, or a proxy's 502/503/504): the request may have done its work anyway."""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (502, 503, 504)
+    reason = getattr(exc, "reason", exc)
+    return isinstance(exc, TimeoutError) or isinstance(reason, (TimeoutError, socket_timeout))
 
 
 def nozzle_hardware(status: dict[str, Any]) -> dict[str, Any]:
