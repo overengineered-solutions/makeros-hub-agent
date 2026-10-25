@@ -23,8 +23,6 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from .nozzles import nozzle_refusal
-from ..vprinter.capture import parse_required_filaments
 from pathlib import Path
 import os
 import re
@@ -37,6 +35,7 @@ import paho.mqtt.client as mqtt
 
 from . import bambu_parse, bambu_send, tray_translate
 from .jobs import JobTracker
+from .nozzles import nozzle_refusal
 from .manager import BUSY_GCODE_STATES   # manager imports this module lazily, so no import cycle
 _IDENTITY_KEYS = ("subtask_name", "gcode_file", "task_id", "subtask_id")   # which print the merged report describes
 from .queue_progress import QueueProgressTracker, _fsync_dir, _safe_file_component

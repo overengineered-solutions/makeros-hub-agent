@@ -537,6 +537,10 @@ class KlipperAdapter:
             if not self._record_dispatch(queue_job_id, uploaded, assignment_seq):
                 return {"ok": False, "reason": "state_persist_failed"}
 
+        refusal = self._nozzle_refusal(meta)
+        if refusal:
+            self._discard_dispatch(queue_job_id)
+            return {"ok": False, "reason": refusal}
         url = f"{self.moonraker_url}/printer/print/start?{urllib.parse.urlencode({'filename': uploaded})}"
         req = urllib.request.Request(
             url, method="POST", data=b"",
