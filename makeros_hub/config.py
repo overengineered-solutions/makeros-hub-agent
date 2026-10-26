@@ -37,9 +37,8 @@ DEFAULT_TELEMETRY_SEC = 5
 # Non-privileged port the OrcaSlicer ingest HTTP server binds on the LAN. The
 # member points OrcaSlicer's Print Host at http://<hub>.local:<port>.
 DEFAULT_INGEST_PORT = 8787
-# Manual HTTP upload is buffered; 64 MiB leaves room for parsing on the shop box.
-# FTPS uses its separate streaming limit.
-DEFAULT_MAX_UPLOAD_MB = 64
+# Raw manual HTTP upload ceiling; intake streams to disk. FTPS has its own limit.
+DEFAULT_MAX_UPLOAD_MB = 1024
 VPRINTER_CODE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 log = logging.getLogger("makeros-hub.config")

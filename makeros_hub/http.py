@@ -6,16 +6,20 @@ touching the enroll/heartbeat logic. Responses are explicitly shape-checked
 
 from __future__ import annotations
 
+import gzip
 import json
 import random
 import time
 import urllib.error
 import urllib.request
+import zlib
 from dataclasses import dataclass
+from typing import BinaryIO
 
 # Cap every parsed response body (config-down included) so a bad/hostile cloud or proxy can't force the Pi to
 # buffer an unbounded body into memory. 8 MiB is far above any real config-down / heartbeat response.
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+MAX_RAW_FILE_BYTES = 1024 * 1024 * 1024   # queue-file protocol: raw bytes after gunzip
 # CSPRNG for backoff jitter — a shared PRNG seed across agents started together (e.g. after a cloud deploy) would
 # leave them synchronized and thundering-herd the endpoint. (dual-review 2026-07-20.)
 _RNG = random.SystemRandom()
@@ -81,16 +85,22 @@ def post_json(
 
 def post_bytes(
     url: str,
-    data: bytes,
+    data: bytes | BinaryIO,
     *,
     content_type: str = "application/octet-stream",
+    content_encoding: str | None = None,
+    content_length: int | None = None,
     bearer: str | None = None,
     timeout: float = 15.0,
 ) -> int:
-    """POST raw bytes (a camera JPEG frame) and return the HTTP status. No JSON body/parse — the frame rides its OWN
-    request, out-of-band from the heartbeat (whose body is size-capped on the cloud). Raises TransportError only on a
-    network failure; callers are best-effort (a failed frame push must never sink the heartbeat)."""
+    """POST bytes or a file stream (with content_length); return the HTTP status without parsing JSON.
+    Files and camera frames travel separately from the size-capped heartbeat. Raises TransportError on a network
+    failure; callers are best-effort (a failed upload must never sink the heartbeat)."""
     headers = {"Content-Type": content_type}
+    if content_encoding:
+        headers["Content-Encoding"] = content_encoding
+    if content_length is not None:
+        headers["Content-Length"] = str(content_length)
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
     try:
@@ -153,12 +163,13 @@ def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 6
                 max_seconds: float = 300.0) -> tuple[str, int]:
     """GET a (web-upload) file into `dest`, streaming with a hard size cap AND a wall-clock budget for the whole transfer
     (`timeout` is only per-read inactivity — a dripping 200 would otherwise never end; codex v0.57 r1); returns
-    (sha256, size). Raises TransportError on a network failure, a non-200, the cap or the deadline; the caller verifies the
-    sha against the cloud's before trusting the bytes and removes `dest` on any failure."""
+    (raw sha256, raw size), decoding Content-Encoding: gzip before hashing/writing. Raises TransportError on a network
+    failure, a non-200, invalid gzip, the raw cap or the deadline; the caller verifies the hash and size against the
+    cloud's before trusting the bytes and removes `dest` on any failure."""
     import hashlib
     from pathlib import Path
 
-    headers = {"Accept": "application/octet-stream"}
+    headers = {"Accept": "application/octet-stream", "Accept-Encoding": "gzip"}
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
     req = urllib.request.Request(url, headers=headers, method="GET")
@@ -169,8 +180,12 @@ def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 6
         with _OPENER.open(req, timeout=timeout) as resp, Path(dest).open("wb") as out:
             if resp.status != 200:
                 raise TransportError(f"GET {url}: HTTP {resp.status}")
+            encoding = resp.headers.get("Content-Encoding", "identity").strip().lower()
+            if encoding not in ("identity", "gzip"):
+                raise TransportError(f"GET {url}: unsupported Content-Encoding {encoding}")
+            source = gzip.GzipFile(fileobj=resp, mode="rb") if encoding == "gzip" else resp
             while True:
-                chunk = resp.read(1024 * 256)
+                chunk = source.read(1024 * 256)
                 if not chunk:
                     break
                 size += len(chunk)
@@ -183,6 +198,8 @@ def get_to_file(url: str, dest, *, bearer: str | None = None, timeout: float = 6
             out.flush()
             import os as _os
             _os.fsync(out.fileno())   # crash-durable before the caller renames + reports (codex v0.57 r2)
+    except (gzip.BadGzipFile, EOFError, zlib.error) as exc:
+        raise TransportError(f"GET {url}: invalid gzip: {exc}") from exc
     except urllib.error.HTTPError as exc:
         raise TransportError(f"GET {url}: HTTP {exc.code}") from exc
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:

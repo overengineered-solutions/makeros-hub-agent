@@ -42,7 +42,7 @@ from .vprinter.live_pool import (
 )
 from .vprinter.pool_ranking import PoolRankingState
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
-from .http import get_to_file, TransportError, get_json, post_bytes, post_json
+from .http import MAX_RAW_FILE_BYTES, get_to_file, TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
 from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
@@ -2100,7 +2100,7 @@ def run(
                                 manager.fetch_uploads(
                                     items,
                                     SPOOL_DIR,
-                                    getter=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential),
+                                    getter=lambda path, dest: get_to_file(cfg.file_url(path), dest, bearer=credential, max_bytes=MAX_RAW_FILE_BYTES),
                                     reporter=lambda body: post_json(cfg.fetched_url, body, bearer=credential, timeout=15.0),
                                 )
                             finally:

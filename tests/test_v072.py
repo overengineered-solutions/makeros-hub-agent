@@ -91,6 +91,15 @@ class TestSliceUploads(unittest.TestCase):
             self.assertEqual((len(self.runs), len(self.downloads), len(self.reports)), (1, 1, 2))
             self.assertEqual(self.reports[-1]["slice"]["warnings"], ok["warnings"])
 
+    def test_raw_size_mismatch_never_reaches_the_slicer(self):
+        with tempfile.TemporaryDirectory() as d:
+            manager = PrinterManager()
+            self.assertEqual(manager.fetch_uploads([fetch(sizeBytes=len(MESH) + 1)], d, getter=self.getter(),
+                             reporter=self.reporter, slice_runner=self.runner(d, {"ok": True})), 0)
+            self.assertEqual((self.runs, self.reports), ([], []))
+            self.assertFalse(list(Path(d).rglob("*.tmp")))
+            self.assertFalse(list(Path(d).rglob("*.stl")))
+
     def test_a_slice_the_slicer_refuses_is_reported_with_its_sentence_and_leaves_no_plate(self):
         with tempfile.TemporaryDirectory() as d:
             m = PrinterManager()

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from ..diagnostics import get_default, redact
+from ..http import MAX_RAW_FILE_BYTES
 from .queue_progress import write_json_durably
 from .threemf_objects import Unreadable3mf, check_plate_entry, gcode_plates, parse_plate_objects, plate_named
 
@@ -699,10 +700,10 @@ class PrinterManager:
         )
 
     def fetch_uploads(self, fetches, spool_dir, *, getter, reporter, max_per_beat: int = 1,
-                      max_bytes: int = 64 * 1024 * 1024, slice_runner=run_slice_job) -> int:
+                      max_bytes: int = MAX_RAW_FILE_BYTES, slice_runner=run_slice_job) -> int:
         """Web uploads (v0.57, design B4): the cloud lists this hub's member uploads it has not fetched; download each
-        into <spool>/<uid>/<file> (streaming, size-capped, wall-clock-bounded), verify the cloud's sha256, parse the sent
-        plate's filaments the same way a VP capture is parsed, and report `fetched` so the job enters the scheduler. One
+        into <spool>/<uid>/<file> (streaming, size-capped, wall-clock-bounded), verify the cloud's raw sha256 and size,
+        parse the sent plate's filaments like a VP capture, and report `fetched` so the job enters the scheduler. One
         per call keeps the loop responsive (the agent runs this on its own worker thread); the cloud lists the rest next
         beat. A failed fetch is logged and retried next beat (the file stays listed) and never leaves a temp file; a sha
         mismatch is reported so the member is told to re-upload. Returns the number of successful reports.
@@ -712,8 +713,10 @@ class PrinterManager:
         import math
         import os as _os
 
-        def stream_sha(path: Path) -> str | None:
+        def stream_sha(path: Path, expected_size=None) -> str | None:
             """sha256 of an existing spool file under the same cap — None when it is over the cap (never read into RAM)."""
+            if expected_size is not None and path.stat().st_size != expected_size:
+                return None
             digest = hashlib.sha256()
             total = 0
             with path.open("rb") as fh:
@@ -742,6 +745,10 @@ class PrinterManager:
             if not str(path).startswith("/api/print/hub/file/"):
                 log.warning("skipping fetch with an unexpected path for %s", job_id)
                 continue
+            expected_size = f.get("sizeBytes")
+            if type(expected_size) is not int or not 0 < expected_size <= max_bytes:
+                log.warning("skipping fetch with an invalid raw size for %s", job_id)
+                continue
             taken += 1
             sha = sha.lower()
             # the plate the cloud will print: a positive int (a digit string is coerced); anything else = 1, the same
@@ -764,22 +771,25 @@ class PrinterManager:
                         continue   # reported: a sha mismatch or a slice the member is told about
                     got = sha
                 else:
-                    got = stream_sha(dest) if dest.exists() else None
+                    got = stream_sha(dest, expected_size) if dest.exists() else None
                     if dest.exists() and got != sha:
                         # a stale same-name file (earlier upload, over the cap, or corrupt): never reused — replaced below
                         log.warning("web upload %s: spool file present but does not match the cloud's sha — re-fetching", job_id)
                         dest.unlink(missing_ok=True)
                         got = None
                     if got is None:
+                        size = None
                         try:
-                            got, _size = getter(path, tmp)
+                            got, size = getter(path, tmp)
                         finally:
-                            if got is None or got != sha:
+                            if got != sha or size != expected_size:
                                 tmp.unlink(missing_ok=True)   # any failure or mismatch: no temp file survives
                         if got != sha:
                             log.error("web upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], got[:12])
                             report_fetch({"queueJobId": job_id, "sha256": got})   # the cloud fails the job + tells the member
                             continue
+                        if size != expected_size:
+                            raise ValueError(f"raw size mismatch (cloud {expected_size}, got {size})")
                         _os.replace(tmp, dest)
                 # Also on retry with an existing file: the prior rename may
                 # have succeeded while its directory flush failed. No ACK yet.
@@ -885,7 +895,7 @@ class PrinterManager:
             return True
 
         same = False
-        if result_path.exists() and mesh.exists() and stream_sha(mesh) == sha:
+        if result_path.exists() and mesh.exists() and stream_sha(mesh, f["sizeBytes"]) == sha:
             try:
                 done = json.loads(result_path.read_text(encoding="utf-8"))
                 same = json.loads((work / "job.json").read_text(encoding="utf-8")) == {**slice_spec_of(spec), "mesh": mesh_name}
@@ -902,16 +912,18 @@ class PrinterManager:
             dest.unlink(missing_ok=True)
             work.mkdir(mode=0o700)
             tmp = work / f".{mesh_name}.fetch.tmp"
-            got = None
+            got, size = None, None
             try:
-                got, _size = getter(path, tmp)
+                got, size = getter(path, tmp)
             finally:
-                if got != sha:
+                if got != sha or size != f["sizeBytes"]:
                     tmp.unlink(missing_ok=True)
             if got != sha:
                 log.error("slice upload %s: sha mismatch (cloud %s…, got %s…) — reporting", job_id, sha[:12], str(got)[:12])
                 reporter({"queueJobId": job_id, "sha256": got})
                 return None
+            if size != f["sizeBytes"]:
+                raise ValueError(f"raw size mismatch (cloud {f['sizeBytes']}, got {size})")
             os.replace(tmp, mesh)
             (work / "job.json").write_text(json.dumps({**slice_spec_of(spec), "mesh": mesh_name}), encoding="utf-8")
         if spec.get("prepare", {}).get("split"):

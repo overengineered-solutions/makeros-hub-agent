@@ -2,6 +2,8 @@
 a live round-trip against the threaded server with a fake cloud-submit.
 Run: python3 -m unittest discover -s tests"""
 
+import hashlib
+import io
 import json
 import tempfile
 import unittest
@@ -9,7 +11,7 @@ import urllib.request
 from unittest import mock
 from pathlib import Path
 
-from makeros_hub.multipart import boundary_from_content_type, parse_multipart
+from makeros_hub.multipart import MultipartError, UploadTooLarge, boundary_from_content_type, parse_multipart, stream_multipart
 from makeros_hub.ingest import IngestServer
 
 
@@ -71,6 +73,33 @@ class TestParseMultipart(unittest.TestCase):
         form = parse_multipart(body, "B")
         self.assertEqual(form.fields.get("print"), "false")
         self.assertIsNone(form.file)
+
+
+class TestStreamingMultipart(unittest.TestCase):
+    def test_every_boundary_split_and_boundary_lookalike_is_binary_safe(self):
+        payload = b"\x00prefix--Bmiddle\r\n--Bnot-a-delimiter\r\n--B--nope\r\nlast\r\n"
+        for closing in (b"--B--", b"--B--\r\n"):
+            body = build_multipart("B", "part.gcode", payload, {"print": "true"}).rsplit(b"--B--", 1)[0] + closing
+            for step in range(1, len(body) + 1):
+                with self.subTest(closing=closing, step=step):
+                    out = io.BytesIO()
+                    result = stream_multipart((body[i:i + step] for i in range(0, len(body), step)), "B", out, len(payload))
+                    self.assertEqual(result, ("part.gcode", {"print": "true"}, hashlib.sha256(payload).hexdigest(), len(payload)))
+                    self.assertEqual(out.getvalue(), payload)
+
+    def test_malformed_or_unbounded_forms_are_refused(self):
+        valid = build_multipart("B", "part.gcode", b"file", {})
+        cases = [valid[:-7], valid + b"junk", b"preamble" + valid,
+                 valid.replace(b'filename="part.gcode"', b'filename="part.gcode"; padding="' + b"x" * 8192 + b'"'),
+                 build_multipart("B", "part.gcode", b"file", {"print": "x" * 1025}),
+                 build_multipart("B", "part.gcode", b"file", {str(i): "x" for i in range(64)}),
+                 valid.replace(b'name="file"', b'name="other"'),
+                 valid[:-7] + valid]
+        for body in cases:
+            with self.subTest(body=body[:100]), self.assertRaises(MultipartError):
+                stream_multipart((body[i:i + 17] for i in range(0, len(body), 17)), "B", io.BytesIO(), 100)
+        with self.assertRaises(UploadTooLarge):
+            stream_multipart([valid], "B", io.BytesIO(), 3)
 
 
 class TestIngestServer(unittest.TestCase):
@@ -203,6 +232,27 @@ class TestIngestServer(unittest.TestCase):
         self.assertEqual(self.calls, [])
         with mock.patch("makeros_hub.ingest.shutil.disk_usage", return_value=mock.Mock(free=0)):
             self.assertEqual(self._upload("good")[0], 507)
+        self.assertEqual(self.calls, [])
+
+    def test_raw_limit_excludes_form_overhead_and_removes_partial_files(self):
+        handler = self.server._server.RequestHandlerClass
+        with mock.patch.object(handler, "max_bytes", 8):
+            self.assertEqual(self._upload("good", data=b"12345678")[0], 201)
+            status, body = self._upload("good", data=b"123456789")
+            self.assertEqual((status, body), (413, {"error": "file_too_large", "maxBytes": 8}))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(len(list(Path(self.tmp.name).iterdir())), 1)
+        self.assertFalse(list(Path(self.tmp.name).rglob("*.tmp")))
+
+    def test_truncated_or_timed_out_uploads_remove_the_partial_spool(self):
+        handler = self.server._server.RequestHandlerClass
+        for error, status in ((EOFError, 400), (TimeoutError, 408)):
+            def broken_read(_handler, _length):
+                yield build_multipart("----makerosTEST", "part.gcode", b"G1" * 100, {})[:-30]
+                raise error("stopped")
+            with mock.patch.object(handler, "_read_chunks", broken_read):
+                self.assertEqual(self._upload("good")[0], status)
+            self.assertEqual(list(Path(self.tmp.name).iterdir()), [])
         self.assertEqual(self.calls, [])
 
     def test_connection_threads_are_bounded_before_headers(self):

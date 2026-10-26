@@ -7,8 +7,8 @@ OrcaSlicer (PrusaSlicer's OctoPrint host) does exactly two things:
   POST /api/files/local    — multipart upload (fields: file, print, path) with
                              the member's print token in `X-Api-Key`.
 
-On upload the hub: saves the sliced file to a local spool dir (the file NEVER
-goes to the cloud), then registers the submission with the cloud control plane
+On upload the hub: saves the sliced file to a local spool dir, then registers
+the submission with the cloud control plane
 (POST /api/print/hub/submit, authenticated by the hub's own bearer + the
 member token). The cloud resolves the token → member, runs the eligibility
 gate, and creates the queue job; the member watches it in their portal.
@@ -19,7 +19,6 @@ without a network or a real cloud.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -31,7 +30,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 
-from .multipart import boundary_from_content_type, parse_multipart
+from . import job_files
+from .multipart import MultipartError, UploadTooLarge, boundary_from_content_type, stream_multipart
 from .printers.gcode_meta import read_gcode_meta
 
 log = logging.getLogger("makeros-hub.ingest")
@@ -49,7 +49,7 @@ VERSION_BODY = {
 #   {"status": "bad_token"}                    -> 403 (OrcaSlicer "invalid API key")
 #   {"status": "error",    "detail": "..."}    -> 502
 SubmitFn = Callable[..., dict]
-MAX_BUFFERED_UPLOAD_BYTES = 64 * 1024 * 1024
+MAX_FORM_OVERHEAD = 1024 * 1024
 MIN_FREE_BYTES = 128 * 1024 * 1024
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -94,8 +94,6 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
-        # ponytail: one buffered upload at a time; use a streaming multipart
-        # library if larger/concurrent manual uploads become necessary.
         if not self.upload_slot.acquire(blocking=False):
             self._json(503, {"error": "upload_busy", "detail": "Another upload is in progress. Try again shortly."})
             return
@@ -126,7 +124,7 @@ class _Handler(BaseHTTPRequestHandler):
         if length <= 0:
             self._json(400, {"error": "empty_body"})
             return
-        if length > self.max_bytes:
+        if length > self.max_bytes + MAX_FORM_OVERHEAD:
             self._json(413, {"error": "file_too_large", "maxBytes": self.max_bytes})
             return
         try:
@@ -139,48 +137,47 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(507, {"error": "spool_full", "detail": "The shop needs to free disk space before another upload."})
             return
 
-        try:
-            body = self._read_exact(length)
-        except TimeoutError:
-            self._json(408, {"error": "upload_timeout"})
-            return
-        if body is None:
-            self._json(400, {"error": "truncated_body"})
-            return
-
-        try:
-            form = parse_multipart(body, boundary)
-            del body
-        except Exception as exc:  # noqa: BLE001 — surface a clean 400, log detail
-            log.warning("multipart parse failed: %s", exc)
-            self._json(400, {"error": "bad_multipart"})
-            return
-        if form.file is None:
-            self._json(400, {"error": "no_file_field"})
-            return
-
-        file_name = _safe_filename(form.file.filename)
-        print_now = (form.fields.get("print", "false").lower() == "true")
         submission_uid = os.urandom(16).hex()
-        sha = hashlib.sha256(form.file.data).hexdigest()
-        size = len(form.file.data)
-
-        # Persist the sliced file hub-local before registering, so a job never
-        # exists in the cloud without its file on disk.
         dest_dir = self.spool_dir / submission_uid
         try:
             dest_dir.mkdir(parents=True, exist_ok=True)
-            with (dest_dir / file_name).open("wb") as fh:
-                fh.write(form.file.data)
+            pending = dest_dir / ".upload.tmp"
+            with pending.open("wb") as fh:
+                filename, fields, sha, size = stream_multipart(self._read_chunks(length), boundary, fh, self.max_bytes)
                 fh.flush()
                 os.fsync(fh.fileno())
+            if filename is None:
+                self._discard_spool(dest_dir)
+                self._json(400, {"error": "no_file_field"})
+                return
+            file_name = _safe_filename(filename)
+            print_now = fields.get("print", "false").lower() == "true"
+            pending.replace(dest_dir / file_name)
             for directory in (dest_dir, self.spool_dir):
                 fd = os.open(directory, os.O_RDONLY)
                 try:
                     os.fsync(fd)
                 finally:
                     os.close(fd)
+        except UploadTooLarge:
+            self._discard_spool(dest_dir)
+            self._json(413, {"error": "file_too_large", "maxBytes": self.max_bytes})
+            return
+        except TimeoutError:
+            self._discard_spool(dest_dir)
+            self._json(408, {"error": "upload_timeout"})
+            return
+        except EOFError:
+            self._discard_spool(dest_dir)
+            self._json(400, {"error": "truncated_body"})
+            return
+        except (MultipartError, UnicodeError) as exc:
+            self._discard_spool(dest_dir)
+            log.warning("multipart parse failed: %s", exc)
+            self._json(400, {"error": "bad_multipart"})
+            return
         except OSError as exc:
+            self._discard_spool(dest_dir)
             log.error("spool write failed: %s", exc)
             self._json(507, {"error": "spool_write_failed"})
             return
@@ -241,6 +238,7 @@ class _Handler(BaseHTTPRequestHandler):
             print_now,
             status,
         )
+        job_files.offer(outcome["jobId"], dest_dir / file_name)
         self._octoprint_created(file_name)
 
     def _octoprint_created(self, file_name: str) -> None:
@@ -273,8 +271,7 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError as exc:
             log.warning("could not discard rejected spool directory %s: %s", dest_dir, exc)
 
-    def _read_exact(self, n: int) -> bytes | None:
-        buf = bytearray()
+    def _read_chunks(self, n: int):
         remaining = n
         deadline = time.monotonic() + self.timeout
         while remaining > 0:
@@ -282,12 +279,11 @@ class _Handler(BaseHTTPRequestHandler):
             if left <= 0:
                 raise TimeoutError("upload deadline exceeded")
             self.connection.settimeout(left)
-            chunk = self.rfile.read1(min(remaining, 1 << 20))
+            chunk = self.rfile.read1(min(remaining, 256 * 1024))
             if not chunk:
-                return None
-            buf.extend(chunk)
+                raise EOFError("truncated body")
             remaining -= len(chunk)
-        return bytes(buf)
+            yield chunk
 
 
 def make_handler(submit_fn: SubmitFn, spool_dir: Path, max_bytes: int):
@@ -338,9 +334,7 @@ class IngestServer:
     def __init__(self, submit_fn: SubmitFn, *, port: int, spool_dir: Path, max_bytes: int):
         self.port = port
         spool_dir.mkdir(parents=True, exist_ok=True)
-        if max_bytes > MAX_BUFFERED_UPLOAD_BYTES:
-            log.warning("manual upload buffer capped at 64 MiB (configured %d bytes)", max_bytes)
-        handler = make_handler(submit_fn, spool_dir, min(max_bytes, MAX_BUFFERED_UPLOAD_BYTES))
+        handler = make_handler(submit_fn, spool_dir, max_bytes)
         self._server = _BoundedServer(("0.0.0.0", port), handler)
         self._thread: threading.Thread | None = None
 

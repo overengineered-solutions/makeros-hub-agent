@@ -1,6 +1,6 @@
 # Procrastination Station shop-box agent
 
-The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.83.0 review candidate**, not evidence that the installed shop box has been updated.
+The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.84.5 review candidate**, not evidence that the installed shop box has been updated.
 
 The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Read [SECURITY.md](SECURITY.md) for the boundaries and limitations.
 
@@ -12,7 +12,7 @@ The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Re
 4. A transfer finishing in Orca means delivery to the queue. `/print` shows physical progress. The website selects a compatible idle printer, checks plate/filament requirements and requires the bed to have been cleared. The box rechecks dispatch conditions and reports the physical result.
 5. Members collect their part, confirm the real bed is clear, and inspect any charge on the website. They never need a physical printer password or shell access to the box.
 
-Linux members can upload a sliced .3mf for a supported Bambu model on the website. The older OctoPrint-style HTTP print-host path remains available for **staff-assisted** work: it carries no verified model and its jobs are held for review. Sovol jobs currently require staff assistance; do not promise automatic model-safe dispatch through that legacy path.
+Linux members can upload a sliced .3mf for a supported Bambu model on the website. The OctoPrint-style HTTP print-host path accepts Klipper G-code from OrcaSlicer and reads its printer model, filaments and nozzle before submitting it. Jobs without readable routing metadata fall back to staff review; Klipper dispatch checks the model and installed nozzle before uploading and starting.
 
 ## Install and enroll — operator only
 
@@ -49,9 +49,17 @@ The main heartbeat loop refreshes physical adapters and virtual printers, sends 
 - **Member cannot connect:** check membership requirements, member network account, pending/completed device grants, VP health and the setup problem code. Removal of a network device and revocation of printer codes are separate actions. Code changes cannot cancel a running physical print.
 - **Upload uncertain:** the box retains a file when the website response cannot confirm whether the job was created. Check the member's job list and staff queue using its time and filename before resending. Compare the private spool SHA/UID with the job record if needed. Remove only a specifically reconciled abandoned file; never blanket-delete spool or outbox state.
 - **Queue waits:** read the member-visible reason. Check model, compatible loaded materials, plate type and actual plate clearance. Do not bypass a gate simply to clear the queue. Legacy jobs without a model require staff-assisted handling or cancellation/re-upload through the supported path.
-- **Low disk:** intake refuses further files before exhausting the box. Preserve pending files/state; clear only verified terminal/abandoned files under the shop retention policy. Manual HTTP has a 64 MiB effective cap and one buffered upload; website and streaming FTPS have their own limits.
+- **Low disk:** intake refuses further files before exhausting the box. Preserve pending files/state; clear only verified terminal/abandoned files under the shop retention policy. Manual HTTP streams one upload at a time with a 1024 MiB raw default (`max_upload_mb` / `MAKEROS_HUB_MAX_UPLOAD_MB` still override it); website and streaming FTPS have their own limits.
 - **Re-enrollment or host change:** stop the service first; mint a fresh token on the intended app, enroll with `--force` only when replacing this box's existing credential, and confirm config persistence before restarting. A failed config write now returns failure, not a ready message.
 - **Unexpected print status:** compare physical machine state and the assigned job before repeating a start. Durable dispatch/progress records exist to prevent replay. Do not delete them to clear an alarm.
+
+OrcaSlicer queue files travel gzip-compressed between hubs and the site in 0.84.5. Submit metadata, SHA-256 and size still
+refer to the raw file. The job-file POST sets `Content-Encoding: gzip` and a compressed `Content-Length`; a temporary
+file on the spool disk keeps RAM bounded. The site copy must fit 64 MiB compressed and 1 GiB raw. Fetch decodes gzip,
+checks the raw hash and size before promoting the spool file, and sends plain G-code to Moonraker; old uncompressed site
+files still work. Pair this hub with the site's gzip storage/streaming verification change: the site must use the existing
+heartbeat `agentVersion >= 0.84.5` gate before offering a compressed file, keeping jobs waiting with a clear reason for
+older hubs. An existing explicit `max_upload_mb = 64` remains a 64 MiB intake limit until changed.
 
 ## Updates and rollback
 

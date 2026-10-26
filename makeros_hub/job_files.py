@@ -8,16 +8,18 @@ heartbeat thread: a failed copy only means that job cannot move, and it still pr
 """
 from __future__ import annotations
 
+import gzip
 import logging
 import os
 import queue
+import tempfile
 import threading
 
-from .http import TransportError, post_bytes
+from .http import MAX_RAW_FILE_BYTES, TransportError, post_bytes
 
 log = logging.getLogger("makeros_hub.job_files")
 
-MAX_BYTES = 64 * 1024 * 1024        # = pstation MAX_UPLOAD_BYTES; the site refuses anything larger
+MAX_BYTES = 64 * 1024 * 1024        # = pstation MAX_UPLOAD_BYTES, measured after gzip
 ATTEMPTS = 3
 
 _wanted = threading.Event()
@@ -47,13 +49,28 @@ def upload_one(url: str, path: str, bearer: str, *, poster=post_bytes) -> bool:
         size = os.path.getsize(path)
     except OSError:
         return True   # the file is gone (printed and cleaned up): nothing to copy
-    if size <= 0 or size > MAX_BYTES:
+    if size <= 0 or size > MAX_RAW_FILE_BYTES:
+        log.info("job file copy outside the raw size limit: %s", path)
         return True
-    with open(path, "rb") as fh:
-        data = fh.read(MAX_BYTES + 1)
     try:
-        status = poster(url, data, bearer=bearer, timeout=180.0)
-    except TransportError as e:
+        # Disk staging supplies Content-Length without buffering the file or requiring chunked POST support.
+        with open(path, "rb") as fh, tempfile.TemporaryFile(dir=os.path.dirname(path)) as data:
+            with gzip.GzipFile(filename="", fileobj=data, mode="wb", mtime=0) as zipped:
+                raw_size = 0
+                while chunk := fh.read(256 * 1024):
+                    raw_size += len(chunk)
+                    if raw_size > MAX_RAW_FILE_BYTES or data.tell() > MAX_BYTES:
+                        log.info("job file copy exceeds the size limit: %s", path)
+                        return True
+                    zipped.write(chunk)
+            compressed_size = data.tell()
+            if compressed_size > MAX_BYTES:
+                log.info("job file copy exceeds the compressed size limit: %s", path)
+                return True
+            data.seek(0)
+            status = poster(url, data, bearer=bearer, timeout=180.0,
+                            content_encoding="gzip", content_length=compressed_size)
+    except (TransportError, OSError) as e:
         log.info("job file copy will retry: %s", e)
         return False
     if status in (200, 204):

@@ -72,7 +72,7 @@ def read_gcode_meta(path) -> dict[str, Any] | None:
         size = fh.seek(0, 2)
         tail_at = max(0, size - WINDOW_BYTES)
         fh.seek(tail_at)
-        tail = fh.read().decode("utf-8", errors="replace")
+        tail = fh.read(WINDOW_BYTES).decode("utf-8", errors="replace")
         fh.seek(0)
         # the whole first window, overlapping the tail: a top config block the tail cut in half is read whole here
         head = fh.read(WINDOW_BYTES if tail_at else 0).decode("utf-8", errors="replace")

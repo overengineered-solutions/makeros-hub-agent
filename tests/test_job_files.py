@@ -1,4 +1,7 @@
+import gzip
+import os
 import threading
+from unittest import mock
 
 from makeros_hub import job_files
 from makeros_hub.http import TransportError
@@ -26,8 +29,11 @@ def test_upload_outcomes(tmp_path):
     seen = []
 
     def poster(status):
-        def p(url, data, bearer=None, timeout=None):
-            seen.append((url, data, bearer))
+        def p(url, data, bearer=None, timeout=None, content_encoding=None, content_length=None):
+            assert content_encoding == "gzip"
+            compressed = data.read(content_length)
+            assert len(compressed) == content_length
+            seen.append((url, gzip.decompress(compressed), bearer))
             if status == "net":
                 raise TransportError("down")
             return status
@@ -49,7 +55,7 @@ def test_the_worker_retries_then_stops(tmp_path):
     calls = []
     stop = threading.Event()
 
-    def poster(url, data, bearer=None, timeout=None):
+    def poster(url, data, bearer=None, timeout=None, **kwargs):
         calls.append(url)
         if len(calls) < 2:
             return 503
@@ -61,3 +67,29 @@ def test_the_worker_retries_then_stops(tmp_path):
     job_files.run(lambda j: f"https://site/api/print/hub/job-file/{j}", "tok", stop, poster=poster, pause=lambda s: None)
     assert calls == ["https://site/api/print/hub/job-file/job-9"] * 2
     job_files.want(False)
+
+
+def test_the_copy_limit_applies_to_compressed_bytes_and_cleans_staging(tmp_path, monkeypatch):
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    path = spool / "tree.gcode"
+    monkeypatch.setattr(job_files, "MAX_BYTES", 80)
+    path.write_bytes(b"G1\n" * 10000)
+    posted = mock.Mock(return_value=204)
+    assert job_files.upload_one("u", str(path), "tok", poster=posted)
+    assert posted.call_args.kwargs["content_length"] <= 80
+    posted.reset_mock()
+    path.write_bytes(os.urandom(30000))
+    assert job_files.upload_one("u", str(path), "tok", poster=posted)
+    posted.assert_not_called()
+    assert list(spool.iterdir()) == [path]
+    monkeypatch.setattr(job_files, "MAX_RAW_FILE_BYTES", 10)
+    assert job_files.upload_one("u", str(path), "tok", poster=posted)
+    posted.assert_not_called()
+
+
+def test_compression_disk_failure_is_retried(tmp_path, monkeypatch):
+    path = tmp_path / "tree.gcode"
+    path.write_bytes(b"G1\n")
+    with mock.patch.object(job_files.tempfile, "TemporaryFile", side_effect=OSError("disk full")):
+        assert job_files.upload_one("u", str(path), "tok") is False

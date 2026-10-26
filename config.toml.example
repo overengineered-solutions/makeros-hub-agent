@@ -17,8 +17,8 @@ heartbeat_sec = 30
 # point OrcaSlicer's Print Host at http://<this-hub>.local:<ingest_port>.
 ingest_port = 8787
 
-# Cap a single sliced-file upload, in MB (guards the Pi against a runaway upload).
-max_upload_mb = 64
+# Cap a single raw sliced-file upload, in MiB (streamed to disk).
+max_upload_mb = 1024
 
 # Lasers (v0.68). Optional; without it every laser reports "not configured". See docs/laser-ha.md.
 # [laser]

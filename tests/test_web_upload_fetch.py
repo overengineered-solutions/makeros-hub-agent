@@ -160,9 +160,25 @@ class TestFetchUploads(unittest.TestCase):
             self.assertEqual(len(calls), 1)
             self.assertEqual((spool / "part.3mf").read_bytes(), data)
             # an existing file over the cap is never read into memory: streamed under the cap, then replaced
-            (spool / "part.3mf").write_bytes(b"x" * 300)
-            self.assertEqual(m.fetch_uploads([self._fetch(data)], d, getter=getter, reporter=lambda b: _Resp(), max_bytes=200), 1)
+            (spool / "part.3mf").write_bytes(b"x" * (len(data) + 1))
+            self.assertEqual(m.fetch_uploads([self._fetch(data)], d, getter=getter, reporter=lambda b: _Resp(), max_bytes=len(data)), 1)
             self.assertEqual(len(calls), 2)
+
+    def test_a_matching_cached_hash_does_not_bypass_the_raw_size_check(self):
+        data = three_mf()
+        with tempfile.TemporaryDirectory() as d:
+            spool = Path(d) / "abcdef1234567890"
+            spool.mkdir()
+            dest = spool / "part.3mf"
+            dest.write_bytes(data)
+            def getter(path, tmp):
+                tmp.write_bytes(data)
+                return hashlib.sha256(data).hexdigest(), len(data)
+            reporter = mock.Mock()
+            self.assertEqual(PrinterManager().fetch_uploads([dict(self._fetch(data), sizeBytes=len(data) + 1)], d,
+                             getter=getter, reporter=reporter), 0)
+            reporter.assert_not_called()
+            self.assertEqual(list(spool.iterdir()), [])
 
     def test_plate_is_coerced_to_the_plate_that_prints(self):
         data = three_mf()
@@ -199,6 +215,7 @@ class TestGetToFileDeadline(unittest.TestCase):
 
         class Drip:
             status = 200
+            headers = {}
 
             def __init__(self):
                 self.n = 0
