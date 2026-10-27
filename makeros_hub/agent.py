@@ -51,7 +51,7 @@ from .printers.klipper import KLIPPER_ACTIONS
 from . import paper as paper_lane
 from . import checks as check_lane
 from . import wake as wake_lane
-from . import job_files
+from . import job_files, toolpaths
 from .printers.camera import FF_SLOTS, CameraScheduler, camera_source_kind, collect_camera_frames, prime_camera_capabilities
 from .gateway import GATEWAY
 from .live import LiveViews
@@ -1656,6 +1656,7 @@ def run(
     wake_event = threading.Event()
     wake_lane.start(cfg, credential, wake_event, stop_event, on_live=live_views.update)
     job_files.start(cfg, credential, stop_event)   # v0.74: copies OrcaSlicer sends up while the site's open queue asks
+    toolpaths.start(cfg, credential, stop_event, SPOOL_DIR)
 
     # Start the OrcaSlicer ingest server (inbound HTTP on the LAN). Best-effort:
     # if the port is taken we log + continue (heartbeat/telemetry still work).

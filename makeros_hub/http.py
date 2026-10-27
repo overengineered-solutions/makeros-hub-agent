@@ -92,11 +92,13 @@ def post_bytes(
     content_length: int | None = None,
     bearer: str | None = None,
     timeout: float = 15.0,
-) -> int:
-    """POST bytes or a file stream (with content_length); return the HTTP status without parsing JSON.
+    extra_headers: dict[str, str] | None = None,
+    response_body: bool = False,
+) -> int | Response:
+    """POST bytes or a file stream (with content_length); return status, or Response when response_body is requested.
     Files and camera frames travel separately from the size-capped heartbeat. Raises TransportError on a network
     failure; callers are best-effort (a failed upload must never sink the heartbeat)."""
-    headers = {"Content-Type": content_type}
+    headers = {**(extra_headers or {}), "Content-Type": content_type}
     if content_encoding:
         headers["Content-Encoding"] = content_encoding
     if content_length is not None:
@@ -106,11 +108,11 @@ def post_bytes(
     try:
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
         with _OPENER.open(req, timeout=timeout) as resp:
-            _read_capped(resp)  # drain (bounded) so the socket can be reused
-            return resp.status
+            raw = _read_capped(resp)  # drain (bounded) so the socket can be reused
+            return _parse(resp.status, raw) if response_body else resp.status
     except urllib.error.HTTPError as exc:
-        _safe_read(exc)
-        return exc.code
+        body = _safe_read(exc)
+        return Response(exc.code, body) if response_body else exc.code
     except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
         raise TransportError(f"network error posting bytes to {url}: {exc}") from exc
 

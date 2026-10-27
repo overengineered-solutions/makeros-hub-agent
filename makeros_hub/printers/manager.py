@@ -24,6 +24,8 @@ from typing import Any
 
 from ..diagnostics import get_default, redact
 from ..http import MAX_RAW_FILE_BYTES
+from .. import toolpaths
+from ..toolpath import sliced_sha256
 from .queue_progress import write_json_durably
 from .start_guard import StartGuard
 from .threemf_objects import Unreadable3mf, check_plate_entry, gcode_plates, parse_plate_objects, plate_boxes, plate_named, plate_picture
@@ -173,6 +175,12 @@ def _add_plate_facts(body: dict, sliced_3mf, plate: int) -> None:
     """The sliced plate's own picture (base64 PNG) and its objects' first-layer boxes, onto a fetched report's slice, when the file has
     them and the report stays within FETCHED_REPORT_BUDGET."""
     import base64
+    try:
+        body["slice"]["slicedSha256"] = sliced_sha256(sliced_3mf)
+    except OSError:
+        log.warning("sliced plate: could not hash the preview's slice; use the slice pictures")
+    if "pieces" in body["slice"]:
+        return
     boxes = plate_boxes(sliced_3mf, plate)
     if boxes:
         body["slice"]["plateBoxes"] = boxes
@@ -891,8 +899,6 @@ class PrinterManager:
                     body["printerModelId"] = model_id   # the cloud refuses a file sliced for another printer (audit)
                 if sliced is not None:
                     body["slice"] = {k: sliced.get(k) for k in ("grams", "seconds", "supportUsed", "filament", "process", "settings", "prepare", "warnings") if k in sliced}
-                    if "pieces" not in sliced:
-                        _add_plate_facts(body, dest, plate)
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
                 if grams:
                     body["estGrams"] = int(math.ceil(sum(grams)))
@@ -915,10 +921,16 @@ class PrinterManager:
                     body["slice"]["pieces"] = summaries
                     body["estGrams"] = sum(p["grams"] for p in summaries)
                     log.info("cut-piece reports: processed=%d, expected=%d", len(summaries), len(pieces))
+                if sliced is not None:
+                    _add_plate_facts(body, dest, plate)
+                preview = None
+                if sliced is not None and "pieces" not in sliced and body["slice"].get("slicedSha256"):
+                    preview = toolpaths.prepare(job_id, dest, plate, body["slice"]["slicedSha256"], assignment_seq=f.get("assignmentSeq"))
                 resp = report_fetch(body)
                 ok = getattr(resp, "status", None) == 200 and isinstance(getattr(resp, "body", None), dict) and resp.body.get("ok") is True
                 if ok:
                     done += 1
+                    toolpaths.accept(preview)
                     log.info("web upload %s fetched into the spool (plate %d, %d filament(s), estGrams=%s)", job_id, plate, len(items), body.get("estGrams"))
                 else:
                     log.warning("web upload %s: cloud did not accept the fetched report: %s", job_id, getattr(resp, "body", resp))
