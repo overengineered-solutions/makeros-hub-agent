@@ -139,21 +139,27 @@ def plate_boxes(threemf_path, plate: int = 1) -> list[dict]:
             if info.file_size > _MAX_PLATE_JSON:
                 return []
             raw = json.loads(zf.read(info).decode("utf-8"))
+        boxes = raw.get("bbox_objects", []) if isinstance(raw, dict) else []
+        if not isinstance(boxes, list):
+            raise ValueError("bbox_objects must be a list")
+        out: list[dict] = []
+        for b in boxes:
+            box = b.get("bbox") if isinstance(b, dict) else None
+            name = b.get("name") if isinstance(b, dict) else None
+            if not isinstance(name, str) or not isinstance(box, list) or len(box) != 4:
+                continue
+            if not all(type(v) in (int, float) for v in box):
+                continue
+            box = [float(v) for v in box]
+            if not all(math.isfinite(v) for v in box) or not (box[2] > box[0] and box[3] > box[1]):
+                continue
+            out.append({"name": name.strip()[:_MAX_NAME], "bbox": [round(v, 3) for v in box]})
+            if len(out) >= _MAX_BOXES:
+                break
+        return out
     except Exception as exc:  # noqa: BLE001 - boxes never stop a print or its report
         log.info("3mf plate boxes skipped (%s): %s", threemf_path, exc)
         return []
-    out: list[dict] = []
-    for b in raw.get("bbox_objects") or [] if isinstance(raw, dict) else []:
-        box = b.get("bbox") if isinstance(b, dict) else None
-        name = b.get("name") if isinstance(b, dict) else None
-        if not isinstance(name, str) or not isinstance(box, list) or len(box) != 4:
-            continue
-        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in box) or not (box[2] > box[0] and box[3] > box[1]):
-            continue
-        out.append({"name": name.strip()[:_MAX_NAME], "bbox": [round(float(v), 3) for v in box]})
-        if len(out) >= _MAX_BOXES:
-            break
-    return out
 
 
 # v0.80.1 (2026-10-22): OrcaSlicer 2.4.2's Export plate sliced file keeps the plate's own number, so plate 2 of a project exports

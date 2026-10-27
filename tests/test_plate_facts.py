@@ -11,6 +11,8 @@ import zipfile
 import zlib
 from pathlib import Path
 
+import pytest
+
 from makeros_hub.printers import manager as manager_mod
 from makeros_hub.printers.manager import PrinterManager
 from makeros_hub.printers.threemf_objects import PLATE_PICTURE_MAX, plate_boxes, plate_picture
@@ -69,6 +71,36 @@ def test_plate_boxes_are_the_files_own_finite_boxes_named_and_bounded(tmp_path):
     assert plate_boxes(f) == []
     (tmp_path / "junk.3mf").write_bytes(b"not a zip")
     assert plate_boxes(tmp_path / "junk.3mf") == []
+
+
+@pytest.mark.parametrize("boxes", [1, True, None, "bad", {"name": "bad"},
+                                   [{"name": "huge", "bbox": [0, 0, 10 ** 400, 1]}]])
+def test_malformed_boxes_never_escape_the_optional_parser(tmp_path, caplog, boxes):
+    f = tmp_path / "bad.3mf"
+    sliced(f, boxes={"bbox_objects": boxes})
+    with caplog.at_level("INFO", logger="makeros-hub.printers"):
+        assert plate_boxes(f) == []
+    assert "3mf plate boxes skipped" in caplog.text
+
+
+@pytest.mark.parametrize("boxes", [1, [{"name": "huge", "bbox": [0, 0, 10 ** 400, 1]}]])
+def test_malformed_first_plate_does_not_stop_the_heartbeat_dispatch_pass(tmp_path, boxes):
+    manager = PrinterManager()
+    first, second = FakeAdapter(), FakeAdapter()
+    manager._adapters.update(p1=first, p2=second)
+    assignments = []
+    for number, metadata in ((1, {"bbox_objects": boxes}), (2, BOXES)):
+        path = tmp_path / f"abcdef1{number}" / "part.3mf"
+        path.parent.mkdir()
+        _write_3mf_with_objects(path, plate=2, objects=[(286, "Cube"), (287, "Sphere")])
+        with zipfile.ZipFile(path, "a") as z:
+            z.writestr("Metadata/plate_2.json", json.dumps(metadata))
+        assignments.append(assignment(queueJobId=f"q{number}", printerId=f"p{number}", submissionUid=path.parent.name))
+    reports = manager.dispatch_assignments(assignments, tmp_path)
+    assert [r["state"] for r in reports] == ["uploading", "uploading"]
+    assert [r["queueJobId"] for r in reports] == ["q1", "q2"]
+    assert "plateBoxes" not in reports[0] and len(reports[1]["plateBoxes"]) == 2
+    assert len(first.calls) == len(second.calls) == 1
 
 
 def _slice(tmp_path, picture, boxes):
