@@ -1,6 +1,7 @@
 """Durable optional previews: accepted fetched reports feed a worker, never the printer/heartbeat lane."""
 from __future__ import annotations
 
+import io
 import json
 import logging
 import math
@@ -42,6 +43,7 @@ def read(path):
             or type(state.get("plate")) is not int or not 1 <= state["plate"] <= 64
             or type(state.get("assignmentSeq")) is not int or not 0 <= state["assignmentSeq"] <= 2 ** 31 - 1
             or type(state.get("accepted")) is not bool or state.get("state") not in STATES
+            or ("unavailable" in state and state["unavailable"] not in ("failed", "too_large"))
             or type(state.get("attempt")) is not int or not 0 <= state["attempt"] <= 1000
             or any(type(state.get(k)) not in (int, float) or not math.isfinite(state[k]) or state[k] < 0 for k in ("expires", "next"))):
         raise ValueError("invalid toolpath state")
@@ -134,20 +136,33 @@ def process(path, url_for, bearer, *, now=None, poster=post_bytes, builder=gener
         if sliced_sha256(sliced) != state["sha256"]:
             finish("stopped")
             return
-        if not output.exists():
-            partial.unlink(missing_ok=True)
-            builder(sliced, state["plate"], state["sha256"], partial)
-            with partial.open("rb") as data:
-                os.fsync(data.fileno())
-            os.replace(partial, output)
+        if not state.get("unavailable"):
+            try:
+                if not output.exists():
+                    partial.unlink(missing_ok=True)
+                    builder(sliced, state["plate"], state["sha256"], partial)
+                    with partial.open("rb") as data:
+                        os.fsync(data.fileno())
+                    os.replace(partial, output)
+                if output.stat().st_size > MAX_BYTES:
+                    raise PreviewFailed("too_large")
+            except Exception as exc:
+                reason = "too_large" if isinstance(exc, PreviewFailed) and exc.reason == "too_large" else "failed"
+                detail = (reason if isinstance(exc, PreviewFailed) else "preview deadline exceeded" if isinstance(exc, subprocess.TimeoutExpired)
+                          else f"preview failed ({type(exc).__name__})")
+                line = exc.line if isinstance(exc, PreviewFailed) else 0
+                log.warning("toolpath %s: %s at line %d; the 3D preview is unavailable, use the slice pictures",
+                            state["jobId"], detail, line)
+                state["unavailable"] = reason
+                save(path, state)
+        unavailable = state.get("unavailable")
+        if unavailable:
+            discard_bytes(path)
         if not sliced.exists() or not path.exists():
             discard_bytes(path)
             return
         if sliced_sha256(sliced) != state["sha256"]:
             finish("stopped")
-            return
-        if output.stat().st_size > MAX_BYTES:
-            finish("too_large", "too_large")
             return
         remaining = state["expires"] - now - (time.monotonic() - started)
         if remaining <= 0:
@@ -157,10 +172,12 @@ def process(path, url_for, bearer, *, now=None, poster=post_bytes, builder=gener
         state["attempt"] += 1
         state["next"] = now + min(300, 10 * 2 ** min(state["attempt"] - 1, 5))
         save(path, state)
-        with output.open("rb") as data:
+        with io.BytesIO() if unavailable else output.open("rb") as data:
             response = poster(url_for(state["jobId"]), data, bearer=bearer, timeout=min(30.0, remaining),
-                              content_type="application/vnd.ps.toolpath", content_encoding="gzip", content_length=output.stat().st_size,
-                              extra_headers={"X-PS-Sliced-Sha256": state["sha256"], "X-PS-Plate": str(state["plate"])}, response_body=True)
+                              content_type="application/vnd.ps.toolpath", content_encoding=None if unavailable else "gzip",
+                              content_length=0 if unavailable else output.stat().st_size,
+                              extra_headers={"X-PS-Sliced-Sha256": state["sha256"], "X-PS-Plate": str(state["plate"]),
+                                             **({"X-PS-Toolpath-Unavailable": unavailable} if unavailable else {})}, response_body=True)
         if response.status == 204:
             finish("stored")
         elif response.status == 404 or response.status == 409 and response.body.get("error") == "slice_mismatch":
@@ -173,10 +190,6 @@ def process(path, url_for, bearer, *, now=None, poster=post_bytes, builder=gener
             finish("failed", f"upload refused ({response.status})")
     except TransportError:
         log.warning("toolpath %s: upload connection failed, retrying", state["jobId"])
-    except PreviewFailed as exc:
-        finish(exc.reason, exc.reason, exc.line)
-    except subprocess.TimeoutExpired:
-        finish("failed", "preview deadline exceeded")
     except Exception as exc:
         finish("failed", f"preview failed ({type(exc).__name__})")
 
