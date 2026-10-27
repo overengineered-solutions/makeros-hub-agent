@@ -136,7 +136,7 @@ _QUERY_OBJECTS = (
     + "&virtual_sdcard=progress"
     "&display_status=progress,message"
     "&toolhead=homed_axes,position,axis_minimum,axis_maximum"
-    "&stepper_enable=steppers&gcode_macro%20m84=release_seq"
+    "&stepper_enable=steppers&gcode_macro%20M84=release_seq"
     "&idle_timeout=state"
     # v0.76: the shared touchscreen's readings (speed, Z offset, part fan, light). The SV08 has no [fan]: its M106 macro
     # drives "fan_generic fan0" and fan1 together, so fan0 stands in for it.
@@ -150,7 +150,7 @@ _QUERY_OBJECTS = (
     # v0.86: Klipper's own state ("shutdown" after an MCU, heater or M112 fault, with its message), and the re-home corners
     # the printer's PS macros name (printers/*/config: _PS_CORNERS). A printer without them answers null attributes.
     "&webhooks=state,state_message"
-    "&gcode_macro%20_ps_corners=fl,fr,bl,br"
+    "&gcode_macro%20_PS_CORNERS=fl,fr,bl,br"
 )
 _SHUTDOWN = "shutdown"
 # v0.86 (operator, 2026-10-26: "i want to do as much as we can by using as much information as we can to keep everything fully
@@ -282,10 +282,10 @@ _LONG_ACTIONS = frozenset({"home", "center", "load_filament", "load_more", "unlo
 # and a print just started from the screen or the queue must never get a jog inside its start routine).
 # v0.79 adds the heat, the probe and Sovol's load temperature variable (Klipper leaves out an object a printer lacks).
 _ACTION_QUERY = ("print_stats=state&toolhead=homed_axes,position,axis_minimum,axis_maximum&extruder=temperature,target"
-                 "&stepper_enable=steppers&gcode_macro%20m84=release_seq"
+                 "&stepper_enable=steppers&gcode_macro%20M84=release_seq"
                  "&heater_bed=temperature,target&probe=is_calibrated"
                  "&gcode_macro%20_global_var=load_filament_extruder_temp,cancel_park&gcode_macro%20_pstation_resume_heat=nozzle"
-                 "&gcode_macro%20_pstation_hold=active&webhooks=state&gcode_macro%20_ps_corners=fl,fr,bl,br,xy_extra_lift"
+                 "&gcode_macro%20_pstation_hold=active&webhooks=state&gcode_macro%20_PS_CORNERS=fl,fr,bl,br,xy_extra_lift"
                  "&gcode_move=homing_origin")
 _JOG_STEPS_MM = frozenset({0.1, 1.0, 10.0, 50.0})
 _JOG_FEED = {"x": 6000, "y": 6000, "z": 600}
@@ -425,6 +425,7 @@ class KlipperAdapter:
         self._corner: Optional[dict] = None
         self._z_rec = False
         self._release_seq: Optional[int] = None
+        self._motor_enabled: dict[str, bool] = {}
         self._trust_generation = 0   # a stop must also invalidate a home whose reply is still in flight
         self._fil_at: Optional[float] = None
         self._z_tuned = 0.0
@@ -1185,14 +1186,21 @@ class KlipperAdapter:
         def run() -> None:
             try:
                 self._post_ok(_script_path(script), LONG_ACTION_TIMEOUT_SEC)
+                verified = False
+                if action in _PROVES_HOME or action in _PROVES_XY:
+                    fresh = self._fetch_once(_ACTION_QUERY, timeout=ACTION_WAIT_SEC)
+                    enabled = self._note_homed(fresh)
+                    homed = _obj(fresh, "toolhead").get("homed_axes")
+                    axes = "xyz" if action in _PROVES_HOME or action == "rehome_xy" else "xy"
+                    verified = enabled and isinstance(homed, str) and set(axes) <= set(homed.lower())
                 outcome.append(None)
                 log.info("klipper %s: action %s finished", self.printer_id, action)
                 with self._lock:
-                    if action in _PROVES_HOME and generation == self._trust_generation:
+                    if action in _PROVES_HOME and verified and generation == self._trust_generation:
                         self._home_proven = True
-                    if action in _PROVES_XY and generation == self._trust_generation:
+                    if action in _PROVES_XY and verified and generation == self._trust_generation:
                         self._xy_proven = True
-                    if action == "rehome_xy" and generation == self._trust_generation:
+                    if action == "rehome_xy" and verified and generation == self._trust_generation:
                         self._z_rec = True   # Z is the recorded height plus the lift: trusted for corner moves only
                     done_stop = dict(self._stop_pt, rehomed=True) if action == "home_z_corner" and self._stop_pt else None
                     if done_stop:
@@ -1223,26 +1231,31 @@ class KlipperAdapter:
             return {"ok": False, "reason": outcome[0]}
         return {"ok": True, "detail": "done" if outcome else "started"}
 
-    def _invalidate_home(self) -> None:
+    def _invalidate_home(self, *, fence: bool = True) -> None:
         """Under _lock: a release or uncertain position also makes the original stop height unsafe to reuse."""
         self._home_proven = self._xy_proven = self._z_rec = False
         self._corner = None
-        self._trust_generation += 1
+        if fence:
+            self._trust_generation += 1
         if self._stop_pt:
             self._stop_pt = dict(self._stop_pt, recoveryAttempted=True)
 
-    def _note_homed(self, status: dict[str, Any]) -> None:
+    def _note_homed(self, status: dict[str, Any]) -> bool:
         """A reading (the poll or an action's fresh read) where any axis is not homed ends the proven home: motors off, a
         Klipper restart, a print's own M84. The Giga marks released axes homed, so read the drivers and its release counter."""
         steppers = _obj(status, "stepper_enable").get("steppers")
         enabled = (isinstance(steppers, dict) and all(steppers.get(f"stepper_{a}") is True for a in "xyz")
                    and all(v is True for k, v in steppers.items() if k.startswith("stepper_")))
-        release_seq = _int(_obj(status, "gcode_macro m84").get("release_seq"))
+        release_seq = _int(_obj(status, "gcode_macro M84").get("release_seq"))
         with self._lock:
             released = self._release_seq is not None and release_seq != self._release_seq
             self._release_seq = release_seq
+            known = isinstance(steppers, dict) and all(type(steppers.get(f"stepper_{a}")) is bool for a in "xyz")
+            released = released or not known or any(on and steppers.get(k) is not True for k, on in self._motor_enabled.items())
+            self._motor_enabled = {k: v for k, v in steppers.items() if k.startswith("stepper_")} if known else {}
             if not enabled or released:
-                self._invalidate_home()
+                # Axes still waiting for their first home are disabled too; only a release invalidates that home's reply.
+                self._invalidate_home(fence=released or self._running_action not in _HOMING_ACTIONS)
         if not _all_homed(status):
             homed = _obj(status, "toolhead").get("homed_axes")
             with self._lock:
@@ -1250,6 +1263,7 @@ class KlipperAdapter:
                 self._z_rec = False
                 if not (isinstance(homed, str) and set("xy") <= set(homed.lower())):
                     self._xy_proven = self._z_rec = False
+        return enabled
 
     def _after_poll(self, data: dict[str, Any]) -> None:
         """v0.79, on the poll thread after each good reading: the proven home, the per-print Z tune, the pause watch, the
@@ -2155,7 +2169,7 @@ def _stop_point(status: dict[str, Any], at_ms: int) -> dict:
 
 def _corners_of(status: dict[str, Any]) -> Optional[dict]:
     """The printer's re-home corners (its PS macro _PS_CORNERS: the nozzle's X Y for each), all four or none."""
-    c = _obj(status, "gcode_macro _ps_corners")
+    c = _obj(status, "gcode_macro _PS_CORNERS")
     out = {}
     for name in CORNERS:
         v = c.get(name)
@@ -2298,7 +2312,7 @@ def _check_rehome(params: dict, status: dict[str, Any], *, home_proven: bool, xy
         if not known and stop.get("recoveryAttempted"):
             raise _Refused("z_unknown")
         z = pos[2] if known else stop_z
-        extra = _obj(status, "gcode_macro _ps_corners").get("xy_extra_lift")
+        extra = _obj(status, "gcode_macro _PS_CORNERS").get("xy_extra_lift")
         if extra is None:
             extra = 5.0   # older macros omit this attribute (Moonraker may return null); reserve Anaya's lift
         if not _finite(extra) or extra < 0:

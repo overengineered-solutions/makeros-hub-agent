@@ -1024,7 +1024,7 @@ STOP = klipper._stop_point(STOPPED, 1761507636000)
 
 def restarted(**toolhead):   # after FIRMWARE_RESTART: standby, Elegoo's boot home faked at 110, 110, 0, the corners macro in
     return {**GIGA, "print_stats": {"state": "standby"}, "webhooks": {"state": "ready"},
-            "gcode_macro _ps_corners": {**GIGA_CORNERS, "xy_extra_lift": 0.0},
+            "gcode_macro _PS_CORNERS": {**GIGA_CORNERS, "xy_extra_lift": 0.0},
             "gcode_move": {"homing_origin": [0.0, 0.0, 0.0, 0.0]},
             "toolhead": {**GIGA["toolhead"], "position": [110.0, 110.0, 0.0, 0.0], **toolhead}}
 
@@ -1136,7 +1136,7 @@ class TestRehomeRules(unittest.TestCase):
         self.assertEqual(rehome_refusal({"action": "move_corner", "corner": "fl"}, st, xy_proven=True), "z_unknown")
         low = restarted(position=[815.0, 805.0, 414.0, 0.0])   # under the print's top + 5
         self.assertEqual(rehome_refusal({"action": "move_corner", "corner": "fl"}, low, xy_proven=True, z_rec=True), "below_print")
-        bare = {**st, "gcode_macro _ps_corners": {}}
+        bare = {**st, "gcode_macro _PS_CORNERS": {}}
         self.assertEqual(rehome_refusal({"action": "move_corner", "corner": "fl"}, bare, xy_proven=True, z_rec=True), "unsupported_on_printer")
         self.assertEqual(rehome_refusal({"action": "move_corner", "corner": "xx"}, st, xy_proven=True, z_rec=True), "bad_params")
 

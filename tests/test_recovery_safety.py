@@ -37,7 +37,7 @@ def test_repeated_recovery_uses_current_height_and_refuses_at_real_travel_limit(
     height = a._stop_pt["z"]
     for _ in range(5):
         fresh = restarted(position=[100, 100, height, 0], axis_maximum=[816, 806, top, 0])
-        fresh["gcode_macro _ps_corners"]["xy_extra_lift"] = extra
+        fresh["gcode_macro _PS_CORNERS"]["xy_extra_lift"] = extra
         a._fetch_once.return_value = fresh
         result = act(a)
         if not result["ok"]:
@@ -87,16 +87,16 @@ def test_recovery_never_moves_when_attempt_cannot_be_saved_durably():
 
 def test_old_macro_without_lift_metadata_reserves_anayas_extra_five_mm():
     fresh = restarted(axis_maximum=[502, 505, 505, 0])
-    del fresh["gcode_macro _ps_corners"]["xy_extra_lift"]
+    del fresh["gcode_macro _PS_CORNERS"]["xy_extra_lift"]
     assert rehome({"action": "rehome_xy"}, fresh, stop={**STOP, "z": 480}) == "PS_REHOME_XY Z=480 LIFT=19"
-    fresh["gcode_macro _ps_corners"]["xy_extra_lift"] = None
+    fresh["gcode_macro _PS_CORNERS"]["xy_extra_lift"] = None
     assert rehome({"action": "rehome_xy"}, fresh, stop={**STOP, "z": 480}) == "PS_REHOME_XY Z=480 LIFT=19"
     assert rehome_refusal({"action": "rehome_xy"}, fresh, stop={**STOP, "z": 495}) == "no_room_to_lift"
 
 
 def test_anayas_offset_counts_in_the_lift_and_a_downward_or_unknown_offset_is_refused():
     fresh = restarted(axis_maximum=[502, 505, 505, 0])
-    fresh["gcode_macro _ps_corners"]["xy_extra_lift"] = 5.0
+    fresh["gcode_macro _PS_CORNERS"]["xy_extra_lift"] = 5.0
     fresh["gcode_move"]["homing_origin"][2] = 2.0
     assert rehome({"action": "rehome_xy"}, fresh, stop={**STOP, "z": 480}) == "PS_REHOME_XY Z=480 LIFT=17"
     fresh["gcode_move"]["homing_origin"][2] = -6.0
@@ -131,9 +131,9 @@ def test_motor_release_or_missing_enable_reading_ends_trust_despite_homed_xyz(st
 
 def test_m84_and_reenable_between_reads_still_loses_home():
     a = adapter()
-    a._note_homed({**restarted(), "gcode_macro m84": {"release_seq": 1}})
+    a._note_homed({**restarted(), "gcode_macro M84": {"release_seq": 1}})
     a._home_proven = a._xy_proven = a._z_rec = True
-    a._fetch_once.return_value = {**restarted(), "gcode_macro m84": {"release_seq": 2}}
+    a._fetch_once.return_value = {**restarted(), "gcode_macro M84": {"release_seq": 2}}
     assert act(a, "jog", axis="x", mm=1)["reason"] == "not_homed"
     assert act(a, "jog", axis="x", mm=1)["reason"] == "not_homed"
     assert act(a)["reason"] == "z_unknown"
@@ -167,3 +167,34 @@ def test_stop_while_home_reply_is_in_flight_cannot_restore_trust():
         time.sleep(0.001)
     assert a._running_action is None
     assert not (a._home_proven or a._xy_proven or a._z_rec)
+
+
+@pytest.mark.parametrize("release_during_home", [False, True])
+def test_homing_from_disabled_axes_earns_trust_unless_a_motor_is_released(release_during_home):
+    a = adapter()
+    disabled = {**restarted(), "stepper_enable": {"steppers": {f"stepper_{axis}": False for axis in "xyz"}}}
+    a._fetch_once.side_effect = [disabled, restarted()]
+    def home(*args):
+        a._note_homed(disabled)   # the first axis has not started yet
+        a._note_homed({**disabled, "stepper_enable": {"steppers": {"stepper_x": True, "stepper_y": False, "stepper_z": False}}})
+        if release_during_home:
+            a._note_homed(disabled)
+    a._post_ok.side_effect = home
+    assert act(a, "home")["ok"]
+    assert a._home_proven is (not release_during_home)
+    assert a._xy_proven is (not release_during_home)
+
+
+def test_home_reply_without_fresh_enabled_axes_never_grants_trust():
+    a = adapter()
+    disabled = {**restarted(), "stepper_enable": {"steppers": {f"stepper_{axis}": False for axis in "xyz"}}}
+    a._fetch_once.side_effect = [restarted(), disabled]
+    assert act(a, "home")["ok"]
+    assert not (a._home_proven or a._xy_proven)
+
+
+def test_queries_use_the_macro_objects_case_sensitive_configured_names():
+    for query in (klipper._QUERY_OBJECTS, klipper._ACTION_QUERY):
+        objects = klipper.urllib.parse.parse_qs(query)
+        assert "release_seq" in objects["gcode_macro M84"][0].split(",")
+        assert "gcode_macro _PS_CORNERS" in objects
