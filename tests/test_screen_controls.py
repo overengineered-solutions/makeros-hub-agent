@@ -34,15 +34,15 @@ def at(x, y, z, base=IDLE, **toolhead) -> dict:
     return {**base, "toolhead": {**base["toolhead"], "position": [x, y, z, 0.0], **toolhead}}
 
 
-def plan(params, status=IDLE, proven=True, z_tuned=0.0):
+def plan(params, status=IDLE, proven=True, z_tuned=0.0, xy=False):
     """_parse_action, then _check_state: the adapter's own order once it is connected. -> (action, script, need)."""
     action, script, need = _parse_action(params)
-    return action, _check_state(params, script, status, home_proven=proven, z_tuned=z_tuned), need
+    return action, _check_state(params, script, status, home_proven=proven, z_tuned=z_tuned, xy_proven=xy), need
 
 
-def refusal(params, status=IDLE, proven=True, z_tuned=0.0) -> str:
+def refusal(params, status=IDLE, proven=True, z_tuned=0.0, xy=False) -> str:
     try:
-        plan(params, status, proven, z_tuned)
+        plan(params, status, proven, z_tuned, xy)
     except _Refused as r:
         return r.reason
     return "accepted"
@@ -89,7 +89,9 @@ class TestParams(unittest.TestCase):
         middle = at(250.0, 250.0, 250.0)
         for mm in (0.1, -0.1, 1, -1, 1.0, 10, -10, 50, -50.0):
             for axis in "xyz":
-                self.assertEqual(refusal({"action": "jog", "axis": axis, "mm": mm}, middle), "accepted", (axis, mm))
+                # v0.85: a jog down in Z is at most JOG_Z_DOWN_MAX_MM (1) a tap; up and sideways keep every step
+                want = "z_down_step" if axis == "z" and mm < -1 else "accepted"
+                self.assertEqual(refusal({"action": "jog", "axis": axis, "mm": mm}, middle), want, (axis, mm))
         for mm in (0, 0.5, 5, 2, 100, -100, 0.01, 0.10000001, True, "10", None, float("nan"), float("inf")):
             self.assertEqual(refusal({"action": "jog", "axis": "x", "mm": mm}), "bad_params", mm)
         for axis in ("X", "e", "xy", "", 1, None, ["x"], {"x": 1}):
@@ -156,8 +158,9 @@ class TestStateRules(unittest.TestCase):
         {"action": "jog", "axis": "x", "mm": 1}, {"action": "preheat", "material": "PLA"}]
     FILAMENT = [{"action": "load_filament", "material": "PLA"}, {"action": "unload_filament", "material": "PETG"},
                 {"action": "load_more"}]
-    PRINT_ONLY = [{"action": "z_offset", "delta": 0.01}, {"action": "speed", "pct": 100}, {"action": "fan", "pct": 50}]
-    ANY = [{"action": "light", "on": True}, {"action": "emergency_stop"}, {"action": "firmware_restart"}]
+    PRINT_ONLY = [{"action": "z_offset", "delta": 0.01}, {"action": "speed", "pct": 100}]
+    # v0.85: the part fan joins them (the Controls tab turns it on or off on an idle printer)
+    ANY = [{"action": "light", "on": True}, {"action": "emergency_stop"}, {"action": "firmware_restart"}, {"action": "fan", "pct": 50}]
 
     def test_moves_and_heat_are_refused_during_a_print(self):
         for s in ("printing", "paused"):
@@ -236,14 +239,14 @@ class TestJogLimits(unittest.TestCase):
         # into the plate; now JOG_Z_FLOOR_MM (2), or position_min when that is higher
         jog = lambda mm, st=IDLE: refusal({"action": "jog", "axis": "z", "mm": mm}, st)   # noqa: E731
         self.assertEqual(jog(-1), "accepted")                         # 10 -> 9
-        self.assertEqual(jog(-10), "z_floor")                         # 10 -> 0
+        self.assertEqual(jog(-1, at(100.0, 200.0, 2.5)), "z_floor")   # 2.5 -> 1.5
         self.assertEqual(jog(-1, at(100.0, 200.0, 3.0)), "accepted")  # 3 -> 2, exactly the floor
         self.assertEqual(jog(-0.1, at(100.0, 200.0, 2.0)), "z_floor")
         self.assertEqual(jog(1, at(100.0, 200.0, 0.0)), "accepted")   # up is always the way out
-        high_floor = at(100.0, 200.0, 10.0, axis_minimum=[0.0, 0.0, 5.0, 0.0])
-        self.assertEqual(jog(-10, high_floor), "z_floor")
+        high_floor = at(100.0, 200.0, 5.5, axis_minimum=[0.0, 0.0, 5.0, 0.0])
+        self.assertEqual(jog(-1, high_floor), "z_floor")
         self.assertEqual(jog(-1, at(100.0, 200.0, 6.0, high_floor)), "accepted")
-        self.assertEqual(jog(-10, at(100.0, 200.0, 250.0)), "accepted")
+        self.assertEqual(jog(-10, at(100.0, 200.0, 250.0)), "z_down_step")   # v0.85: down is at most 1 mm a tap
 
     def test_sideways_only_clear_of_the_plate(self):
         # v0.79 (report D2): no X/Y move with the nozzle under the floor (its clips, the SV08's wiper brush)
@@ -826,6 +829,170 @@ class TestResume(unittest.TestCase):
     def test_not_paused_goes_to_moonraker_as_before(self):
         self.resume(dict(PRINTING), 220.0)
         self.assertEqual(self.mr.posts, [("/printer/print/resume", None)])
+
+
+# v0.85: the printer page's Controls tab (operator, 2026-10-26: "we nee da tab for movement and commands where i can do stops
+# and stuff"). Giga-shaped: X/Y home to the back-right corner (axis_maximum 815.5, 805.5), Z to 1020, no Sovol park variable.
+GIGA = {**IDLE, "toolhead": {"homed_axes": "xyz", "position": [359.9, 392.0, 10.0, 0.0],
+                             "axis_minimum": [-5.0, -1.0, -8.75, 0.0], "axis_maximum": [815.5, 805.5, 1020.0, 0.0]},
+        "gcode_macro _global_var": {}}
+# What the Controls tab sends (pstation src/lib/printer-controls.ts): each must be in the list the heartbeat reports.
+TAB = [{"action": "home"}, {"action": "home_xy"}, {"action": "home_z"}, {"action": "jog", "axis": "x", "mm": 10},
+       {"action": "jog", "axis": "z", "mm": -1}, {"action": "park"}, {"action": "nozzle_temp", "to": "PLA"},
+       {"action": "nozzle_temp", "to": "off"}, {"action": "bed_temp", "to": "PETG"}, {"action": "bed_temp", "to": "off"},
+       {"action": "cooldown"}, {"action": "fan", "pct": 100}, {"action": "fan", "pct": 0}, {"action": "motors_off"},
+       {"action": "emergency_stop"}, {"action": "firmware_restart"}]
+
+
+class TestControlsTab(unittest.TestCase):
+    def test_the_heartbeat_lists_exactly_the_actions_this_hub_runs(self):
+        from makeros_hub.agent import heartbeat_payload
+        self.assertEqual(heartbeat_payload()["klipperActions"], sorted(klipper._ACTION_PARAMS))
+        self.assertLessEqual({p["action"] for p in TAB}, set(klipper.KLIPPER_ACTIONS))
+
+    def test_anything_off_the_list_is_refused_before_any_state_is_read(self):
+        for params in ({"action": "gcode", "script": "G28"}, {"action": "G28 X Y"}, {"action": "home_all"},
+                       {"action": "move_to", "x": 1, "y": 2}, {"action": "set_temp", "heater": "extruder", "target": 300},
+                       {"action": "M112"}, {"action": "park", "x": 0}, {"action": "nozzle_temp", "to": 300},
+                       {"action": "nozzle_temp", "to": "ABS"}, {"action": "bed_temp", "to": "PLA", "zone": 2},
+                       {"action": "nozzle_temp"}):
+            self.assertIn(refusal(params, {}), ("unsupported_action", "bad_params"), params)
+        a = KlipperAdapter("p", "http://127.0.0.1:1")   # never polled: validation comes first
+        self.assertEqual(a.send_command("klipper_action", {"action": "gcode", "script": "M84"})["reason"], "unsupported_action")
+        self.assertEqual(a.send_command("gcode", {"script": "M84"})["reason"], "unsupported_command")
+
+    def test_the_new_actions_send_exactly_their_named_commands(self):
+        self.assertEqual(plan({"action": "home_xy"}, GIGA)[1], "G28 X Y")
+        self.assertEqual(plan({"action": "home_z"}, GIGA, xy=True)[1], "G28 Z\nG90\nG1 Z10 F600")
+        for to, nozzle, bed in (("PLA", 215, 60), ("PETG", 240, 70), ("off", 0, 0)):
+            self.assertEqual(plan({"action": "nozzle_temp", "to": to})[1], f"M104 S{nozzle}")
+            self.assertEqual(plan({"action": "bed_temp", "to": to})[1], f"M140 S{bed}")   # the Giga's M140 sets all four zones
+        self.assertEqual(plan({"action": "fan", "pct": 100})[1], "M106 S255")   # idle: on and off from the tab
+        self.assertEqual(plan({"action": "fan", "pct": 0})[1], "M106 S0")
+
+    def test_every_motion_and_heat_is_refused_during_a_print_or_a_pause_and_while_held(self):
+        held = {**state("error"), "gcode_macro _pstation_hold": {"active": True}}
+        for s in (state("printing"), state("paused"), held):
+            for params in TAB:
+                a = params["action"]
+                if a in ("emergency_stop", "firmware_restart", "fan") or (a == "cooldown" and s is held):
+                    continue   # the way out, the fan (the screen's tune), and Cool down letting a hold go
+                self.assertEqual(refusal(params, s, xy=True), "printer_busy", (s["print_stats"], params))
+
+    def test_a_jog_or_park_needs_a_home_this_hub_saw_and_a_readable_printer(self):
+        for params in ({"action": "jog", "axis": "x", "mm": 1}, {"action": "jog", "axis": "z", "mm": 1}, {"action": "park"}):
+            self.assertEqual(refusal(params, GIGA, proven=False), "not_homed", params)
+            self.assertEqual(refusal(params, at(1.0, 2.0, 10.0, GIGA, homed_axes="xy")), "not_homed", params)
+            self.assertEqual(refusal(params, {}), "printer_stale", params)                       # no state in the read
+            self.assertEqual(refusal(params, {"print_stats": {"state": "standby"}, "toolhead": {"homed_axes": "xyz"}}),
+                             "printer_stale", params)                                            # no position or limits
+
+    def test_a_stale_poll_sends_nothing(self):
+        mr = Moonraker()
+        self.addCleanup(mr.close)
+        a = KlipperAdapter("p1", mr.url)
+        a._record_poll(dict(GIGA))
+        a._home_proven = a._xy_proven = True
+        a._last_poll_ok_at = time.monotonic() - klipper.STALE_SEC - 1
+        for params in TAB:
+            self.assertEqual(a.send_command("klipper_action", params)["reason"], "not_connected", params)
+        self.assertEqual(mr.posts, [])
+
+    def test_down_in_z_is_one_millimetre_at_most(self):
+        high = at(400.0, 400.0, 400.0, GIGA)
+        for mm in (-10, -50):
+            self.assertEqual(refusal({"action": "jog", "axis": "z", "mm": mm}, high), "z_down_step", mm)
+        for mm in (-1, -0.1, 0.1, 1, 10, 50):
+            self.assertEqual(refusal({"action": "jog", "axis": "z", "mm": mm}, high), "accepted", mm)
+        self.assertEqual(klipper.JOG_Z_DOWN_MAX_MM, 1.0)
+
+    def test_home_z_travels_on_an_xy_home_this_hub_saw(self):
+        self.assertEqual(refusal({"action": "home_z"}, GIGA), "home_xy_first")                       # Klipper's homed_axes alone
+        self.assertEqual(refusal({"action": "home_z"}, at(1.0, 2.0, 3.0, GIGA, homed_axes="z"), xy=True), "home_xy_first")
+        self.assertEqual(refusal({"action": "home_z"}, at(1.0, 2.0, 3.0, GIGA, homed_axes="xy"), xy=True), "accepted")
+        self.assertEqual(refusal({"action": "home_z"}, {**GIGA, "heater_bed": {"temperature": 95.0}}, xy=True), "bed_too_hot")
+
+    def test_park_lifts_first_then_goes_back_right_on_the_giga(self):
+        # from Z10: up 40 to Z50 (PARK_Z_MIN_MM), then X/Y 15 mm in from the back-right corner
+        self.assertEqual(plan({"action": "park"}, GIGA)[1], "G91\nG1 Z40 F600\nG90\nG1 X800.5 Y790.5 F6000")
+        # high already: 10 more, never down
+        self.assertEqual(plan({"action": "park"}, at(359.9, 392.0, 410.37, GIGA))[1],
+                         "G91\nG1 Z10 F600\nG90\nG1 X800.5 Y790.5 F6000")
+        # near the top: capped 1 mm under axis_maximum, and no lift at all from there
+        self.assertEqual(plan({"action": "park"}, at(1.0, 1.0, 1015.0, GIGA))[1], "G91\nG1 Z4 F600\nG90\nG1 X800.5 Y790.5 F6000")
+        self.assertEqual(plan({"action": "park"}, at(1.0, 1.0, 1019.5, GIGA))[1], "G90\nG1 X800.5 Y790.5 F6000")
+        # from under the jog floor it still goes up first (park is the way off the plate)
+        self.assertTrue(plan({"action": "park"}, at(100.0, 100.0, 0.4, GIGA))[1].startswith("G91\nG1 Z49.6 F600\n"))
+
+    def test_park_uses_the_printers_own_park_when_it_names_one(self):
+        sv08 = {**IDLE, "gcode_macro _global_var": {"load_filament_extruder_temp": 250,
+                                                     "cancel_park": {"x": -2, "y": 501, "z": 10, "e": 1}},
+                "toolhead": {**IDLE["toolhead"], "axis_minimum": [-11.0, -1.0, -10.0, 0.0], "axis_maximum": [502.0, 505.0, 505.0, 0.0]}}
+        self.assertEqual(plan({"action": "park"}, sv08)[1], "G91\nG1 Z40 F600\nG90\nG1 X-2 Y501 F6000")
+        self.assertIn("cancel_park", klipper._ACTION_QUERY)
+        outside = {**sv08, "gcode_macro _global_var": {"cancel_park": {"x": 900, "y": 501}}}
+        self.assertEqual(refusal({"action": "park"}, outside), "out_of_range")
+        junk = {**sv08, "gcode_macro _global_var": {"cancel_park": {"x": "left", "y": 501}}}
+        self.assertEqual(plan({"action": "park"}, junk)[1], "G91\nG1 Z40 F600\nG90\nG1 X487 Y490 F6000")   # back-right
+
+
+class TestXYHome(unittest.TestCase):
+    """v0.85: Home X/Y earns the X/Y home Home Z needs; Home Z on it earns the full home a jog needs; both end as v0.79's did."""
+
+    def setUp(self):
+        self.mr = Moonraker()
+        self.addCleanup(self.mr.close)
+        self.mr.status = dict(GIGA)
+        self.a = KlipperAdapter("p1", self.mr.url)
+        self.a._record_poll(dict(GIGA))
+
+    def finish(self, **params):
+        out = self.a.send_command("klipper_action", params)
+        self.assertTrue(_wait(lambda: self.a._running_action is None))
+        return out
+
+    def test_xy_then_z_earns_the_home_and_the_status_says_which(self):
+        self.assertEqual(self.a.status()["toolhead"]["homed"], "")
+        self.assertEqual(self.finish(action="home_z")["reason"], "home_xy_first")
+        self.assertTrue(self.finish(action="home_xy")["ok"])
+        self.assertEqual(self.a.status()["toolhead"]["homed"], "xy")
+        self.assertEqual(self.finish(action="jog", axis="x", mm=1)["reason"], "not_homed")   # Z is not trusted yet
+        self.assertTrue(self.finish(action="home_z")["ok"])
+        self.assertEqual(self.a.status()["toolhead"]["homed"], "xyz")
+        self.assertTrue(self.finish(action="jog", axis="x", mm=1)["ok"])
+        self.assertEqual([p[1] for p in self.mr.posts], ["G28 X Y", "G28 Z\nG90\nG1 Z10 F600", "G91\nG1 X1 F6000\nG90"])
+
+    def test_motors_off_a_stop_an_unhomed_reading_or_another_homing_action_end_it(self):
+        for action in ("motors_off", "emergency_stop", "firmware_restart", "bed_mesh"):
+            self.a._home_proven = self.a._xy_proven = True
+            self.finish(action=action)
+            self.assertFalse(self.a._home_proven or self.a._xy_proven, action)
+        self.a._home_proven = self.a._xy_proven = True
+        self.a._after_poll(at(1.0, 2.0, 3.0, GIGA, homed_axes="yz"))
+        self.assertFalse(self.a._home_proven or self.a._xy_proven)
+        self.a._xy_proven = True
+        self.a._after_poll(at(1.0, 2.0, 3.0, GIGA, homed_axes="xy"))   # Z lost, X/Y kept
+        self.assertTrue(self.a._xy_proven)
+        self.a._xy_proven = True
+        self.finish(action="home_z")                                    # homes Z alone: keeps X/Y
+        self.assertTrue(self.a._xy_proven)
+
+    def test_a_refused_park_puts_g90_back(self):
+        self.a._home_proven = True
+        self.mr.reply = lambda path, script: ((400, {"error": {"message": "Move out of range: 0 0 1030 [0]"}})
+                                              if script and script.startswith("G91") else (200, {"result": "ok"}))
+        self.assertEqual(self.finish(action="park")["reason"], "out_of_range")
+        self.assertEqual(self.mr.posts[-1], ("/printer/gcode/script", "G90"))
+
+
+def test_command_answers_go_back_at_once():
+    # v0.85 (operator, 2026-10-26: "i think the 30 second updates might need to go waway"): after a batch of commands the loop
+    # checks in again at once with their results, instead of waiting out the heartbeat interval
+    import inspect
+    from makeros_hub import agent
+    src = inspect.getsource(agent.run)
+    after = src[src.index("_keep_command_results(command_reports)"):]
+    assert after.index("wake_event.set()") < after.index("elif resp.status == 401")
 
 
 if __name__ == "__main__":

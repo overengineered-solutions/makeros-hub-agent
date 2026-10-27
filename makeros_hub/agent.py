@@ -47,6 +47,7 @@ from .ingest import IngestServer
 from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import SLICE_RUNNER, SLICER_CAPS, PrinterManager, probe_slicer
+from .printers.klipper import KLIPPER_ACTIONS
 from . import paper as paper_lane
 from . import checks as check_lane
 from . import wake as wake_lane
@@ -791,6 +792,9 @@ def heartbeat_payload(
         # ingests them into print_jobs (observe-only until a printer is
         # billing-authoritative) and dedupes on jobKey, so re-sends are safe.
         "jobs": (jobs or [])[:HEARTBEAT_JOBS_MAX],
+        # v0.85: the named Klipper actions this hub runs; the site offers a printer control only when it is listed here, so
+        # a hub that has not been updated never gets one it cannot run (pstation's Controls tab, operator 2026-10-26)
+        "klipperActions": list(KLIPPER_ACTIONS),
     }
     if isinstance(tailscale_status, dict):
         for key in TAILSCALE_HEARTBEAT_FIELDS:
@@ -2243,6 +2247,11 @@ def run(
                         log.info(
                             "executed %d printer command(s) from the heartbeat", len(command_reports)
                         )
+                        # v0.85: the answers go back at once, not on the next 30 s beat, so the site's Controls tab shows
+                        # what the printer did within a second and the next tap is not held behind an unanswered one
+                        # (operator, 2026-10-26: "i think the 30 second updates might need to go waway if i want to just
+                        # stop something form happening"). One extra beat per batch; the site's nextPollMs is unchanged.
+                        wake_event.set()
                 elif resp.status == 401:
                     # Graceful-degradation, NOT exit: a 401 means this hub's
                     # credential was revoked/rotated. Exiting here would tear down

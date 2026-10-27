@@ -190,7 +190,13 @@ _ACTION_PARAMS: dict[str, tuple[str, ...]] = {
     "z_offset": ("delta",), "speed": ("pct",), "fan": ("pct",),
     "emergency_stop": (), "firmware_restart": (),
     "aux_fan": ("pct",), "exhaust_fan": ("pct",),
+    # v0.85: the printer page's Controls tab (operator, 2026-10-26: "we nee da tab for movement and commands where i can do
+    # stops and stuff"; "i am assuming all of this will get incorporated with a new tab for movement and homing stuff").
+    # Home X/Y and Home Z apart, Park, and the nozzle and bed set to a material's temperature or off ("to").
+    "home_xy": (), "home_z": (), "park": (), "nozzle_temp": ("to",), "bed_temp": ("to",),
 }
+# What this hub can run, sent in every heartbeat (klipperActions): the site offers a control only to a hub that lists it.
+KLIPPER_ACTIONS = tuple(sorted(_ACTION_PARAMS))
 # Parameterless actions -> their G-code, or (the two that bypass klippy's G-code queue) a Moonraker endpoint. home is
 # Klipper's G28; on the SV08, Sovol's G28 macro runs Z_OFFSET_CALIBRATION and SAVE_CONFIG (a Klipper restart) when the
 # probe is uncalibrated, so v0.79 refuses every homing action then (probe_uncalibrated). MOVE_TO_CENTER homes first on the
@@ -203,6 +209,10 @@ _PLAIN_ACTIONS = {
     "cooldown": "TURN_OFF_HEATERS", "qgl": "QUAD_GANTRY_LEVEL\nG28 Z", "bed_mesh": "BED_MESH_CALIBRATE",
     "clean_nozzle": "CLEAN_NOZZLE",
     "emergency_stop": "/printer/emergency_stop", "firmware_restart": "/printer/firmware_restart",
+    # v0.85: each printer's own homing_override does the moving. The Giga's lifts 20 mm when below Z10, homes X/Y to the
+    # back-right corner, and homes Z at X620.5 Y203 ending at Z10; the SV08's moves Z to 5 (absolute) before X/Y and homes
+    # Z at X271 Y251 ending at Z10. Home Z needs X/Y homed (_check_state): it travels to its spot first.
+    "home_xy": "G28 X Y", "home_z": "G28 Z\nG90\nG1 Z10 F600",
 }
 # The Klipper object (lower-cased, as /printer/objects/list names it) an action needs; light's is its macro (see below).
 _ACTION_NEEDS = {
@@ -219,30 +229,44 @@ _GENERIC_FANS = {"aux_fan": "fan2", "exhaust_fan": "fan3"}
 # run idle or paused (a runout pause needs them; Sovol's macros reheat to the print's own temperature then) and are refused
 # only while printing. Everything else runs in any state: light, and the two endpoint actions.
 _IDLE_ONLY_ACTIONS = frozenset({"home", "jog", "center", "motors_off", "preheat", "qgl", "bed_mesh", "clean_nozzle",
-                                "cooldown"})
+                                "cooldown", "home_xy", "home_z", "park", "nozzle_temp", "bed_temp"})
 _FILAMENT_ACTIONS = frozenset({"load_filament", "load_more", "unload_filament"})
-_PRINT_ONLY_ACTIONS = frozenset({"z_offset", "speed", "fan"})
+# v0.85: the part fan runs in any state (the Controls tab turns it on or off on an idle printer; the screen tunes it mid-print)
+_PRINT_ONLY_ACTIONS = frozenset({"z_offset", "speed"})
 # v0.79: every action that homes or probes. Refused when the probe says it is uncalibrated (on the SV08 a G28 would then
 # calibrate and SAVE_CONFIG, a Klipper restart: Barnes, 2026-10-21 report D10) or the bed is at PROBE_BED_MAX_C or more
 # (the SV08's eddy probe left its valid range at a 100 C bed: D9). Each also drops the home a jog trusts until it ends.
-_HOMING_ACTIONS = frozenset({"home", "center", "qgl", "bed_mesh", "clean_nozzle"})
-# ...and these restore it when they finish: each ends with a real G28 Z (qgl's own, MOVE_TO_CENTER's G28).
-_PROVES_HOME = frozenset({"home", "center", "qgl"})
+_HOMING_ACTIONS = frozenset({"home", "center", "qgl", "bed_mesh", "clean_nozzle", "home_xy", "home_z"})
+# ...and these restore it when they finish: each ends with a real G28 Z (qgl's own, MOVE_TO_CENTER's G28). v0.85: Home Z
+# completes a home only on top of an X/Y home this hub trusts (_check_state refuses it otherwise).
+_PROVES_HOME = frozenset({"home", "center", "qgl", "home_z"})
+# v0.85: the X/Y home Home Z needs. Home X/Y earns only that; Home Z keeps it (it homes Z alone); every other homing
+# action ends it when it starts, as it ends the full home.
+_PROVES_XY = frozenset({"home", "center", "qgl", "home_xy"})
 # Skip the running-action check, the fresh read and the state rules (still not_connected on a stale poll): the way
 # out of a stuck printer.
 _ENDPOINT_ACTIONS = frozenset({"emergency_stop", "firmware_restart"})
 # Minutes, not seconds (homing with the SV08's probe calibration, QGL, a mesh, a heat-and-load): sent on a thread.
 _LONG_ACTIONS = frozenset({"home", "center", "load_filament", "load_more", "unload_filament", "qgl", "bed_mesh",
-                           "clean_nozzle"})
+                           "clean_nozzle", "home_xy", "home_z"})
 # The state an action is checked against, read fresh when it arrives (start_print's rule: the poll may be seconds old,
 # and a print just started from the screen or the queue must never get a jog inside its start routine).
 # v0.79 adds the heat, the probe and Sovol's load temperature variable (Klipper leaves out an object a printer lacks).
 _ACTION_QUERY = ("print_stats=state&toolhead=homed_axes,position,axis_minimum,axis_maximum&extruder=temperature,target"
                  "&heater_bed=temperature,target&probe=is_calibrated"
-                 "&gcode_macro%20_global_var=load_filament_extruder_temp&gcode_macro%20_pstation_resume_heat=nozzle"
+                 "&gcode_macro%20_global_var=load_filament_extruder_temp,cancel_park&gcode_macro%20_pstation_resume_heat=nozzle"
                  "&gcode_macro%20_pstation_hold=active")
 _JOG_STEPS_MM = frozenset({0.1, 1.0, 10.0, 50.0})
 _JOG_FEED = {"x": 6000, "y": 6000, "z": 600}
+# v0.85, calibration knobs. A jog down in Z moves at most this far in one tap (the lead's brief, 2026-10-26: "Keep downward Z
+# steps small"; the Giga incident that day: a move over a part on a Z nobody had checked). Up keeps every step.
+JOG_Z_DOWN_MAX_MM = 1.0
+# Park: up first, by at least PARK_LIFT_MM and to no lower than PARK_Z_MIN_MM (the printer's top, less 1 mm, caps it), then
+# to the printer's own park when it names one (Sovol's _global_var.cancel_park, where its END_PRINT and soak put the head:
+# X-2 Y501) or else the back-right corner, PARK_MARGIN_MM in from axis_maximum (the Giga's X815.5 Y805.5, where X/Y home;
+# operator, 2026-10-26: "the giga parks itself at the front left after a print finishes and that should probably be at the
+# back right"). ponytail: one Z rule for every printer; a part taller than PARK_Z_MIN_MM needs a jog up first.
+PARK_LIFT_MM, PARK_Z_MIN_MM, PARK_MARGIN_MM = 10.0, 50.0, 15.0
 
 # v0.79: the machine controls protect the printer from a tap (operator, 2026-10-21: "i definitely also want the stupid
 # logic of z and everything else fixed like we are doing weith the giga to make it run smoothly and protect it form
@@ -350,6 +374,7 @@ class KlipperAdapter:
         # trust only that: _check_state); when the last filament move ended (_filament_standby); and the Z offset this hub
         # has nudged during the current print (Z_TUNE_MAX_MM). All start empty: a restarted hub asks for a home again.
         self._home_proven = False
+        self._xy_proven = False   # v0.85: an X/Y home this hub saw finish (Home Z needs it; _PROVES_XY), lost as the full one is
         self._fil_at: Optional[float] = None
         self._z_tuned = 0.0
         # The pause watch (PAUSE_ALERT_SEC), also under _lock: the nozzle target last seen while printing (what a resume
@@ -430,7 +455,7 @@ class KlipperAdapter:
             data = self._data
             started = self._started
             metadata = self._metadata_for(data)
-            proven = self._home_proven
+            proven, xy = self._home_proven, self._xy_proven
             paused_at = self._pause["at"] if self._pause else None
             nozzles = dict(self._nozzles)
 
@@ -440,7 +465,8 @@ class KlipperAdapter:
             if not proven and "toolhead" in out:
                 # v0.79: "homed" is what a jog from the site may trust, so the screen says "Home first" exactly when
                 # the hub would refuse one (Klipper's homed_axes counts the SV08's guessed Z and the Giga's boot home).
-                out["toolhead"]["homed"] = ""
+                # v0.85: "xy" after a Home X/Y this hub saw, so the Controls tab offers Home Z exactly when it would run.
+                out["toolhead"]["homed"] = "xy" if xy and set("xy") <= set(out["toolhead"]["homed"].lower()) else ""
             if paused_at is not None and now - paused_at >= PAUSE_ALERT_SEC:
                 out["printFault"] = "paused_long"   # v0.79: the site alerts the shop, once per print
             # v0.70: when this reading was taken (wall ms), so the site can say "updated 4 s ago" instead of dating
@@ -1001,8 +1027,8 @@ class KlipperAdapter:
                 fresh = self._fetch_once(_ACTION_QUERY, timeout=ACTION_WAIT_SEC)
                 self._note_homed(fresh)
                 with self._lock:
-                    proven, z_tuned = self._home_proven, self._z_tuned
-                script = _check_state(params, script, fresh, home_proven=proven, z_tuned=z_tuned)
+                    proven, xy, z_tuned = self._home_proven, self._xy_proven, self._z_tuned
+                script = _check_state(params, script, fresh, home_proven=proven, z_tuned=z_tuned, xy_proven=xy)
                 if need and need not in self._printer_objects():
                     raise _Refused("unsupported_on_printer")
         except _Refused as refused:
@@ -1011,7 +1037,7 @@ class KlipperAdapter:
             return {"ok": False, "reason": _action_failure(exc)[0]}
         if action in _ENDPOINT_ACTIONS or action == "motors_off":   # whatever the answer, the home is gone
             with self._lock:
-                self._home_proven = False
+                self._home_proven = self._xy_proven = False
         if action in _ENDPOINT_ACTIONS or action in ("preheat", "cooldown"):   # a new heat plan: no filament standby
             with self._lock:
                 self._fil_at = None
@@ -1024,7 +1050,7 @@ class KlipperAdapter:
             reason, message = _action_failure(exc)
             log.warning("klipper %s: action %s failed: %s %s", self.printer_id, action, reason, message)
             self._diag("klipper", f"action {action} failed: {reason}")
-            if action == "jog" and isinstance(exc, urllib.error.HTTPError):
+            if action in ("jog", "park") and isinstance(exc, urllib.error.HTTPError):
                 # klippy stops a script at its first error, so a refused G1 left the printer in G91: put G90 back
                 try:
                     self._post_ok(_script_path("G90"), ACTION_WAIT_SEC)
@@ -1046,6 +1072,8 @@ class KlipperAdapter:
             self._running_action = action
             if action in _HOMING_ACTIONS:
                 self._home_proven = False
+                if action != "home_z":
+                    self._xy_proven = False
         outcome: list[Optional[str]] = []   # appended once by the thread: None = finished ok, else the reason
 
         def run() -> None:
@@ -1053,9 +1081,11 @@ class KlipperAdapter:
                 self._post_ok(_script_path(script), LONG_ACTION_TIMEOUT_SEC)
                 outcome.append(None)
                 log.info("klipper %s: action %s finished", self.printer_id, action)
-                if action in _PROVES_HOME:
-                    with self._lock:
+                with self._lock:
+                    if action in _PROVES_HOME:
                         self._home_proven = True
+                    if action in _PROVES_XY:
+                        self._xy_proven = True
             except Exception as exc:  # noqa: BLE001 - never let the thread die with the action still marked running
                 reason, message = _action_failure(exc)
                 outcome.append(reason)
@@ -1076,10 +1106,13 @@ class KlipperAdapter:
 
     def _note_homed(self, status: dict[str, Any]) -> None:
         """A reading (the poll or an action's fresh read) where any axis is not homed ends the proven home: motors off, a
-        Klipper restart, a print's own M84."""
+        Klipper restart, a print's own M84. v0.85: one where X or Y is not homed ends the X/Y home too."""
         if not _all_homed(status):
+            homed = _obj(status, "toolhead").get("homed_axes")
             with self._lock:
                 self._home_proven = False
+                if not (isinstance(homed, str) and set("xy") <= set(homed.lower())):
+                    self._xy_proven = False
 
     def _after_poll(self, data: dict[str, Any]) -> None:
         """v0.79, on the poll thread after each good reading: the proven home, the per-print Z tune, the pause watch, the
@@ -1239,7 +1272,7 @@ class KlipperAdapter:
                     self._last_error_reason = reason
                     self._consecutive_failures += 1
                     failures = self._consecutive_failures
-                    self._home_proven = False   # v0.79: the printer may be restarting (the Giga fakes a home at boot)
+                    self._home_proven = self._xy_proven = False   # v0.79: the printer may be restarting (the Giga fakes a home at boot)
                 # Adversarial review MED #13: first failure after a run of
                 # successes is WARN-level so it lands in the diag ring (which
                 # gates on WARN+). Subsequent failures stay at DEBUG so a
@@ -1783,7 +1816,19 @@ def _parse_action(params: Any) -> tuple[str, str, Optional[str]]:
         axis, mm = params["axis"], params["mm"]
         if not isinstance(axis, str) or axis not in _JOG_FEED or not _finite(mm) or abs(mm) not in _JOG_STEPS_MM:
             raise _Refused("bad_params")
+        if axis == "z" and mm < 0 and -mm > JOG_Z_DOWN_MAX_MM + 1e-9:
+            raise _Refused("z_down_step")
         script = f"G91\nG1 {axis.upper()}{mm:g} F{_JOG_FEED[axis]}\nG90"
+    elif action == "park":
+        script = ""   # built by _check_state from the fresh read: the printer's own limits and park
+    elif action in ("nozzle_temp", "bed_temp"):
+        # a material's temperature (MATERIALS, the caps the tests hold) or off, never a number from the site. On the Giga
+        # M140 is Elegoo's macro that sets all four bed zones (printers/orangestorm-giga/config/printer.cfg).
+        to = params["to"]
+        if not (isinstance(to, str) and (to == "off" or to in MATERIALS)):
+            raise _Refused("bad_params")
+        nozzle = action == "nozzle_temp"
+        script = f"{'M104' if nozzle else 'M140'} S{0 if to == 'off' else MATERIALS[to][0 if nozzle else 1]}"
     elif action == "preheat":
         script = f"M104 S{NOZZLE_STANDBY_C}\nM140 S{MATERIALS[params['material']][1]}"
     elif action == "light":
@@ -1822,15 +1867,16 @@ def _all_homed(status: dict[str, Any]) -> bool:
 
 
 def _check_state(params: dict, script: str, status: dict[str, Any], *, home_proven: bool = False,
-                 z_tuned: float = 0.0) -> str:
+                 z_tuned: float = 0.0, xy_proven: bool = False) -> str:
     """Pure: may this parsed action run in `status` (the fresh _ACTION_QUERY read), and the script to send then. Raises
     _Refused: printer_stale, printer_busy / not_printing ("printing" and "paused" both count as a print; filament moves are
-    refused only while printing), probe_uncalibrated, bed_too_hot, not_homed, z_floor, lift_first, out_of_range,
-    nozzle_cold, nozzle_heating, unsupported_on_printer, z_offset_limit.
+    refused only while printing), probe_uncalibrated, bed_too_hot, home_xy_first, not_homed, z_floor, lift_first,
+    out_of_range, nozzle_cold, nozzle_heating, unsupported_on_printer, z_offset_limit.
 
     home_proven: a full home this hub saw finish, never lost since (the adapter's _home_proven). homed_axes alone is not
     enough: the SV08's homing_override marks Z homed at a guessed 0 on any G28 X or Y, and the Giga fakes "xyz" at boot.
-    z_tuned: the Z offset this hub has already nudged during this print."""
+    xy_proven: an X/Y home this hub saw finish (v0.85, what Home Z travels on). z_tuned: the Z offset this hub has already
+    nudged during this print."""
     action = params["action"]
     if action in _ENDPOINT_ACTIONS:
         return script
@@ -1854,7 +1900,24 @@ def _check_state(params: dict, script: str, status: dict[str, Any], *, home_prov
         bed = _obj(status, "heater_bed")
         if max(_num(bed.get("temperature")) or 0.0, _num(bed.get("target")) or 0.0) >= PROBE_BED_MAX_C:
             raise _Refused("bed_too_hot")
-    if action == "jog":
+    homed = toolhead.get("homed_axes")
+    if action == "home_z" and not (xy_proven and isinstance(homed, str) and set("xy") <= set(homed.lower())):
+        raise _Refused("home_xy_first")   # Home Z travels in X and Y to its spot first (the Giga's X620.5 Y203)
+    if action == "park":
+        if not (home_proven and _all_homed(status)):
+            raise _Refused("not_homed")
+        pos, low, high = ([_axis(toolhead.get(k), i) for i in range(3)] for k in ("position", "axis_minimum", "axis_maximum"))
+        if None in pos or None in low or None in high:
+            raise _Refused("printer_stale")
+        own = _obj(status, "gcode_macro _global_var").get("cancel_park")
+        own = own if isinstance(own, dict) and _finite(own.get("x")) and _finite(own.get("y")) else None
+        px, py = (own["x"], own["y"]) if own else (high[0] - PARK_MARGIN_MM, high[1] - PARK_MARGIN_MM)
+        if not (low[0] - 1e-6 <= px <= high[0] + 1e-6 and low[1] - 1e-6 <= py <= high[1] + 1e-6):
+            raise _Refused("out_of_range")
+        # up first, relative (toolhead Z and G-code Z differ under a bed mesh: the Giga's averages -6.68), then across
+        lift = round(max(0.0, min(high[2] - 1.0, max(pos[2] + PARK_LIFT_MM, PARK_Z_MIN_MM)) - pos[2]), 2)
+        script = (f"G91\nG1 Z{lift:g} F600\n" if lift > 0 else "") + f"G90\nG1 X{px:g} Y{py:g} F6000"
+    elif action == "jog":
         axis, mm = params["axis"], params["mm"]
         if not (home_proven and _all_homed(status)):
             raise _Refused("not_homed")

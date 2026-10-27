@@ -1,6 +1,6 @@
 # Procrastination Station shop-box agent
 
-The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.84.5 review candidate**, not evidence that the installed shop box has been updated.
+The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.85.0 review candidate**, not evidence that the installed shop box has been updated.
 
 The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Read [SECURITY.md](SECURITY.md) for the boundaries and limitations.
 
@@ -60,6 +60,12 @@ checks the raw hash and size before promoting the spool file, and sends plain G-
 files still work. Pair this hub with the site's gzip storage/streaming verification change: the site must use the existing
 heartbeat `agentVersion >= 0.84.5` gate before offering a compressed file, keeping jobs waiting with a clear reason for
 older hubs. An existing explicit `max_upload_mb = 64` remains a 64 MiB intake limit until changed.
+
+0.85.0 adds the named Klipper actions behind the site's staff Controls tab: Home X/Y, Home Z (only on an X/Y home this hub
+saw finish), Park (up at least 10 mm and to Z 50 or more, then the printer's own park or the back-right corner), the nozzle
+and bed to a material's temperature or off, and the part fan in any state. A jog down in Z is at most 1 mm a tap. The
+heartbeat lists every action this hub runs (`klipperActions`), and the site offers only those, so an older hub gets none.
+After a batch of commands the hub checks in again at once, so the answers reach the site within a second.
 
 ## Updates and rollback
 
