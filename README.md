@@ -1,6 +1,6 @@
 # Procrastination Station shop-box agent
 
-The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.86.0 review candidate**, not evidence that the installed shop box has been updated.
+The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.86.1 review candidate**, not evidence that the installed shop box has been updated.
 
 The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Read [SECURITY.md](SECURITY.md) for the boundaries and limitations.
 
@@ -80,6 +80,22 @@ seen. The site acknowledges it (`printerStartsAck`) and, when its switch is on, 
 checks every rule again on a fresh reading and only then sends the existing stop. Still starting: Bambu PREPARE, Klipper
 START_PRINT (printing, no extrusion yet), or printing on layer 1 or none with progress at most 1 %. A print running when the
 hub starts, one past that point, or one the hub dispatched is never stopped, and nothing stops without the site's command.
+
+0.86.1 fixes the review's recovery and command safety findings. Repeated recovery lifts use the current trusted height and
+budget the homing override's extra lift and Z offset. A restart, motor release, Cancel or uncertain reading invalidates the
+old stop height; staff must establish a fresh position at the printer before recovery can continue. The Giga's updated M84
+macro exposes a release counter, and the hub also checks motor-enable state. The matching printer macros remain subject to
+the operator's supervised test. Long commands retain `detail: "started"`, and Emergency stop tries its endpoint even with a
+stale poll. The start guard waits for a new reading and refuses after a connection interruption. Malformed optional 3MF
+plate boxes are logged and omitted without interrupting dispatch of other assignments.
+
+Heartbeat metrics advertise `commandExpect: true`. A command's optional top-level `expect: {jobId, assignmentSeq}` binds it
+to the hub's observed run; a mismatch fails with `the print it was for is no longer on the printer`. Bound skips and Stops
+also refresh the printer reading. Assignments saved by an older hub without a provable run binding refuse bound commands;
+staff's machine-wide controls remain available. Unbound commands retain their existing behavior. At v0.86.0 (`67d531b`),
+`makeros_hub/printers/manager.py:1072-1075,1103,1132` extracted the known envelope fields and passed only `params` to the adapter,
+so unknown envelope keys were already ignored. `klipper.py:1943` checks parameter keys strictly: `expect` must stay outside
+`params`, and the site must require the capability before offering a bound command.
 
 ## Updates and rollback
 
