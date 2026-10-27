@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from makeros_hub import config, http, job_files
+from makeros_hub import __version__, config, http, job_files
 from makeros_hub.agent import heartbeat_payload, make_cloud_submit
 from makeros_hub.ingest import IngestServer
 from makeros_hub.multipart import boundary_from_content_type, stream_multipart
@@ -148,7 +148,7 @@ def test_more_than_64_mib_goes_from_orca_to_another_hub_and_plain_moonraker(rig,
     assert expected[1] > job_files.MAX_BYTES
     cfg = config.Config(cloud_url=rig.url)
     assert cfg.max_upload_mb == 1024
-    assert heartbeat_payload()["agentVersion"] == "0.86.0"
+    assert heartbeat_payload()["agentVersion"] == __version__
     monkeypatch.setattr(job_files, "_queue", queue.Queue())
     monkeypatch.setattr(job_files, "_wanted", threading.Event())
     job_files.want(True)
