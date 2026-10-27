@@ -74,6 +74,13 @@ kept on disk until a print runs again, and sends it to the site. Four actions re
 printers' own PS macros (pstation printers/*/config): Home X/Y from above it (lift first, never down), Move to a corner,
 Home Z at that corner only after staff confirm it clear, and the bed back to the print's own temperatures.
 
+The print-start guard (`printers/start_guard.py`) reports, in every heartbeat's `printerStarts`, a print this hub saw start
+(idle, then busy) with no dispatch of its own pending: its id, printer, file, whether it is still starting, and when it was
+seen. The site acknowledges it (`printerStartsAck`) and, when its switch is on, sends `guard_stop` naming that id; the hub
+checks every rule again on a fresh reading and only then sends the existing stop. Still starting: Bambu PREPARE, Klipper
+START_PRINT (printing, no extrusion yet), or printing on layer 1 or none with progress at most 1 %. A print running when the
+hub starts, one past that point, or one the hub dispatched is never stopped, and nothing stops without the site's command.
+
 ## Updates and rollback
 
 Back up the private state/config and installed runtime first. Set a reviewed newer release tag and exact commit in `/admin/hub`; follow the reported version and errors. The root gate refuses downgrades and same-version reinstalls even for direct service-user calls. The install stages code and helpers, stops the service during replacement, and restores them on a failed swap/start. Required dependency failure stops before replacing code.

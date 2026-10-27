@@ -25,6 +25,7 @@ from typing import Any
 from ..diagnostics import get_default, redact
 from ..http import MAX_RAW_FILE_BYTES
 from .queue_progress import write_json_durably
+from .start_guard import StartGuard
 from .threemf_objects import Unreadable3mf, check_plate_entry, gcode_plates, parse_plate_objects, plate_boxes, plate_named, plate_picture
 
 log = logging.getLogger("makeros-hub.printers")
@@ -232,6 +233,8 @@ class PrinterManager:
         # (Bambu :6000 / HTTP snapshot / …) without re-plumbing config-down.
         self._camera_meta: dict[str, dict] = {}
         self.config_version: str | None = None
+        # Prints started at the printer, not through the site (start_guard.py): reported, stopped only on the site's word
+        self.start_guard = StartGuard()
 
     def _record_failure(self, message, extra_secrets=None) -> None:
         if self._diagnostics is not None:
@@ -286,6 +289,7 @@ class PrinterManager:
         for pid in list(self._adapters):
             if pid not in desired_ids:
                 self._stop(pid)
+                self.start_guard.forget(pid)
         for pid in list(self._static):
             if pid not in desired_ids:
                 self._static.pop(pid, None)
@@ -508,7 +512,9 @@ class PrinterManager:
                             ask()
                         except Exception:  # noqa: BLE001 — a probe or nudge is never worth a failed status read
                             pass
-                out.append(adapter.status())
+                st = adapter.status()
+                out.append(st)
+                self._observe_start(pid, adapter, st)
             except Exception as e:  # noqa: BLE001 — one bad adapter must not sink the heartbeat
                 code = self._access_code_for(pid)
                 safe = self._redact_printer_exception(e, code)
@@ -517,6 +523,42 @@ class PrinterManager:
                 out.append({"printerId": pid, "connectionState": "error", "errorReason": "agent_status_error"})
         out.extend(self._static.values())
         return out
+
+    def _observe_start(self, pid: str, adapter, st: dict) -> None:
+        try:
+            pend = getattr(adapter, "pending_queue_job_ids", None)
+            self.start_guard.observe(pid, st, dispatching=bool(pend()) if callable(pend) else False,
+                                     needs_gcode_state=pid in self._bambu_configs)
+        except Exception as exc:  # noqa: BLE001 — the guard fails open: it never costs a status read or a beat
+            log.warning("start guard: observing %s failed: %s", pid, self._redact_printer_exception(exc, self._access_code_for(pid)))
+
+    def _guard_stop(self, request_id: str, printer_id: str, params: dict | None) -> dict:
+        """The site's stop for a print started at the printer (start_guard.py): every rule again on a fresh status, then the
+        existing stop (Bambu MQTT stop, Klipper Moonraker cancel). Any refusal or failure leaves the print running."""
+        def failed(detail: str) -> dict:
+            return {"requestId": request_id, "command": "guard_stop", "status": "failed", "detail": detail}
+        adapter = self._adapters.get(printer_id)
+        if adapter is None or not callable(getattr(adapter, "send_command", None)):
+            return failed("printer_unavailable")
+        try:
+            pend = getattr(adapter, "pending_queue_job_ids", None)
+            refusal = self.start_guard.check(printer_id, (params or {}).get("startId"), adapter.status(),
+                                             dispatching=bool(pend()) if callable(pend) else False)
+        except Exception as exc:  # noqa: BLE001 — a check that cannot run stops nothing
+            log.warning("start guard: check for %s raised: %s", printer_id, exc)
+            return failed("exception")
+        if refusal:
+            log.info("start guard: not stopping %s (%s)", printer_id, refusal)
+            return failed(refusal)
+        try:
+            result = adapter.send_command("stop", None)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("start guard: stop for %s raised: %s", printer_id, exc)
+            return failed("exception")
+        if isinstance(result, dict) and result.get("ok"):
+            log.info("start guard: stopped a print started at the printer on %s", printer_id)
+            return {"requestId": request_id, "command": "guard_stop", "status": "ok"}
+        return failed(str(result.get("reason") if isinstance(result, dict) else "unknown"))
 
     def live_statuses(self) -> list[dict]:
         """v0.70: the telemetry push's read, every second on its own thread. Only each adapter's status(), which takes
@@ -1067,6 +1109,12 @@ class PrinterManager:
                     if report.get("status") == "ok":
                         self._remember_command(request_id)
                     reports.append(report)
+                continue
+            if command == "guard_stop":
+                report = self._guard_stop(request_id, printer_id, params)
+                if report["status"] == "ok":
+                    self._remember_command(request_id)
+                reports.append(report)
                 continue
             adapter = self._adapters.get(printer_id)
             send = getattr(adapter, "send_command", None) if adapter is not None else None
