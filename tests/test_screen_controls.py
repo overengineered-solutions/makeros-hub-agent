@@ -995,5 +995,221 @@ def test_command_answers_go_back_at_once():
     assert after.index("wake_event.set()") < after.index("elif resp.status == 401")
 
 
+# v0.86 (operator, 2026-10-26): an honest shutdown, the stop point a recovery needs, and the re-home over a print. The Giga's
+# stop of 2026-10-26 (reports/giga-mcu-shutdown-2026-10-26.md): toolhead (359.929, 392.005) Z 410.37, byte 35,710,026 of
+# 36,803,071, layer 1233 of 1307, fan 189, nozzle 215, all four zones 60, relative extrusion, offset -1.85, mesh default.
+SHUTDOWN_MSG = "MCU 'mcu' shutdown: Rescheduled timer in the past\nThis generally occurs when the micro-controller has been"
+STOPPED = {**GIGA, "print_stats": {"state": "paused", "filename": "tditto_combinatory_form.gcode", "info": {"current_layer": 1233, "total_layer": 1307}},
+           "webhooks": {"state": "shutdown", "state_message": SHUTDOWN_MSG},
+           "toolhead": {**GIGA["toolhead"], "position": [359.929, 392.005, 410.37, 0.0]},
+           "virtual_sdcard": {"file_position": 35710026, "file_size": 36803071, "progress": 0.9703},
+           "gcode_move": {"gcode_position": [359.9, 392.0, 417.05, 0.0], "homing_origin": [0.0, 0.0, -1.85, 0.0], "absolute_extrude": False,
+                          "speed_factor": 1.0, "extrude_factor": 1.0},
+           "extruder": {"temperature": 190.0, "target": 215.0}, "heater_bed": {"temperature": 40.0, "target": 60.0},
+           "heater_generic heater_bed1": {"target": 60.0}, "heater_generic heater_bed2": {"target": 60.0}, "heater_generic heater_bed3": {"target": 60.0},
+           "output_pin fan1": {"value": 189.0}, "bed_mesh": {"profile_name": "default"},
+           "exclude_object": {"objects": [{"name": "form", "polygon": [[300, 300], [520, 300], [520, 640], [300, 640]]}]},
+           "gcode_macro _pstation_hold": {"active": True, "minutes": 4, "ceiling_minutes": 2880}}
+GIGA_CORNERS = {"fl": [40.0, 40.0], "fr": [775.0, 40.0], "bl": [40.0, 765.0], "br": [775.0, 765.0]}
+STOP = klipper._stop_point(STOPPED, 1761507636000)
+
+
+def restarted(**toolhead):   # after FIRMWARE_RESTART: standby, Elegoo's boot home faked at 110, 110, 0, the corners macro in
+    return {**GIGA, "print_stats": {"state": "standby"}, "webhooks": {"state": "ready"}, "gcode_macro _ps_corners": GIGA_CORNERS,
+            "toolhead": {**GIGA["toolhead"], "position": [110.0, 110.0, 0.0, 0.0], **toolhead}}
+
+
+def rehome(params, status, **kw):
+    action, script, _ = _parse_action(params)
+    return _check_state(params, script, status, **{"stop": STOP, **kw})
+
+
+def rehome_refusal(params, status, **kw):
+    try:
+        rehome(params, status, **kw)
+    except _Refused as r:
+        return r.reason
+    return "accepted"
+
+
+class TestShutdownIsHonest(unittest.TestCase):
+    def test_a_shutdown_reads_as_an_error_with_every_heater_off_and_no_hold(self):
+        out = _build_status("p", STOPPED, "connected")
+        self.assertEqual(out["state"], "error")   # never "paused"
+        self.assertEqual(out["klipperShutdown"], "MCU 'mcu' shutdown: Rescheduled timer in the past")
+        self.assertEqual(out["errorReason"], out["klipperShutdown"])
+        self.assertEqual((out["nozzleTargetC"], out["bedTargetC"]), (0.0, 0.0))   # Klipper cut them; it still reports 215 and 60
+        self.assertNotIn("hold", out)
+        self.assertEqual(_build_status("p", {**STOPPED, "webhooks": {"state": "ready"}}, "connected")["state"], "paused")
+
+    def test_the_stop_point_holds_what_the_recovery_wrote_down_by_hand(self):
+        self.assertEqual({k: STOP[k] for k in ("x", "y", "z", "gcodeZ", "zOffset", "fileByte", "fileSize", "layer", "file", "mesh")},
+                         {"x": 359.929, "y": 392.005, "z": 410.37, "gcodeZ": 417.05, "zOffset": -1.85, "fileByte": 35710026,
+                          "fileSize": 36803071, "layer": [1233, 1307], "file": "tditto_combinatory_form.gcode", "mesh": "default"})
+        self.assertEqual((STOP["nozzleTargetC"], STOP["bedTargetsC"], STOP["fanPin"], STOP["absoluteExtrude"]),
+                         (215.0, {"heater_bed": 60.0, "heater_bed1": 60.0, "heater_bed2": 60.0, "heater_bed3": 60.0}, 189.0, False))
+        self.assertEqual((STOP["shutdown"], STOP["reason"], STOP["progressPct"]), (True, "MCU 'mcu' shutdown: Rescheduled timer in the past", 97.0))
+        self.assertEqual(STOP["objects"], [{"name": "form", "box": [300.0, 300.0, 520.0, 640.0]}])
+        self.assertEqual(klipper._stop_point({}, 1), {"at": 1, "shutdown": False})   # only what Klipper gave
+
+    def test_nothing_but_the_two_stops_is_sent_into_a_shutdown(self):
+        for params in TAB + [{"action": "rehome_xy"}, {"action": "move_corner", "corner": "fl"}, {"action": "restore_bed"}]:
+            want = "accepted" if params["action"] in ("emergency_stop", "firmware_restart") else "klipper_shutdown"
+            self.assertEqual(rehome_refusal(params, STOPPED, xy_proven=True, home_proven=True), want, params)
+
+    def test_the_wire_carries_them(self):
+        for key in ("klipperShutdown", "stopPoint", "corners", "rehome"):
+            self.assertIn(key, telemetry._WIRE_KEYS)
+            self.assertIn(key, telemetry._TRANSITION_KEYS)
+
+
+class TestStopWatch(unittest.TestCase):
+    def setUp(self):
+        self.mr = Moonraker()
+        self.addCleanup(self.mr.close)
+        self.a = KlipperAdapter("p-stop", self.mr.url)
+
+    def poll(self, status):
+        self.mr.status = status
+        self.a._record_poll(dict(status))
+        self.a._after_poll(dict(status))
+
+    def test_recorded_once_on_the_stop_kept_through_a_restart_cleared_when_a_print_runs(self):
+        self.poll({**STOPPED, "webhooks": {"state": "ready"}, "print_stats": {"state": "printing", "filename": "f.gcode"}})
+        self.assertIsNone(self.a.status().get("stopPoint"))
+        self.poll(STOPPED)
+        sp = self.a.status()["stopPoint"]
+        self.assertEqual((sp["z"], sp["fileByte"], sp["layer"]), (410.37, 35710026, [1233, 1307]))
+        self.assertEqual(klipper._load_json(self.a._stop_path)["fileByte"], 35710026)   # on disk
+        self.mr.status = {**STOPPED, "virtual_sdcard": {"file_position": 1}}
+        self.a._after_poll(dict(self.mr.status))
+        self.assertEqual(self.a.status()["stopPoint"]["fileByte"], 35710026)            # read once, not again
+        self.assertEqual(KlipperAdapter("p-stop", self.mr.url)._stop_pt["z"], 410.37)    # a hub restart keeps it
+        self.poll(restarted())                                                         # the firmware restart forgets the print; the record stays
+        self.assertEqual(self.a.status()["stopPoint"]["z"], 410.37)
+        self.poll({**restarted(), "print_stats": {"state": "printing", "filename": "remainder.gcode"}})
+        self.assertIsNone(self.a.status().get("stopPoint"))
+        self.assertIsNone(klipper._load_json(self.a._stop_path))
+
+    def test_an_idle_error_with_no_print_records_nothing(self):
+        self.poll({**restarted(), "print_stats": {"state": "error", "filename": ""}})
+        self.assertIsNone(self.a.status().get("stopPoint"))
+
+    def test_no_long_pause_alert_inside_a_shutdown(self):
+        self.poll(STOPPED)
+        self.a._pause = {"at": time.monotonic() - klipper.PAUSE_ALERT_SEC - 5, "alerted": True, "cooled": False}
+        self.assertNotIn("printFault", self.a.status())
+
+
+class TestRehomeRules(unittest.TestCase):
+    def test_without_a_stop_point_nothing_is_offered(self):
+        for params in ({"action": "rehome_xy"}, {"action": "move_corner", "corner": "fl"}, {"action": "home_z_corner", "corner": "fl"},
+                       {"action": "restore_bed"}):
+            self.assertEqual(rehome_refusal(params, restarted(), stop=None, xy_proven=True, z_rec=True), "no_stop_point", params)
+
+    def test_home_xy_over_the_print_lifts_from_the_recorded_height_and_never_down(self):
+        self.assertEqual(rehome({"action": "rehome_xy"}, restarted()), "PS_REHOME_XY Z=410.37 LIFT=30")
+        near_top = {**STOP, "z": 1000.0}
+        self.assertEqual(rehome({"action": "rehome_xy"}, restarted(), stop=near_top), "PS_REHOME_XY Z=1000 LIFT=19")
+        self.assertEqual(rehome_refusal({"action": "rehome_xy"}, restarted(), stop={**STOP, "z": 1016.0}), "no_room_to_lift")
+        # a home this hub trusts wins over the record, and must still clear the print's top by the minimum
+        self.assertEqual(rehome({"action": "rehome_xy"}, restarted(position=[1.0, 1.0, 430.0, 0.0]), home_proven=True), "PS_REHOME_XY Z=430 LIFT=30")
+        self.assertEqual(rehome_refusal({"action": "rehome_xy"}, restarted(position=[1.0, 1.0, 300.0, 0.0]), home_proven=True), "below_print")
+        for z in (0.0, 2.0, 410.37, 700.0, 1014.0):   # whatever Z is, the lift is up
+            out = rehome({"action": "rehome_xy"}, restarted(), stop={**STOP, "z": z})
+            self.assertGreater(float(out.split("LIFT=")[1]), 0, z)
+
+    def test_a_corner_only_on_that_home_above_the_print_and_x_y_only(self):
+        st = restarted(position=[815.0, 805.0, 440.37, 0.0])
+        self.assertEqual(rehome({"action": "move_corner", "corner": "fl"}, st, xy_proven=True, z_rec=True), "G90\nG1 X40 Y40 F6000")
+        self.assertEqual(rehome_refusal({"action": "move_corner", "corner": "fl"}, st, xy_proven=False, z_rec=True), "not_homed")
+        self.assertEqual(rehome_refusal({"action": "move_corner", "corner": "fl"}, st, xy_proven=True), "z_unknown")
+        low = restarted(position=[815.0, 805.0, 414.0, 0.0])   # under the print's top + 5
+        self.assertEqual(rehome_refusal({"action": "move_corner", "corner": "fl"}, low, xy_proven=True, z_rec=True), "below_print")
+        bare = {**st, "gcode_macro _ps_corners": {}}
+        self.assertEqual(rehome_refusal({"action": "move_corner", "corner": "fl"}, bare, xy_proven=True, z_rec=True), "unsupported_on_printer")
+        self.assertEqual(rehome_refusal({"action": "move_corner", "corner": "xx"}, st, xy_proven=True, z_rec=True), "bad_params")
+
+    def test_z_homes_only_at_the_corner_the_nozzle_went_to_and_is_still_at(self):
+        at_fl = restarted(position=[40.0, 40.0, 440.37, 0.0])
+        ok = {"xy_proven": True, "z_rec": True, "corner_at": {"name": "fl", "x": 40.0, "y": 40.0}}
+        self.assertEqual(rehome({"action": "home_z_corner", "corner": "fl"}, at_fl, **ok), "PS_HOME_Z_HERE LIFT_TO=430.37")
+        self.assertEqual(rehome_refusal({"action": "home_z_corner", "corner": "fl"}, at_fl, xy_proven=True, z_rec=True), "not_at_corner")
+        self.assertEqual(rehome_refusal({"action": "home_z_corner", "corner": "br"}, at_fl, **ok), "not_at_corner")   # nobody confirmed br
+        moved = restarted(position=[41.0, 40.0, 440.37, 0.0])
+        self.assertEqual(rehome_refusal({"action": "home_z_corner", "corner": "fl"}, moved, **ok), "not_at_corner")
+        self.assertEqual(rehome_refusal({"action": "home_z_corner", "corner": "fl"}, {**at_fl, "probe": {"is_calibrated": False}}, **ok), "probe_uncalibrated")
+        self.assertEqual(rehome_refusal({"action": "home_z_corner", "corner": "fl"}, {**at_fl, "heater_bed": {"temperature": 95.0}}, **ok), "bed_too_hot")
+        high = restarted(position=[40.0, 40.0, 1010.0, 0.0])   # a tall print: the lift ends 1 mm under the top
+        self.assertEqual(rehome({"action": "home_z_corner", "corner": "fl"}, high, stop={**STOP, "z": 1000.0}, **ok), "PS_HOME_Z_HERE LIFT_TO=1019")
+
+    def test_the_bed_goes_back_to_the_prints_own_zones_capped(self):
+        self.assertEqual(rehome({"action": "restore_bed"}, restarted()).splitlines(),
+                         [f"SET_HEATER_TEMPERATURE HEATER={z} TARGET=60" for z in ("heater_bed", "heater_bed1", "heater_bed2", "heater_bed3")])
+        hot = {**STOP, "bedTargetsC": {"heater_bed": 120.0, "heater_bed1": 0.0}}
+        self.assertEqual(rehome({"action": "restore_bed"}, restarted(), stop=hot), "SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=100")
+        self.assertEqual(rehome_refusal({"action": "restore_bed"}, restarted(), stop={**STOP, "bedTargetsC": {}}), "nothing_to_restore")
+        self.assertEqual(rehome_refusal({"action": "restore_bed"}, {**restarted(), "print_stats": {"state": "printing"}}), "printer_busy")
+
+
+class TestRehomeOverTheWire(unittest.TestCase):
+    """The three steps through the adapter: each answers, the status says how far it got, and a corner nobody confirmed is
+    never homed at."""
+
+    def setUp(self):
+        self.mr = Moonraker(objects=SV08_OBJECTS + ["gcode_macro ps_rehome_xy", "gcode_macro _ps_corners", "gcode_macro ps_home_z_here"])
+        self.addCleanup(self.mr.close)
+        self.a = KlipperAdapter("p-rehome", self.mr.url)
+        self.a._stop_pt = dict(STOP)
+        self.mr.status = restarted()
+        self.a._record_poll(dict(self.mr.status))
+
+    def act(self, **params):
+        out = self.a.send_command("klipper_action", params)
+        self.assertTrue(_wait(lambda: self.a._running_action is None))
+        return out
+
+    def test_xy_then_a_confirmed_corner_then_z_and_the_status_follows(self):
+        self.assertTrue(self.act(action="rehome_xy")["ok"])
+        self.assertEqual(self.a.status()["rehome"], {"stage": "xy"})
+        self.assertEqual(self.act(action="jog", axis="x", mm=1)["reason"], "not_homed")    # Z from a record: corners only
+        self.mr.status = restarted(position=[815.0, 805.0, 440.37, 0.0])
+        self.assertTrue(self.act(action="move_corner", corner="fl")["ok"])
+        self.assertEqual(self.a.status()["rehome"], {"stage": "corner", "corner": "fl"})
+        self.mr.status = restarted(position=[40.0, 40.0, 440.37, 0.0])
+        self.assertEqual(self.act(action="home_z_corner", corner="fr")["reason"], "not_at_corner")
+        self.assertTrue(self.act(action="move_corner", corner="fl")["ok"])
+        self.assertTrue(self.act(action="home_z_corner", corner="fl")["ok"])
+        self.assertEqual(self.a.status()["rehome"], {"stage": "z"})
+        self.assertEqual([p[1] for p in self.mr.posts], ["PS_REHOME_XY Z=410.37 LIFT=30", "G90\nG1 X40 Y40 F6000", "G90\nG1 X40 Y40 F6000",
+                                                         "PS_HOME_Z_HERE LIFT_TO=430.37"])
+        self.assertTrue(self.act(action="jog", axis="x", mm=1)["ok"])                       # X, Y and Z known again
+
+    def test_any_other_action_or_a_move_between_the_corner_and_the_answer_cancels_it(self):
+        self.act(action="rehome_xy")
+        self.mr.status = restarted(position=[40.0, 40.0, 440.37, 0.0])
+        self.act(action="move_corner", corner="fl")
+        self.act(action="fan", pct=0)
+        self.assertEqual(self.act(action="home_z_corner", corner="fl")["reason"], "not_at_corner")
+        self.act(action="move_corner", corner="fl")
+        self.a._after_poll(restarted(position=[60.0, 40.0, 440.37, 0.0]))                   # moved by hand or by the screen
+        self.assertEqual(self.act(action="home_z_corner", corner="fl")["reason"], "not_at_corner")
+
+    def test_a_failed_corner_home_puts_the_g_code_offset_back(self):
+        self.act(action="rehome_xy")
+        self.mr.status = {**restarted(position=[40.0, 40.0, 440.37, 0.0]), "gcode_move": {"homing_origin": [0.0, 0.0, -1.85, 0.0]}}
+        self.act(action="move_corner", corner="fl")
+        self.mr.reply = lambda path, script: ((400, {"error": {"message": "No trigger on z after full movement"}})
+                                              if script and script.startswith("PS_HOME_Z_HERE") else (200, {"result": "ok"}))
+        self.a.send_command("klipper_action", {"action": "home_z_corner", "corner": "fl"})
+        self.assertTrue(_wait(lambda: self.a._running_action is None and self.mr.posts[-1][1] == "SET_GCODE_OFFSET X=0 Y=0 MOVE=0"))
+        self.assertNotEqual(self.a.status().get("rehome", {}).get("stage"), "z")
+
+    def test_without_the_printers_macros_it_is_refused(self):
+        self.mr.objects = list(SV08_OBJECTS)
+        self.assertEqual(self.act(action="rehome_xy")["reason"], "unsupported_on_printer")
+        self.assertEqual(self.mr.posts, [])
+
+
 if __name__ == "__main__":
     unittest.main()

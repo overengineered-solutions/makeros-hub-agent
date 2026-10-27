@@ -1,6 +1,6 @@
 # Procrastination Station shop-box agent
 
-The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.85.0 review candidate**, not evidence that the installed shop box has been updated.
+The always-on Linux bridge between the sovereign pstation website and the shop's physical printers. The historical package/service name remains `makeros-hub`; it does not require the old MakerOS app. This checkout is a **0.86.0 review candidate**, not evidence that the installed shop box has been updated.
 
 The source version is `makeros_hub/__init__.py`; `pyproject.toml` must match. Read [SECURITY.md](SECURITY.md) for the boundaries and limitations.
 
@@ -66,6 +66,13 @@ saw finish), Park (up at least 10 mm and to Z 50 or more, then the printer's own
 and bed to a material's temperature or off, and the part fan in any state. A jog down in Z is at most 1 mm a tap. The
 heartbeat lists every action this hub runs (`klipperActions`), and the site offers only those, so an older hub gets none.
 After a batch of commands the hub checks in again at once, so the answers reach the site within a second.
+
+0.86.0 reports a Klipper shutdown as what it is: an error in Klipper's own words, every heater target 0 (Klipper turned them
+off; it still reports the old targets) and no hold. When a print stops on a shutdown or error the hub records a stop point
+(file byte, layer, toolhead and G-code Z, X Y, offset, temperatures, fan, extrusion mode, speed and flow, mesh, object boxes),
+kept on disk until a print runs again, and sends it to the site. Four actions re-home over a stopped print, using the
+printers' own PS macros (pstation printers/*/config): Home X/Y from above it (lift first, never down), Move to a corner,
+Home Z at that corner only after staff confirm it clear, and the bed back to the print's own temperatures.
 
 ## Updates and rollback
 

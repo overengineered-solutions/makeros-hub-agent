@@ -148,7 +148,7 @@ def test_more_than_64_mib_goes_from_orca_to_another_hub_and_plain_moonraker(rig,
     assert expected[1] > job_files.MAX_BYTES
     cfg = config.Config(cloud_url=rig.url)
     assert cfg.max_upload_mb == 1024
-    assert heartbeat_payload()["agentVersion"] == "0.85.0"
+    assert heartbeat_payload()["agentVersion"] == "0.86.0"
     monkeypatch.setattr(job_files, "_queue", queue.Queue())
     monkeypatch.setattr(job_files, "_wanted", threading.Event())
     job_files.want(True)

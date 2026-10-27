@@ -43,6 +43,7 @@ _STATE_PATHS = [
     (bambu, "TERMINAL_JOBS_DIR", True),
     (klipper, "QUEUE_PROGRESS_DIR", True),
     (klipper, "TERMINAL_JOBS_DIR", True),
+    (klipper, "STOP_POINTS_DIR", True),   # v0.86: the recorded stop point of a print stopped on a shutdown or error
     (update, "STATE_PATH", False),
     (laser, "RUNS_STATE_PATH", False),
     (laser, "SECRETS_DIR", True),   # v0.68: the operator's laser secret files; a test never reads the real ones

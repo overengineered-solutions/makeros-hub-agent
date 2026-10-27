@@ -68,6 +68,12 @@ _WIRE_KEYS = {
     "light": "light",
     # v0.82, Klipper: the printer's heater hold, {minutes, ceilingMinutes}; omitted when it holds nothing.
     "hold": "hold",
+    # v0.86, Klipper: a shutdown in Klipper's words, the stop point recorded for a recovery, the printer's re-home corners
+    # and how far a re-home over the print has got (klipper.py _build_status / status).
+    "klipperShutdown": "klipperShutdown",
+    "stopPoint": "stopPoint",
+    "corners": "corners",
+    "rehome": "rehome",
 }
 _HALF_DEGREE_KEYS = ("nozzleC", "nozzleTargetC", "bedC", "bedTargetC", "chamberC")
 _WHOLE_SECOND_KEYS = ("printDurationSec", "elapsedSec")
@@ -76,7 +82,9 @@ _IDENTITY_KEYS = ("printerId", "sampledAt")
 # ("idle printers silent"), but the moment it starts, stops, finishes (gcodeState FINISH) or changes file must go out.
 # v0.76: so must a jog, a homing or the light from the screen (an idle toolhead only moves when someone moves it).
 # v0.82: so must a hold's start and end, which on an SV08 stopped on an error comes without a state change.
-_TRANSITION_KEYS = ("connected", "state", "gcodeState", "preparing", "jobName", "toolhead", "light", "hold")
+# v0.86: and a shutdown, a stop point and a re-home step, the moment they change.
+_TRANSITION_KEYS = ("connected", "state", "gcodeState", "preparing", "jobName", "toolhead", "light", "hold",
+                    "klipperShutdown", "stopPoint", "corners", "rehome")
 _ACTIVE_STATES = frozenset({"printing", "paused"})
 
 

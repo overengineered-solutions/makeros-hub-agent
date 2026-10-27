@@ -54,6 +54,9 @@ log = logging.getLogger(__name__)
 # imported: bambu.py needs paho.
 QUEUE_PROGRESS_DIR = Path(os.environ.get("MAKEROS_HUB_QUEUE_PROGRESS_DIR", "/var/lib/makeros-hub/queue-progress"))
 TERMINAL_JOBS_DIR = Path(os.environ.get("MAKEROS_HUB_TERMINAL_JOBS_DIR", "/var/lib/makeros-hub/terminal-jobs"))
+# v0.86: the stop point recorded when a print stops on a Klipper shutdown or error (_stop_point), one file per printer, so it
+# survives a hub restart and the printer's own firmware restart (which forgets where the print was).
+STOP_POINTS_DIR = Path(os.environ.get("MAKEROS_HUB_STOP_POINTS_DIR", "/var/lib/makeros-hub/klipper-stops"))
 
 # Job-buffer cap (mirror of the Bambu JobTracker). If somehow the cloud is
 # offline for >MAX_PENDING completed prints we drop the OLDEST so we never
@@ -143,7 +146,25 @@ _QUERY_OBJECTS = (
     # v0.82: the printer's heater hold (pstation printers/*/config: shop.cfg on the SV08s, pstation-hold.cfg on the Giga).
     # A printer without it answers null attributes (read on both, 2026-10-23).
     "&gcode_macro%20_pstation_hold=active,minutes,ceiling_minutes,since"
+    # v0.86: Klipper's own state ("shutdown" after an MCU, heater or M112 fault, with its message), and the re-home corners
+    # the printer's PS macros name (printers/*/config: _PS_CORNERS). A printer without them answers null attributes.
+    "&webhooks=state,state_message"
+    "&gcode_macro%20_ps_corners=fl,fr,bl,br"
 )
+_SHUTDOWN = "shutdown"
+# v0.86 (operator, 2026-10-26: "i want to do as much as we can by using as much information as we can to keep everything fully
+# up to date and honest with the users abotu what is going on and what they need to wait on and keeping prints safe through an
+# outage like that"): when a print stops on a Klipper shutdown or error, one read of everything a recovery needs (the Giga's
+# 2026-10-26 recovery wrote these down by hand: reports/giga-mcu-shutdown-2026-10-26.md). In a shutdown Klipper still answers
+# this with the last values it had, which is where the print stopped.
+_STOP_QUERY = (
+    "print_stats=state,filename,info,message&virtual_sdcard=file_position,file_size,progress"
+    "&toolhead=position,axis_maximum&gcode_move=gcode_position,homing_origin,absolute_extrude,speed_factor,extrude_factor"
+    "&extruder=target&fan=speed&fan_generic%20fan0=speed&output_pin%20fan1=value&exclude_object=objects"
+    "&bed_mesh=profile_name&webhooks=state,state_message"
+    + "".join(f"&{urllib.parse.quote(zone)}=target" for zone in BED_ZONES)
+)
+STOP_OBJECTS_MAX = 16          # objects kept in a stop point, each as its bounding box (enough to choose a corner by)
 # v0.82 (operator, 2026-10-23: "I do not want to just turn heaters off if we have a chance to recover a print"): a print
 # stopped on an error or paused keeps its bed warm with the nozzle off, the motors on, until someone answers or the
 # printer's own ceiling (48 h). The printer owns the timing, so it holds with the hub down too; the hub only reports it.
@@ -194,6 +215,10 @@ _ACTION_PARAMS: dict[str, tuple[str, ...]] = {
     # stops and stuff"; "i am assuming all of this will get incorporated with a new tab for movement and homing stuff").
     # Home X/Y and Home Z apart, Park, and the nozzle and bed set to a material's temperature or off ("to").
     "home_xy": (), "home_z": (), "park": (), "nozzle_temp": ("to",), "bed_temp": ("to",),
+    # v0.86: re-home over a print after a stop (operator, 2026-10-26: "maybe on both giga and sovols they should get the option
+    # to move home x an y above their print and then they can choose which corner to move the head too home z it moves the head
+    # to that corner ad then asks if this is a safe corner"), and the bed back to the stopped print's own temperatures.
+    "rehome_xy": (), "move_corner": ("corner",), "home_z_corner": ("corner",), "restore_bed": (),
 }
 # What this hub can run, sent in every heartbeat (klipperActions): the site offers a control only to a hub that lists it.
 KLIPPER_ACTIONS = tuple(sorted(_ACTION_PARAMS))
@@ -220,6 +245,8 @@ _ACTION_NEEDS = {
     "load_more": "gcode_macro _continue_load_filament", "unload_filament": "gcode_macro unload_filament",
     "qgl": "quad_gantry_level", "bed_mesh": "bed_mesh", "clean_nozzle": "gcode_macro clean_nozzle",
     "aux_fan": "fan_generic fan2", "exhaust_fan": "fan_generic fan3",
+    # v0.86: the printer's own PS macros (printers/*/config), deployed by the operator; until then these are refused
+    "rehome_xy": "gcode_macro ps_rehome_xy", "move_corner": "gcode_macro _ps_corners", "home_z_corner": "gcode_macro ps_home_z_here",
 }
 # v0.79 (operator, 2026-10-21, the sv08 report's question 6: "sure"): staff get the SV08's auxiliary and exhaust fans, any
 # state, 0-100 %. Refused on a printer without them (unsupported_on_printer).
@@ -229,33 +256,36 @@ _GENERIC_FANS = {"aux_fan": "fan2", "exhaust_fan": "fan3"}
 # run idle or paused (a runout pause needs them; Sovol's macros reheat to the print's own temperature then) and are refused
 # only while printing. Everything else runs in any state: light, and the two endpoint actions.
 _IDLE_ONLY_ACTIONS = frozenset({"home", "jog", "center", "motors_off", "preheat", "qgl", "bed_mesh", "clean_nozzle",
-                                "cooldown", "home_xy", "home_z", "park", "nozzle_temp", "bed_temp"})
+                                "cooldown", "home_xy", "home_z", "park", "nozzle_temp", "bed_temp",
+                                "rehome_xy", "move_corner", "home_z_corner", "restore_bed"})
 _FILAMENT_ACTIONS = frozenset({"load_filament", "load_more", "unload_filament"})
 # v0.85: the part fan runs in any state (the Controls tab turns it on or off on an idle printer; the screen tunes it mid-print)
 _PRINT_ONLY_ACTIONS = frozenset({"z_offset", "speed"})
 # v0.79: every action that homes or probes. Refused when the probe says it is uncalibrated (on the SV08 a G28 would then
 # calibrate and SAVE_CONFIG, a Klipper restart: Barnes, 2026-10-21 report D10) or the bed is at PROBE_BED_MAX_C or more
 # (the SV08's eddy probe left its valid range at a 100 C bed: D9). Each also drops the home a jog trusts until it ends.
-_HOMING_ACTIONS = frozenset({"home", "center", "qgl", "bed_mesh", "clean_nozzle", "home_xy", "home_z"})
+_HOMING_ACTIONS = frozenset({"home", "center", "qgl", "bed_mesh", "clean_nozzle", "home_xy", "home_z", "rehome_xy", "home_z_corner"})
 # ...and these restore it when they finish: each ends with a real G28 Z (qgl's own, MOVE_TO_CENTER's G28). v0.85: Home Z
 # completes a home only on top of an X/Y home this hub trusts (_check_state refuses it otherwise).
-_PROVES_HOME = frozenset({"home", "center", "qgl", "home_z"})
+_PROVES_HOME = frozenset({"home", "center", "qgl", "home_z", "home_z_corner"})
 # v0.85: the X/Y home Home Z needs. Home X/Y earns only that; Home Z keeps it (it homes Z alone); every other homing
 # action ends it when it starts, as it ends the full home.
-_PROVES_XY = frozenset({"home", "center", "qgl", "home_xy"})
+_PROVES_XY = frozenset({"home", "center", "qgl", "home_xy", "rehome_xy"})
+_KEEPS_XY = frozenset({"home_z", "home_z_corner"})   # home Z alone: the X/Y home they travel on stands
 # Skip the running-action check, the fresh read and the state rules (still not_connected on a stale poll): the way
 # out of a stuck printer.
 _ENDPOINT_ACTIONS = frozenset({"emergency_stop", "firmware_restart"})
 # Minutes, not seconds (homing with the SV08's probe calibration, QGL, a mesh, a heat-and-load): sent on a thread.
 _LONG_ACTIONS = frozenset({"home", "center", "load_filament", "load_more", "unload_filament", "qgl", "bed_mesh",
-                           "clean_nozzle", "home_xy", "home_z"})
+                           "clean_nozzle", "home_xy", "home_z", "rehome_xy", "home_z_corner"})
 # The state an action is checked against, read fresh when it arrives (start_print's rule: the poll may be seconds old,
 # and a print just started from the screen or the queue must never get a jog inside its start routine).
 # v0.79 adds the heat, the probe and Sovol's load temperature variable (Klipper leaves out an object a printer lacks).
 _ACTION_QUERY = ("print_stats=state&toolhead=homed_axes,position,axis_minimum,axis_maximum&extruder=temperature,target"
                  "&heater_bed=temperature,target&probe=is_calibrated"
                  "&gcode_macro%20_global_var=load_filament_extruder_temp,cancel_park&gcode_macro%20_pstation_resume_heat=nozzle"
-                 "&gcode_macro%20_pstation_hold=active")
+                 "&gcode_macro%20_pstation_hold=active&webhooks=state&gcode_macro%20_ps_corners=fl,fr,bl,br"
+                 "&gcode_move=homing_origin")
 _JOG_STEPS_MM = frozenset({0.1, 1.0, 10.0, 50.0})
 _JOG_FEED = {"x": 6000, "y": 6000, "z": 600}
 # v0.85, calibration knobs. A jog down in Z moves at most this far in one tap (the lead's brief, 2026-10-26: "Keep downward Z
@@ -267,6 +297,12 @@ JOG_Z_DOWN_MAX_MM = 1.0
 # operator, 2026-10-26: "the giga parks itself at the front left after a print finishes and that should probably be at the
 # back right"). ponytail: one Z rule for every printer; a part taller than PARK_Z_MIN_MM needs a jog up first.
 PARK_LIFT_MM, PARK_Z_MIN_MM, PARK_MARGIN_MM = 10.0, 50.0, 15.0
+# v0.86, re-home over a print, calibration knobs. Home X/Y from above it lifts REHOME_LIFT_MM first (less when the top is nearer)
+# and is refused when it cannot get at least REHOME_MIN_LIFT_MM above the recorded stop height, which is the print's top: every
+# X/Y move until Z is homed again happens at least that high. Home Z at a corner ends REHOME_CLEAR_MM above the print's top.
+REHOME_LIFT_MM, REHOME_MIN_LIFT_MM, REHOME_CLEAR_MM = 30.0, 5.0, 20.0
+CORNERS = ("fl", "fr", "bl", "br")
+BED_RESTORE_MAX_C = 100.0   # the Giga's Q3 cap, as for every other bed target the hub sends
 
 # v0.79: the machine controls protect the printer from a tap (operator, 2026-10-21: "i definitely also want the stupid
 # logic of z and everything else fixed like we are doing weith the giga to make it run smoothly and protect it form
@@ -375,6 +411,15 @@ class KlipperAdapter:
         # has nudged during the current print (Z_TUNE_MAX_MM). All start empty: a restarted hub asks for a home again.
         self._home_proven = False
         self._xy_proven = False   # v0.85: an X/Y home this hub saw finish (Home Z needs it; _PROVES_XY), lost as the full one is
+        # v0.86, under _lock: the stop point of the last print that stopped on a shutdown or error (kept on disk until a print
+        # runs again), whether the poll before this one had a print running, the corner Move to corner put the nozzle at
+        # ({"name", "x", "y"}, waiting for staff to confirm it clear), and whether Z is known from that record after Home X/Y
+        # over the print (not homed: only corner moves trust it).
+        self._stop_path = STOP_POINTS_DIR / f"{safe_id}.json"
+        self._stop_pt: Optional[dict] = _load_json(self._stop_path)
+        self._was_active = False
+        self._corner: Optional[dict] = None
+        self._z_rec = False
         self._fil_at: Optional[float] = None
         self._z_tuned = 0.0
         # The pause watch (PAUSE_ALERT_SEC), also under _lock: the nozzle target last seen while printing (what a resume
@@ -458,6 +503,7 @@ class KlipperAdapter:
             proven, xy = self._home_proven, self._xy_proven
             paused_at = self._pause["at"] if self._pause else None
             nozzles = dict(self._nozzles)
+            stop, corner, z_rec = (dict(self._stop_pt) if self._stop_pt else None), self._corner, self._z_rec
 
         if last is not None:
             out = _build_status(self.printer_id, data, "connected" if (now - last) <= STALE_SEC else "offline",
@@ -467,8 +513,16 @@ class KlipperAdapter:
                 # the hub would refuse one (Klipper's homed_axes counts the SV08's guessed Z and the Giga's boot home).
                 # v0.85: "xy" after a Home X/Y this hub saw, so the Controls tab offers Home Z exactly when it would run.
                 out["toolhead"]["homed"] = "xy" if xy and set("xy") <= set(out["toolhead"]["homed"].lower()) else ""
-            if paused_at is not None and now - paused_at >= PAUSE_ALERT_SEC:
-                out["printFault"] = "paused_long"   # v0.79: the site alerts the shop, once per print
+            if paused_at is not None and now - paused_at >= PAUSE_ALERT_SEC and "klipperShutdown" not in out:
+                out["printFault"] = "paused_long"   # v0.79: the site alerts the shop, once per print (never "heaters on" in a shutdown)
+            if stop:
+                # v0.86: the recorded stop point, and how far a re-home over the print has got: "xy" (X/Y homed from above it,
+                # Z from the record), "corner" (the nozzle at a corner, waiting for staff to confirm it clear), "z" (Z homed
+                # there: X, Y and Z known)
+                out["stopPoint"] = stop
+                stage = "z" if proven and stop.get("rehomed") else "corner" if corner else "xy" if z_rec and xy else None
+                if stage:
+                    out["rehome"] = {"stage": stage, **({"corner": corner["name"]} if corner else {})}
             # v0.70: when this reading was taken (wall ms), so the site can say "updated 4 s ago" instead of dating
             # everything by the heartbeat's arrival. The poll clock is monotonic; its age is moved onto the wall clock.
             out["sampledAt"] = int((time.time() - (now - last)) * 1000)
@@ -1028,7 +1082,9 @@ class KlipperAdapter:
                 self._note_homed(fresh)
                 with self._lock:
                     proven, xy, z_tuned = self._home_proven, self._xy_proven, self._z_tuned
-                script = _check_state(params, script, fresh, home_proven=proven, z_tuned=z_tuned, xy_proven=xy)
+                    stop, corner, z_rec = self._stop_pt, self._corner, self._z_rec
+                script = _check_state(params, script, fresh, home_proven=proven, z_tuned=z_tuned, xy_proven=xy,
+                                      stop=stop, corner_at=corner, z_rec=z_rec)
                 if need and need not in self._printer_objects():
                     raise _Refused("unsupported_on_printer")
         except _Refused as refused:
@@ -1037,12 +1093,19 @@ class KlipperAdapter:
             return {"ok": False, "reason": _action_failure(exc)[0]}
         if action in _ENDPOINT_ACTIONS or action == "motors_off":   # whatever the answer, the home is gone
             with self._lock:
-                self._home_proven = self._xy_proven = False
+                self._home_proven = self._xy_proven = self._z_rec = False
+        if action != "home_z_corner":   # v0.86: a corner is confirmed by the very next action, or not at all
+            with self._lock:
+                self._corner = None
         if action in _ENDPOINT_ACTIONS or action in ("preheat", "cooldown"):   # a new heat plan: no filament standby
             with self._lock:
                 self._fil_at = None
         if action in _LONG_ACTIONS:
-            return self._start_long_action(action, script)
+            undo = None
+            if action == "home_z_corner":   # PS_HOME_Z_HERE shifts X/Y for its one home; a failed home must not leave that
+                ox, oy = (_axis(_obj(fresh, "gcode_move").get("homing_origin"), i) or 0.0 for i in range(2))
+                undo = f"SET_GCODE_OFFSET X={ox:g} Y={oy:g} MOVE=0"
+            return self._start_long_action(action, script, undo=undo)
         path = script if action in _ENDPOINT_ACTIONS else _script_path(script)
         try:
             self._post_ok(path, ACTION_WAIT_SEC)
@@ -1062,18 +1125,23 @@ class KlipperAdapter:
                 self._objects = None
             if action == "z_offset":
                 self._z_tuned += params["delta"]
+            if action == "move_corner":   # the corner staff are now asked about: the next action may home Z there, nothing else
+                c = _corners_of(fresh)
+                self._corner = {"name": params["corner"], "x": c[params["corner"]][0], "y": c[params["corner"]][1]}
         log.info("klipper %s: action %s ok", self.printer_id, action)
         return {"ok": True}
 
-    def _start_long_action(self, action: str, script: str) -> dict:
+    def _start_long_action(self, action: str, script: str, undo: Optional[str] = None) -> dict:
         with self._lock:
             if self._running_action:
                 return {"ok": False, "reason": "action_running"}
             self._running_action = action
             if action in _HOMING_ACTIONS:
-                self._home_proven = False
-                if action != "home_z":
+                self._home_proven = self._z_rec = False
+                if action not in _KEEPS_XY:
                     self._xy_proven = False
+            if action == "home_z_corner":
+                self._corner = None
         outcome: list[Optional[str]] = []   # appended once by the thread: None = finished ok, else the reason
 
         def run() -> None:
@@ -1086,11 +1154,24 @@ class KlipperAdapter:
                         self._home_proven = True
                     if action in _PROVES_XY:
                         self._xy_proven = True
+                    if action == "rehome_xy":
+                        self._z_rec = True   # Z is the recorded height plus the lift: trusted for corner moves only
+                    done_stop = dict(self._stop_pt, rehomed=True) if action == "home_z_corner" and self._stop_pt else None
+                    if done_stop:
+                        self._stop_pt = done_stop
+                if done_stop:
+                    _save_json(self._stop_path, done_stop)
             except Exception as exc:  # noqa: BLE001 - never let the thread die with the action still marked running
                 reason, message = _action_failure(exc)
                 outcome.append(reason)
                 log.warning("klipper %s: action %s failed: %s %s", self.printer_id, action, reason, message)
                 self._diag("klipper", f"action {action} failed: {reason}")
+                if undo:
+                    try:
+                        self._post_ok(_script_path(undo), ACTION_WAIT_SEC)
+                    except Exception as exc2:  # noqa: BLE001
+                        log.error("klipper %s: %s after a failed %s did not answer: %s (check the G-code offset)",
+                                  self.printer_id, undo, action, _action_failure(exc2)[0])
             finally:
                 with self._lock:
                     self._running_action = None
@@ -1112,13 +1193,16 @@ class KlipperAdapter:
             with self._lock:
                 self._home_proven = False
                 if not (isinstance(homed, str) and set("xy") <= set(homed.lower())):
-                    self._xy_proven = False
+                    self._xy_proven = self._z_rec = False
 
     def _after_poll(self, data: dict[str, Any]) -> None:
         """v0.79, on the poll thread after each good reading: the proven home, the per-print Z tune, the pause watch, the
         filament standby."""
         self._note_homed(data)
+        self._stop_watch(data)
         state = _obj(data, "print_stats").get("state")
+        if _obj(data, "webhooks").get("state") == _SHUTDOWN:
+            return   # v0.86: nothing to time, cool or tune while Klipper refuses every command
         target = _num(_obj(data, "extruder").get("target")) or 0.0
         with self._lock:
             if state not in ("printing", "paused"):
@@ -1136,6 +1220,39 @@ class KlipperAdapter:
             self._pause_watch(data, pause)
         if fil_at is not None:
             self._filament_standby(data, fil_at)
+
+    def _stop_watch(self, data: dict[str, Any]) -> None:
+        """v0.86, on the poll thread: the first reading of a print stopped on a Klipper shutdown or error records its stop
+        point (one read of _STOP_QUERY; tried again next poll if it fails), kept on disk until a print runs again. A pending
+        corner ends when the toolhead is no longer there."""
+        ps = _obj(data, "print_stats")
+        state, shutdown = ps.get("state"), _obj(data, "webhooks").get("state") == _SHUTDOWN
+        file = ps.get("filename") if isinstance(ps.get("filename"), str) else ""
+        pos = _xyz(_obj(data, "toolhead").get("position"))
+        with self._lock:
+            was_active, self._was_active = self._was_active, state in ("printing", "paused") and not shutdown
+            have = self._stop_pt is not None
+            if self._corner and (None in pos[:2] or abs(pos[0] - self._corner["x"]) > 0.5 or abs(pos[1] - self._corner["y"]) > 0.5):
+                self._corner = None
+        if state == "printing" and not shutdown and have:
+            with self._lock:
+                self._stop_pt = None
+            _save_json(self._stop_path, None)
+            log.info("klipper %s: a print runs again; the stop point is cleared", self.printer_id)
+            return
+        if have or not (shutdown or state == "error") or not (was_active or file.strip()):
+            return
+        try:
+            stop = _stop_point(self._fetch_once(_STOP_QUERY), int(time.time() * 1000))
+        except Exception as exc:  # noqa: BLE001 - the next poll tries again
+            log.warning("klipper %s: stop point not read: %s", self.printer_id, _classify_error(exc))
+            return
+        with self._lock:
+            self._stop_pt = stop
+        _save_json(self._stop_path, stop)
+        log.warning("klipper %s: print stopped (%s): recorded at byte %s, layer %s, Z %s", self.printer_id,
+                    stop.get("reason", "error"), stop.get("fileByte"), stop.get("layer"), stop.get("z"))
+        self._diag("klipper", f"print stopped on {self.printer_id[:12]}: {stop.get('reason', 'error')}")
 
     def _filament_standby(self, data: dict[str, Any], fil_at: float) -> None:
         """The Giga's Q2 (operator, 2026-10-21): FIL_STANDBY_SEC after this hub's last filament move with no print, the
@@ -1272,7 +1389,8 @@ class KlipperAdapter:
                     self._last_error_reason = reason
                     self._consecutive_failures += 1
                     failures = self._consecutive_failures
-                    self._home_proven = self._xy_proven = False   # v0.79: the printer may be restarting (the Giga fakes a home at boot)
+                    self._home_proven = self._xy_proven = self._z_rec = False   # v0.79: the printer may be restarting (the Giga fakes a home at boot)
+                    self._corner = None
                 # Adversarial review MED #13: first failure after a run of
                 # successes is WARN-level so it lands in the diag ring (which
                 # gates on WARN+). Subsequent failures stay at DEBUG so a
@@ -1648,6 +1766,9 @@ def _build_status(
             xyz = [_axis(toolhead.get("position"), i) for i in range(3)]
             if None not in xyz:
                 head.update(zip("xyz", (round(v, 2) for v in xyz)))
+            top = _xyz(toolhead.get("axis_maximum"))
+            if None not in top:
+                head["max"] = [round(v, 1) for v in top]   # v0.86: the site draws the bed from it (re-home corners)
             out["toolhead"] = head
         move = status.get("gcode_move")
         if isinstance(move, dict):
@@ -1683,6 +1804,20 @@ def _build_status(
         # render this connection as 'offline' (no state) by accident.
         if "state" not in out:
             out["state"] = "idle"
+        # v0.86 (board 18d68d74, a shutdown reads as stopped, heaters off): in a shutdown (an MCU, heater or fan fault, M112)
+        # Klipper has turned every heater off and refuses motion until a firmware restart, yet print_stats can still say
+        # "paused" or "printing" and every heater still reports its old target with nothing driving it (the Giga, 2026-10-26:
+        # the site said "paused, target 60" while the bed fell from 60 to 40 C). So: an error, in Klipper's own words, with
+        # the targets off and no hold (the hold's macro cannot run in a shutdown).
+        hooks = status.get("webhooks")
+        if isinstance(hooks, dict) and hooks.get("state") == _SHUTDOWN:
+            msg = hooks.get("state_message")
+            words = msg.strip().splitlines()[0][:200] if isinstance(msg, str) and msg.strip() else "Klipper shut down"
+            out.update(state="error", klipperShutdown=words, errorReason=words, nozzleTargetC=0.0, bedTargetC=0.0, preparing=False)
+            out.pop("hold", None)
+        corners = _corners_of(status)
+        if corners:
+            out["corners"] = corners
 
     return out
 
@@ -1821,6 +1956,12 @@ def _parse_action(params: Any) -> tuple[str, str, Optional[str]]:
         script = f"G91\nG1 {axis.upper()}{mm:g} F{_JOG_FEED[axis]}\nG90"
     elif action == "park":
         script = ""   # built by _check_state from the fresh read: the printer's own limits and park
+    elif action in ("rehome_xy", "restore_bed"):
+        script = ""   # v0.86: built by _check_rehome from the stop point and the fresh read
+    elif action in ("move_corner", "home_z_corner"):
+        if params["corner"] not in CORNERS:
+            raise _Refused("bad_params")
+        script = ""
     elif action in ("nozzle_temp", "bed_temp"):
         # a material's temperature (MATERIALS, the caps the tests hold) or off, never a number from the site. On the Giga
         # M140 is Elegoo's macro that sets all four bed zones (printers/orangestorm-giga/config/printer.cfg).
@@ -1866,8 +2007,110 @@ def _all_homed(status: dict[str, Any]) -> bool:
     return isinstance(homed, str) and set("xyz") <= set(homed.lower())
 
 
+def _load_json(path: Path) -> Optional[dict]:
+    try:
+        v = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return v if isinstance(v, dict) else None
+
+
+def _save_json(path: Path, value: Optional[dict]) -> None:
+    """Atomic write (temp file + rename), or remove when value is None. Never raises: the record stays in memory."""
+    try:
+        if value is None:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(value), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        log.warning("klipper stop point %s not saved: %s", path.name, exc)
+
+
+def _xyz(v: Any) -> list:
+    return [_axis(v, i) for i in range(3)]
+
+
+def _stop_point(status: dict[str, Any], at_ms: int) -> dict:
+    """Pure, v0.86: what a recovery needs from the read taken when a print stopped (_STOP_QUERY), each value only when Klipper
+    gave it. z is the toolhead's (what the motors were told, the frame SET_KINEMATIC_POSITION and the axis limits are in);
+    gcodeZ the file's own (on the Giga they differ by its bed mesh, -6.68 mm, reports/giga-mcu-shutdown-2026-10-26.md)."""
+    ps, vs, th, gm, wh = (_obj(status, k) for k in ("print_stats", "virtual_sdcard", "toolhead", "gcode_move", "webhooks"))
+    out: dict[str, Any] = {"at": at_ms, "shutdown": wh.get("state") == _SHUTDOWN}
+    reason = wh.get("state_message") if out["shutdown"] else ps.get("message")
+    if isinstance(reason, str) and reason.strip():
+        out["reason"] = reason.strip().splitlines()[0][:200]
+    if isinstance(ps.get("filename"), str) and ps["filename"].strip():
+        out["file"] = ps["filename"].strip()[:JOB_NAME_MAX_CHARS]
+    for key, v in (("fileByte", vs.get("file_position")), ("fileSize", vs.get("file_size"))):
+        if _int(v) is not None and _int(v) >= 0:
+            out[key] = _int(v)
+    if _num(vs.get("progress")) is not None:
+        out["progressPct"] = round(max(0.0, min(1.0, _num(vs["progress"]))) * 100, 1)
+    info = ps.get("info") if isinstance(ps.get("info"), dict) else {}
+    cur, total = _int(info.get("current_layer")), _int(info.get("total_layer"))
+    if cur is not None and total is not None and total > 0 and cur >= 0:
+        out["layer"] = [cur, total]
+    for k, v in zip("xyz", _xyz(th.get("position"))):
+        if v is not None:
+            out[k] = round(v, 3)
+    top = _axis(th.get("axis_maximum"), 2)
+    if top is not None:
+        out["zMax"] = top
+    gz, zoff = _axis(gm.get("gcode_position"), 2), _axis(gm.get("homing_origin"), 2)
+    if gz is not None:
+        out["gcodeZ"] = round(gz, 3)
+    if zoff is not None:
+        out["zOffset"] = round(zoff, 3)
+    if isinstance(gm.get("absolute_extrude"), bool):
+        out["absoluteExtrude"] = gm["absolute_extrude"]
+    for key, v in (("speedPct", gm.get("speed_factor")), ("flowPct", gm.get("extrude_factor"))):
+        if _num(v) is not None:
+            out[key] = round(_num(v) * 100)
+    if _num(_obj(status, "extruder").get("target")) is not None:
+        out["nozzleTargetC"] = _num(status["extruder"]["target"])
+    beds = {zone.split(" ")[-1]: _num(_obj(status, zone).get("target")) for zone in BED_ZONES}
+    beds = {k: t for k, t in beds.items() if t is not None}
+    if beds:
+        out["bedTargetsC"] = beds
+    fan = next((_num(f.get("speed")) for f in (_obj(status, "fan"), _obj(status, "fan_generic fan0")) if _num(f.get("speed")) is not None), None)
+    if fan is not None:
+        out["fanPct"] = round(fan * 100)
+    pin = _num(_obj(status, "output_pin fan1").get("value"))   # the Giga's part fan is a pin (Elegoo's M106), its value as Klipper reports it
+    if pin is not None:
+        out["fanPin"] = round(pin, 3)
+    if isinstance(_obj(status, "bed_mesh").get("profile_name"), str) and status["bed_mesh"]["profile_name"]:
+        out["mesh"] = status["bed_mesh"]["profile_name"][:64]
+    boxes = []
+    objects = _obj(status, "exclude_object").get("objects")
+    for o in objects if isinstance(objects, list) else []:
+        pts = [(_num(p[0]), _num(p[1])) for p in (o.get("polygon") or []) if isinstance(p, list) and len(p) >= 2] if isinstance(o, dict) else []
+        pts = [p for p in pts if None not in p]
+        if pts and len(boxes) < STOP_OBJECTS_MAX:
+            xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+            boxes.append({"name": str(o.get("name", ""))[:80], "box": [round(min(xs), 1), round(min(ys), 1), round(max(xs), 1), round(max(ys), 1)]})
+    if boxes:
+        out["objects"] = boxes
+    return out
+
+
+def _corners_of(status: dict[str, Any]) -> Optional[dict]:
+    """The printer's re-home corners (its PS macro _PS_CORNERS: the nozzle's X Y for each), all four or none."""
+    c = _obj(status, "gcode_macro _ps_corners")
+    out = {}
+    for name in CORNERS:
+        v = c.get(name)
+        if not (isinstance(v, (list, tuple)) and len(v) == 2 and all(_finite(n) for n in v)):
+            return None
+        out[name] = [float(v[0]), float(v[1])]
+    return out
+
+
 def _check_state(params: dict, script: str, status: dict[str, Any], *, home_proven: bool = False,
-                 z_tuned: float = 0.0, xy_proven: bool = False) -> str:
+                 z_tuned: float = 0.0, xy_proven: bool = False, stop: Optional[dict] = None,
+                 corner_at: Optional[dict] = None, z_rec: bool = False) -> str:
     """Pure: may this parsed action run in `status` (the fresh _ACTION_QUERY read), and the script to send then. Raises
     _Refused: printer_stale, printer_busy / not_printing ("printing" and "paused" both count as a print; filament moves are
     refused only while printing), probe_uncalibrated, bed_too_hot, home_xy_first, not_homed, z_floor, lift_first,
@@ -1876,10 +2119,14 @@ def _check_state(params: dict, script: str, status: dict[str, Any], *, home_prov
     home_proven: a full home this hub saw finish, never lost since (the adapter's _home_proven). homed_axes alone is not
     enough: the SV08's homing_override marks Z homed at a guessed 0 on any G28 X or Y, and the Giga fakes "xyz" at boot.
     xy_proven: an X/Y home this hub saw finish (v0.85, what Home Z travels on). z_tuned: the Z offset this hub has already
-    nudged during this print."""
+    nudged during this print. v0.86: stop, the recorded stop point; corner_at, the corner Move to corner left the nozzle at;
+    z_rec, Z known from that record after Home X/Y over the print. Refusals added: klipper_shutdown, no_stop_point,
+    no_room_to_lift, below_print, z_unknown, not_at_corner, nothing_to_restore."""
     action = params["action"]
     if action in _ENDPOINT_ACTIONS:
         return script
+    if _obj(status, "webhooks").get("state") == _SHUTDOWN:
+        raise _Refused("klipper_shutdown")   # it refuses every command until a firmware restart
     state = _obj(status, "print_stats").get("state")
     if not isinstance(state, str):
         raise _Refused("printer_stale")
@@ -1894,7 +2141,7 @@ def _check_state(params: dict, script: str, status: dict[str, Any], *, home_prov
         raise _Refused("not_printing")
     toolhead = _obj(status, "toolhead")
     z, z_low, z_high = (_axis(toolhead.get(k), 2) for k in ("position", "axis_minimum", "axis_maximum"))
-    if action in _HOMING_ACTIONS:
+    if action in _HOMING_ACTIONS and action != "rehome_xy":   # X/Y homing over a print never probes
         if _obj(status, "probe").get("is_calibrated") is False:
             raise _Refused("probe_uncalibrated")
         bed = _obj(status, "heater_bed")
@@ -1903,6 +2150,9 @@ def _check_state(params: dict, script: str, status: dict[str, Any], *, home_prov
     homed = toolhead.get("homed_axes")
     if action == "home_z" and not (xy_proven and isinstance(homed, str) and set("xy") <= set(homed.lower())):
         raise _Refused("home_xy_first")   # Home Z travels in X and Y to its spot first (the Giga's X620.5 Y203)
+    if action in ("rehome_xy", "move_corner", "home_z_corner", "restore_bed"):
+        return _check_rehome(params, status, home_proven=home_proven, xy_proven=xy_proven, stop=stop,
+                             corner_at=corner_at, z_rec=z_rec)
     if action == "park":
         if not (home_proven and _all_homed(status)):
             raise _Refused("not_homed")
@@ -1956,6 +2206,65 @@ def _check_state(params: dict, script: str, status: dict[str, Any], *, home_prov
     elif action == "z_offset" and abs(z_tuned + params["delta"]) > Z_TUNE_MAX_MM + 1e-9:
         raise _Refused("z_offset_limit")
     return script
+
+
+def _check_rehome(params: dict, status: dict[str, Any], *, home_proven: bool, xy_proven: bool, stop: Optional[dict],
+                  corner_at: Optional[dict], z_rec: bool) -> str:
+    """Pure, v0.86: re-home over a stopped print (operator, 2026-10-26: "move home x an y above their print and then they can
+    choose which corner to move the head too home z it moves the head to that corner ad then asks if this is a safe corner").
+    The remote-motion protocol (reports/giga-mcu-shutdown-2026-10-26.md): Z is never moved down until it is homed again, and
+    every X/Y move before that happens at least REHOME_MIN_LIFT_MM above the recorded stop height, which is the print's top.
+      rehome_xy: Z from a home this hub trusts, else the stop point's (a firmware restart forgets it); up REHOME_LIFT_MM (less
+        near the top, refused under REHOME_MIN_LIFT_MM); then the printer's PS_REHOME_XY homes X and Y with no Z move down.
+      move_corner: only on that X/Y home, at a Z known and above the print; X and Y only, at the current height.
+      home_z_corner: only at the corner the last move went to, still there; the printer's PS_HOME_Z_HERE homes Z there and
+        goes up to REHOME_CLEAR_MM above the print.
+      restore_bed: the bed zones back to the stopped print's own targets (never above BED_RESTORE_MAX_C)."""
+    action, toolhead = params["action"], _obj(status, "toolhead")
+    if not stop:
+        raise _Refused("no_stop_point")
+    if action == "restore_bed":
+        beds = stop.get("bedTargetsC") if isinstance(stop.get("bedTargetsC"), dict) else {}
+        lines = [f"SET_HEATER_TEMPERATURE HEATER={zone} TARGET={min(t, BED_RESTORE_MAX_C):g}" for zone, t in beds.items()
+                 if zone in {z.split(" ")[-1] for z in BED_ZONES} and _finite(t) and t > 0]
+        if not lines:
+            raise _Refused("nothing_to_restore")
+        return "\n".join(lines)
+    pos = _xyz(toolhead.get("position"))
+    top = _axis(toolhead.get("axis_maximum"), 2)
+    stop_z = stop.get("z") if _finite(stop.get("z")) else None
+    if None in pos or top is None or stop_z is None:
+        raise _Refused("printer_stale" if stop_z is not None else "no_stop_point")
+    floor = stop_z + REHOME_MIN_LIFT_MM   # every X/Y move until Z is homed again: at least this high
+    if action == "rehome_xy":
+        z = pos[2] if home_proven and _all_homed(status) else stop_z
+        lift = round(min(REHOME_LIFT_MM, top - 1.0 - z), 3)
+        if lift < REHOME_MIN_LIFT_MM - 1e-6:
+            raise _Refused("no_room_to_lift")
+        if z + lift < floor - 1e-6:
+            raise _Refused("below_print")
+        return f"PS_REHOME_XY Z={round(z, 3):g} LIFT={lift:g}"
+    homed = toolhead.get("homed_axes")
+    if not (xy_proven and isinstance(homed, str) and set("xy") <= set(homed.lower())):
+        raise _Refused("not_homed")
+    if not (home_proven or z_rec):
+        raise _Refused("z_unknown")
+    if pos[2] < floor - 1e-6:
+        raise _Refused("below_print")
+    corners = _corners_of(status)
+    if corners is None:
+        raise _Refused("unsupported_on_printer")
+    cx, cy = corners[params["corner"]]
+    if action == "move_corner":
+        lows, highs = _xyz(toolhead.get("axis_minimum")), _xyz(toolhead.get("axis_maximum"))
+        if None in lows[:2] or None in highs[:2] or not (lows[0] <= cx <= highs[0] and lows[1] <= cy <= highs[1]):
+            raise _Refused("out_of_range")
+        ox, oy = (_axis(_obj(status, "gcode_move").get("homing_origin"), i) or 0.0 for i in range(2))
+        return f"G90\nG1 X{round(cx - ox, 3):g} Y{round(cy - oy, 3):g} F6000"   # the nozzle lands on the corner whatever the G-code offset
+    # home_z_corner: staff answered "clear" for the corner the nozzle went to, and it is still there
+    if not (corner_at and corner_at.get("name") == params["corner"] and abs(pos[0] - cx) <= 0.5 and abs(pos[1] - cy) <= 0.5):
+        raise _Refused("not_at_corner")
+    return f"PS_HOME_Z_HERE LIFT_TO={round(min(top - 1.0, max(stop_z + REHOME_CLEAR_MM, LIFT_Z_MM)), 3):g}"
 
 
 def _action_failure(err: BaseException) -> tuple[str, str]:
