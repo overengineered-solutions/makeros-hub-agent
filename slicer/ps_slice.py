@@ -1124,6 +1124,121 @@ def set_model_id(threemf: str, model_id: str) -> None:
     os.replace(tmp, threemf)
 
 
+# The plate's own picture (2026-10-26; operator: "sending a sliced image back tot he user showing our recommended settings"). OrcaSlicer
+# 2.4.2's command line writes no Metadata/plate_N.png (checked on a slice from this image: plate_1.json, no picture), so the wrapper
+# draws one from the slice's own G-code: every extruding move, seen from the front and above, coloured by what it is (walls, infill,
+# supports, brim), so the member sees the supports and the brim the shop's settings laid. The hub sends it to the site with the slice
+# report; Bambu printers show a plate's picture on their screen too. Best-effort: a picture that cannot be drawn leaves the plate as it
+# was, and the site shows the check's picture instead.
+PICTURE_SIZE = 512
+MAX_SEGMENTS = 200_000
+FEATURE_COLOURS = {"outer wall": (232, 128, 40), "overhang wall": (232, 128, 40), "inner wall": (240, 170, 70), "top surface": (250, 205, 95),
+                   "bottom surface": (205, 160, 90), "internal solid infill": (210, 165, 95), "sparse infill": (190, 150, 95),
+                   "bridge": (200, 120, 60), "gap infill": (235, 180, 90), "support": (50, 170, 160), "support interface": (35, 130, 120),
+                   "support transition": (50, 170, 160), "brim": (70, 130, 220), "skirt": (70, 130, 220)}
+_NOT_PRINTED = ("custom", "prime tower", "wipe tower", "purge", "wipe")
+
+
+def gcode_segments(gcode: bytes, limit: int = MAX_SEGMENTS) -> list[tuple]:
+    """The extruding moves of a sliced plate as (feature, x0, y0, z, x1, y1), in print order, thinned evenly to at most `limit`;
+    the start and end G-code (Orca's Custom feature), prime towers and wipes are left out."""
+    x = y = z = e = 0.0
+    relative, feature, step, n = True, None, 1, 0
+    out: list[tuple] = []
+    for raw in gcode.split(b"\n"):
+        line = raw.split(b";", 1)[0].strip() if not raw.startswith(b"; FEATURE:") else b""
+        if raw.startswith(b"; FEATURE:"):
+            feature = raw[10:].decode("utf-8", "replace").strip().lower()
+            continue
+        if not line:
+            continue
+        head = line.split(None, 1)[0]
+        if head == b"M83":
+            relative = True
+        elif head == b"M82":
+            relative = False
+        elif head == b"G92":
+            for w in line.split()[1:]:
+                if w[:1] == b"E":
+                    try:
+                        e = float(w[1:])
+                    except ValueError:
+                        pass
+        elif head in (b"G0", b"G1", b"G2", b"G3"):
+            nx, ny, nz, ne = x, y, z, None
+            for w in line.split()[1:]:
+                try:
+                    if w[:1] == b"X": nx = float(w[1:])
+                    elif w[:1] == b"Y": ny = float(w[1:])
+                    elif w[:1] == b"Z": nz = float(w[1:])
+                    elif w[:1] == b"E": ne = float(w[1:])
+                except ValueError:
+                    pass
+            extruded = ne is not None and (ne > 0 if relative else ne > e)
+            if ne is not None and not relative:
+                e = ne
+            if extruded and feature and not any(k in feature for k in _NOT_PRINTED) and (nx, ny) != (x, y):
+                n += 1
+                if n % step == 0:
+                    out.append((feature, x, y, nz, nx, ny))
+                    if len(out) > limit:
+                        out, step = out[::2], step * 2
+            x, y, z = nx, ny, nz
+    return out
+
+
+def draw_plate_picture(gcode: bytes, size: int = PICTURE_SIZE) -> bytes | None:
+    """The plate seen from the front and above, a PNG of size x size (8-bit RGB), or None when it has nothing to draw or Pillow is
+    missing."""
+    try:
+        from PIL import Image, ImageDraw
+    except ImportError:
+        return None
+    import io
+    segs = gcode_segments(gcode)
+    if not segs:
+        return None
+    # isometric from the front: across is x - y, down is (x + y) / 2 - z; in print order, so higher layers cover lower ones
+    pts = [((s[1] - s[2]) * 0.866, (s[1] + s[2]) * 0.5 - s[3], (s[4] - s[5]) * 0.866, (s[4] + s[5]) * 0.5 - s[3]) for s in segs]
+    us = [p[0] for p in pts] + [p[2] for p in pts]
+    vs = [p[1] for p in pts] + [p[3] for p in pts]
+    u0, v0, span = min(us), min(vs), max(max(us) - min(us), max(vs) - min(vs), 1e-6)
+    pad = size * 0.06
+    k = (size - 2 * pad) / span
+    ou, ov = (size - (max(us) - u0) * k) / 2, (size - (max(vs) - v0) * k) / 2
+    zmax = max(s[3] for s in segs) or 1.0
+    img = Image.new("RGB", (size, size), (246, 246, 243))
+    draw = ImageDraw.Draw(img)
+    width = 2 if len(segs) < 20_000 else 1
+    for s, p in zip(segs, pts):
+        base = FEATURE_COLOURS.get(s[0], (200, 160, 100))
+        light = 0.72 + 0.28 * (s[3] / zmax)
+        colour = tuple(min(255, int(c * light)) for c in base)
+        draw.line([(ou + (p[0] - u0) * k, ov + (p[1] - v0) * k), (ou + (p[2] - u0) * k, ov + (p[3] - v0) * k)], fill=colour, width=width)
+    buf = io.BytesIO()
+    img.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+def add_plate_picture(threemf: str, plate: int = 1) -> bool:
+    """Writes the drawn picture into the sliced 3MF as Metadata/plate_N.png, unless it has one; True when it did. Never raises."""
+    name = f"Metadata/plate_{plate}.png"
+    try:
+        with zipfile.ZipFile(threemf) as z:
+            if name in z.namelist():
+                return False
+            gcode = z.read(f"Metadata/plate_{plate}.gcode")
+        png = draw_plate_picture(gcode)
+        if png is None:
+            return False
+        with zipfile.ZipFile(threemf, "a", zipfile.ZIP_DEFLATED) as z:
+            z.writestr(name, png)
+        return True
+    except Exception as exc:  # noqa: BLE001 - the picture never costs the slice
+        print(f"plate picture skipped: {type(exc).__name__}", file=sys.stderr)
+        return False
+
+
 def summarize(threemf: str) -> dict:
     with zipfile.ZipFile(threemf) as z:
         names = z.namelist()
@@ -1238,6 +1353,7 @@ def run(job_dir: str | None = None) -> dict:
             tail = (p.stdout + p.stderr).strip().splitlines()[-3:]
             raise SliceError("the slicer could not slice this part" + (f" ({' / '.join(tail)[:300]})" if tail else ""))
         set_model_id(sliced, model_id)
+        add_plate_picture(sliced)
         result = {"ok": True, "filament": filament_name, "process": PROCESS.format(sfx=sfx), "settings": effective_settings(process),
                   **summarize(sliced), **caps(processes, machines)}
         with open(os.path.join(out, "result.json"), encoding="utf-8") as fh:
@@ -1357,6 +1473,9 @@ def selftest() -> None:
     assert line_width({"outer_wall_line_width": "0.42"}, {}) == 0.42
     assert line_width({"outer_wall_line_width": "105%"}, {"nozzle_diameter": ["0.4"]}) == 0.42
     assert line_width({"outer_wall_line_width": "0"}, {}) is None and line_width({}, {}) is None
+    walls = b"M83\n; FEATURE: Custom\nG1 X0 Y0 E5\n; FEATURE: Outer wall\nG1 Z0.2\nG1 X10 Y0 E0.5\nG1 X10 Y10 E0.5\nG0 X0 Y0\n; FEATURE: Support\nG1 X5 Y5 E0.2\n"
+    assert [s[0] for s in gcode_segments(walls)] == ["outer wall", "outer wall", "support"], gcode_segments(walls)
+    assert len(gcode_segments(b"M83\n; FEATURE: Inner wall\n" + b"".join(b"G1 X%d Y0 E0.1\n" % i for i in range(1, 1001)), limit=100)) <= 101
     if os.path.isdir(PROFILES):   # inside the image (its build runs this): every model's process names its line width
         got = caps()
         assert set(got["lineWidth"]) == set(MODELS) and (got["scaleMin"], got["scaleMax"]) == (SCALE_MIN, SCALE_MAX), got
