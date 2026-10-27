@@ -10,6 +10,9 @@ any other form, and nothing prints that the site did not approve against the all
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import math
 import json
 import logging
 import os
@@ -29,7 +32,10 @@ log = logging.getLogger("makeros_hub.paper")
 
 PAPER_RUNNER = os.environ.get("MAKEROS_HUB_PAPER_RUNNER", "/opt/ps-paper/run-paper")
 MEDIA = {"letter": "na_letter_8.5x11in", "tabloid": "na_ledger_11x17in"}
-FILES = {"pdf": "doc.pdf", "jpeg": "doc.jpg", "png": "doc.png"}
+FILES = {"pdf": "doc.pdf", "jpeg": "doc.jpg", "png": "doc.png", **{k: "doc." + k for k in
+    "docx doc pptx ppt xlsx xls odt odp ods rtf txt heic heif".split()}}
+BASE_FILES = {"pdf", "jpeg", "png"}
+_formats_cache = (0.0, [])
 ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 HOST_RE = re.compile(r"^(192\.168|10\.\d{1,3})\.\d{1,3}\.\d{1,3}$")
 FOLLOW_SECONDS = 20 * 60
@@ -37,6 +43,55 @@ FOLLOW_SECONDS = 20 * 60
 
 def paper_ready() -> bool:
     return os.path.isfile(PAPER_RUNNER) and os.access(PAPER_RUNNER, os.X_OK)
+
+
+def paper_formats() -> list[str]:
+    """Ask the installed image, not the hub version; an old runner cannot advertise conversion."""
+    global _formats_cache
+    if time.monotonic() < _formats_cache[0]:
+        return list(_formats_cache[1])
+    formats = []
+    try:
+        r = subprocess.run(["sudo", "-n", PAPER_RUNNER, "formats"], capture_output=True, text=True, timeout=15)
+        data = json.loads(r.stdout) if r.returncode == 0 else None
+        if isinstance(data, list) and data and all(isinstance(k, str) and k in FILES for k in data):
+            formats = sorted(set(data))
+        else:
+            log.warning("paper format probe unavailable; using the original paper formats")
+    except (OSError, ValueError, subprocess.TimeoutExpired) as e:
+        log.warning("paper format probe failed: %s", type(e).__name__)
+    _formats_cache = (time.monotonic() + 60, formats)
+    return list(formats)
+
+
+def measurement(result, work, extended):
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise ValueError("Invalid renderer result")
+    pages = result.get("pages")
+    if not isinstance(pages, list) or not 1 <= len(pages) <= (200 if extended else 30) or any(
+        not isinstance(p, dict) or any(type(p.get(k)) not in (int, float) or not math.isfinite(p[k]) or not 0 <= p[k] <= 1
+        for k in ("c", "m", "y", "k")) for p in pages):
+        raise ValueError("Invalid renderer page measurements")
+    pwg = Path(work) / "out" / "doc.pwg"
+    if not 0 < pwg.stat().st_size <= 512 * 1024 * 1024:
+        raise ValueError("Invalid raster size")
+    data = {"pages": pages}
+    if extended:
+        preview, count, digest = result.get("preview"), result.get("sourcePages"), result.get("renderHash")
+        if type(count) is not int or not 1 <= count <= 200 or not isinstance(preview, list) or len(preview) != min(20, len(pages)):
+            raise ValueError("Missing paper preview")
+        if any(not isinstance(p, str) or len(p) > 24 * 1024 for p in preview) or sum(map(len, preview)) > 512 * 1024:
+            raise ValueError("Paper preview too large")
+        for p in preview:
+            raw = base64.b64decode(p, validate=True)
+            if not raw.startswith(b"\x89PNG\r\n\x1a\n") or len(raw) < 24 or not all(0 < n <= 240 for n in struct.unpack(">II", raw[16:24])):
+                raise ValueError("Invalid paper thumbnail")
+        with pwg.open("rb") as fh:
+            actual = hashlib.file_digest(fh, "sha256").hexdigest()
+        if digest != actual:
+            raise ValueError("Paper rendering changed")
+        data.update(preview=preview, sourcePages=count, renderHash=digest)
+    return data
 
 
 # ── IPP, just what Print-Job and Get-Job-Attributes need (RFC 8010) ─────────────────────────────────────────────────
@@ -180,7 +235,7 @@ def flush_reports(spool_dir: str, poster) -> bool:
 
 
 # ── one job, end to end ──────────────────────────────────────────────────────────────────────────────────────────
-def process(job: dict, host: str, spool_dir: str, *, getter, poster, runner=None, sender=send_to_printer, follower=follow) -> str:
+def process(job: dict, host: str, spool_dir: str, *, getter, poster, runner=None, formats=None, sender=send_to_printer, follower=follow) -> str:
     """Fetch, measure, ask, print, report. Returns a short outcome for the log. `getter(path, dest)` downloads the file,
     `poster(body)` posts to /api/print/hub/paper and returns the site's JSON answer."""
     jid = job.get("id")
@@ -190,6 +245,15 @@ def process(job: dict, host: str, spool_dir: str, *, getter, poster, runner=None
         return "skipped: no paper printer address"
     if not flush_reports(spool_dir, poster):
         return "outcome report pending"
+    extended = job.get("preview") is True
+    if job.get("fileType") not in BASE_FILES and not extended:
+        poster({"id": jid, "measured": False, "reason": "This converted file needs a site version that shows its preview. Ask staff."})
+        return "missing preview protocol"
+    if extended or job.get("fileType") not in BASE_FILES or job.get("options") is not None:
+        available = paper_formats() if formats is None else formats
+        if job["fileType"] not in available:
+            poster({"id": jid, "measured": False, "reason": "The paper converter is unavailable. Ask staff, or send a PDF with the original options."})
+            return "missing paper capability"
     copies = job.get("copies") if isinstance(job.get("copies"), int) and 1 <= job["copies"] <= 10 else 1
     work = os.path.join(spool_dir, "paper-" + jid.replace("-", ""))
     receipt = Path(spool_dir) / "paper-outcome.json"
@@ -198,22 +262,32 @@ def process(job: dict, host: str, spool_dir: str, *, getter, poster, runner=None
         os.makedirs(work, mode=0o700)
         name = FILES[job["fileType"]]
         with open(os.path.join(work, "job.json"), "w", encoding="utf-8") as fh:
-            json.dump({"file": name, "media": job["media"], "colour": job.get("colour") is True}, fh)
+            config = {"file": name, "media": job["media"], "colour": job.get("colour") is True}
+            if extended:
+                config.update(options=job.get("options"), preview=True)
+            json.dump(config, fh)
         try:
             getter(job.get("path"), os.path.join(work, name))
         except OSError as e:
             # a download hiccup is not the member's file being bad: leave the job queued, the next beat tries again
             log.warning("paper job %s: download failed, will retry: %s", jid, e)
             return "download failed; will retry"
+        if not 0 < os.path.getsize(os.path.join(work, name)) <= 20 * 1024 * 1024:
+            raise ValueError("Paper upload exceeds 20 MB")
         rc = (runner or (lambda uid: subprocess.run(["sudo", "-n", PAPER_RUNNER, uid], capture_output=True, timeout=660).returncode))(jid.replace("-", ""))
         try:
-            result = json.load(open(os.path.join(work, "out", "result.json"), encoding="utf-8"))
+            result_file = Path(work) / "out" / "result.json"
+            if result_file.stat().st_size > 768 * 1024:
+                raise ValueError("Paper renderer result exceeds 768 KiB")
+            result = json.loads(result_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             result = {"ok": False, "reason": f"the paper renderer did not answer (exit {rc})"}
+        if not isinstance(result, dict):
+            raise ValueError("Invalid paper renderer response")
         if not result.get("ok"):
             poster({"id": jid, "measured": False, "reason": str(result.get("reason") or "could not read the file")[:300]})
             return "refused by the renderer"
-        answer = poster({"id": jid, "pages": result.get("pages") or []})
+        answer = poster({"id": jid, **measurement(result, work, extended)})
         if not (isinstance(answer, dict) and answer.get("print") is True):
             return "not approved by the site"
         # A restart after sending cannot tell whether paper came out. Persist that uncertainty BEFORE sending.

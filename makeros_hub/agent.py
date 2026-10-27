@@ -778,6 +778,7 @@ def heartbeat_payload(
     slicer_caps: dict | None = None,
     checker: dict | None = None,
     paper_ready: bool | None = None,
+    paper_formats: list[str] | None = None,
     camera_gateway: bool | None = None,
     camera_live_stats: list[dict] | None = None,
     screen_events: list[dict] | None = None,
@@ -875,6 +876,8 @@ def heartbeat_payload(
     # checker at least its own format, and only on a beat that says the worker is free)
     if isinstance(checker, dict):
         payload["checker"] = {"format": checker.get("format"), "version": checker.get("version"), "free": checker.get("free") is True}
+    if paper_formats is not None:
+        payload["paperFormats"] = paper_formats
     if paper_ready is not None:
         payload["paperReady"] = bool(paper_ready)   # v0.73: the site hands paper jobs only to a box that can render them
     # v0.75: whether the camera gateway answered recently (the site offers live view of the RTSPS printers only while it
@@ -2042,6 +2045,7 @@ def run(
                         slicer_caps=SLICER_CAPS.value,
                         checker=check_lane.heartbeat_checker(not check_lock.locked()) if checker_ready else None,
                         paper_ready=paper_lane.paper_ready(),
+                        paper_formats=paper_lane.paper_formats() if paper_lane.paper_ready() else [],
                         camera_gateway=GATEWAY.available(),
                         camera_live_stats=live_views.stats(),
                         screen_events=screen_events,

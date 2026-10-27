@@ -7,6 +7,10 @@ set -eu
 SPOOL=/var/lib/makeros-hub/spool
 HUB_USER=makeros-hub
 IMAGE=ps-paper:current
+if [ "${1:-}" = formats ]; then
+  exec timeout 10 docker run --rm --network none --read-only --memory 128m --pids-limit 32 \
+    --security-opt no-new-privileges --cap-drop ALL "$IMAGE" formats
+fi
 id="${1:-}"
 case "$id" in ""|*[!0-9a-f]*) echo "run-paper: the job id is lowercase hex" >&2; exit 2 ;; esac
 [ "${#id}" -ge 8 ] && [ "${#id}" -le 64 ] || { echo "run-paper: the job id is 8 to 64 characters" >&2; exit 2; }
@@ -16,6 +20,8 @@ real=$(realpath -e -- "$dir" 2>/dev/null) || { echo "run-paper: no paper job at 
 [ -d "$real" ] || { echo "run-paper: $dir is not a directory" >&2; exit 2; }
 uid=$(id -u "$HUB_USER"); gid=$(id -g "$HUB_USER")
 [ "$(stat -c %u "$real")" = "$uid" ] || { echo "run-paper: $dir is not the hub's" >&2; exit 2; }
-exec timeout 600 docker run --rm --network none --read-only --tmpfs /tmp:size=1g,mode=1777 \
+container="ps-paper-$id"
+trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT INT TERM
+timeout 600 docker run --name "$container" --rm --network none --read-only --tmpfs /tmp:size=1g,mode=1777 \
   --memory 2g --memory-swap 2g --cpus 2 --pids-limit 256 --security-opt no-new-privileges --cap-drop ALL \
   --user "$uid:$gid" -e HOME=/tmp -v "$real":/job "$IMAGE"
