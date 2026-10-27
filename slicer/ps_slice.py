@@ -1220,19 +1220,123 @@ def draw_plate_picture(gcode: bytes, size: int = PICTURE_SIZE) -> bytes | None:
     return buf.getvalue()
 
 
-def add_plate_picture(threemf: str, plate: int = 1) -> bool:
-    """Writes the drawn picture into the sliced 3MF as Metadata/plate_N.png, unless it has one; True when it did. Never raises."""
-    name = f"Metadata/plate_{plate}.png"
+# The member's four views (2026-10-27; operator: "i think it might make sense to just send a few views ... and then match the default rhino
+# views behind it"): Rhino's default layout, Top upper left, Perspective upper right, Front lower left, Right lower right, each titled as
+# Rhino titles its viewports, in the same feature colours, the bed's outline in Top and Perspective and its edge in Front and Right. One
+# RGB PNG (the site takes 8-bit RGB up to 1024 px) as Metadata/ps_views_N.png, which the hub sends in place of plate_N.png; plate_N.png
+# stays the one view the printer's own screen shows. Kept under VIEWS_MAX (the site's cap) by drawing smaller panels when it must.
+VIEW_PANEL = 400
+VIEWS_MAX = 192 * 1024
+# Rhino's default Perspective camera looks this way (opennurbs's default perspective viewport: from the front right, above)
+_RHINO_PERSPECTIVE = (-43.0, 75.0, -50.0)
+
+
+def _bed(printable_area) -> list[tuple[float, float]]:
+    """The bed's corners from the machine profile's printable_area ("0x0", "180x0", ...); [] when it does not read."""
+    try:
+        pts = [tuple(float(v) for v in str(p).split("x")) for p in printable_area or []]
+    except ValueError:
+        return []
+    return pts if len(pts) >= 3 and all(len(p) == 2 for p in pts) else []
+
+
+def _views(segs: list[tuple], bed: list[tuple[float, float]]) -> list[tuple]:
+    """(title, project, outline) per panel in Rhino's order; project maps (x, y, z) to (across, down, depth), farther is larger."""
+    xs = [v for s in segs for v in (s[1], s[4])]
+    ys = [v for s in segs for v in (s[2], s[5])]
+    zs = [s[3] for s in segs]
+    c = ((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2, (min(zs) + max(zs)) / 2)
+    radius = max(max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs), 1.0)
+    n = math.sqrt(sum(v * v for v in _RHINO_PERSPECTIVE))
+    d = tuple(v / n for v in _RHINO_PERSPECTIVE)
+    r = (d[1], -d[0], 0.0)
+    rn = math.hypot(r[0], r[1])
+    r = (r[0] / rn, r[1] / rn, 0.0)
+    u = (r[1] * d[2] - r[2] * d[1], r[2] * d[0] - r[0] * d[2], r[0] * d[1] - r[1] * d[0])
+    eye = tuple(c[i] - d[i] * radius * 2.6 for i in range(3))
+
+    def persp(x, y, z):
+        q = (x - eye[0], y - eye[1], z - eye[2])
+        depth = max(q[0] * d[0] + q[1] * d[1] + q[2] * d[2], 1e-3)
+        return ((q[0] * r[0] + q[1] * r[1]) / depth, -(q[0] * u[0] + q[1] * u[1] + q[2] * u[2]) / depth, depth)
+    edge = [(min(p[0] for p in bed), 0.0), (max(p[0] for p in bed), 0.0)] if bed else []
+    return [("Top", lambda x, y, z: (x, -y, -z), [(x, y, 0.0) for x, y in bed], True),
+            ("Perspective", persp, [(x, y, 0.0) for x, y in bed], False),
+            ("Front", lambda x, y, z: (x, -z, y), [(x, c[1], 0.0) for x, _ in edge], False),
+            ("Right", lambda x, y, z: (y, -z, -x), [(c[0], y, 0.0) for y in ([min(p[1] for p in bed), max(p[1] for p in bed)] if bed else [])], False)]
+
+
+def draw_plate_views(gcode: bytes, printable_area=None, panel: int = VIEW_PANEL) -> bytes | None:
+    """Rhino's four default views of the sliced plate as one 2 x 2 RGB PNG, or None when there is nothing to draw or Pillow is missing.
+    Each view is fitted to the print (Top to the bed too, so its place on the plate shows), far moves drawn first."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return None
+    import io
+    segs = gcode_segments(gcode, 120_000)
+    if not segs:
+        return None
+    bed = _bed(printable_area)
+    zmax = max(s[3] for s in segs) or 1.0
+    colours = [tuple(min(255, int(ch * (0.72 + 0.28 * s[3] / zmax))) for ch in FEATURE_COLOURS.get(s[0], (200, 160, 100))) for s in segs]
+    try:
+        font = ImageFont.load_default(size=max(11, panel // 28))
+    except TypeError:   # Pillow before 10.1: the bitmap font
+        font = ImageFont.load_default()
+    gap, title = 2, max(18, panel // 18)
+    out = Image.new("RGB", (panel * 2 + gap, panel * 2 + gap), (120, 120, 120))
+    for i, (name, project, outline, with_bed) in enumerate(_views(segs, bed)):
+        img = Image.new("RGB", (panel, panel), (232, 232, 230))
+        draw = ImageDraw.Draw(img)
+        lines = [(project(s[1], s[2], s[3]), project(s[4], s[5], s[3]), k) for k, s in enumerate(segs)]
+        ring = [project(*p) for p in outline]
+        us = [a[0] for a, b, _ in lines] + [b[0] for a, b, _ in lines] + ([p[0] for p in ring] if with_bed else [])
+        vs = [a[1] for a, b, _ in lines] + [b[1] for a, b, _ in lines] + ([p[1] for p in ring] if with_bed else [])
+        u0, v0 = min(us), min(vs)
+        span = max(max(us) - u0, max(vs) - v0, 1e-9)
+        pad = panel * 0.07
+        k = (panel - 2 * pad - title) / span
+        ou, ov = (panel - (max(us) - u0) * k) / 2, title + (panel - title - (max(vs) - v0) * k) / 2
+        at = lambda p: (ou + (p[0] - u0) * k, ov + (p[1] - v0) * k)
+        if len(ring) > 2:
+            draw.polygon([at(p) for p in ring], outline=(150, 150, 150), fill=(244, 244, 242))
+        elif len(ring) == 2:
+            draw.line([at(p) for p in ring], fill=(150, 150, 150), width=2)
+        width = 2 if len(segs) < 20_000 and panel >= 300 else 1
+        for a, b, j in sorted(lines, key=lambda x: -(x[0][2] + x[1][2])):
+            draw.line([at(a), at(b)], fill=colours[j], width=width)
+        draw.rectangle([0, 0, panel - 1, title], fill=(208, 208, 206))
+        draw.text((6, 3), name, fill=(40, 40, 40), font=font)
+        out.paste(img, ((i % 2) * (panel + gap), (i // 2) * (panel + gap)))
+    buf = io.BytesIO()
+    out.save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+def add_plate_picture(threemf: str, plate: int = 1, printable_area=None) -> bool:
+    """Writes the drawn picture into the sliced 3MF as Metadata/plate_N.png, unless it has one, and the four views as
+    Metadata/ps_views_N.png (smaller panels until it fits VIEWS_MAX); True when it wrote either. Never raises."""
+    name, views = f"Metadata/plate_{plate}.png", f"Metadata/ps_views_{plate}.png"
     try:
         with zipfile.ZipFile(threemf) as z:
-            if name in z.namelist():
-                return False
+            have = set(z.namelist())
             gcode = z.read(f"Metadata/plate_{plate}.gcode")
-        png = draw_plate_picture(gcode)
-        if png is None:
+        add = {}
+        if name not in have and (png := draw_plate_picture(gcode)) is not None:
+            add[name] = png
+        if views not in have:
+            for panel in (VIEW_PANEL, 320, 256):
+                png = draw_plate_views(gcode, printable_area, panel)
+                if png is None or len(png) <= VIEWS_MAX:
+                    break
+            if png is not None and len(png) <= VIEWS_MAX:
+                add[views] = png
+        if not add:
             return False
         with zipfile.ZipFile(threemf, "a", zipfile.ZIP_DEFLATED) as z:
-            z.writestr(name, png)
+            for n, data in add.items():
+                z.writestr(n, data)
         return True
     except Exception as exc:  # noqa: BLE001 - the picture never costs the slice
         print(f"plate picture skipped: {type(exc).__name__}", file=sys.stderr)
@@ -1353,7 +1457,7 @@ def run(job_dir: str | None = None) -> dict:
             tail = (p.stdout + p.stderr).strip().splitlines()[-3:]
             raise SliceError("the slicer could not slice this part" + (f" ({' / '.join(tail)[:300]})" if tail else ""))
         set_model_id(sliced, model_id)
-        add_plate_picture(sliced)
+        add_plate_picture(sliced, printable_area=machine.get("printable_area"))
         result = {"ok": True, "filament": filament_name, "process": PROCESS.format(sfx=sfx), "settings": effective_settings(process),
                   **summarize(sliced), **caps(processes, machines)}
         with open(os.path.join(out, "result.json"), encoding="utf-8") as fh:

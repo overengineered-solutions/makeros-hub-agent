@@ -112,10 +112,12 @@ _MAX_BOXES = 256
 
 
 def plate_picture(threemf_path, plate: int = 1) -> bytes | None:
-    """The plate's own picture, Metadata/plate_N.png (else plate_N_small.png): a PNG of at most PLATE_PICTURE_MAX bytes, or None."""
+    """The plate's picture for the member: the shop slicer's four views, Metadata/ps_views_N.png (2026-10-27; operator: "i think it might
+    make sense to just send a few views"), else the plate's own Metadata/plate_N.png (else plate_N_small.png), as an OrcaSlicer send
+    has: a PNG of at most PLATE_PICTURE_MAX bytes, or None."""
     try:
         with zipfile.ZipFile(threemf_path) as zf:
-            for name in (f"Metadata/plate_{int(plate)}.png", f"Metadata/plate_{int(plate)}_small.png"):
+            for name in (f"Metadata/ps_views_{int(plate)}.png", f"Metadata/plate_{int(plate)}.png", f"Metadata/plate_{int(plate)}_small.png"):
                 try:
                     info = zf.getinfo(name)
                 except KeyError:
