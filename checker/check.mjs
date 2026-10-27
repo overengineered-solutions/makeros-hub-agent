@@ -1,4 +1,4 @@
-// ps-checker d444bec7e29c, format 4: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
+// ps-checker 922419fb41dd, format 5: bundled from pstation by scripts/build-checker.mjs. Do not edit; rebuild it.
 
 // src/checker/main.ts
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
@@ -471,7 +471,7 @@ function analyze(mesh, models = Object.keys(PLATES), minWallMm = MIN_WALL_MM, st
   const { thinTris, ...thin } = { ...thickness(P, n, normals, areas, flip, closed.boundaryEdges === 0 || closed.boundaryEdges < n * 0.01, minWallMm, bvh), minWallMm };
   const shell = Math.min(volume, area * 0.84), infill = Math.max(0, volume - shell) * 0.15;
   const solid = shell + infill;
-  const grams = { pla: round1(solid * 124e-5), petg: round1(solid * 127e-5) };
+  const grams = { pla: solid * 124e-5, petg: solid * 127e-5 };
   const fits = models.flatMap((model) => {
     const f = fitsPlate(model, size);
     return f ? [{ model, ...f }] : [];
@@ -495,8 +495,24 @@ function analyze(mesh, models = Object.keys(PLATES), minWallMm = MIN_WALL_MM, st
     marks
   };
   report.findings = findingsFor(report);
-  if (report.findings.some((f) => f.id === "too-thin" || f.id === "thin")) for (const t of thinTris) marks[t] = 3;
+  if (report.findings.some((f) => f.id === "too-thin" || f.id === "thin")) {
+    for (const t of thinTris) marks[t] = 3;
+    report.thin.marked = thinByObject(thinTris, mesh.objects);
+  }
   return report;
+}
+var MAX_THIN_FACES = 2e4;
+function thinByObject(tris, objects) {
+  const sorted = [...new Set(tris)].sort((a, b) => a - b).slice(0, MAX_THIN_FACES);
+  if (!objects) return sorted.length ? [{ from: "file", faces: sorted }] : [];
+  const first = /* @__PURE__ */ new Map();
+  for (let t = 0; t < objects.of.length; t++) if (!first.has(objects.of[t])) first.set(objects.of[t], t);
+  const by = /* @__PURE__ */ new Map();
+  for (const t of sorted) {
+    const k = objects.of[t];
+    by.set(k, [...by.get(k) ?? [], t - first.get(k)]);
+  }
+  return [...by].sort(([a], [b]) => a - b).map(([k, faces]) => ({ from: objects.from[k], faces }));
 }
 function edgeTopology(P, n) {
   const corners = n * 3;
@@ -1296,7 +1312,7 @@ function render(mesh, marks, width = 640, height = 480) {
 }
 
 // src/lib/check-job.ts
-var CHECKER_FORMAT = 4;
+var CHECKER_FORMAT = 5;
 var MAX_REPORT_CHARS = 6e5;
 function checkFile(input, stage = () => {
 }) {
@@ -1324,7 +1340,7 @@ function bounded(report) {
 }
 
 // src/checker/main.ts
-var CHECKER_VERSION = true ? "d444bec7e29c" : "source";
+var CHECKER_VERSION = true ? "922419fb41dd" : "source";
 var JOB = process.env.PS_JOB_DIR ?? "/job";
 function readJob(raw) {
   if (!raw || typeof raw !== "object") return "job.json is not an object";
