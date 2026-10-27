@@ -161,9 +161,30 @@ def test_the_slicer_draws_the_plate_from_its_own_gcode_and_keeps_one_that_is_the
     pytest.importorskip("PIL")
     with zipfile.ZipFile(tmp_path / "g.3mf", "w") as z:
         z.writestr("Metadata/plate_1.gcode", GCODE)
-    assert ps.add_plate_picture(str(tmp_path / "g.3mf")) is True
-    assert plate_picture(tmp_path / "g.3mf").startswith(b"\x89PNG")
-    assert ps.add_plate_picture(str(tmp_path / "g.3mf")) is False   # one already there is kept
+    assert ps.add_plate_picture(str(tmp_path / "g.3mf"), printable_area=["0x0", "180x0", "180x180", "0x180"]) is True
+    with zipfile.ZipFile(tmp_path / "g.3mf") as z:
+        one, views = z.read("Metadata/plate_1.png"), z.read("Metadata/ps_views_1.png")
+    assert one.startswith(b"\x89PNG") and plate_picture(tmp_path / "g.3mf") == views   # the member gets the four views; the printer keeps one
+    assert ps.add_plate_picture(str(tmp_path / "g.3mf")) is False   # ones already there are kept
     with zipfile.ZipFile(tmp_path / "empty.3mf", "w") as z:
         z.writestr("Metadata/plate_1.gcode", b"; nothing printed\n")
     assert ps.add_plate_picture(str(tmp_path / "empty.3mf")) is False and plate_picture(tmp_path / "empty.3mf") is None
+
+
+def test_the_four_views_are_rhinos_layout_in_one_rgb_png_the_site_takes(tmp_path):
+    """Top, Perspective, Front, Right in a 2 x 2 grid (operator, 2026-10-27: "match the default rhino views behind it"): 8-bit RGB, at most
+    1024 px and VIEWS_MAX bytes (the site's own limits, check-runner.ts pictureOk and plate-facts.ts); the walls are orange in Top, where
+    the bed's outline shows, and the support is teal in Front."""
+    PIL = __import__("pytest").importorskip("PIL.Image")
+    import io
+    ps = _ps_slice()
+    assert [v[0] for v in ps._views(ps.gcode_segments(GCODE), [])] == ["Top", "Perspective", "Front", "Right"]
+    assert ps._bed(["0x0", "180x0", "180x180", "0x180"]) == [(0, 0), (180, 0), (180, 180), (0, 180)] and ps._bed(["junk"]) == [] and ps._bed(None) == []
+    png = ps.draw_plate_views(GCODE, ["0x0", "180x0", "180x180", "0x180"])
+    img = PIL.open(io.BytesIO(png))
+    assert img.mode == "RGB" and img.size == (2 * ps.VIEW_PANEL + 2, 2 * ps.VIEW_PANEL + 2) and max(img.size) <= 1024 and len(png) <= ps.VIEWS_MAX
+    top, front = img.crop((0, 0, ps.VIEW_PANEL, ps.VIEW_PANEL)), img.crop((0, ps.VIEW_PANEL + 2, ps.VIEW_PANEL, 2 * ps.VIEW_PANEL + 2))
+    def has(panel, rgb):
+        return any(all(abs(a - b) < 40 for a, b in zip(px, rgb)) for px in panel.getdata())
+    assert has(top, ps.FEATURE_COLOURS["outer wall"]) and has(top, (150, 150, 150)) and has(front, ps.FEATURE_COLOURS["support"])
+    assert ps.draw_plate_views(b"; nothing printed\n") is None
