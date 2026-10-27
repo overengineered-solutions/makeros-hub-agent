@@ -779,6 +779,7 @@ def heartbeat_payload(
     camera_gateway: bool | None = None,
     camera_live_stats: list[dict] | None = None,
     screen_events: list[dict] | None = None,
+    printer_starts: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -795,6 +796,9 @@ def heartbeat_payload(
         # v0.85: the named Klipper actions this hub runs; the site offers a printer control only when it is listed here, so
         # a hub that has not been updated never gets one it cannot run (pstation's Controls tab, operator 2026-10-26)
         "klipperActions": list(KLIPPER_ACTIONS),
+        # Prints started at the printer, not through the site (printers/start_guard.py): always sent, so the site can tell a hub
+        # that reports them; it answers printerStartsAck and, when its switch is on, a guard_stop command
+        "printerStarts": list(printer_starts or [])[:16],
     }
     if isinstance(tailscale_status, dict):
         for key in TAILSCALE_HEARTBEAT_FIELDS:
@@ -2009,6 +2013,7 @@ def run(
                 slicer_ready = os.path.isfile(SLICE_RUNNER) and os.access(SLICE_RUNNER, os.X_OK)
                 checker_ready = check_lane.checker_installed()
                 screen_events = manager.screen_events()
+                printer_starts = manager.start_guard.reports()
                 resp = post_json(
                     cfg.heartbeat_url,
                     heartbeat_payload(
@@ -2037,6 +2042,7 @@ def run(
                         camera_gateway=GATEWAY.available(),
                         camera_live_stats=live_views.stats(),
                         screen_events=screen_events,
+                        printer_starts=printer_starts,
                     ),
                     bearer=credential,
                     retries=3,
@@ -2048,6 +2054,8 @@ def run(
                         manager.update_screens(resp.body, screen_events)
                     except Exception as exc:  # a screen failure must not lose the print/command acknowledgements
                         log.warning("screen response failed (%s); will retry", type(exc).__name__)
+                    # before this response's commands run: a guard_stop rides the same reply as the ack of its report
+                    manager.start_guard.ack(resp.body.get("printerStartsAck"))
                     tailscale_state.mark_reported()
                     log.info("heartbeat status rows processed=%d, expected=%d", resp.body["applied"], len(statuses))
                     reported_probe_count = len(pending_probe_results)
