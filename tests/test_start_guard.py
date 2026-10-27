@@ -1,7 +1,15 @@
 """The print-start guard (start_guard.py): reported only on an edge this process saw, never the hub's own print, stopped only
 on the site's guard_stop and only while the print is still starting."""
 
+import json
+import time
+from types import SimpleNamespace
+
+import pytest
+
 from makeros_hub.agent import heartbeat_payload
+from makeros_hub.printers.bambu import BambuAdapter
+from makeros_hub.printers.klipper import KlipperAdapter
 from makeros_hub.printers.manager import PrinterManager
 from makeros_hub.printers.start_guard import still_starting
 
@@ -12,6 +20,9 @@ class FakePrinter:
 
     def status(self):
         return dict(self.st)
+
+    def fresh_status(self):
+        return self.status()
 
     def pending_queue_job_ids(self):
         return list(self.pending)
@@ -93,6 +104,129 @@ def test_a_start_that_moved_on_before_the_stop_is_not_stopped():
     [r] = beat(m, p, PREP_B)
     p.st = DEEP_B   # the stop arrives after the first layer
     assert guard_stop(m, r["id"])["detail"] == "past_start" and p.sent == []
+
+
+def _bambu_guard(monkeypatch):
+    manager = PrinterManager()
+    printer = BambuAdapter("p1", "printer.invalid", "serial", "code")
+    sent = []
+    response = [None]
+
+    def report(data):
+        printer._on_message(None, None, SimpleNamespace(payload=json.dumps({"print": data}).encode()))
+
+    def publish(_topic, payload):
+        doc = json.loads(payload)
+        if "pushing" in doc:
+            if callable(response[0]):
+                response[0]()
+            elif response[0] is not None:
+                report(response[0])
+        elif doc.get("print", {}).get("command") == "stop":
+            sent.append("stop")
+        return SimpleNamespace(rc=0)
+
+    printer._client = SimpleNamespace(publish=publish, subscribe=lambda *a, **k: None, is_connected=lambda: True)
+    printer._on_connect(printer._client, None, None, 0)
+    fresh_status = printer.fresh_status
+    monkeypatch.setattr(printer, "fresh_status", lambda: fresh_status(timeout=0.001))
+    manager._adapters["p1"] = printer
+    manager._bambu_configs["p1"] = {"id": "p1", "vendor": "bambu"}
+    report({"gcode_state": "IDLE"})
+    manager.statuses()
+    report({"gcode_state": "PREPARE", "subtask_name": "cube.3mf"})
+    manager.statuses()
+    [start] = manager.start_guard.reports()
+    printer._last_status_at = printer._last_report_at = time.monotonic() - 45
+    assert printer.status()["preparing"] is True and printer.status()["connectionState"] == "connected"
+    return manager, printer, start, response, sent, report
+
+
+@pytest.mark.parametrize("reply,detail", [
+    ({"gcode_state": "RUNNING", "subtask_name": "cube.3mf", "layer_num": 5, "total_layer_num": 80, "mc_percent": 12}, "past_start"),
+    (None, "printer_stale"),
+    ({"nozzle_temper": 210}, "printer_stale"),
+    ({"gcode_state": "PREPARE"}, "unknown_print"),
+])
+def test_guard_never_stops_from_cached_prepare(monkeypatch, reply, detail):
+    manager, printer, start, response, sent, report = _bambu_guard(monkeypatch)
+    response[0] = reply
+    assert guard_stop(manager, start["id"])["detail"] == detail
+    assert sent == []
+
+
+def test_guard_accepts_a_new_starting_reading_on_the_same_connection(monkeypatch):
+    manager, printer, start, response, sent, report = _bambu_guard(monkeypatch)
+    response[0] = {"gcode_state": "PREPARE", "subtask_name": "cube.3mf"}
+    assert guard_stop(manager, start["id"])["status"] == "ok"
+    assert sent == ["stop"]
+
+
+@pytest.mark.parametrize("during_refresh", [False, True])
+def test_guard_refuses_a_lost_connection_even_if_the_same_filename_returns(monkeypatch, during_refresh):
+    manager, printer, start, response, sent, report = _bambu_guard(monkeypatch)
+
+    def reconnect():
+        response[0] = None
+        printer._on_disconnect()
+        printer._on_connect(printer._client, None, None, 0)
+        report({"gcode_state": "PREPARE", "subtask_name": "cube.3mf"})
+
+    if during_refresh:
+        response[0] = reconnect
+    else:
+        reconnect()
+        response[0] = {"gcode_state": "PREPARE", "subtask_name": "cube.3mf"}
+    result = guard_stop(manager, start["id"])
+    assert result["detail"] == ("printer_stale" if during_refresh else "connection_changed")
+    assert sent == []
+
+
+@pytest.mark.parametrize("answers", [False, True])
+def test_klipper_guard_reads_moonraker_again_before_stopping(monkeypatch, answers):
+    manager, printer, start = _klipper_guard()
+    sent = []
+
+    def fetch():
+        if not answers:
+            raise TimeoutError("no answer")
+        return {"print_stats": {"state": "printing", "filename": "part.gcode", "print_duration": 300,
+                                "info": {"current_layer": 5, "total_layer": 80}}, "virtual_sdcard": {"progress": 0.12}}
+
+    monkeypatch.setattr(printer, "_fetch_once", fetch)
+    monkeypatch.setattr(printer, "send_command", lambda *args: sent.append(args) or {"ok": True})
+    assert guard_stop(manager, start["id"])["detail"] == ("past_start" if answers else "exception")
+    assert sent == []
+
+
+def _klipper_guard():
+    manager = PrinterManager()
+    printer = KlipperAdapter("p1", "http://printer.invalid")
+    manager._adapters["p1"] = printer
+    printer._record_poll({"print_stats": {"state": "standby"}})
+    manager.statuses()
+    printer._record_poll({"print_stats": {"state": "printing", "filename": "part.gcode", "print_duration": 0}})
+    manager.statuses()
+    [start] = manager.start_guard.reports()
+    return manager, printer, start
+
+
+def test_klipper_guard_remembers_a_poll_outage_after_telemetry_recovers(monkeypatch):
+    manager, printer, start = _klipper_guard()
+    sent = []
+
+    def offline():
+        raise TimeoutError("printer went away")
+
+    monkeypatch.setattr(printer, "_fetch_once", offline)
+    printer._poll_loop(SimpleNamespace(is_set=lambda: False, wait=lambda _: True))
+    back = {"print_stats": {"state": "printing", "filename": "part.gcode", "print_duration": 0}}
+    printer._record_poll(back)
+    monkeypatch.setattr(printer, "_fetch_once", lambda: back)
+    monkeypatch.setattr(printer, "send_command", lambda *args: sent.append(args) or {"ok": True})
+    assert printer.status()["connectionState"] == "connected"
+    assert guard_stop(manager, start["id"])["detail"] == "connection_changed"
+    assert sent == []
 
 
 def test_running_at_hub_start_is_grandfathered():

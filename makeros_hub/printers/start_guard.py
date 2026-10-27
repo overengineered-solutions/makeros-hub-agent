@@ -64,7 +64,7 @@ class StartGuard:
         self._last: dict[str, str] = {}             # printerId -> "idle" | "busy", the last connected observation
         self._starts: dict[str, dict] = {}          # printerId -> the start reported for its current run
 
-    def observe(self, pid: str, st: Any, *, dispatching: bool, needs_gcode_state: bool = False) -> None:
+    def observe(self, pid: str, st: Any, *, dispatching: bool, needs_gcode_state: bool = False, connection=None) -> None:
         """One heartbeat's status. `dispatching`: the adapter holds a pending dispatch of the hub's own (its print).
         `needs_gcode_state` (Bambu): only a status carrying the printer's gcode_state counts, so a partial report before the
         connect-time pushall never reads as idle and turns a print running at hub start into a false edge."""
@@ -82,6 +82,7 @@ class StartGuard:
                 self._starts.pop(pid, None)   # the hub's own print: never reported
                 return
             entry = {"id": uuid.uuid4().hex, "printerId": pid, "fileName": _name(st), "seenAt": int(time.time() * 1000), "acked": False}
+            entry["connection"] = connection
             self._starts[pid] = entry
         if entry is not None:
             entry["starting"] = still_starting(st)
@@ -104,16 +105,20 @@ class StartGuard:
         self._last.pop(pid, None)
         self._starts.pop(pid, None)
 
-    def check(self, pid: str, start_id: Any, st: Any, *, dispatching: bool) -> str | None:
+    def check(self, pid: str, start_id: Any, st: Any, *, dispatching: bool, connection=None) -> str | None:
         """Why a site guard_stop must not run on this fresh status, or None when it may."""
         e = self._starts.get(pid)
         if e is None or not isinstance(start_id, str) or e["id"] != start_id:
             return "unknown_start"
         if not _connected(st):
             return "not_connected"
+        if e["connection"] != connection:
+            return "connection_changed"
         if not busy(st):
             return "print_ended"
         name = _name(st)
+        if not name or not e["fileName"]:
+            return "unknown_print"
         if name and e["fileName"] and name != e["fileName"]:
             return "other_print"
         if dispatching:

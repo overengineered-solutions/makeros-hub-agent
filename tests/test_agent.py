@@ -121,6 +121,7 @@ class TestHeartbeatPayload(unittest.TestCase):
             self.assertIn(key, p)
         self.assertEqual(p["printers"], [])
         self.assertEqual(p["jobs"], [])
+        self.assertIs(p["commandExpect"], True)
 
     def test_collect_pi_metrics_includes_tick_wall_ms_when_provided(self):
         # tickWallMs is the only field with a caller-supplied input — the rest

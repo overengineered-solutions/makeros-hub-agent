@@ -227,6 +227,7 @@ class PrinterManager:
         # A successfully-dispatched requestId here makes a redelivery re-report
         # ok without republishing. Bounded like _dispatched_queue_jobs.
         self._dispatched_commands: OrderedDict[str, float] = OrderedDict()   # requestId -> wall stamp (v0.69: persisted)
+        self._command_details: dict[str, str] = {}
         self._load_dispatched_commands()
         # Per-printer camera-routing facts (vendor/model/host/accessCode/urls),
         # rebuilt every reconcile. Lets the camera capturer pick the right source
@@ -527,23 +528,31 @@ class PrinterManager:
     def _observe_start(self, pid: str, adapter, st: dict) -> None:
         try:
             pend = getattr(adapter, "pending_queue_job_ids", None)
+            connection = getattr(adapter, "guard_connection", None)
             self.start_guard.observe(pid, st, dispatching=bool(pend()) if callable(pend) else False,
-                                     needs_gcode_state=pid in self._bambu_configs)
+                                     needs_gcode_state=pid in self._bambu_configs,
+                                     connection=connection() if callable(connection) else st.get("mqttConnectedAtMs"))
         except Exception as exc:  # noqa: BLE001 — the guard fails open: it never costs a status read or a beat
             log.warning("start guard: observing %s failed: %s", pid, self._redact_printer_exception(exc, self._access_code_for(pid)))
 
     def _guard_stop(self, request_id: str, printer_id: str, params: dict | None) -> dict:
         """The site's stop for a print started at the printer (start_guard.py): every rule again on a fresh status, then the
-        existing stop (Bambu MQTT stop, Klipper Moonraker cancel). Any refusal or failure leaves the print running."""
+        existing stop (Bambu MQTT stop, Klipper Moonraker cancel). A refusal sends nothing; a failed send may still run."""
         def failed(detail: str) -> dict:
             return {"requestId": request_id, "command": "guard_stop", "status": "failed", "detail": detail}
         adapter = self._adapters.get(printer_id)
         if adapter is None or not callable(getattr(adapter, "send_command", None)):
             return failed("printer_unavailable")
         try:
+            refresh = getattr(adapter, "fresh_status", None)
+            fresh = refresh() if callable(refresh) else None
+            if not isinstance(fresh, dict):
+                return failed("printer_stale")
             pend = getattr(adapter, "pending_queue_job_ids", None)
-            refusal = self.start_guard.check(printer_id, (params or {}).get("startId"), adapter.status(),
-                                             dispatching=bool(pend()) if callable(pend) else False)
+            connection = getattr(adapter, "guard_connection", None)
+            refusal = self.start_guard.check(printer_id, (params or {}).get("startId"), fresh,
+                                             dispatching=bool(pend()) if callable(pend) else False,
+                                             connection=connection() if callable(connection) else fresh.get("mqttConnectedAtMs"))
         except Exception as exc:  # noqa: BLE001 — a check that cannot run stops nothing
             log.warning("start guard: check for %s raised: %s", printer_id, exc)
             return failed("exception")
@@ -709,14 +718,19 @@ class PrinterManager:
         log.warning("could not persist the dispatched-job guard")
         return False
 
-    def _remember_command(self, request_id: str) -> None:
+    def _remember_command(self, request_id: str, detail: str | None = None) -> None:
         """Guard a command that ran, durably before its result is even queued. ponytail: the publish and this write are
         not atomic — a crash in the milliseconds between them can still re-run a command the cloud redelivers."""
+        if detail == "started":
+            self._command_details[request_id] = detail
         self._dispatched_commands[request_id] = time.time()
         self._dispatched_commands.move_to_end(request_id)
         while len(self._dispatched_commands) > MAX_DISPATCHED_COMMANDS:
-            self._dispatched_commands.popitem(last=False)
-        if not write_json_durably(DISPATCHED_COMMANDS_PATH, json.dumps(dict(self._dispatched_commands))):
+            old, _ = self._dispatched_commands.popitem(last=False)
+            self._command_details.pop(old, None)
+        saved = {rid: {"t": stamp, "detail": self._command_details[rid]} if rid in self._command_details else stamp
+                 for rid, stamp in self._dispatched_commands.items()}
+        if not write_json_durably(DISPATCHED_COMMANDS_PATH, json.dumps(saved)):
             log.warning("command guard not durable: a restart could re-run %s if the cloud redelivers it", request_id)
 
     def _load_dispatched_commands(self) -> None:
@@ -728,8 +742,14 @@ class PrinterManager:
             return
         now = time.time()
         # a stamp from the future (the clock stepped back across the restart) is kept, like the dispatch guard
-        fresh = {rid: float(t) for rid, t in raw.items()
-                 if isinstance(rid, str) and isinstance(t, (int, float)) and not isinstance(t, bool) and now - t < DISPATCHED_COMMANDS_TTL_SEC}
+        fresh = {}
+        for rid, value in raw.items():
+            stamp = value.get("t") if isinstance(value, dict) else value
+            if (isinstance(rid, str) and isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+                    and now - stamp < DISPATCHED_COMMANDS_TTL_SEC):
+                fresh[rid] = float(stamp)
+                if isinstance(value, dict) and value.get("detail") == "started":
+                    self._command_details[rid] = "started"
         for rid in sorted(fresh, key=fresh.get):   # oldest first, so the cap evicts the oldest
             self._dispatched_commands[rid] = fresh[rid]
 
@@ -1083,7 +1103,8 @@ class PrinterManager:
                 # republish (a duplicate ams_dry mode=1 would restart the dryer).
                 # Re-report ok so the cloud can close out a row whose first
                 # result report was lost. Doesn't consume a rate-limit slot.
-                reports.append({"requestId": request_id, "command": command, "status": "ok"})
+                reports.append({"requestId": request_id, "command": command, "status": "ok",
+                                **({"detail": self._command_details[request_id]} if request_id in self._command_details else {})})
                 continue
             if command.startswith("laser_") and self.laser.seen(request_id):
                 # A laser requestId is attempted once: a redelivery gets no second HA call or store and no second,
@@ -1100,6 +1121,27 @@ class PrinterManager:
                     }
                 )
                 continue
+            if "expect" in item:
+                adapter = self._adapters.get(printer_id)
+                matches = getattr(adapter, "matches_expect", None)
+                try:
+                    params = item.get("params")
+                    emergency = command == "klipper_action" and isinstance(params, dict) and params.get("action") == "emergency_stop"
+                    fresh_ok = True
+                    if not emergency:
+                        refresh = getattr(adapter, "fresh_status", None)
+                        fresh = refresh() if callable(refresh) else None
+                        fresh_ok = (isinstance(fresh, dict) and fresh.get("connectionState") == "connected"
+                                    and isinstance(fresh.get("jobName"), str) and bool(fresh["jobName"])
+                                    and fresh["jobName"] == adapter.status().get("jobName"))
+                    expected = fresh_ok and callable(matches) and matches(item["expect"])
+                except Exception as exc:  # noqa: BLE001 - uncertain identity never authorizes a bound command
+                    log.warning("command identity check for %s raised: %s", printer_id, exc)
+                    expected = False
+                if not expected:
+                    reports.append({"requestId": request_id, "command": command, "status": "failed",
+                                    "detail": "the print it was for is no longer on the printer"})
+                    continue
             params = item.get("params") if isinstance(item.get("params"), dict) else None
             if command.startswith("laser_"):
                 # Lasers (v0.68): before the adapter lookup, so a laser row can never reach a printer adapter. A load
@@ -1145,8 +1187,9 @@ class PrinterManager:
                 # Record only successful dispatches so a failed one (e.g. a
                 # transient printer_unavailable) can still be retried if the cloud
                 # ever redelivers; bound it like the queue-job guard.
-                self._remember_command(request_id)
-                reports.append({"requestId": request_id, "command": command, "status": "ok"})
+                self._remember_command(request_id, result.get("detail"))
+                reports.append({"requestId": request_id, "command": command, "status": "ok",
+                                **({"detail": "started"} if result.get("detail") == "started" else {})})
             else:
                 reason = result.get("reason") if isinstance(result, dict) else "unknown"
                 reports.append(

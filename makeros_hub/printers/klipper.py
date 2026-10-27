@@ -136,6 +136,7 @@ _QUERY_OBJECTS = (
     + "&virtual_sdcard=progress"
     "&display_status=progress,message"
     "&toolhead=homed_axes,position,axis_minimum,axis_maximum"
+    "&stepper_enable=steppers&gcode_macro%20m84=release_seq"
     "&idle_timeout=state"
     # v0.76: the shared touchscreen's readings (speed, Z offset, part fan, light). The SV08 has no [fan]: its M106 macro
     # drives "fan_generic fan0" and fan1 together, so fan0 stands in for it.
@@ -272,8 +273,7 @@ _PROVES_HOME = frozenset({"home", "center", "qgl", "home_z", "home_z_corner"})
 # action ends it when it starts, as it ends the full home.
 _PROVES_XY = frozenset({"home", "center", "qgl", "home_xy", "rehome_xy"})
 _KEEPS_XY = frozenset({"home_z", "home_z_corner"})   # home Z alone: the X/Y home they travel on stands
-# Skip the running-action check, the fresh read and the state rules (still not_connected on a stale poll): the way
-# out of a stuck printer.
+# Skip the running-action check, the fresh read and the state rules; Emergency stop also skips poll liveness.
 _ENDPOINT_ACTIONS = frozenset({"emergency_stop", "firmware_restart"})
 # Minutes, not seconds (homing with the SV08's probe calibration, QGL, a mesh, a heat-and-load): sent on a thread.
 _LONG_ACTIONS = frozenset({"home", "center", "load_filament", "load_more", "unload_filament", "qgl", "bed_mesh",
@@ -282,9 +282,10 @@ _LONG_ACTIONS = frozenset({"home", "center", "load_filament", "load_more", "unlo
 # and a print just started from the screen or the queue must never get a jog inside its start routine).
 # v0.79 adds the heat, the probe and Sovol's load temperature variable (Klipper leaves out an object a printer lacks).
 _ACTION_QUERY = ("print_stats=state&toolhead=homed_axes,position,axis_minimum,axis_maximum&extruder=temperature,target"
+                 "&stepper_enable=steppers&gcode_macro%20m84=release_seq"
                  "&heater_bed=temperature,target&probe=is_calibrated"
                  "&gcode_macro%20_global_var=load_filament_extruder_temp,cancel_park&gcode_macro%20_pstation_resume_heat=nozzle"
-                 "&gcode_macro%20_pstation_hold=active&webhooks=state&gcode_macro%20_ps_corners=fl,fr,bl,br"
+                 "&gcode_macro%20_pstation_hold=active&webhooks=state&gcode_macro%20_ps_corners=fl,fr,bl,br,xy_extra_lift"
                  "&gcode_move=homing_origin")
 _JOG_STEPS_MM = frozenset({0.1, 1.0, 10.0, 50.0})
 _JOG_FEED = {"x": 6000, "y": 6000, "z": 600}
@@ -372,6 +373,7 @@ class KlipperAdapter:
         self._lock = threading.Lock()
         self._data: dict[str, Any] = {}
         self._last_poll_ok_at: Optional[float] = None
+        self._connection_generation = 0
         self._last_error_reason: Optional[str] = None
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -417,9 +419,13 @@ class KlipperAdapter:
         # over the print (not homed: only corner moves trust it).
         self._stop_path = STOP_POINTS_DIR / f"{safe_id}.json"
         self._stop_pt: Optional[dict] = _load_json(self._stop_path)
+        if self._stop_pt:
+            self._stop_pt["recoveryAttempted"] = True   # a prior process cannot prove nobody moved since its record
         self._was_active = False
         self._corner: Optional[dict] = None
         self._z_rec = False
+        self._release_seq: Optional[int] = None
+        self._trust_generation = 0   # a stop must also invalidate a home whose reply is still in flight
         self._fil_at: Optional[float] = None
         self._z_tuned = 0.0
         # The pause watch (PAUSE_ALERT_SEC), also under _lock: the nozzle target last seen while printing (what a resume
@@ -537,6 +543,22 @@ class KlipperAdapter:
             )
         return _build_status(self.printer_id, {}, "connecting")
 
+    def fresh_status(self) -> dict:
+        """A new Moonraker reading for the start guard; never the last successful cached poll."""
+        try:
+            data = self._fetch_once()
+        except Exception:
+            with self._lock:
+                self._connection_generation += 1
+                self._invalidate_home()
+            raise
+        self._record_poll(data)
+        return _build_status(self.printer_id, data, "connected")
+
+    def guard_connection(self) -> int:
+        with self._lock:
+            return self._connection_generation
+
     def pending_jobs(self) -> list[dict]:
         """Unacked terminal jobs observed since the last successful heartbeat
         ack. Same shape as `BambuAdapter.pending_jobs`. Safe to send
@@ -557,6 +579,11 @@ class KlipperAdapter:
     def pending_queue_jobs(self) -> list[dict]:
         with self._lock:
             return self._queue_progress.pending_queue_jobs()
+
+    def matches_expect(self, expect: Any) -> bool:
+        with self._lock:
+            return (self._data.get("print_stats", {}).get("state") in ("printing", "paused")
+                    and self._queue_progress.matches_expect(expect, self._job_tracker.active_key()))
 
     def start_print(
         self,
@@ -964,6 +991,9 @@ class KlipperAdapter:
                 "reason": "not_connected",
                 "command": command,
             }
+        if command == "stop":
+            with self._lock:
+                self._invalidate_home()
         url = f"{self.moonraker_url}{cmd_path}"
         # Moonraker accepts POST with an empty body for the three control
         # endpoints; no params needed. We send an explicit Content-Length 0
@@ -1056,8 +1086,8 @@ class KlipperAdapter:
     # --- screen controls (v0.76) -----------------------------------------
     def _klipper_action(self, params: Any) -> dict:
         """One named action from the shared touchscreen: {ok, reason?, detail?}. Refusals, in order: _parse_action's
-        (unsupported_action, bad_params), not_connected (the poll's liveness rule, as for pause), then for everything but
-        the two endpoint actions action_running (a long one is still going), _check_state's against a fresh read (v0.79:
+        (unsupported_action, bad_params), not_connected (except Emergency stop, which always tries its endpoint), then
+        for everything but the two endpoint actions action_running (a long one is still going), _check_state's against a fresh read (v0.79:
         the Z floor, a proven home, the heat, the probe, the Z tune; it also gives load and unload their temperature), and
         unsupported_on_printer (the macro or module is not on this printer).
 
@@ -1073,7 +1103,7 @@ class KlipperAdapter:
             last_ok, running = self._last_poll_ok_at, self._running_action
         try:
             action, script, need = _parse_action(params)
-            if last_ok is None or (now - last_ok) > STALE_SEC:
+            if action != "emergency_stop" and (last_ok is None or (now - last_ok) > STALE_SEC):
                 raise _Refused("not_connected")
             if action not in _ENDPOINT_ACTIONS:
                 if running:
@@ -1090,10 +1120,12 @@ class KlipperAdapter:
         except _Refused as refused:
             return {"ok": False, "reason": refused.reason}
         except Exception as exc:  # noqa: BLE001 - the fresh state or the objects list could not be read
+            with self._lock:
+                self._invalidate_home()
             return {"ok": False, "reason": _action_failure(exc)[0]}
         if action in _ENDPOINT_ACTIONS or action == "motors_off":   # whatever the answer, the home is gone
             with self._lock:
-                self._home_proven = self._xy_proven = self._z_rec = False
+                self._invalidate_home()
         if action != "home_z_corner":   # v0.86: a corner is confirmed by the very next action, or not at all
             with self._lock:
                 self._corner = None
@@ -1135,7 +1167,13 @@ class KlipperAdapter:
         with self._lock:
             if self._running_action:
                 return {"ok": False, "reason": "action_running"}
+            if action in _HOMING_ACTIONS and self._stop_pt:
+                # Record before sending: a crash or lost answer must never reuse the pre-lift height.
+                self._stop_pt = dict(self._stop_pt, recoveryAttempted=True)
+                if not write_json_durably(self._stop_path, json.dumps(self._stop_pt)):
+                    return {"ok": False, "reason": "state_persist_failed"}
             self._running_action = action
+            generation = self._trust_generation
             if action in _HOMING_ACTIONS:
                 self._home_proven = self._z_rec = False
                 if action not in _KEEPS_XY:
@@ -1150,11 +1188,11 @@ class KlipperAdapter:
                 outcome.append(None)
                 log.info("klipper %s: action %s finished", self.printer_id, action)
                 with self._lock:
-                    if action in _PROVES_HOME:
+                    if action in _PROVES_HOME and generation == self._trust_generation:
                         self._home_proven = True
-                    if action in _PROVES_XY:
+                    if action in _PROVES_XY and generation == self._trust_generation:
                         self._xy_proven = True
-                    if action == "rehome_xy":
+                    if action == "rehome_xy" and generation == self._trust_generation:
                         self._z_rec = True   # Z is the recorded height plus the lift: trusted for corner moves only
                     done_stop = dict(self._stop_pt, rehomed=True) if action == "home_z_corner" and self._stop_pt else None
                     if done_stop:
@@ -1185,13 +1223,31 @@ class KlipperAdapter:
             return {"ok": False, "reason": outcome[0]}
         return {"ok": True, "detail": "done" if outcome else "started"}
 
+    def _invalidate_home(self) -> None:
+        """Under _lock: a release or uncertain position also makes the original stop height unsafe to reuse."""
+        self._home_proven = self._xy_proven = self._z_rec = False
+        self._corner = None
+        self._trust_generation += 1
+        if self._stop_pt:
+            self._stop_pt = dict(self._stop_pt, recoveryAttempted=True)
+
     def _note_homed(self, status: dict[str, Any]) -> None:
         """A reading (the poll or an action's fresh read) where any axis is not homed ends the proven home: motors off, a
-        Klipper restart, a print's own M84. v0.85: one where X or Y is not homed ends the X/Y home too."""
+        Klipper restart, a print's own M84. The Giga marks released axes homed, so read the drivers and its release counter."""
+        steppers = _obj(status, "stepper_enable").get("steppers")
+        enabled = (isinstance(steppers, dict) and all(steppers.get(f"stepper_{a}") is True for a in "xyz")
+                   and all(v is True for k, v in steppers.items() if k.startswith("stepper_")))
+        release_seq = _int(_obj(status, "gcode_macro m84").get("release_seq"))
+        with self._lock:
+            released = self._release_seq is not None and release_seq != self._release_seq
+            self._release_seq = release_seq
+            if not enabled or released:
+                self._invalidate_home()
         if not _all_homed(status):
             homed = _obj(status, "toolhead").get("homed_axes")
             with self._lock:
                 self._home_proven = False
+                self._z_rec = False
                 if not (isinstance(homed, str) and set("xy") <= set(homed.lower())):
                     self._xy_proven = self._z_rec = False
 
@@ -1386,11 +1442,11 @@ class KlipperAdapter:
                 reason = _classify_error(e)
                 with self._lock:
                     was_clean = self._last_error_reason is None
+                    self._connection_generation += 1
                     self._last_error_reason = reason
                     self._consecutive_failures += 1
                     failures = self._consecutive_failures
-                    self._home_proven = self._xy_proven = self._z_rec = False   # v0.79: the printer may be restarting (the Giga fakes a home at boot)
-                    self._corner = None
+                    self._invalidate_home()   # the printer may be restarting (the Giga fakes a home at boot)
                 # Adversarial review MED #13: first failure after a run of
                 # successes is WARN-level so it lands in the diag ring (which
                 # gates on WARN+). Subsequent failures stay at DEBUG so a
@@ -1452,7 +1508,6 @@ class KlipperAdapter:
             pending = self._queue_progress.to_state()["dispatches"]
             if pending and _job_filename(stats) == pending[0].get("taskName"):
                 self._queue_progress.observe_running(_GCODE_STATE_MAP.get(stats.get("state")))
-            self._save_queue_progress()
             self._last_error_reason = None
             self._consecutive_failures = 0
             # Feed the job tracker every successful poll. Pure helper —
@@ -1462,6 +1517,8 @@ class KlipperAdapter:
             # concurrent `pending_jobs()` / `ack_jobs()` call sees a
             # consistent buffer.
             self._job_tracker.observe(data, time.monotonic())
+            self._queue_progress.observe_active(_job_filename(stats), self._job_tracker.active_key(), self._job_tracker.pending())
+            self._save_queue_progress()
         return was_first
 
     def _refresh_nozzles(self) -> None:
@@ -2214,8 +2271,8 @@ def _check_rehome(params: dict, status: dict[str, Any], *, home_proven: bool, xy
     choose which corner to move the head too home z it moves the head to that corner ad then asks if this is a safe corner").
     The remote-motion protocol (reports/giga-mcu-shutdown-2026-10-26.md): Z is never moved down until it is homed again, and
     every X/Y move before that happens at least REHOME_MIN_LIFT_MM above the recorded stop height, which is the print's top.
-      rehome_xy: Z from a home this hub trusts, else the stop point's (a firmware restart forgets it); up REHOME_LIFT_MM (less
-        near the top, refused under REHOME_MIN_LIFT_MM); then the printer's PS_REHOME_XY homes X and Y with no Z move down.
+      rehome_xy: current trusted Z, else an unused stop point from this process; up REHOME_LIFT_MM (less near the top,
+        including the override's lift, refused under REHOME_MIN_LIFT_MM); then PS_REHOME_XY homes X/Y with no Z move down.
       move_corner: only on that X/Y home, at a Z known and above the print; X and Y only, at the current height.
       home_z_corner: only at the corner the last move went to, still there; the printer's PS_HOME_Z_HERE homes Z there and
         goes up to REHOME_CLEAR_MM above the print.
@@ -2237,8 +2294,23 @@ def _check_rehome(params: dict, status: dict[str, Any], *, home_proven: bool, xy
         raise _Refused("printer_stale" if stop_z is not None else "no_stop_point")
     floor = stop_z + REHOME_MIN_LIFT_MM   # every X/Y move until Z is homed again: at least this high
     if action == "rehome_xy":
-        z = pos[2] if home_proven and _all_homed(status) else stop_z
-        lift = round(min(REHOME_LIFT_MM, top - 1.0 - z), 3)
+        known = (home_proven or z_rec) and _all_homed(status)
+        if not known and stop.get("recoveryAttempted"):
+            raise _Refused("z_unknown")
+        z = pos[2] if known else stop_z
+        extra = _obj(status, "gcode_macro _ps_corners").get("xy_extra_lift")
+        if extra is None:
+            extra = 5.0   # older macros omit this attribute (Moonraker may return null); reserve Anaya's lift
+        if not _finite(extra) or extra < 0:
+            raise _Refused("printer_stale")
+        if extra:
+            offset = _axis(_obj(status, "gcode_move").get("homing_origin"), 2)
+            if offset is None:
+                raise _Refused("printer_stale")
+            if extra + offset < 0:
+                raise _Refused("z_unknown")   # the override's absolute Z5 would move down from its guessed zero
+            extra += max(0.0, offset)
+        lift = round(min(REHOME_LIFT_MM, top - 1.0 - z - extra), 3)
         if lift < REHOME_MIN_LIFT_MM - 1e-6:
             raise _Refused("no_room_to_lift")
         if z + lift < floor - 1e-6:

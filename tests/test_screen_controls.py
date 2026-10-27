@@ -15,6 +15,7 @@ from makeros_hub.printers.klipper import KlipperAdapter, _build_status, _check_s
 
 # An SV08-shaped idle printer, homed at Z10 (where its homing_override ends), the nozzle cold, Sovol's load variable 250.
 IDLE = {"print_stats": {"state": "standby"},
+        "stepper_enable": {"steppers": {"stepper_x": True, "stepper_y": True, "stepper_z": True}},
         "toolhead": {"homed_axes": "xyz", "position": [100.0, 200.0, 10.0, 0.0],
                      "axis_minimum": [0.0, 0.0, -5.0, 0.0], "axis_maximum": [500.0, 500.0, 500.0, 0.0]},
         "extruder": {"temperature": 24.0, "target": 0.0}, "heater_bed": {"temperature": 24.0, "target": 0.0},
@@ -73,7 +74,7 @@ class TestWhitelist(unittest.TestCase):
                          {"ok": False, "reason": "unsupported_action", "command": "klipper_action"})
         self.assertEqual(a.send_command("klipper_action", {"action": "home", "x": 1})["reason"], "bad_params")
         self.assertEqual(a.send_command("klipper_action", {"action": "home"})["reason"], "not_connected")
-        self.assertEqual(a.send_command("klipper_action", {"action": "emergency_stop"})["reason"], "not_connected")
+        self.assertIn(a.send_command("klipper_action", {"action": "emergency_stop"})["reason"], ("unreachable", "timeout"))
 
 
 class TestParams(unittest.TestCase):
@@ -412,8 +413,11 @@ class TestWire(unittest.TestCase):
     def test_a_stale_poll_is_not_connected(self):
         self.a._last_poll_ok_at = time.monotonic() - 600.0
         self.assertEqual(self.act(action="light", on=True)["reason"], "not_connected")
-        self.assertEqual(self.act(action="emergency_stop")["reason"], "not_connected")
         self.assertEqual(self.mr.posts, [])
+        self.assertTrue(self.act(action="emergency_stop")["ok"])
+        self.assertEqual(self.mr.posts, [("/printer/emergency_stop", None)])
+        self.a._last_poll_ok_at = None
+        self.assertTrue(self.act(action="emergency_stop")["ok"])
 
     def test_long_action_returns_promptly_and_holds_the_printer_until_it_ends(self):
         self.mr.held = {"LOAD_FILAMENT"}
@@ -887,7 +891,7 @@ class TestControlsTab(unittest.TestCase):
             self.assertEqual(refusal(params, {"print_stats": {"state": "standby"}, "toolhead": {"homed_axes": "xyz"}}),
                              "printer_stale", params)                                            # no position or limits
 
-    def test_a_stale_poll_sends_nothing(self):
+    def test_a_stale_poll_only_allows_emergency_stop(self):
         mr = Moonraker()
         self.addCleanup(mr.close)
         a = KlipperAdapter("p1", mr.url)
@@ -895,8 +899,12 @@ class TestControlsTab(unittest.TestCase):
         a._home_proven = a._xy_proven = True
         a._last_poll_ok_at = time.monotonic() - klipper.STALE_SEC - 1
         for params in TAB:
-            self.assertEqual(a.send_command("klipper_action", params)["reason"], "not_connected", params)
-        self.assertEqual(mr.posts, [])
+            result = a.send_command("klipper_action", params)
+            if params["action"] == "emergency_stop":
+                self.assertTrue(result["ok"])
+            else:
+                self.assertEqual(result["reason"], "not_connected", params)
+        self.assertEqual(mr.posts, [("/printer/emergency_stop", None)])
 
     def test_down_in_z_is_one_millimetre_at_most(self):
         high = at(400.0, 400.0, 400.0, GIGA)
@@ -1015,7 +1023,9 @@ STOP = klipper._stop_point(STOPPED, 1761507636000)
 
 
 def restarted(**toolhead):   # after FIRMWARE_RESTART: standby, Elegoo's boot home faked at 110, 110, 0, the corners macro in
-    return {**GIGA, "print_stats": {"state": "standby"}, "webhooks": {"state": "ready"}, "gcode_macro _ps_corners": GIGA_CORNERS,
+    return {**GIGA, "print_stats": {"state": "standby"}, "webhooks": {"state": "ready"},
+            "gcode_macro _ps_corners": {**GIGA_CORNERS, "xy_extra_lift": 0.0},
+            "gcode_move": {"homing_origin": [0.0, 0.0, 0.0, 0.0]},
             "toolhead": {**GIGA["toolhead"], "position": [110.0, 110.0, 0.0, 0.0], **toolhead}}
 
 

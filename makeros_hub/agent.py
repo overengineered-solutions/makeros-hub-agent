@@ -798,6 +798,7 @@ def heartbeat_payload(
         # v0.85: the named Klipper actions this hub runs; the site offers a printer control only when it is listed here, so
         # a hub that has not been updated never gets one it cannot run (pstation's Controls tab, operator 2026-10-26)
         "klipperActions": list(KLIPPER_ACTIONS),
+        "commandExpect": True,
         # Prints started at the printer, not through the site (printers/start_guard.py): always sent, so the site can tell a hub
         # that reports them; it answers printerStartsAck and, when its switch is on, a guard_stop command
         "printerStarts": list(printer_starts or [])[:16],

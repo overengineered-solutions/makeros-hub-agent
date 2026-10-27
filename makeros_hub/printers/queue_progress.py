@@ -118,6 +118,7 @@ class QueueProgressTracker:
                     "reported_printing": bool(d["reported_printing"]),
                     "baselineKeys": sorted(d["baselineKeys"]),
                     "taskName": d.get("taskName"),
+                    "activeKey": d.get("activeKey"),
                     "startReply": d.get("startReply", {"commandReply": "unconfirmed"}),
                     "startSequence": d.get("startSequence"),
                     "sawRunning": bool(d.get("sawRunning")),
@@ -148,6 +149,7 @@ class QueueProgressTracker:
                     "reported_printing": bool(d.get("reported_printing")),
                     "baselineKeys": {k for k in _list(d.get("baselineKeys")) if isinstance(k, str)},
                     "taskName": d.get("taskName") if isinstance(d.get("taskName"), str) else None,
+                    "activeKey": d.get("activeKey") if isinstance(d.get("activeKey"), str) else None,
                     **({"assignmentSeq": d["assignmentSeq"]} if isinstance(d.get("assignmentSeq"), int) and not isinstance(d.get("assignmentSeq"), bool) else {}),
                     "startReply": d.get("startReply") if isinstance(d.get("startReply"), dict) else {"commandReply": "unconfirmed"},
                     "startSequence": d.get("startSequence"),
@@ -192,6 +194,27 @@ class QueueProgressTracker:
         # A RUNNING frame between heartbeats still forbids a retry, even if its terminal cannot be matched.
         if self._dispatches and _gcode_state(state) in _ACTIVE_GCODE_STATES:
             self._dispatches[0]["sawRunning"] = True
+
+    def observe_active(self, task_name: str | None, active_key: str | None, pending_jobs: list[dict], previous_key: str | None = None) -> None:
+        if not self._dispatches or not active_key:
+            return
+        dispatch = self._dispatches[0]
+        # Bambu may learn the task id after RUNNING; only carry the binding across that change without an ending.
+        known = dispatch.get("activeKey")
+        if ((not known and "rehydrated_monotonic" not in dispatch or known and known == previous_key)
+                and task_name and task_name == dispatch.get("taskName")
+                and active_key not in dispatch["baselineKeys"]
+                and not (_job_keys(pending_jobs) - dispatch["baselineKeys"])):
+            dispatch["activeKey"] = active_key
+
+    def matches_expect(self, expect: Any, active_key: str | None) -> bool:
+        """An unresolved dispatch alone is not proof: the printer must still be running its observed run."""
+        if (not isinstance(expect, dict) or not isinstance(expect.get("jobId"), str) or not expect["jobId"]
+                or type(expect.get("assignmentSeq")) is not int or not active_key or not self._dispatches):
+            return False
+        dispatch = self._dispatches[0]
+        return (dispatch["queueJobId"] == expect["jobId"] and dispatch.get("assignmentSeq") == expect["assignmentSeq"]
+                and dispatch.get("activeKey") == active_key)
 
     def command_reply(self, sequence: str, result: str, code: str | None = None) -> None:
         for d in self._dispatches:

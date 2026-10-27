@@ -109,6 +109,10 @@ class BambuAdapter:
         self._access_code = (access_code or "").strip()  # secret — never logged
         self.model = model
         self._lock = threading.Lock()
+        self._fresh_condition = threading.Condition(self._lock)
+        self._fresh_report: dict | None = None
+        self._fresh_report_seq = 0
+        self._connection_generation = 0
         self._data: dict[str, Any] = {}
         self._connack: str | None = None  # None | 'ok' | 'fail'
         # v0.69: wall ms of the last successful MQTT connect. A power-cycled printer reconnects, so a new stamp is how the
@@ -192,7 +196,9 @@ class BambuAdapter:
         with self._lock:
             self._connack = "ok"
             self._error_reason = None
-            self._connected_at_ms = int(time.time() * 1000)
+            self._connected_at_ms = max(int(time.time() * 1000), (self._connected_at_ms or 0) + 1)
+            self._connection_generation += 1
+            self._fresh_condition.notify_all()
             self._state_seen = False
             self._refill_asks = 0
             self._version_logged = False
@@ -250,6 +256,10 @@ class BambuAdapter:
             report = doc.get("print")
             if isinstance(report, dict) and report and report.get("command", "push_status") == "push_status":
                 self._last_status_at = self._last_report_at
+                if isinstance(report.get("gcode_state"), str):
+                    self._fresh_report = copy.deepcopy(doc)
+                    self._fresh_report_seq += 1
+                    self._fresh_condition.notify_all()
             if isinstance(doc.get("print"), dict) and doc["print"].get("gcode_state"):
                 self._state_seen = True
             # Job lifecycle detection (wall-clock — startedAt/endedAt are real
@@ -258,8 +268,11 @@ class BambuAdapter:
             # (codex review of 61c12f8: it spent the reconnect judgement on a stale IDLE).
             if self._state_seen:
                 self._queue_progress.observe_running(self._data.get("print", {}).get("gcode_state"))
-                self._save_queue_progress()
+                previous_key = self._jobs.active_key()
                 self._jobs.observe(self._data, time.time())
+                self._queue_progress.observe_active(self._data.get("print", {}).get("subtask_name"),
+                                                    self._jobs.active_key(), self._jobs.pending(), previous_key)
+                self._save_queue_progress()
             if not self._shape_logged:
                 self._shape_logged = True
                 # First-parse shape observability (redacted) — see CLAUDE doctrine.
@@ -309,6 +322,8 @@ class BambuAdapter:
         # degrades to offline if reports go stale.
         with self._lock:
             self._state_seen = False
+            self._connection_generation += 1
+            self._fresh_condition.notify_all()
             self._lan_commands = "unknown"
             self._lan_probe = None
         log.info("bambu %s disconnected — will reconnect", self.printer_id)
@@ -425,6 +440,26 @@ class BambuAdapter:
             out["sampledAt"] = int((time.time() - (now - sampled)) * 1000)
         return out
 
+    def fresh_status(self, timeout: float = 4.0) -> dict | None:
+        """A new state-bearing report on this same connection; unrelated deltas cannot refresh a cached PREPARE."""
+        with self._lock:
+            client = self._client
+            if client is None or self._connack != "ok" or not self._state_seen:
+                return None
+            generation, sequence = self._connection_generation, self._fresh_report_seq
+        result = client.publish(self._request_topic, PUSHALL)
+        if getattr(result, "rc", mqtt.MQTT_ERR_SUCCESS) != mqtt.MQTT_ERR_SUCCESS:
+            return None
+        with self._fresh_condition:
+            answered = self._fresh_condition.wait_for(
+                lambda: self._fresh_report_seq > sequence or self._connection_generation != generation, timeout)
+            if not answered or self._connection_generation != generation or not self._state_seen:
+                return None
+            data, connected_at = copy.deepcopy(self._fresh_report), self._connected_at_ms
+        out = bambu_parse.normalize_status(self.printer_id, data, connection_state="connected", model=self.model)
+        out["mqttConnectedAtMs"] = connected_at
+        return out
+
     def pending_queue_job_ids(self) -> list[str]:
         """Queue jobs dispatched here whose outcome is not yet known (v0.58: the manager asks before its busy check)."""
         with self._lock:
@@ -433,6 +468,12 @@ class BambuAdapter:
     def pending_queue_jobs(self) -> list[dict]:
         with self._lock:
             return self._queue_progress.pending_queue_jobs()
+
+    def matches_expect(self, expect: Any) -> bool:
+        with self._lock:
+            return (self._state_seen and self._connack == "ok"
+                    and self._data.get("print", {}).get("gcode_state") in ("PREPARE", "RUNNING", "PAUSE")
+                    and self._queue_progress.matches_expect(expect, self._jobs.active_key()))
 
     def pending_jobs(self) -> list[dict]:
         """Unacked terminal jobs (re-send-safe — the cloud dedupes on jobKey)."""
