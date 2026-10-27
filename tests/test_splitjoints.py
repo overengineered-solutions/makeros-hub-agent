@@ -93,7 +93,7 @@ def test_refuses_ambiguous_missing_or_overlapping_layers(name, first, z):
 
 
 def test_wire_rejects_unbounded_and_invalid_choices():
-    raw = dict(mesh="synthetic.stl", model="A1 Mini", filament=dict(type="PLA"), fixes=dict(orient=False, brim=False, supports=False))
+    raw = dict(mesh="synthetic.stl", model="A1 Mini", nozzleDiameterMm=.4, filament=dict(type="PLA"), fixes=dict(orient=False, brim=False, supports=False))
     for split in [request(clearance=0), request(clearance=float("nan")), request() | {"bed": [1, 2, 3]}, request() | {"mode": "guess"}]:
         with pytest.raises(ps.SliceError):
             ps.read_spec(raw | {"prepare": dict(version=1, thicken=False, moveLargeGaps=False, split=split)})
