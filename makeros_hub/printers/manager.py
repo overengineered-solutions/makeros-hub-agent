@@ -1134,7 +1134,10 @@ class PrinterManager:
                         fresh_ok = (isinstance(fresh, dict) and fresh.get("connectionState") == "connected"
                                     and isinstance(fresh.get("jobName"), str) and bool(fresh["jobName"])
                                     and fresh["jobName"] == adapter.status().get("jobName"))
-                    expected = fresh_ok and callable(matches) and matches(item["expect"])
+                    # An emergency stop can only harm a print that is running: on a held, failed or idle printer it goes
+                    # (stop always one tap away); while a print runs, it must be the one the member asked about.
+                    busy = getattr(adapter, "printing_now", None)
+                    expected = fresh_ok and callable(matches) and (matches(item["expect"]) or (emergency and callable(busy) and not busy()))
                 except Exception as exc:  # noqa: BLE001 - uncertain identity never authorizes a bound command
                     log.warning("command identity check for %s raised: %s", printer_id, exc)
                     expected = False

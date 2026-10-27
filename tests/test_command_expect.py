@@ -168,3 +168,14 @@ def test_actual_adapter_refresh_updates_identity_before_bound_stop(vendor):
         adapter._fetch_once = Mock(return_value={"print_stats": {"state": "printing", "filename": "b.gcode", "print_duration": 1}})
     assert manager.dispatch_commands([item(expect=EXPECT)])[0]["detail"] == REFUSAL
     adapter.send_command.assert_not_called()
+
+
+def test_bound_emergency_goes_on_a_held_printer_but_never_into_another_run():
+    adapter, reading, manager = setup_adapter("klipper")
+    reading("error", "a.gcode", "1")   # the member's print failed and is held: nothing runs, so the stop goes
+    stop = item("klipper_action", {"action": "emergency_stop"}, expect={"jobId": "job-b", "assignmentSeq": 9})
+    assert manager.dispatch_commands([stop])[0]["status"] == "ok"
+    adapter2, reading2, manager2 = setup_adapter("klipper")   # another run is printing: refused
+    stop2 = {**stop, "requestId": "r2"}   # a new request: r1 is remembered as sent, so its redelivery re-reports ok
+    assert manager2.dispatch_commands([stop2])[0] == {"requestId": "r2", "command": "klipper_action", "status": "failed", "detail": REFUSAL}
+    adapter2.send_command.assert_not_called()

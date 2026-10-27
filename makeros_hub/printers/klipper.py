@@ -581,6 +581,11 @@ class KlipperAdapter:
         with self._lock:
             return self._queue_progress.pending_queue_jobs()
 
+    def printing_now(self) -> bool:
+        """A print is running or paused on the printer, by the last poll."""
+        with self._lock:
+            return self._data.get("print_stats", {}).get("state") in ("printing", "paused")
+
     def matches_expect(self, expect: Any) -> bool:
         with self._lock:
             return (self._data.get("print_stats", {}).get("state") in ("printing", "paused")
