@@ -25,7 +25,7 @@ from typing import Any
 from ..diagnostics import get_default, redact
 from ..http import MAX_RAW_FILE_BYTES
 from .queue_progress import write_json_durably
-from .threemf_objects import Unreadable3mf, check_plate_entry, gcode_plates, parse_plate_objects, plate_named
+from .threemf_objects import Unreadable3mf, check_plate_entry, gcode_plates, parse_plate_objects, plate_boxes, plate_named, plate_picture
 
 log = logging.getLogger("makeros-hub.printers")
 
@@ -161,6 +161,29 @@ def plate_of(value) -> int:
 def _fingerprint(p: dict) -> tuple:
     """What, if changed, means we must rebuild the adapter (new connection)."""
     return (p.get("vendor"), p.get("host"), p.get("serial"), p.get("accessCode"))
+
+
+# The site's fetched report is read up to 512 KB (pstation lib/hub.ts readJson); the plate's picture rides only when the report stays
+# well under that, so a large fix report never costs the slice its report (an older site ignores both fields).
+FETCHED_REPORT_BUDGET = 480 * 1024
+
+
+def _add_plate_facts(body: dict, sliced_3mf, plate: int) -> None:
+    """The sliced plate's own picture (base64 PNG) and its objects' first-layer boxes, onto a fetched report's slice, when the file has
+    them and the report stays within FETCHED_REPORT_BUDGET."""
+    import base64
+    boxes = plate_boxes(sliced_3mf, plate)
+    if boxes:
+        body["slice"]["plateBoxes"] = boxes
+    picture = plate_picture(sliced_3mf, plate)
+    if picture is None:
+        log.info("sliced plate: no plate picture in the slice")
+        return
+    encoded = base64.b64encode(picture).decode("ascii")
+    if len(json.dumps(body)) + len(encoded) + 32 <= FETCHED_REPORT_BUDGET:
+        body["slice"]["plateImage"] = encoded
+    else:
+        log.info("sliced plate: picture left out (%d bytes) to keep the report under the site's limit", len(picture))
 
 
 class PrinterManager:
@@ -806,6 +829,8 @@ class PrinterManager:
                     body["printerModelId"] = model_id   # the cloud refuses a file sliced for another printer (audit)
                 if sliced is not None:
                     body["slice"] = {k: sliced.get(k) for k in ("grams", "seconds", "supportUsed", "filament", "process", "settings", "prepare", "warnings") if k in sliced}
+                    if "pieces" not in sliced:
+                        _add_plate_facts(body, dest, plate)
                 grams = [i.get("usedG") for i in items if isinstance(i.get("usedG"), (int, float)) and not isinstance(i.get("usedG"), bool)]
                 if grams:
                     body["estGrams"] = int(math.ceil(sum(grams)))
@@ -1222,6 +1247,9 @@ class PrinterManager:
             objects = parse_plate_objects(local_path, plate_int)
             if objects:
                 uploading["objects"] = objects
+                boxes = plate_boxes(local_path, plate_int)   # each object's first-layer box, for the site's skip-objects tab
+                if boxes:
+                    uploading["plateBoxes"] = boxes
             # The member's own print command (cloud-stored from the capture, agent v0.51+): replayed verbatim by
             # the adapter so dual-nozzle/H2D fields survive. Absent for web uploads → the adapter rebuilds.
             raw_print = assignment.get("rawPrint")

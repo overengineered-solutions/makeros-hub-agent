@@ -184,6 +184,8 @@ def make_queue_status_reporter(cfg: Config, credential: str, diagnostics=None):
             body["assignmentSeq"] = seq   # v0.58: the cloud binds the report to THAT assignment (a stale one is ignored)
         if status_report.get("objects"):
             body["objects"] = status_report["objects"]
+        if status_report.get("plateBoxes"):
+            body["plateBoxes"] = status_report["plateBoxes"]   # the plate's first-layer boxes, for the site's skip-objects tab
         try:
             resp = post_json(
                 cfg.queue_status_url,

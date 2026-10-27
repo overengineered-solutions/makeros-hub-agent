@@ -13,7 +13,9 @@ one assignment.
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import os
 import re
 import struct
@@ -97,6 +99,61 @@ def parse_plate_objects(threemf_path, plate: int = 1) -> list[dict]:
             return []
         return deduped
     return []
+
+
+# The plate's picture and its objects' first-layer boxes, for the site (operator, 2026-10-26: "sending a sliced image back tot he user
+# showing our recommended settings"; the site's skip-objects tab outlines each object by its box). Read from the sliced 3MF the hub
+# holds (a Print it slice, an OrcaSlicer send); both best-effort and bounded, never raising: a file without them sends neither, as
+# before. The site checks both again (a PNG it decodes; boxes it matches to the plate's objects by name).
+PLATE_PICTURE_MAX = 192 * 1024        # Bambu's plate_N.png is 512 x 512, usually 40-150 KB; anything larger is not sent
+_PNG = b"\x89PNG\r\n\x1a\n"
+_MAX_PLATE_JSON = 1024 * 1024
+_MAX_BOXES = 256
+
+
+def plate_picture(threemf_path, plate: int = 1) -> bytes | None:
+    """The plate's own picture, Metadata/plate_N.png (else plate_N_small.png): a PNG of at most PLATE_PICTURE_MAX bytes, or None."""
+    try:
+        with zipfile.ZipFile(threemf_path) as zf:
+            for name in (f"Metadata/plate_{int(plate)}.png", f"Metadata/plate_{int(plate)}_small.png"):
+                try:
+                    info = zf.getinfo(name)
+                except KeyError:
+                    continue
+                if info.file_size > PLATE_PICTURE_MAX:
+                    continue
+                data = zf.read(info)
+                if data.startswith(_PNG) and len(data) <= PLATE_PICTURE_MAX:
+                    return data
+    except Exception as exc:  # noqa: BLE001 - a picture never stops a print or its report
+        log.info("3mf plate picture skipped (%s): %s", threemf_path, exc)
+    return None
+
+
+def plate_boxes(threemf_path, plate: int = 1) -> list[dict]:
+    """Metadata/plate_N.json's bbox_objects, as OrcaSlicer writes them: ``[{"name": str, "bbox": [x0, y0, x1, y1]}]`` (each object's
+    first layer, bed millimetres), names cut to 120, finite boxes with x1 > x0 and y1 > y0, at most 256; ``[]`` otherwise."""
+    try:
+        with zipfile.ZipFile(threemf_path) as zf:
+            info = zf.getinfo(f"Metadata/plate_{int(plate)}.json")
+            if info.file_size > _MAX_PLATE_JSON:
+                return []
+            raw = json.loads(zf.read(info).decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - boxes never stop a print or its report
+        log.info("3mf plate boxes skipped (%s): %s", threemf_path, exc)
+        return []
+    out: list[dict] = []
+    for b in raw.get("bbox_objects") or [] if isinstance(raw, dict) else []:
+        box = b.get("bbox") if isinstance(b, dict) else None
+        name = b.get("name") if isinstance(b, dict) else None
+        if not isinstance(name, str) or not isinstance(box, list) or len(box) != 4:
+            continue
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in box) or not (box[2] > box[0] and box[3] > box[1]):
+            continue
+        out.append({"name": name.strip()[:_MAX_NAME], "bbox": [round(float(v), 3) for v in box]})
+        if len(out) >= _MAX_BOXES:
+            break
+    return out
 
 
 # v0.80.1 (2026-10-22): OrcaSlicer 2.4.2's Export plate sliced file keeps the plate's own number, so plate 2 of a project exports
