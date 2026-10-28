@@ -172,6 +172,26 @@ def test_the_uploading_report_reaches_the_site_with_its_boxes():
     assert "plateBoxes" not in post.call_args.args[1]
 
 
+def test_a_refused_start_and_a_failure_reach_the_site_with_the_printers_own_answer():
+    # v0.87.1: the reporter used to drop startEvidence and failure, so the site recorded only "start_refused" (2026-10-28)
+    from unittest import mock
+    from makeros_hub import http
+    from makeros_hub.agent import make_queue_status_reporter
+    from makeros_hub.config import Config
+    cfg = Config(cloud_url="https://cloud.invalid")
+    evidence = {"started": False, "gcodeState": "IDLE", "sampledAt": 1, "commandReply": "refused", "replyCode": "0500_4003", "hms": []}
+    failure = {"printError": 0x0300400C, "hms": [{"attr": 1, "code": 2}]}
+    with mock.patch("makeros_hub.agent.post_json", return_value=http.Response(200, {"ok": True})) as post:
+        make_queue_status_reporter(cfg, "cred")({"queueJobId": "q1", "state": "held", "reason": "start_refused", "assignmentSeq": 1, "startEvidence": evidence})
+    assert post.call_args.args[1]["startEvidence"] == evidence and post.call_args.args[1]["reason"] == "start_refused"
+    with mock.patch("makeros_hub.agent.post_json", return_value=http.Response(200, {"ok": True})) as post:
+        make_queue_status_reporter(cfg, "cred")({"queueJobId": "q1", "state": "held", "reason": "print_failed", "failure": failure})
+    assert post.call_args.args[1]["failure"] == failure
+    with mock.patch("makeros_hub.agent.post_json", return_value=http.Response(200, {"ok": True})) as post:
+        make_queue_status_reporter(cfg, "cred")({"queueJobId": "q1", "state": "uploading"})
+    assert "startEvidence" not in post.call_args.args[1] and "failure" not in post.call_args.args[1]
+
+
 def _ps_slice():
     import importlib.util
     spec = importlib.util.spec_from_file_location("ps_slice_pictures", Path(__file__).resolve().parents[1] / "slicer" / "ps_slice.py")

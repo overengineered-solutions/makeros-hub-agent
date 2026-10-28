@@ -186,6 +186,12 @@ def make_queue_status_reporter(cfg: Config, credential: str, diagnostics=None):
             body["objects"] = status_report["objects"]
         if status_report.get("plateBoxes"):
             body["plateBoxes"] = status_report["plateBoxes"]   # the plate's first-layer boxes, for the site's skip-objects tab
+        # v0.87.1 (2026-10-28: three P2S starts were refused and the site saw only "start_refused"): the printer's own answer
+        # (startEvidence: commandReply, replyCode, HMS, print error) and a failed print's fault (failure) reach the site, which
+        # validates both; without them a refused start skipped the site's back-in-line retry and recorded no reason.
+        for key in ("startEvidence", "failure"):
+            if isinstance(status_report.get(key), dict):
+                body[key] = status_report[key]
         try:
             resp = post_json(
                 cfg.queue_status_url,
