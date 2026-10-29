@@ -68,6 +68,11 @@ def cap_aux_fan(preset: dict, ftype: str) -> dict:
     if cap is not None:
         values = preset.get("additional_cooling_fan_speed") or [str(cap)]
         preset["additional_cooling_fan_speed"] = [str(min(cap, round(float(v)))) for v in (values if isinstance(values, list) else [values])]
+        # Bambu's layer-change code runs the aux fans at first_x_layer_fan_speed for the first layers (P2S: M106 P2 and P10 at 40%
+        # for PLA), exactly where warping starts, so the same cap applies there.
+        first = preset.get("first_x_layer_fan_speed")
+        if first is not None:
+            preset["first_x_layer_fan_speed"] = [str(min(cap, round(float(v)))) for v in (first if isinstance(first, list) else [first])]
     return preset
 
 # The shop's own settings for every automatic slice, per model, in one place. Each value is written into the process, so a

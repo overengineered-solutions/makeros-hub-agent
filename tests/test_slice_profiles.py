@@ -54,3 +54,7 @@ def test_pla_and_petg_run_the_aux_fan_at_most_10_percent_and_other_materials_kee
     assert ps.cap_aux_fan({"additional_cooling_fan_speed": ["5"]}, "petg")["additional_cooling_fan_speed"] == ["5"]   # a cap, never a raise
     assert ps.cap_aux_fan({}, "PLA")["additional_cooling_fan_speed"] == ["10"]
     assert ps.cap_aux_fan({"additional_cooling_fan_speed": ["80"]}, "ABS")["additional_cooling_fan_speed"] == ["80"]
+    assert ps.cap_aux_fan({"first_x_layer_fan_speed": ["40"]}, "PLA")["first_x_layer_fan_speed"] == ["10"]
+    assert ps.cap_aux_fan({"first_x_layer_fan_speed": ["0"]}, "PETG")["first_x_layer_fan_speed"] == ["0"]
+    assert "first_x_layer_fan_speed" not in ps.cap_aux_fan({}, "PLA")
+    assert ps.cap_aux_fan({"first_x_layer_fan_speed": ["40"]}, "ABS")["first_x_layer_fan_speed"] == ["40"]
