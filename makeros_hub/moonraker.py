@@ -149,11 +149,15 @@ class LivePools:
         trays = vp_pool_from_statuses_ranked(scoped, 1, capacity, ranking, time.time())
         lanes = {}
         for i, tray in enumerate(trays):
+            # The AMS colour with its alpha (RRGGBBAA): Orca 2.4.2 and 2.5 both read 8 digits (normalize_color_value), so
+            # clear PETG (00000000) stays Clear and translucent pink (F9C1BD80) stays translucent. Cutting it to 6 digits
+            # synced clear as opaque black, and the site matches alpha exactly, so such a slice could never meet its spool.
+            colour = tray.get("tray_color")
+            colour = colour.upper() if isinstance(colour, str) and re.fullmatch(r"[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?", colour) else "000000FF"
             # The VP's min/max temperatures can be catalog fallbacks, not a spool's
             # chosen printing temperature. Zero is Orca's explicit unknown sentinel.
             lanes[f"lane{i + 1}"] = {"lane": str(i), "material": tray.get("tray_type", ""),
-                                    "color": "#" + tray.get("tray_color", "000000FF")[:6],
-                                    "bed_temp": 0, "nozzle_temp": 0}
+                                    "color": "#" + colour, "bed_temp": 0, "nozzle_temp": 0}
             filament_id = tray.get("tray_info_idx")
             if isinstance(filament_id, str) and re.fullmatch(r"[A-Za-z0-9_+-]{1,32}", filament_id):
                 lanes[f"lane{i + 1}"]["filament_id"] = filament_id

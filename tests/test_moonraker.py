@@ -286,7 +286,7 @@ def test_lane_data_shape_membership_empty_remove_reorder_and_unknown_temps(door)
     assert status == 200
     value = body["result"]["value"]
     assert body["result"]["namespace"] == "lane_data"
-    assert value["lane1"] == {"lane": "0", "material": "PLA", "color": "#FFFFFF", "bed_temp": 0, "nozzle_temp": 0,
+    assert value["lane1"] == {"lane": "0", "material": "PLA", "color": "#FFFFFFFF", "bed_temp": 0, "nozzle_temp": 0,
                               "filament_id": "GFL99"}
     assert len(value) == 1
     other = door.request(endpoint, token="bob")[1]["result"]["value"]
@@ -651,6 +651,13 @@ def test_lane_ids_are_optional_bounded_strings_and_lanes_follow_ranked_order(doo
         assert lanes['lane1']['filament_id'] == filament_id
     else:
         assert 'filament_id' not in lanes['lane1']
+
+
+@pytest.mark.parametrize('tray_color, sent', [('00000000', '#00000000'), ('F9C1BD80', '#F9C1BD80'), ('898989FF', '#898989FF'),
+                                              ('abcdef', '#ABCDEF'), ('bad', '#000000FF'), (None, '#000000FF')])
+def test_lane_colour_keeps_the_ams_alpha(door, monkeypatch, tray_color, sent):
+    monkeypatch.setattr(moonraker, 'vp_pool_from_statuses_ranked', lambda *args: [{'tray_type': 'PETG', 'tray_color': tray_color}])
+    assert door.pools.lanes(door.authorize('alice', 'sv08-max'))['lane1']['color'] == sent
 
 
 def test_beta_upload_uses_top_level_path_and_explicit_start(door):
