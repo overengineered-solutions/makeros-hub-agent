@@ -1386,8 +1386,6 @@ class TestCommandsSurviveARestart(unittest.TestCase):
         stop = threading.Event()
 
         class Ingest:
-            listener_status = []
-
             def __init__(self, *a, **k):
                 pass
 

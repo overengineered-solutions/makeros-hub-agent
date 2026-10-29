@@ -895,8 +895,6 @@ class H9RunLoop(Base):
         sent, offered, acks = [], [], []
 
         class Nothing:
-            listener_status = [{"modelPool": "p2s", "port": 8812, "state": "failed", "error": "EADDRINUSE"}]
-
             def __init__(self, *a, **k):
                 pass
 
@@ -934,7 +932,7 @@ class H9RunLoop(Base):
                 mock.patch("makeros_hub.agent._drain_vprinter_submissions_safely", return_value=0):
             agent.run(Config(cloud_url="https://host.example", heartbeat_sec=5), _stop_event=stop, _install_signals=False)
         [body] = sent
-        self.assertEqual(body["moonrakerListeners"], Nothing.listener_status)
+        self.assertFalse(any(key.startswith("moonraker") for key in body))
         self.assertEqual([e["machineId"] for e in body["lasers"]], [LASER_ID])
         self.assertEqual((body["lasers"][0]["haLink"], body["lasers"][0]["gateLink"]), ("not_configured", "not_configured"))
         self.assertIn({"requestId": "L1", "command": "laser_load", "status": "ok"}, body["commandResults"])

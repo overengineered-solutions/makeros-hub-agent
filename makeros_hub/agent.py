@@ -815,7 +815,6 @@ def heartbeat_payload(
     camera_live_stats: list[dict] | None = None,
     screen_events: list[dict] | None = None,
     printer_starts: list[dict] | None = None,
-    moonraker_listeners: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -867,8 +866,6 @@ def heartbeat_payload(
         payload["piMetrics"] = pi_metrics
     if isinstance(camera_stats, dict) and camera_stats:
         payload["cameraStats"] = camera_stats   # v0.69: the site stores it in hubs.last_metrics (capped at 2 KB there)
-    if moonraker_listeners is not None:
-        payload["moonrakerListeners"] = moonraker_listeners
     if failure_samples:
         payload["failureSamples"] = list(failure_samples)[:64]
     # V4 Slice 2 — managed CA delivery. When the agent has an enabled VP
@@ -1708,7 +1705,7 @@ def run(
             max_bytes=cfg.max_upload_mb * 1024 * 1024,
             moonraker_authorize=make_moonraker_authorize(cfg, credential),
             moonraker_pools=moonraker_pools,
-            moonraker_ports=cfg.moonraker_ports,
+            moonraker_pool=cfg.moonraker_pool,
         )
         ingest.start()
     except OSError as exc:
@@ -2079,7 +2076,6 @@ def run(
                         discovery_hits=discovery_hits,
                         vp_bindings=pending_vp_bindings,
                         pi_metrics=pi_metrics,
-                        moonraker_listeners=ingest.listener_status if ingest else None,
                         lasers=laser_report.lasers if laser_report else None,
                         laser_file_checks=laser_report.file_checks if laser_report else None,
                         camera_stats=camera_stats,

@@ -20,14 +20,9 @@ ingest_port = 8787
 # Cap a single raw sliced-file upload, in MiB (streamed to disk).
 max_upload_mb = 1024
 
-# Staff-only Moonraker trial. Fixed defaults; changing ingest_port does not move these.
-# Overrides need matching Orca presets, operator-only ACL and userspace forwards; restart the hub after review.
-# [moonraker_ports]
-# sv08-max = 8810
-# giga = 8811
-# p2s = 8812
-# a1-mini = 8813
-# x1c = 8814
+# Staff-only Moonraker trial on ingest_port, for one pool. Restart after a reviewed change.
+# Known pools: p2s, sv08-max, giga, a1-mini, x1c. Empty disables only the Moonraker door.
+moonraker_pool = "p2s"
 
 # Lasers (v0.68). Optional; without it every laser reports "not configured". See docs/laser-ha.md.
 # [laser]

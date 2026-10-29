@@ -19,7 +19,6 @@ without a network or a real cloud.
 
 from __future__ import annotations
 
-import errno
 import json
 import logging
 import os
@@ -34,7 +33,6 @@ from typing import Callable
 from . import job_files
 from .multipart import MultipartError, UploadTooLarge, boundary_from_content_type, stream_multipart
 from .printers.gcode_meta import read_gcode_meta
-from .config import DEFAULT_MOONRAKER_PORTS
 from .moonraker import LivePools, MoonrakerDoor
 
 log = logging.getLogger("makeros-hub.ingest")
@@ -354,54 +352,26 @@ class IngestServer:
     down cleanly. Bind host 0.0.0.0 so members on the LAN can reach it."""
 
     def __init__(self, submit_fn: SubmitFn, *, port: int, spool_dir: Path, max_bytes: int,
-                 moonraker_authorize=None, moonraker_pools=None, moonraker_ports=None):
+                 moonraker_authorize=None, moonraker_pools=None, moonraker_pool="p2s"):
         self.port = port
         spool_dir.mkdir(parents=True, exist_ok=True)
         handler = make_handler(submit_fn, spool_dir, max_bytes)
-        if moonraker_authorize is not None:
+        if moonraker_pool and moonraker_authorize is not None:
             try:
                 handler.moonraker = MoonrakerDoor(spool_dir, moonraker_authorize, moonraker_pools or LivePools())
+                handler.model_pool = moonraker_pool
             except Exception:  # noqa: BLE001 — the staff trial's store must never take member ingest or the hub down
-                log.exception("Moonraker staged-file store unavailable; model listeners off, member ingest stays available")
+                log.exception("Moonraker staged-file store unavailable; door off, member ingest stays available")
         self._server = _BoundedServer(("0.0.0.0", port), handler)
-        self.model_servers = {}
-        self.listener_status = []
-        self._threads = []
-        if handler.moonraker:
-            ports = moonraker_ports if moonraker_ports is not None else DEFAULT_MOONRAKER_PORTS
-            for pool, model_port in ports.items():
-                status = {"modelPool": pool, "port": None, "state": "failed"}
-                try:
-                    if pool not in DEFAULT_MOONRAKER_PORTS or type(model_port) is not int or not 0 <= model_port <= 65535:
-                        raise ValueError("invalid model port")
-                    status["port"] = model_port
-                    model_handler = make_handler(submit_fn, spool_dir, max_bytes)
-                    model_handler.moonraker = handler.moonraker
-                    model_handler.model_pool = pool
-                    model_handler.upload_slot = handler.upload_slot
-                    self.model_servers[pool] = _BoundedServer(("0.0.0.0", model_port), model_handler)
-                    status.update(port=self.model_servers[pool].server_address[1], state="listening")
-                except (OSError, ValueError) as exc:
-                    # Only fixed codes cross the heartbeat boundary, never exception text or config values.
-                    status["error"] = errno.errorcode.get(exc.errno, "bind_failed") if isinstance(exc, OSError) else "invalid_port"
-                    log.error("Moonraker %s listener on port %s failed (%s); skipped. Member ingest and other models stay available.",
-                              pool, status["port"], status["error"])
-                self.listener_status.append(status)
-            log.log(logging.WARNING if ports and not self.model_servers else logging.INFO,
-                    "Moonraker listeners bound processed=%d, expected=%d", len(self.model_servers), len(ports))
 
     def start(self) -> None:
-        for pool, server in [("ingest", self._server), *self.model_servers.items()]:
-            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1},
-                                      name=f"makeros-hub-{pool}", daemon=True)
-            thread.start()
-            self._threads.append(thread)
-            log.info("OrcaSlicer %s server listening on :%d", pool, server.server_address[1])
+        threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.1},
+                         name="makeros-hub-ingest", daemon=True).start()
+        log.info("OrcaSlicer ingest server listening on :%d", self._server.server_address[1])
 
     def stop(self) -> None:
-        for server in [self._server, *self.model_servers.values()]:
-            try:
-                server.shutdown()
-                server.server_close()
-            except Exception:  # noqa: BLE001 — best-effort teardown
-                pass
+        try:
+            self._server.shutdown()
+            self._server.server_close()
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            pass

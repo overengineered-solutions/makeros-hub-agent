@@ -321,17 +321,10 @@ class MoonrakerDoor:
 
     def handle(self, handler):
         url = urlsplit(handler.path)
-        bound_pool = handler.model_pool
-        if bound_pool is None and not url.path.startswith(("/moonraker", "/server/", "/printer/", "/machine/", "/access/")):
+        pool, endpoint = handler.model_pool, url.path
+        if pool is None or not endpoint.startswith(("/server/", "/printer/", "/machine/", "/access/")):
             return False
         try:
-            if bound_pool is not None:
-                pool, endpoint = bound_pool, url.path
-            else:
-                match = re.fullmatch(r"/moonraker/([a-z0-9-]+)(/.*)", url.path)
-                if match is None or match[1] not in POOLS:
-                    raise DoorError(404, "Use the preset's model-specific hub port. " + CONTROLS)
-                pool, endpoint = match.groups()
             allowed = {("GET", "/server/info"), ("GET", "/server/database/item"),
                        ("GET", "/server/files/roots"), ("POST", "/server/files/upload"),
                        ("POST", "/printer/print/start")}

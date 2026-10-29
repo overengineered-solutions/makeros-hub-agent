@@ -12,7 +12,7 @@ import zipfile
 import pytest
 
 from makeros_hub import agent, moonraker
-from makeros_hub.config import Config, DEFAULT_MOONRAKER_PORTS
+from makeros_hub.config import Config
 from makeros_hub.http import Response, TransportError
 from makeros_hub.ingest import IngestServer
 from makeros_hub.printers import ingest_facts
@@ -88,20 +88,20 @@ class Door:
             raise TimeoutError("reply lost after cloud committed")
         return self.jobs[uid]
 
-    def open(self, *, models=False):
+    def open(self, *, pool="sv08-max"):
+        self.pool = pool
         self.server = IngestServer(self.submit, port=0, spool_dir=self.path, max_bytes=2 * 1024**2,
                                    moonraker_authorize=self.authorize, moonraker_pools=self.pools,
-                                   moonraker_ports={pool: 0 for pool in DEFAULT_MOONRAKER_PORTS} if models else {})
+                                   moonraker_pool=pool)
         self.server.start()
         self.base = f"http://127.0.0.1:{self.server._server.server_address[1]}"
         self.store = self.server._server.RequestHandlerClass.moonraker.store
 
-    def restart(self):
+    def restart(self, *, pool=None):
         self.server.stop()
-        self.open()
+        self.open(pool=pool or self.pool)
 
-    def request(self, suffix, *, pool="sv08-max", method="GET", token="alice", data=None, content_type=None):
-        path = suffix if suffix.startswith("/moonraker") or pool is None else f"/moonraker/{pool}{suffix}"
+    def request(self, path, *, method="GET", token="alice", data=None, content_type=None):
         headers = {"X-Api-Key": token}
         if content_type:
             headers["Content-Type"] = content_type
@@ -141,40 +141,20 @@ def door(tmp_path):
 
 
 def test_connection_info_identifies_pool_and_cloud_availability(door):
-    status, body = door.request("/server/info", pool="p2s")
+    door.restart(pool="p2s")
+    status, body = door.request("/server/info")
     assert status == 200
     assert body["result"]["klippy_state"] == "ready"
     assert body["result"]["model_pool"] == "p2s"
     assert "P2S" in body["result"]["machine_name"]
     assert door.request("/server/files/roots")[1]["result"] == [{"name": "gcodes", "permissions": "rw"}]
-    assert door.request("/server/info", pool="typo")[0] == 404
-    assert door.request("/server/info", pool=None)[0] == 404
+    assert door.request("/moonraker/p2s/server/info")[0] == 404
+    assert door.request("/moonraker/typo/server/info")[0] == 404
     assert door.request("/server/info", token="bad")[0] == 403
     assert door.request("/server/info", token="")[0] == 403
     door.available = False
     assert door.request("/server/info")[0] == 503
     assert door.calls == []
-
-
-def test_model_ports_preserve_identity_for_orcas_path_stripping_and_switches(door):
-    door.server.stop()
-    door.open(models=True)
-    servers = door.server.model_servers
-    assert set(servers) == set(ingest_facts.POOLS) == set(DEFAULT_MOONRAKER_PORTS)
-    assert len({s.server_address[1] for s in servers.values()}) == len(servers)
-    paths = {}
-    for model in ("p2s", "giga", "p2s"):
-        door.base = f"http://127.0.0.1:{servers[model].server_address[1]}"
-        assert door.request("/server/info", pool=None)[1]["result"]["model_pool"] == model
-        assert door.request("/server/database/item?namespace=lane_data", pool=None)[0] == 200
-        assert door.request("/moonraker/giga/server/info", pool=None)[0] == 405
-        if model == "p2s":
-            paths[model] = door.stage(pool=None, name="part.3mf", data=threemf())
-        else:
-            assert door.start(paths["p2s"], pool=None)[0] == 404
-            assert door.upload(pool=None, name="part.3mf", data=threemf())[0] == 400
-    assert door.start(paths["p2s"], pool=None)[0] == 200
-    assert len(door.calls) == 1
 
 
 def test_upload_only_even_with_print_true_creates_zero_jobs(door):
@@ -189,16 +169,19 @@ def test_upload_only_even_with_print_true_creates_zero_jobs(door):
 
 
 def test_two_members_same_filename_are_separate_and_bound_to_pool(door):
-    a = door.stage(pool="p2s", name="part.3mf", data=threemf())
-    b = door.stage(pool="p2s", token="bob", name="part.3mf", data=threemf())
+    door.restart(pool="p2s")
+    a = door.stage(name="part.3mf", data=threemf())
+    b = door.stage(token="bob", name="part.3mf", data=threemf())
     assert a != b
     assert (door.path / a).exists() and (door.path / b).exists()
-    assert door.start(a, pool="p2s", token="bob")[0] == 404
-    assert door.start(b, pool="p2s", token="alice")[0] == 404
-    assert door.start(a, pool="sv08-max")[0] == 404
+    assert door.start(a, token="bob")[0] == 404
+    assert door.start(b, token="alice")[0] == 404
+    door.restart(pool="sv08-max")
+    assert door.start(a)[0] == 404
+    door.restart(pool="p2s")
     assert door.calls == []
-    assert door.start(a, pool="p2s")[0] == 200
-    assert door.start(b, pool="p2s", token="bob")[0] == 200
+    assert door.start(a)[0] == 200
+    assert door.start(b, token="bob")[0] == 200
     assert len(door.jobs) == 2
 
 
@@ -297,45 +280,47 @@ def test_forged_start_paths_do_not_resolve(door, name):
 
 
 def test_lane_data_shape_membership_empty_remove_reorder_and_unknown_temps(door):
+    door.restart(pool="p2s")
     endpoint = "/server/database/item?namespace=lane_data"
-    status, body = door.request(endpoint, pool="p2s")
+    status, body = door.request(endpoint)
     assert status == 200
     value = body["result"]["value"]
     assert body["result"]["namespace"] == "lane_data"
     assert value["lane1"] == {"lane": "0", "material": "PLA", "color": "#FFFFFF", "bed_temp": 0, "nozzle_temp": 0}
     assert len(value) == moonraker.LANES
-    other = door.request(endpoint, pool="p2s", token="bob")[1]["result"]["value"]
+    other = door.request(endpoint, token="bob")[1]["result"]["value"]
     assert other["lane1"]["material"] == "PETG"
     assert all(l["material"] != "PETG" for l in value.values())
     assert all(type(l["lane"]) is str and type(l["bed_temp"]) is int and type(l["nozzle_temp"]) is int for l in value.values())
     door.statuses[0]["ams"][0]["trays"] = [{"slot": 3, "material": "MYSTERY", "colorHex": "123456FF"}]
     door.refresh()
-    assert door.request(endpoint, pool="p2s")[1]["result"]["value"]["lane1"]["material"] == "MYSTERY"
+    assert door.request(endpoint)[1]["result"]["value"]["lane1"]["material"] == "MYSTERY"
     door.statuses = []
     door.refresh()
-    empty = door.request(endpoint, pool="p2s")[1]["result"]["value"]
+    empty = door.request(endpoint)[1]["result"]["value"]
     # {} makes Orca 2.4.2 return false; explicit empty lanes make it clear old trays.
     assert len(empty) == moonraker.LANES and all(l["material"] == "" for l in empty.values())
 
 
 def test_failed_or_stale_refresh_never_serves_old_pool(door):
+    door.restart(pool="p2s")
     endpoint = "/server/database/item?namespace=lane_data"
-    assert door.request(endpoint, pool="p2s")[0] == 200
+    assert door.request(endpoint)[0] == 200
     with pytest.raises(ValueError):
         door.pools.update(None, None)
-    assert door.request(endpoint, pool="p2s")[0] == 503
+    assert door.request(endpoint)[0] == 503
     door.refresh()
     door.pools.max_age = -1
-    assert door.request(endpoint, pool="p2s")[0] == 503
+    assert door.request(endpoint)[0] == 503
     door.pools.max_age = 90
     door.statuses[0]["connectionState"] = "error"
     door.refresh()
-    assert door.request(endpoint, pool="p2s")[0] == 503
+    assert door.request(endpoint)[0] == 503
     door.statuses[0]["connectionState"] = "offline"
     door.refresh()
-    assert all(not lane["material"] for lane in door.request(endpoint, pool="p2s")[1]["result"]["value"].values())
+    assert all(not lane["material"] for lane in door.request(endpoint)[1]["result"]["value"].values())
     door.available = False
-    assert door.request(endpoint, pool="p2s")[0] == 503
+    assert door.request(endpoint)[0] == 503
 
 
 def test_klipper_uses_fresh_site_staff_spool_and_live_connected_state(door):
@@ -350,10 +335,11 @@ def test_klipper_uses_fresh_site_staff_spool_and_live_connected_state(door):
 
 
 def test_selected_plate_facts_survive_staging_restart_and_submit(door):
+    door.restart(pool="p2s")
     original = threemf((1, 3))
-    path = door.stage(pool="p2s", name="part.3mf", data=original, fields={"plateindex": "3"})
+    path = door.stage(name="part.3mf", data=original, fields={"plateindex": "3"})
     door.restart()
-    assert door.start(path, pool="p2s")[0] == 200
+    assert door.start(path)[0] == 200
     call = door.calls[0]
     assert call["print_now"] is True
     assert call["printer_model"] == "P2S"
@@ -367,8 +353,9 @@ def test_selected_plate_facts_survive_staging_restart_and_submit(door):
 
 @pytest.mark.parametrize("spool_moves", [False, True])
 def test_staged_plate_reaches_existing_dispatch_and_live_spool_recheck(door, monkeypatch, spool_moves):
-    path = door.stage(pool="p2s", name="part.3mf", data=threemf((1, 3)), fields={"plateindex": "3"})
-    receipt = door.start(path, pool="p2s")[1]["result"]
+    door.restart(pool="p2s")
+    path = door.stage(name="part.3mf", data=threemf((1, 3)), fields={"plateindex": "3"})
+    receipt = door.start(path)[1]["result"]
     call = door.calls[-1]
     monkeypatch.setattr(bambu_module, "QUEUE_PROGRESS_DIR", door.path / "progress")
     monkeypatch.setattr(bambu_module, "TERMINAL_JOBS_DIR", door.path / "terminal")
@@ -406,7 +393,8 @@ def test_staged_plate_reaches_existing_dispatch_and_live_spool_recheck(door, mon
 
 @pytest.mark.parametrize("fields", [{"plateindex": "0"}, {"plateindex": "2"}, {"plateindex": "x"}, {"plateindex": "65"}, {}])
 def test_missing_invalid_or_unchosen_plate_is_refused(door, fields):
-    assert door.upload(pool="p2s", name="part.3mf", data=threemf((1, 3)), fields=fields)[0] == 400
+    door.restart(pool="p2s")
+    assert door.upload(name="part.3mf", data=threemf((1, 3)), fields=fields)[0] == 400
     assert door.calls == []
     assert not list(door.path.glob("*/*.3mf"))
 
@@ -422,6 +410,8 @@ def test_missing_invalid_or_unchosen_plate_is_refused(door, fields):
     {"name": "part.3mf", "data": threemf()}, {"name": "part.stl", "data": b"solid"},
 ])
 def test_file_facts_and_target_validation(door, kwargs):
+    kwargs = kwargs.copy()
+    door.restart(pool=kwargs.pop("pool", "sv08-max"))
     assert door.upload(**kwargs)[0] == 400
     assert door.calls == []
 
@@ -454,6 +444,7 @@ def test_moonraker_shares_legacy_upload_concurrency_limit(door):
 
 @pytest.mark.parametrize("change", ["dual_nozzles", "duplicate_filament", "second_extruder"])
 def test_ambiguous_3mf_filament_facts_are_refused(door, change):
+    door.restart(pool="p2s")
     original = io.BytesIO(threemf())
     edited = io.BytesIO()
     with zipfile.ZipFile(original) as src, zipfile.ZipFile(edited, "w") as dst:
@@ -466,7 +457,7 @@ def test_ambiguous_3mf_filament_facts_are_refused(door, change):
             elif change == "second_extruder" and name.endswith(".config"):
                 data = data.replace(b"<filament", b'<filament group_id="1"')
             dst.writestr(name, data)
-    assert door.upload(pool="p2s", name="part.3mf", data=edited.getvalue())[0] == 400
+    assert door.upload(name="part.3mf", data=edited.getvalue())[0] == 400
     assert door.calls == []
 
 
@@ -514,20 +505,22 @@ def test_bounds_disk_count_bytes_member_and_busy(door, monkeypatch):
 
 
 def test_zip_bounds_duplicates_traversal_and_expansion(door):
+    door.restart(pool="p2s")
     for entries in ([('Metadata/plate_1.gcode', b'x')] * 2,
                     [('../evil', b'x')], [('bomb', b'0' * 100_000)]):
         data = io.BytesIO()
         with zipfile.ZipFile(data, "w", zipfile.ZIP_DEFLATED) as archive:
             for name, value in entries:
                 archive.writestr(name, value)
-        assert door.upload(pool="p2s", name="part.3mf", data=data.getvalue())[0] == 400
+        assert door.upload(name="part.3mf", data=data.getvalue())[0] == 400
     assert door.calls == []
 
 
 @pytest.mark.parametrize("limit", ["MAX_ZIP_ENTRIES", "MAX_EXPANDED_BYTES", "MAX_SLICE_INFO_BYTES"])
 def test_zip_count_expanded_and_metadata_limits(door, monkeypatch, limit):
+    door.restart(pool="p2s")
     monkeypatch.setattr(ingest_facts, limit, 1)
-    assert door.upload(pool="p2s", name="part.3mf", data=threemf())[0] == 400
+    assert door.upload(name="part.3mf", data=threemf())[0] == 400
     assert door.calls == []
 
 
@@ -546,10 +539,11 @@ def test_zip_directory_limit_is_checked_before_zipfile_allocates_entries(tmp_pat
 
 
 def test_zip64_directory_cannot_override_the_bounded_end_record(door):
+    door.restart(pool="p2s")
     data = threemf()
     end = data.rfind(b"PK\x05\x06")
     data = data[:end] + b"PK\x06\x07" + bytes(16) + data[end:]
-    assert door.upload(pool="p2s", name="part.3mf", data=data)[0] == 400
+    assert door.upload(name="part.3mf", data=data)[0] == 400
 
 
 def test_second_identical_upload_is_an_intentional_second_job(door):

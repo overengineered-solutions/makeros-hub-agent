@@ -18,12 +18,13 @@ import os
 import re
 import tempfile
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 from .laser import parse_laser_config
+from .printers.ingest_facts import POOLS
 
 CONFIG_PATH = Path(os.environ.get("MAKEROS_HUB_CONFIG", "/etc/makeros-hub/config.toml"))
 CREDENTIAL_PATH = Path(
@@ -37,8 +38,6 @@ DEFAULT_TELEMETRY_SEC = 5
 # Non-privileged port the OrcaSlicer ingest HTTP server binds on the LAN. The
 # member points OrcaSlicer's Print Host at http://<hub>.local:<port>.
 DEFAULT_INGEST_PORT = 8787
-# Independent of ingest_port: 8788 already belongs to laser telemetry.
-DEFAULT_MOONRAKER_PORTS = {"sv08-max": 8810, "giga": 8811, "p2s": 8812, "a1-mini": 8813, "x1c": 8814}
 # Raw manual HTTP upload ceiling; intake streams to disk. FTPS has its own limit.
 DEFAULT_MAX_UPLOAD_MB = 1024
 VPRINTER_CODE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -66,10 +65,13 @@ class Config:
     laser: Any = None
     # v0.70: telemetry push cadence in seconds, 0 = off (last so positional construction of older callers is unchanged).
     telemetry_sec: int = DEFAULT_TELEMETRY_SEC
-    moonraker_ports: dict = field(default_factory=lambda: DEFAULT_MOONRAKER_PORTS.copy())
+    moonraker_pool: str = "p2s"
 
     def __post_init__(self):
         self.cloud_url = validate_cloud_url(self.cloud_url)
+        if not isinstance(self.moonraker_pool, str) or (self.moonraker_pool and self.moonraker_pool not in POOLS):
+            log.error("moonraker_pool must name a known pool or be empty; Moonraker door disabled, member ingest remains available")
+            self.moonraker_pool = ""
 
     @property
     def enroll_url(self) -> str:
@@ -389,12 +391,6 @@ def load_config(cloud_url_override: str | None = None) -> Config:
         # A bad [laser] table never stops the printers: lasers run not_configured and the reason is logged.
         log.error("%s; lasers stay not configured until it is fixed", exc)
         laser = None
-    ports = data.get("moonraker_ports", {})
-    if not isinstance(ports, dict):
-        log.error("moonraker_ports must be a table; model listeners disabled, member ingest remains available")
-        ports = dict.fromkeys(DEFAULT_MOONRAKER_PORTS)
-    if set(ports) - DEFAULT_MOONRAKER_PORTS.keys():
-        log.error("moonraker_ports contains unknown model names; unknown entries ignored")
     return Config(
         cloud_url=cloud_url,
         heartbeat_sec=heartbeat,
@@ -402,8 +398,7 @@ def load_config(cloud_url_override: str | None = None) -> Config:
         max_upload_mb=max_upload_mb,
         laser=laser,
         telemetry_sec=telemetry_sec,
-        moonraker_ports={pool: ports.get(pool, port) if ports.get(pool, port) != 0 else None
-                        for pool, port in DEFAULT_MOONRAKER_PORTS.items()},
+        moonraker_pool=data.get("moonraker_pool", "p2s"),
     )
 
 

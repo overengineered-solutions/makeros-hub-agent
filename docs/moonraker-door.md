@@ -4,108 +4,47 @@ This is the hub half of the contract, unreleased. The site additions below are r
 An old/unavailable site fails closed; neither the session check nor an upload creates a job. Nothing in this HTTP door sends
 commands to a printer. The normal cloud queue and existing final dispatch guards own physical printing.
 
-## Preset addresses
+## Preset address
 
-Use the **hub's member-reachable hostname**, never a physical printer's address. Fixed defaults (independent of `ingest_port`):
+Use `http://<hub-host>:8787`, the **hub's member-reachable hostname and ingest port**, for the configured pool.
+If `ingest_port` changes, use that port in the preset. One listener serves both the Moonraker door and the existing
+OctoPrint `/api/version` and `/api/files/local` endpoints.
 
-| Model pool | Exact `print_host` form | `use_3mf` |
-| --- | --- | --- |
-| `sv08-max` | `http://<hub-host>:8810` | `0` |
-| `giga` | `http://<hub-host>:8811` | `0` |
-| `p2s` | `http://<hub-host>:8812` | `1` |
-| `a1-mini` | `http://<hub-host>:8813` | `1` |
-| `x1c` | `http://<hub-host>:8814` | `1` |
+The top-level `moonraker_pool` setting in `config.toml` defaults to `"p2s"`. It accepts `p2s`, `sv08-max`, `giga`,
+`a1-mini` or `x1c`. An empty string disables the Moonraker door. An unknown name or a non-string value logs one ERROR
+and disables it; existing member ingest stays available. Restart the hub after a reviewed configuration change.
+A damaged Moonraker staged-file store also disables only the door.
 
 Set `host_type=moonraker`, `printer_agent=moonraker`, and `printhost_apikey` to the member's existing **print token**.
 Leave `printhost_port` empty (or matching the inline port); set `print_host_webui` to the site's member print page.
-Use a non-Bambu-vendor PS preset for Moonraker filament sync. P2S needs the stage-1 preset; H2D is deliberately unsupported.
-The original OctoPrint endpoint remains on the configured ingest port (default 8787). Change model ports only in the
-optional `[moonraker_ports]` table in `config.toml`; omitted models keep the defaults. Example:
+Use the stage-1 non-Bambu-vendor PS P2S preset with `use_3mf=1`. If the operator later configures another supported pool,
+its preset must match: Bambu models use `use_3mf=1`; Sovol/Giga use `use_3mf=0`. H2D is unsupported.
+There is no model path prefix: the configured pool applies to every Moonraker request on this listener.
 
-```toml
-[moonraker_ports]
-sv08-max = 8810
-giga = 8811
-p2s = 8812
-a1-mini = 8813
-x1c = 8814
-```
+Testing remains **staff/admin only until the operator switches it on**. The site's session and submit gates must enforce
+that restriction; ordinary members keep their stock Bambu presets and virtual-printer sync.
 
-Restart the hub after a reviewed config change, and update the matching Orca presets, userspace forwards and operator-only
-Headscale ACL together. The setup build currently writes the default P2S port, 8812; it does not discover custom ports.
-A custom ingest port never shifts this map. Port 0 is reserved for local test sockets, not an operator configuration.
-A failed model bind logs an ERROR with model, port and fixed OS error code, skips that model, and continues binding the
-others. It never closes the existing member ingest listener or a successful model listener. Fix the collision and restart
-the hub to retry. Each heartbeat carries `moonrakerListeners`, for example
-`[{"modelPool":"p2s","port":8812,"state":"failed","error":"EADDRINUSE"}]`; successful entries have `state:"listening"`
-and no error. Site Build A validates these entries into `hubs.last_metrics` and shows failures on the admin hub health line.
-No credentials, member identities or exception text are included. A failed ingest bind remains a separate ingest failure.
+Port 8788 is the laser listener; never reuse it for Moonraker.
 
-### Existing port inventory (offline, 2026-10-29)
-
-**8810–8814 is unused in the checked-in sources below. Live socket availability is unverified.** No shop, printer, preview
-or production connection was made. This inventory includes other hosts, container-only ports, disabled defaults and probe
-candidates conservatively; it does not claim they all listen on the shop box. `platform/` below means
-`oes-pool-deploy` (also checked against the supplied `oes-pool-deploy-doorports` checkout). Scanned hub code/docs/config,
-`platform/network/shop.json`, every `scripts/install-*.py` and `box-*.py`, `apps/`, `cron/`, plus pipeline, Headscale and
-Compose service definitions. Cron adds no listener; its jobs call existing HTTPS services. The fixed-range test parses
-this whole table and rejects any overlap.
-
-<!-- existing-port-inventory -->
-| Existing/reserved ports | Use and checked-in evidence |
-| --- | --- |
-| `22,2022` | Shop/pool SSH and forced-command doors; `platform/AGENT-OPERATIONS.md`, `scripts/install-agents-door.py`, `install-box-lane.py`. |
-| `53,67,68` | Gateway DNS/DHCP (UDP and DNS TCP); `platform/network/shop.json`. |
-| `80,443` | HTTP/HTTPS proxies, apps, UniFi console/door, Headscale coordination and DERP; `platform/compose.yaml`, `apps/`, `network/shop.json`; Klipper HTTP proxy in hub README. |
-| `322,6000` | Bambu printer camera RTSPS/TLS destinations; `printers/rtsp_camera.py`, `bambu_camera.py`. |
-| `554,1883,8000,8081,9000` | LAN camera/MQTT/web probe candidates, not confirmed listeners; `platform/pipeline/agents-door.py:PROBE_PORTS`. |
-| `631` | Paper printer IPPS destination; `makeros_hub/paper.py` (other device). |
-| `990,8883,50000-50009` | Virtual printer FTPS, MQTT TLS and passive data; `vprinter/manager.py`, `platform/headscale/acl.hujson`, `network/shop.json`. |
-| `1900` | Obsolete SSDP firewall rule, removed by `platform/scripts/box-firewall-tidy.py`; reserved to avoid reusing an old service port. |
-| `1984,8555` | go2rtc API/WebRTC defaults explicitly disabled by `platform/scripts/install-camera-gateway.py`. |
-| `1990,2021` | Bambu discovery multicast/broadcast UDP; `bambu_ssdp.py`, `vprinter/manager.py`, platform firewall notes. |
-| `3000,3002` | Virtual printer bind services; `vprinter/manager.py`, `platform/network/shop.json`; app containers also use 3000 (`apps/`). |
-| `3478,41641` | STUN/WireGuard UDP; `platform/headscale/config.yaml`, `headscale/RUNBOOK.md` firewall record. |
-| `5000` | Registry on pool/loopback; `platform/pipeline/shipyard-trust.sh`, `apps/`. |
-| `5432` | Postgres container; `platform/compose.yaml` (private network only). |
-| `7125` | Physical Klipper Moonraker destination; `lan_scan.py` (not this queue door). |
-| `7650` | Laser gate HTTP loopback/private listener; `docs/laser-gate.md`, `config.toml.example`. |
-| `7788` | Shop-box Conclave categorizer; `platform/apps/{pstation,oefm,hoa,wannaplay}.yaml`, `headscale/RUNBOOK.md`. |
-| `8080,9090` | Headscale container HTTP/metrics; `platform/headscale/config.yaml`; 8080 also a LAN camera probe. |
-| `8123` | Home Assistant destination on its Pi; `platform/network/shop.json`, `docs/laser-ha.md`. |
-| `8440-8459` | Pool preview range; `platform/compose.yaml`, `apps/*-preview.yaml`, `headscale/acl.hujson`; 8443 also go2rtc SRTP default (disabled). |
-| `8554` | Shop-box go2rtc loopback RTSP; `platform/scripts/install-camera-gateway.py`. |
-| `8787` | Existing member OctoPrint ingest; `config.py`, `platform/network/shop.json`. |
-| `8788` | Hub laser telemetry listener; `laser.py`, `docs/laser-ha.md`. Never use for a model door. |
-| `8790` | Operator approval server on pool 100.64.0.6; `platform/AGENT-OPERATIONS.md`, `headscale/acl.hujson`. |
-| `12445` | UniFi Access on the console; `platform/scripts/install-door-bridge.py`, `pipeline/door-bridge.py`. |
-<!-- /existing-port-inventory -->
-
-Testing remains staff/admin only: the site's session and submit gates apply on every model port and on the diagnostic
-paths on 8787. Network Build D grants only `operator@` access to 8810–8814 on `tag:print-hub`; it adds no member or LAN
-allow. The all-interface hub bind is unchanged. Persistent userspace forwarding, local LAN isolation and the pool ACL
-apply lane still need their separate reviewed implementations and operator taps; see Network Build D's runbook.
-
-**Why ports, not path prefixes:** v2.4.2 `GUI_App.cpp:3643` calls `MachineObject::dev_id_from_address`
-(`DeviceManager.cpp:366`), which strips the URL path and uses the resulting address as the device IP.
-`MoonrakerPrinterAgent.cpp:1076` then rebuilds its base URL from that address. A prefix works in `Moonraker::make_url` for
-upload, but disappears for filament sync and collapses model identities. Distinct ports survive both clients. The ingest
-port also supports `/moonraker/<pool>/...` for HTTP diagnostics; **do not put that prefix in an Orca preset**.
+**Planned, not built:** one stand-in address per model on the routed range, using the vendor's real ports, is described in
+the machine-network greenfield report (pstation `reports/machine-network-greenfield-2026-10-29.md`, a local report not in git).
+This change implements only the single-pool door on the existing ingest port.
 
 ## HTTP contract
 
 All allowed operations require `X-Api-Key`, perform a fresh site authorization, and return `Cache-Control: no-store`.
 Revoked tokens/membership return 403; unavailable authorization or spool refresh returns 503. No positive auth cache and no
-offline success. Unknown model prefixes return 404; a file for another model returns 400, or 404 when resolving a staged path.
+offline success. A file for another model returns 400, or 404 when resolving a staged path. GET/POST requests to removed
+model-prefixed URLs return 404.
 
-| Request on a model port | Result |
+| Request on the ingest port | Result |
 | --- | --- |
 | `GET /server/info` | `{result:{machine_name:"PS P2S queue",model_pool:"p2s",moonraker_version:"makeros-hub-0.88.0",klippy_state:"ready"}}`. Ready means the authenticated queue door has spool capacity, not that a printer is idle. |
 | `GET /server/files/roots` | `{result:[{name:"gcodes",permissions:"rw"}]}`. |
 | `GET /server/database/item?namespace=lane_data` | `{result:{namespace:"lane_data",value:{lane1:{lane:"0",material:"PLA",color:"#FFFFFF",bed_temp:0,nozzle_temp:0},...}}}`. |
 | `POST /server/files/upload` | Multipart `file`, `root=gcodes`, optional `plateindex` (1–64), empty `path`, optional `print`. Returns HTTP 201 `{result:{item:{path:"<opaque-uid>/<safe-name>",root:"gcodes"},print_started:false}}`. Even `print=true` only stages. |
 | `POST /printer/print/start` | JSON `{filename:"<returned-path>"}`. Returns `{result:{jobId:"...",status:"queued"}}`; eligibility, member/pool ownership, file hash, size and facts are checked. |
-| Everything else on a model port | HTTP 405 with `{error:{code,message}}` directing members to the PS site's **Your prints and printer controls**. This includes G-code, pause/resume/cancel, temperature changes, deletes and alternate methods. |
+| Other requests under `/server/`, `/printer/`, `/machine/` or `/access/` | HTTP 405 with `{error:{code,message}}` directing members to the PS site's **Your prints and printer controls**. This includes G-code, pause/resume/cancel, temperature changes, deletes and alternate methods. |
 
 Lane data uses the existing VP live-pool builder and ranking, filtered by the freshly authorized printer IDs before deriving
 a member view. Bambu spools come from heartbeat statuses; Klipper's staff-set spool comes from the site's current record,
@@ -178,7 +117,8 @@ site code come from the supplied review; no site files were edited here.
    the site owns its staff-set spool matching.
 
 4. Update the existing preset installers (`orca-setup.ts`, `orca-setup-mac.ts`, named in the review; full paths unverified)
-   to use the model ports above and preserve the existing fallback presets. Member tokens remain local connection settings.
+   to use the ingest-port address for the configured pool and preserve the existing fallback presets. Keep the testing
+   gate enabled for staff/admin only. Member tokens remain local connection settings.
 
 ## Durability and limits
 
@@ -195,17 +135,17 @@ delete uncertain rows/files to make room; first establish the site's durable out
 receipts if terminal payloads are reclaimed, so old starts cannot recreate jobs.
 
 Other bounds: 16 unstarted stages per member, configured per-file limit (default 1 GiB), 1 MiB multipart overhead,
-128 MiB free-disk reserve, one upload shared with legacy ingest, four connections per listener (24 total), 120-second
+128 MiB free-disk reserve, one upload shared with legacy ingest, four connections total on the shared listener, 120-second
 body deadline, 4 KiB start JSON, 1,024 ZIP entries, 2 MiB ZIP directory (checked before loading), 2 GiB total expanded size,
 200:1 maximum expansion ratio, 10 MiB per metadata entry. ZIP64/multidisk archives and
 duplicate/traversal/encrypted/unsupported-compression entries are refused.
 
 ## Ten-minute operator test after both halves are available in the approved test environment
 
-1. **0–2 minutes:** use Orca 2.4.2 and the PS SV08 MAX/Giga presets (PS P2S only with the stage-1 preset). Set the model
-   URL/API key above. Test connection; an invalid token must fail. Keep the existing connection available as fallback.
-2. **2–4:** Sync filaments in Prepare. Compare material/colour against the shop's current spools. Switch P2S → Giga → P2S;
-   repeat sync. Remove/reorder a test spool, then empty the test pool and sync: stale choices must clear. Make the site
+1. **0–2 minutes:** use Orca 2.4.2 and the stage-1 PS P2S preset, matching the configured `p2s` pool. Set the
+   ingest URL/API key above. Test connection; an invalid token must fail. Keep the existing connection available as fallback.
+2. **2–4:** Sync filaments in Prepare. Compare material/colour against the shop's current P2S spools; repeat sync.
+   Remove/reorder a test spool, then empty the test pool and sync: stale choices must clear. Make the site
    session unavailable: sync must report failure. Check two differently tuned PLA presets/custom material and colour-only
    sync; matching colour alone does not prove the intended flow/temperature preset survived.
 3. **4–6:** slice a tiny one-filament part. Upload only: **zero new queue jobs**. Upload and Print: exactly one job in
@@ -223,12 +163,20 @@ in lane data; this cannot promise distinct tuned PLA identities. Its live websoc
 This change does not restore PS Bambu object markers or prove multi-colour/H2D behavior. Keep the existing sync fallback
 until the GUI and stage-1 gates pass.
 
-Automated proof in this checkout (2026-10-28):
-`PYTHONPATH=. ~/.pyvenv/bin/pytest -q tests --deselect tests/test_real_splitjoints.py`
-completed with **1,784 passed, 42 skipped, 2 deselected, 165,171 subtests passed** in 248.91 seconds.
-The one warning is the deliberately duplicated ZIP-entry fixture. The focused Moonraker suite has **73 passing tests**;
-`git diff --check` and compilation of the changed Python modules also passed. Cloud commit/retry proofs use a fake control
-plane; they do not establish that the separate site's transaction already implements this contract.
+Automated verification for the shared ingest listener (2026-10-29):
 
-Port-fix verification (2026-10-29), including the full-suite limitations and cross-checkout results:
-[port-fix-verification-2026-10-29.md](port-fix-verification-2026-10-29.md).
+- Before the implementation, the new default-pool HTTP test failed with 404 on `/server/info`; six disabled/invalid-config
+  cases failed because the single-pool setting did not exist.
+- `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh -k 'moonraker or H9RunLoop' --tb=short`:
+  **116 passed, 3 skipped, 1,725 deselected, 5 subtests passed**.
+- `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh --tb=short`:
+  **1,800 passed, 42 skipped, 2 failed, 165,065 subtests passed** in 258.05 seconds. Both failures are in the unchanged
+  `tests/test_real_splitjoints.py` (`fit` and `floors`): the cached slicer image cannot import NumPy. This full run is
+  **not green**. No image or dependency was fetched or modified. The one warning is the intentional duplicate-ZIP fixture.
+- The README's shell syntax checks and `git diff --check` passed.
+
+One self-review covered the whole diff: routing and configuration, member/pool isolation, submission and money behavior,
+privacy, wording, and tests. The connection-limit description and operator test now match the single listener.
+The old port configuration, extra listeners and listener heartbeat field have been removed. Cloud commit/retry tests use a
+fake control plane; the separate site's staff gate, transaction and preset installer still require paired verification.
+No commit, release, deployment or live-system request was made.
