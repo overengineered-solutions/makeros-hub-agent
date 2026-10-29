@@ -6,12 +6,14 @@ import hashlib
 import io
 import json
 import tempfile
+import time
 import unittest
 import urllib.request
 from unittest import mock
 from pathlib import Path
 
 from makeros_hub.multipart import MultipartError, UploadTooLarge, boundary_from_content_type, parse_multipart, stream_multipart
+from makeros_hub import ingest
 from makeros_hub.ingest import IngestServer
 
 
@@ -257,15 +259,29 @@ class TestIngestServer(unittest.TestCase):
 
     def test_connection_threads_are_bounded_before_headers(self):
         slots = self.server._server.connections
-        for _ in range(4):
+        limit = ingest._BoundedServer.MAX_CONNECTIONS
+        self.assertGreaterEqual(limit, 32)   # 4 let a few dead tailnet connections refuse every member (2026-10-29)
+        for _ in range(limit):
             slots.acquire()
         try:
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 urllib.request.urlopen(self._url("/api/version"), timeout=5)
             self.assertEqual(caught.exception.code, 503)
         finally:
-            for _ in range(4):
+            for _ in range(limit):
                 slots.release()
+
+    def test_a_silent_connection_frees_its_slot(self):
+        import socket
+        with mock.patch.object(self.server._server.RequestHandlerClass, "REQUEST_LINE_TIMEOUT", 0.3):
+            silent = [socket.create_connection(("127.0.0.1", self.server._server.server_address[1])) for _ in range(40)]
+            try:
+                time.sleep(1.5)   # every silent connection timed out and gave its slot back
+                with urllib.request.urlopen(self._url("/api/version"), timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+            finally:
+                for s in silent:
+                    s.close()
 
     def test_rejected_discards_the_spooled_file(self):
         # A rejected job's file won't print — it must not leak on disk.

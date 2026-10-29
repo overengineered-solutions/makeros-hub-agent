@@ -85,6 +85,18 @@ class _Handler(BaseHTTPRequestHandler):
     # upload won't hold a thread forever). A normal LAN upload is seconds;
     # 120s is generous headroom.
     timeout = 120
+    # Until the request line arrives the connection holds a slot for nothing: a client whose network vanished (a tailnet
+    # login switch, 2026-10-29) left its connections open on the members daemon and four of them filled every slot for
+    # minutes. A real client sends its request at once.
+    REQUEST_LINE_TIMEOUT = 10
+
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(self.REQUEST_LINE_TIMEOUT)
+
+    def parse_request(self):
+        self.connection.settimeout(self.timeout)
+        return super().parse_request()
 
     # Quiet the default stderr logging; route through our logger at debug.
     def log_message(self, fmt: str, *args) -> None:  # noqa: A003
@@ -329,12 +341,20 @@ def make_handler(submit_fn: SubmitFn, spool_dir: Path, max_bytes: int):
 
 class _BoundedServer(ThreadingHTTPServer):
     # Bound threads even before headers arrive; body limits alone miss slow clients.
+    # 32, not 4: every member's slicer shares this port, and Orca 2.5 opens several at once (sync, status, uploads).
+    # Uploads still go one at a time (upload_slot); this bounds threads, not work.
+    MAX_CONNECTIONS = 32
+
     def __init__(self, *args):
-        self.connections = threading.BoundedSemaphore(4)
+        self.connections = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+        self._last_full_log = 0.0
         super().__init__(*args)
 
     def process_request(self, request, client_address):
         if not self.connections.acquire(blocking=False):
+            if time.monotonic() - self._last_full_log > 60:
+                self._last_full_log = time.monotonic()
+                log.warning("ingest connections full (%d); answering 503 until one finishes", self.MAX_CONNECTIONS)
             try:
                 request.settimeout(1)
                 request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nRetry-After: 5\r\nContent-Length: 0\r\n\r\n")
