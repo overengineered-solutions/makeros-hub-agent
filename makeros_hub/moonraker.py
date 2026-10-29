@@ -19,6 +19,7 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 from . import __version__, job_files
+from .config import DEFAULT_MOONRAKER_HOSTS, moonraker_hostname
 from .multipart import MultipartError, UploadTooLarge, boundary_from_content_type, stream_multipart
 from .printers.ingest_facts import POOLS, read_file_facts
 from .printers.threemf_objects import Unreadable3mf, plate_picture
@@ -367,17 +368,25 @@ class StagedUploads:
 
 
 class MoonrakerDoor:
-    def __init__(self, spool_dir, authorize, pools, health=None):
+    def __init__(self, spool_dir, authorize, pools, health=None, *, hosts=None):
         self.health = health or DoorHealth()
         self.store = StagedUploads(spool_dir, self.health)
         self.authorize = authorize
         self.pools = pools
+        self.hosts = dict(DEFAULT_MOONRAKER_HOSTS if hosts is None else hosts)
 
     def handle(self, handler):
-        url = urlsplit(handler.path)
+        try:
+            url = urlsplit(handler.path)
+        except ValueError:
+            self._error(handler, 400, "Invalid request URL. Use the PS preset's hub address.")
+            return True
         pool, endpoint = handler.model_pool, url.path
         if pool is None or not (endpoint == "/websocket" or endpoint.startswith(("/server/", "/printer/", "/machine/", "/access/"))):
             return False
+        hosts = handler.headers.get_all("Host", [])
+        if len(hosts) == 1:
+            pool = self.hosts.get(moonraker_hostname(hosts[0]), pool)
         try:
             allowed = {("GET", "/server/info"), ("GET", "/server/database/item"),
                        ("GET", "/server/files/roots"), ("POST", "/server/files/upload"),

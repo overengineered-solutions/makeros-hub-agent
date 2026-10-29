@@ -18,7 +18,7 @@ import os
 import re
 import tempfile
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -39,9 +39,34 @@ DEFAULT_TELEMETRY_SEC = 5
 DEFAULT_INGEST_PORT = 8787
 # Raw manual HTTP upload ceiling; intake streams to disk. FTPS has its own limit.
 DEFAULT_MAX_UPLOAD_MB = 1024
+DEFAULT_MOONRAKER_HOSTS = {
+    "p2s-printers.oes-mesh.internal": "p2s",
+    "x1c-printers.oes-mesh.internal": "x1c",
+    "a1mini-printers.oes-mesh.internal": "a1-mini",
+    "sv08-printers.oes-mesh.internal": "sv08-max",
+    "giga-printers.oes-mesh.internal": "giga",
+}
 VPRINTER_CODE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
 log = logging.getLogger("makeros-hub.config")
+
+
+def moonraker_hostname(value: str) -> str:
+    """A bounded DNS name from Host; IPs and malformed values use the fallback pool."""
+    if not isinstance(value, str) or len(value) > 260:
+        return ""
+    name, separator, port = value.partition(":")
+    if separator and (not re.fullmatch(r"[0-9]{1,5}", port) or not 0 < int(port) <= 65535):
+        return ""
+    name = name.removesuffix(".")
+    if len(name) > 253 or any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+                              for label in name.split(".")):
+        return ""
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return name.lower()
+    return ""
 
 
 def validate_cloud_url(value: str) -> str:
@@ -66,6 +91,7 @@ class Config:
     telemetry_sec: int = DEFAULT_TELEMETRY_SEC
     moonraker_pool: str = "p2s"
     members_tailscale_socket: str = "/run/tailscale-members.sock"
+    moonraker_hosts: dict[str, str] = field(default_factory=lambda: DEFAULT_MOONRAKER_HOSTS.copy())
 
     def __post_init__(self):
         self.cloud_url = validate_cloud_url(self.cloud_url)
@@ -75,6 +101,17 @@ class Config:
         if not isinstance(self.moonraker_pool, str) or (self.moonraker_pool and self.moonraker_pool not in POOLS):
             log.error("moonraker_pool must name a known pool or be empty; Moonraker door disabled, member ingest remains available")
             self.moonraker_pool = ""
+        raw_hosts = self.moonraker_hosts
+        self.moonraker_hosts = {}
+        if not isinstance(raw_hosts, dict):
+            log.error("moonraker_hosts must be a table; ignored, moonraker_pool and member ingest remain available")
+            return
+        for host, pool in raw_hosts.items():
+            name = moonraker_hostname(host)
+            if not name or not isinstance(pool, str) or pool not in POOLS:
+                log.error("moonraker_hosts entry must name a DNS host and a known pool; entry ignored")
+                continue
+            self.moonraker_hosts[name] = pool
 
     @property
     def enroll_url(self) -> str:
@@ -403,6 +440,7 @@ def load_config(cloud_url_override: str | None = None) -> Config:
         telemetry_sec=telemetry_sec,
         moonraker_pool=data.get("moonraker_pool", "p2s"),
         members_tailscale_socket=data.get("members_tailscale_socket", "/run/tailscale-members.sock"),
+        moonraker_hosts=data.get("moonraker_hosts", DEFAULT_MOONRAKER_HOSTS),
     )
 
 

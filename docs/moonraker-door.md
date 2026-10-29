@@ -1,26 +1,56 @@
 # Orca 2.4.2 / 2.5.0-beta Moonraker queue door
 
-Build H (2026-10-29) is an uncommitted hub change for review. The operator has already verified a 2.4.2 send through
+Build H3 (2026-10-29) adds host-based model selection as an uncommitted hub change for review. The operator has already verified a 2.4.2 send through
 hub 0.89.1; this build has only local automated verification. The site contract below must remain in place.
 An old/unavailable site fails closed; neither the session check nor an upload creates a job. Nothing in this HTTP door sends
 commands to a printer. The normal cloud queue and existing final dispatch guards own physical printing.
 
 ## Preset address
 
-Use `http://<hub-host>:8787`, the **hub's member-reachable hostname and ingest port**, for the configured pool.
-If `ingest_port` changes, use that port in the preset. One listener serves both the Moonraker door and the existing
-OctoPrint `/api/version` and `/api/files/local` endpoints.
+Each model has its own hostname on the same hub address and port. Orca identifies a Moonraker connection by host and port,
+so separate names let staff keep several models configured at once. The parallel platform build must supply these DNS names.
+If `ingest_port` changes, use that port in every preset. One listener serves both Moonraker and the existing OctoPrint
+`/api/version` and `/api/files/local` endpoints; OctoPrint does not use this model routing.
 
-The top-level `moonraker_pool` setting in `config.toml` defaults to `"p2s"`. It accepts `p2s`, `sv08-max`, `giga`,
+| Preset address | Model pool | Sliced file |
+| --- | --- | --- |
+| `http://p2s-printers.oes-mesh.internal:8787` | `p2s` | 3MF |
+| `http://x1c-printers.oes-mesh.internal:8787` | `x1c` | 3MF |
+| `http://a1mini-printers.oes-mesh.internal:8787` | `a1-mini` | 3MF, PLA only |
+| `http://sv08-printers.oes-mesh.internal:8787` | `sv08-max` | G-code, one filament |
+| `http://giga-printers.oes-mesh.internal:8787` | `giga` | G-code, one filament |
+
+These five mappings are the defaults for the optional `[moonraker_hosts]` table in `config.toml`:
+
+```toml
+[moonraker_hosts]
+"p2s-printers.oes-mesh.internal" = "p2s"
+"x1c-printers.oes-mesh.internal" = "x1c"
+"a1mini-printers.oes-mesh.internal" = "a1-mini"
+"sv08-printers.oes-mesh.internal" = "sv08-max"
+"giga-printers.oes-mesh.internal" = "giga"
+```
+
+An explicit table replaces the defaults; an empty table leaves every name using `moonraker_pool`. Put top-level settings
+before the table. An entry with an unknown pool (including H2D) or invalid DNS name logs one ERROR at config load and is
+ignored. A malformed table logs one ERROR and uses no host mappings. No request adds entries or changes configuration.
+
+Selection uses only the request's single `Host` header, ignoring case, its numeric port and one trailing dot. DNS names
+are bounded to 253 characters and labels to 63. Missing, duplicate, malformed or unknown hosts, and IP addresses, use
+`moonraker_pool`; HTTP headers exceeding the server's own size limit are rejected. Forwarding headers and the hostname
+in an absolute-form request line never select a pool. The selected pool applies to fresh site authorization, authorized
+printers' lane data, upload model checks and staged-file ownership at start. A Host header supplies no authorization.
+
+The top-level fallback `moonraker_pool` setting in `config.toml` defaults to `"p2s"`. It accepts `p2s`, `sv08-max`, `giga`,
 `a1-mini` or `x1c`. An empty string disables the Moonraker door. An unknown name or a non-string value logs one ERROR
 and disables it; existing member ingest stays available. Restart the hub after a reviewed configuration change.
-A damaged Moonraker staged-file store also disables only the door.
+A damaged Moonraker staged-file store also disables only the door. With the default fallback, today's
+`http://100.64.0.1:8787` P2S presets work unchanged. Disabling the door also disables all named Moonraker routes.
 
 Set `host_type=moonraker`, `printer_agent=moonraker`, and `printhost_apikey` to the member's existing **print token**.
 Leave `printhost_port` empty (or matching the inline port); set `print_host_webui` to the site's member print page.
-Use the stage-1 non-Bambu-vendor PS P2S preset with `use_3mf=1`. If the operator later configures another supported pool,
-its preset must match: Bambu models use `use_3mf=1`; Sovol/Giga use `use_3mf=0`. H2D is unsupported.
-There is no model path prefix: the configured pool applies to every Moonraker request on this listener.
+Use the matching non-Bambu-vendor PS preset: Bambu models use `use_3mf=1`; Sovol/Giga use `use_3mf=0`.
+H2D is unsupported because this door does not support dual nozzles. There is no model path prefix.
 
 Testing remains **staff/admin only until the operator switches it on**. The site's session and submit gates must enforce
 that restriction; ordinary members keep their stock Bambu presets and virtual-printer sync.
@@ -29,7 +59,7 @@ Port 8788 is the laser listener; never reuse it for Moonraker.
 
 **Planned, not built:** one stand-in address per model on the routed range, using the vendor's real ports, is described in
 the machine-network greenfield report (pstation `reports/machine-network-greenfield-2026-10-29.md`, a local report not in git).
-This change implements only the single-pool door on the existing ingest port.
+H3 implements hostname selection on the existing ingest port; it does not add those stand-in addresses or vendor ports.
 
 ## HTTP contract
 
@@ -131,9 +161,11 @@ site code come from the supplied review; no site files were edited here.
    No physical tray address may be inferred from a displayed lane. Klipper final model/nozzle/idle checks remain in place;
    the site owns its staff-set spool matching.
 
-4. Update the existing preset installers (`orca-setup.ts`, `orca-setup-mac.ts`, named in the review; full paths unverified)
-   to use the ingest-port address for the configured pool and preserve the existing fallback presets. Keep the testing
-   gate enabled for staff/admin only. Member tokens remain local connection settings.
+4. Supply staff presets for all five hostnames above, with each model's correct sliced-file format and native model ID.
+   Keep the existing `MOONRAKER` testing constant in `src/lib/moonraker-contract.ts` and `PS_P2S_TESTING` in
+   `src/lib/orca-p2s-setup.ts` enabled, with the staff bypass. Session and submit must enforce the staff gate for every pool.
+   Preserve ordinary members' setup downloads byte-for-byte and run `orca-member-bytes` in the site build.
+   Member tokens remain local connection settings. DNS provisioning belongs to the parallel platform build.
 
 ## Durability and limits
 
@@ -164,11 +196,13 @@ The existing 256-record / 4-GiB quotas bound active and uncertain records; susta
 requires reconciliation, never blind deletion. The local store has an additive column migration, with no version bump.
 
 Other bounds: 16 unstarted stages per member, configured per-file limit (default 1 GiB), 1 MiB multipart overhead,
-128 MiB free-disk reserve, one upload shared with legacy ingest, 32 connections total on the shared listener, six per device,
+128 MiB free-disk reserve, one upload shared with legacy ingest, 32 connections total on the shared listener, six per identified device,
 10-second request-line timeout, 120-second body deadline, 4 KiB start JSON, 1,024 ZIP entries,
 2 MiB ZIP directory (checked before loading), 2 GiB total expanded size,
 200:1 maximum expansion ratio, 10 MiB per metadata entry. ZIP64/multidisk archives and
 duplicate/traversal/encrypted/unsupported-compression entries are refused.
+All hostnames share those connection and upload limits, the staged-file store and quotas. Changing model names does not
+give a device another six connections; admission uses device evidence before any HTTP header is read.
 
 ## Ten-minute operator test after both halves are available in the approved test environment
 
@@ -186,6 +220,10 @@ duplicate/traversal/encrypted/unsupported-compression entries are refused.
 5. **8–10:** pause/cancel/G-code from Orca must return the site's control guidance. Close/reopen Orca, then sleep/wake or
    switch tailnets and recheck the selected model and Sync. Only an operator-approved tiny physical print can establish
    actual end-to-end dispatch; use the site's controls for it.
+
+For H3, repeat connection, Sync, upload and start for each named preset while keeping the others configured. Confirm the
+selected model and its spools, refusal of an X1C slice on the P2S name, and the old IP-based P2S connection. This is still
+an operator trial to perform after the paired builds are available; no DNS, GUI or physical-print verification is claimed here.
 
 Not verified here: the actual beta binary, GUI/cache behaviour, Windows/Mac installation, paired site changes, or any
 physical print. The M624 check does not restore missing markers; such a PS plate deliberately reports no skippable objects.

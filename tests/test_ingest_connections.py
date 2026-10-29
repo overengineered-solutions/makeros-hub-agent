@@ -12,17 +12,18 @@ from test_device_evidence import whois
 
 
 class FakeSocket:
-    def __init__(self):
+    def __init__(self, host):
         self.closed = threading.Event()
         self.ready = threading.Event()
         self.finished = threading.Event()
         self.served = False
+        self.request_bytes = f"GET /server/info HTTP/1.1\r\nHost: {host}\r\n\r\n".encode()
 
     def settimeout(self, timeout):
         pass
 
     def makefile(self, *args):
-        return io.BytesIO()
+        return io.BytesIO(self.request_bytes)
 
     def sendall(self, data):
         pass
@@ -49,6 +50,9 @@ def listener(tmp_path, monkeypatch, whois):
         return lookup(*args)
 
     def serve(handler):
+        handler.raw_requestline = handler.rfile.readline()
+        assert handler.parse_request()
+        handler.request.host = handler.headers["Host"]
         handler.request.served = True
         handler.request.ready.set()
         assert handler.request.closed.wait(10)
@@ -66,8 +70,8 @@ def listener(tmp_path, monkeypatch, whois):
     monkeypatch.setattr(BaseHTTPRequestHandler, "handle", serve)
     monkeypatch.setattr(server, "process_request_thread", run)
 
-    def connect(ip="127.0.0.1"):
-        request = FakeSocket()
+    def connect(ip="127.0.0.1", host="hub"):
+        request = FakeSocket(host)
         sockets.append(request)
         server.process_request(request, (ip, 40000 + len(sockets)))
         assert request.ready.wait(3)
@@ -85,16 +89,18 @@ def listener(tmp_path, monkeypatch, whois):
 
 
 @pytest.mark.parametrize("protect_first", [False, True])
-def test_ten_connections_keep_six_and_leave_other_device_room(listener, whois, caplog, protect_first):
+def test_model_hosts_share_six_connections_and_leave_other_device_room(listener, whois, caplog, protect_first):
     server, connect = listener
     caplog.set_level(logging.INFO, logger="makeros-hub.ingest")
     whois["body"]["Node"]["StableID"] = "n-other"
     other = connect()  # The globally oldest connection belongs to a different device.
     whois["body"]["Node"]["StableID"] = "n-test"
-    own = [connect()]
+    hosts = [f"{model}-printers.oes-mesh.internal:8787" for model in ("p2s", "x1c", "a1mini", "sv08", "giga")] * 2
+    own = [connect(host=hosts[0])]
     if protect_first:
         assert server.set_uploading(own[0], True)
-    own += [connect() for _ in range(9)]
+    own += [connect(host=host) for host in hosts[1:]]
+    assert [request.host for request in own] == hosts
     dropped = own[1:5] if protect_first else own[:4]
     assert [request for request in own if request.closed.is_set()] == dropped
     assert all(request.served for request in own)

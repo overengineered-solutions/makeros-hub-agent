@@ -76,7 +76,8 @@ def test_disabled_or_invalid_pool_leaves_member_ingest_up(tmp_path, monkeypatch,
     server.start()
     base = f"http://127.0.0.1:{server._server.server_address[1]}"
     try:
-        request = urllib.request.Request(base + "/server/info", headers={"X-Api-Key": "synthetic-token"})
+        request = urllib.request.Request(base + "/server/info", headers={"X-Api-Key": "synthetic-token",
+            "Host": "x1c-printers.oes-mesh.internal:8787"})
         with pytest.raises(urllib.error.HTTPError) as refused:
             urllib.request.urlopen(request, timeout=2)
         assert refused.value.code == 404

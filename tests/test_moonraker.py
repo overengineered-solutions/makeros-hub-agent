@@ -88,21 +88,23 @@ class Door:
             raise TimeoutError("reply lost after cloud committed")
         return self.jobs[uid]
 
-    def open(self, *, pool="sv08-max"):
+    def open(self, *, pool="sv08-max", hosts=None):
         self.pool = pool
         self.server = IngestServer(self.submit, port=0, spool_dir=self.path, max_bytes=2 * 1024**2,
                                    moonraker_authorize=self.authorize, moonraker_pools=self.pools,
-                                   moonraker_pool=pool)
+                                   moonraker_pool=pool, moonraker_hosts=hosts)
         self.server.start()
         self.base = f"http://127.0.0.1:{self.server._server.server_address[1]}"
         self.store = self.server._server.RequestHandlerClass.moonraker.store
 
-    def restart(self, *, pool=None):
+    def restart(self, *, pool=None, hosts=None):
         self.server.stop()
-        self.open(pool=pool or self.pool)
+        self.open(pool=pool or self.pool, hosts=hosts)
 
-    def request(self, path, *, method="GET", token="alice", data=None, content_type=None):
+    def request(self, path, *, method="GET", token="alice", data=None, content_type=None, host=None):
         headers = {"X-Api-Key": token}
+        if host is not None:
+            headers["Host"] = host
         if content_type:
             headers["Content-Type"] = content_type
         if isinstance(data, dict):

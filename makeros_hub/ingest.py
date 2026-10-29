@@ -448,7 +448,7 @@ class IngestServer:
 
     def __init__(self, submit_fn: SubmitFn, *, port: int, spool_dir: Path, max_bytes: int,
                  moonraker_authorize=None, moonraker_pools=None, moonraker_pool="p2s",
-                 members_tailscale_socket=None):
+                 members_tailscale_socket=None, moonraker_hosts=None):
         self.port = port
         spool_dir.mkdir(parents=True, exist_ok=True)
         handler = make_handler(submit_fn, spool_dir, max_bytes)
@@ -456,7 +456,8 @@ class IngestServer:
         self._door_health = handler.door_health
         if moonraker_pool and moonraker_authorize is not None:
             try:
-                handler.moonraker = MoonrakerDoor(spool_dir, moonraker_authorize, moonraker_pools or LivePools(), self._door_health)
+                handler.moonraker = MoonrakerDoor(spool_dir, moonraker_authorize, moonraker_pools or LivePools(),
+                                                self._door_health, hosts=moonraker_hosts)
                 handler.model_pool = moonraker_pool
             except Exception:  # noqa: BLE001 — the staff trial's store must never take member ingest or the hub down
                 self._door_health.set_state("store_unavailable")

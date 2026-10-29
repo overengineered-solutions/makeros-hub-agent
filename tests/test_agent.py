@@ -991,6 +991,7 @@ class TestRunLoopShutdown(unittest.TestCase):
     def test_heartbeat_transport_error_still_invokes_vprinter_drain(self):
         stop_event = threading.Event()
         drains = []
+        hosts = {"custom.example": "x1c"}
 
         class FakeIngest:
             def moonraker_health(self):
@@ -1000,7 +1001,7 @@ class TestRunLoopShutdown(unittest.TestCase):
                 return True
 
             def __init__(self, *args, **kwargs):
-                pass
+                assert kwargs["moonraker_hosts"] == hosts
 
             def start(self):
                 pass
@@ -1035,7 +1036,7 @@ class TestRunLoopShutdown(unittest.TestCase):
             "makeros_hub.agent._drain_vprinter_submissions_safely", side_effect=drain
         ):
             result = run(
-                Config(cloud_url="https://host.example", heartbeat_sec=1),
+                Config(cloud_url="https://host.example", heartbeat_sec=1, moonraker_hosts=hosts),
                 _stop_event=stop_event,
                 _install_signals=False,
                 _outbox=_FakeVPrinterOutbox(),

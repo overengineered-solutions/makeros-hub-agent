@@ -1718,6 +1718,7 @@ def run(
             moonraker_authorize=make_moonraker_authorize(cfg, credential),
             moonraker_pools=moonraker_pools,
             moonraker_pool=cfg.moonraker_pool,
+            moonraker_hosts=cfg.moonraker_hosts,
             members_tailscale_socket=cfg.members_tailscale_socket,
         )
         ingest.start()
