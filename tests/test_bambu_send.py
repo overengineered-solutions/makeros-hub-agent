@@ -37,6 +37,13 @@ class TestPrintStartPayload(unittest.TestCase):
         self.assertIsInstance(p["sequence_id"], str)
         self.assertEqual(p["sequence_id"], "seq123")
 
+    def test_first_layer_inspection_is_off_for_a_replayed_orca_command_too(self):
+        # v0.88.0, operator 2026-10-28: "first layer inspection should be off"; OrcaSlicer's send always says true
+        raw = {"command": "project_file", "layer_inspect": True, "vibration_cali": False, "timelapse": False, "bed_type": "textured_plate"}
+        p = build_print_start_payload("bracket.3mf", sequence_id="s", raw_print=raw)["print"]
+        self.assertIs(p["layer_inspect"], False)
+        self.assertIs(p["vibration_cali"], False)   # everything else the member's Orca chose still reaches the printer
+
     def test_options_override_defaults(self):
         payload = build_print_start_payload(
             "plate-set.3mf",

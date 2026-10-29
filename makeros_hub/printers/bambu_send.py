@@ -138,6 +138,10 @@ def build_print_start_payload(
         merged["bed_type"] = bed_type
     for key in _FORCED_KEYS:
         merged[key] = built[key]
+    # v0.88.0 (operator, 2026-10-28: "first layer inspection should be off"): OrcaSlicer's send dialog hard-codes
+    # layer_inspect=true (SelectMachine.cpp:2540-2551), so the replay kept it on for every Orca send while rebuilt commands
+    # had it off (review of the evening plan, finding 6). One policy for both entrances.
+    merged["layer_inspect"] = False
     return {"print": merged}
 
 

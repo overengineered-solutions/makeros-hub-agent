@@ -57,6 +57,19 @@ TWO_NOZZLES = {"H2D"}
 # Operator, 2026-10-22: "A1 minis PLA only" (an open printer; PETG and the rest go to the closed ones).
 PLA_ONLY = {"A1 Mini"}
 
+# Operator, 2026-10-28, after long thin PLA parts lifted at the ends on a P2S: "if we are printing with pla or petg the aux fan needs
+# to be popped down to no more than 10 percent" (Bambu's stock PLA presets ask 70%). A cap on the preset's
+# additional_cooling_fan_speed, never a raise; what the printer then does with its own fans is a hardware check (review finding 7).
+AUX_FAN_CAP = {"PLA": 10, "PETG": 10}
+
+
+def cap_aux_fan(preset: dict, ftype: str) -> dict:
+    cap = AUX_FAN_CAP.get((ftype or "").upper())
+    if cap is not None:
+        values = preset.get("additional_cooling_fan_speed") or [str(cap)]
+        preset["additional_cooling_fan_speed"] = [str(min(cap, round(float(v)))) for v in (values if isinstance(values, list) else [values])]
+    return preset
+
 # The shop's own settings for every automatic slice, per model, in one place. Each value is written into the process, so a
 # preset change or an OrcaSlicer default never decides it quietly. Change a model's line here and the hub's next release
 # slices with it; the site's OrcaSlicer setup download should carry the same values (reports/auto-slice-quality-plan).
@@ -1388,7 +1401,7 @@ def run(job_dir: str | None = None) -> dict:
     filament_names, presets = [], []
     for f in selected:
         name = pick_filament(filaments, machine_name, sfx, f["type"], f["tray"], f.get("stated"))
-        preset = flatten(filaments, name)
+        preset = cap_aux_fan(flatten(filaments, name), f["type"])
         if f["color"]:
             preset["filament_colour"] = [f["color"]]
         filament_names.append(name)

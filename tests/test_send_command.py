@@ -396,3 +396,54 @@ class TestDeviceCapture(unittest.TestCase):
             adapter._on_message(None, None, _msg(report))
             logging.getLogger("makeros-hub.bambu").info("sentinel")
         self.assertEqual([o for o in logs2.output if "device_observed" in o], [])
+
+
+class TestUnloadDryStopRereadTag(unittest.TestCase):
+    """v0.88.0 (operator, 2026-10-28): unload after idle, stop a dry to print, re-read a spool's tag; each in Bambu's own words."""
+
+    def _adapter(self, print_obj, state="idle", extruders=1):
+        adapter = make_adapter()
+        adapter._client = FakeClient(connected=True)
+        adapter._connack = "ok"
+        adapter._data = {"print": print_obj}
+        adapter.status = lambda: {"state": state, "extruderCount": extruders}
+        return adapter
+
+    def _sent(self, adapter):
+        self.assertEqual(len(adapter._client.published), 1)
+        doc = json.loads(adapter._client.published[0][1])["print"]
+        self.assertIsInstance(doc.pop("sequence_id"), str)
+        return doc
+
+    def test_stop_drying_is_bambu_studios_mode_0(self):
+        a = self._adapter({})
+        self.assertEqual(a.send_command("ams_dry_stop", {"amsId": 1}), {"ok": True})
+        self.assertEqual(self._sent(a), {"command": "ams_filament_drying", "ams_id": 1, "mode": 0, "filament": "", "temp": 0, "duration": 0,
+                                         "humidity": 0, "rotate_tray": False, "cooling_temp": 0, "close_power_conflict": False})
+        self.assertEqual(self._adapter({}).send_command("ams_dry_stop", {"amsId": True})["reason"], "invalid_dry_params")
+
+    def test_unload_sends_orcas_unload_for_the_unit_the_printer_reports_loaded(self):
+        a = self._adapter({"ams": {"tray_now": "6"}})
+        self.assertEqual(a.send_command("ams_unload", {"amsId": 3}), {"ok": True})   # params are ignored: the printer says which unit
+        self.assertEqual(self._sent(a), {"command": "ams_change_filament", "curr_temp": 210, "tar_temp": 210, "ams_id": 1, "target": 255, "slot_id": 255})
+
+    def test_unload_sends_nothing_mid_job_with_nothing_loaded_or_on_a_two_nozzle_printer(self):
+        for print_obj, state, extruders, reason in (({"ams": {"tray_now": "2"}}, "printing", 1, "not_idle"),
+                                                    ({"ams": {"tray_now": "255"}}, "idle", 1, "nothing_loaded"),
+                                                    ({"ams": {"tray_now": "2"}}, "idle", 2, "unsupported_model")):
+            a = self._adapter(print_obj, state, extruders)
+            self.assertEqual(a.send_command("ams_unload"), {"ok": False, "reason": reason})
+            self.assertEqual(a._client.published, [])
+
+    def test_reread_tag_uses_the_new_command_on_new_firmware_and_m620_on_old(self):
+        a = self._adapter({"ams": {"tray_now": "255"}, "cfg": "1", "fun": "1", "aux": "1", "stat": "1"})
+        self.assertEqual(a.send_command("ams_reread_tag", {"amsId": 0, "slotId": 3}), {"ok": True})
+        self.assertEqual(self._sent(a), {"command": "ams_get_rfid", "ams_id": 0, "slot_id": 3})
+        a = self._adapter({"ams": {"tray_now": "255"}})
+        self.assertEqual(a.send_command("ams_reread_tag", {"amsId": 1, "slotId": 2}), {"ok": True})
+        self.assertEqual(self._sent(a), {"command": "gcode_line", "param": "M620 R6 \n"})
+
+    def test_reread_tag_is_refused_while_filament_is_loaded_as_bambu_refuses_it(self):
+        a = self._adapter({"ams": {"tray_now": "3"}, "cfg": "1", "fun": "1", "aux": "1", "stat": "1"})
+        self.assertEqual(a.send_command("ams_reread_tag", {"amsId": 0, "slotId": 1}), {"ok": False, "reason": "filament_loaded"})
+        self.assertEqual(self._adapter({}).send_command("ams_reread_tag", {"amsId": 0, "slotId": 4})["reason"], "invalid_tag_params")

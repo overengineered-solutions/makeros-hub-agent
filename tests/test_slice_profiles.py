@@ -46,3 +46,11 @@ def test_a_known_spool_gets_its_profile_an_unknown_plain_one_goes_generic_a_vari
 
 def test_a_spool_with_no_id_gets_the_generic_profile_of_its_type():
     assert ps.pick_filament(_index(), A1M, "A1M", "PLA", None) == "Generic PLA @BBL A1M"
+
+
+def test_pla_and_petg_run_the_aux_fan_at_most_10_percent_and_other_materials_keep_their_own():
+    # v0.88.0, operator 2026-10-28: "if we are printing with pla or petg the aux fan needs to be popped down to no more than 10 percent"
+    assert ps.cap_aux_fan({"additional_cooling_fan_speed": ["70"]}, "PLA")["additional_cooling_fan_speed"] == ["10"]
+    assert ps.cap_aux_fan({"additional_cooling_fan_speed": ["5"]}, "petg")["additional_cooling_fan_speed"] == ["5"]   # a cap, never a raise
+    assert ps.cap_aux_fan({}, "PLA")["additional_cooling_fan_speed"] == ["10"]
+    assert ps.cap_aux_fan({"additional_cooling_fan_speed": ["80"]}, "ABS")["additional_cooling_fan_speed"] == ["80"]

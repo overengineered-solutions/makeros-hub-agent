@@ -685,10 +685,12 @@ class BambuAdapter:
         commands; pybambu's proven shape) + ams_dry (`ams_filament_drying`;
         params {amsId, temp, durationHours}) + skip_objects (cancel specific
         objects mid-print; params {objList: [identify_id ints]}) +
-        clear_external_spool (no params). The cloud only
+        clear_external_spool (no params) + v0.88.0 ams_unload (no params: the loaded
+        unit comes from the printer), ams_dry_stop {amsId} and ams_reread_tag {amsId, slotId}. The cloud only
         delivers the allowlisted set + validates params, but we re-check here as
         defense-in-depth. Returns {"ok": bool, "reason": str}."""
-        if command not in {"pause", "resume", "stop", "ams_dry", "skip_objects", "clear_external_spool"}:
+        if command not in {"pause", "resume", "stop", "ams_dry", "skip_objects", "clear_external_spool",
+                           "ams_unload", "ams_dry_stop", "ams_reread_tag"}:
             return {"ok": False, "reason": "unsupported_command"}
         client = self._client
         connected = False
@@ -801,6 +803,59 @@ class BambuAdapter:
                     "obj_list": list(dict.fromkeys(int(o) for o in obj_list)),
                 }
             }
+        elif command == "ams_dry_stop":
+            # v0.88.0 (operator, 2026-10-28: "if we need a drying printer then we stop the drying and then send the queued print"):
+            # Bambu Studio's own Stop (DevFilaSystemCtrl.cpp CtrlAmsStopDrying): the drying command with mode 0 = DryCtrlMode::Off
+            # and every setting zeroed.
+            ams_id = (params or {}).get("amsId")
+            if not (isinstance(ams_id, int) and not isinstance(ams_id, bool) and ams_id >= 0):
+                return {"ok": False, "reason": "invalid_dry_params"}
+            payload = {
+                "print": {
+                    "sequence_id": sequence_id, "command": "ams_filament_drying", "ams_id": ams_id, "mode": 0, "filament": "",
+                    "temp": 0, "duration": 0, "humidity": 0, "rotate_tray": False, "cooling_temp": 0, "close_power_conflict": False,
+                }
+            }
+        elif command in ("ams_unload", "ams_reread_tag"):
+            st = self.status()
+            with self._lock:
+                print_obj = copy.deepcopy(self._data.get("print")) if isinstance(self._data.get("print"), dict) else {}
+            loaded = bambu_parse.build_active_tray(print_obj)   # tray_now: the AMS tray loaded to the toolhead, None when none
+            if st.get("extruderCount") == 2:
+                # the H2D reports a loaded slot per nozzle; one unit id from tray_now would be a guess, so nothing is sent
+                return {"ok": False, "reason": "unsupported_model"}
+            if command == "ams_unload":
+                # v0.88.0 (operator, 2026-10-28: "cn we unload any loaded filament after 20 minutes of the printer being idle" and
+                # "drying wont start if filament is loaded"): exactly OrcaSlicer's Unload button (DeviceManager.cpp
+                # command_ams_change_filament(false, ams, "255") with its default 210/210): target 255 + slot_id 255 = unload.
+                # The unit comes from the printer's own report, never from the cloud; nothing loaded or a job on = nothing sent.
+                if st.get("state") != "idle":
+                    return {"ok": False, "reason": "not_idle"}
+                if loaded is None:
+                    return {"ok": False, "reason": "nothing_loaded"}
+                if loaded >= 64:   # an AMS-HT / second-port tray (512+): its raw unit id is not recoverable from tray_now
+                    return {"ok": False, "reason": "unsupported_tray"}
+                payload = {
+                    "print": {
+                        "sequence_id": sequence_id, "command": "ams_change_filament", "curr_temp": 210, "tar_temp": 210,
+                        "ams_id": loaded // 4, "target": 255, "slot_id": 255,
+                    }
+                }
+            else:
+                # v0.88.0 (operator, 2026-10-28: "can we inititate a re read of the tags on wade?"): what OrcaSlicer's AMS refresh
+                # sends (StatusPanel.cpp on_ams_refresh_rfid): ams_get_rfid on new-protocol printers (a report carrying
+                # cfg/fun/aux/stat, DeviceManager.cpp check_enable_np), the G-code M620 R<tray> on older ones. Bambu refuses a
+                # read while filament is loaded to the toolhead ("please unload the filament and try again"), and so do we.
+                p = params or {}
+                ams_id, slot_id = p.get("amsId"), p.get("slotId")
+                if not all(isinstance(v, int) and not isinstance(v, bool) for v in (ams_id, slot_id)) or not (0 <= ams_id < 16 and 0 <= slot_id < 4):
+                    return {"ok": False, "reason": "invalid_tag_params"}
+                if loaded is not None:
+                    return {"ok": False, "reason": "filament_loaded"}
+                if all(k in print_obj for k in ("cfg", "fun", "aux", "stat")):
+                    payload = {"print": {"sequence_id": sequence_id, "command": "ams_get_rfid", "ams_id": ams_id, "slot_id": slot_id}}
+                else:
+                    payload = {"print": {"sequence_id": sequence_id, "command": "gcode_line", "param": f"M620 R{ams_id * 4 + slot_id} \n"}}
         else:
             payload = {"print": {"sequence_id": sequence_id, "command": command, "param": ""}}
         try:
