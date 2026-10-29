@@ -1381,11 +1381,17 @@ class TestCommandsSurviveARestart(unittest.TestCase):
         self.assertEqual(PrinterManager()._dispatched_commands, {})
 
     @staticmethod
-    def one_beat(post, *extra):
+    def one_beat(post, *extra, reconcile=True):
         """agent.run for one heartbeat: `post` answers it and sets the stop event it is given."""
         stop = threading.Event()
 
         class Ingest:
+            def moonraker_health(self):
+                return {"state": "off", "refusals": {}}
+
+            def reconcile_moonraker(self, reports, released_jobs=()):
+                return reconcile
+
             def __init__(self, *a, **k):
                 pass
 
@@ -1422,6 +1428,23 @@ class TestCommandsSurviveARestart(unittest.TestCase):
                     p.stop()
 
     OK = {"hubId": "h", "configVersion": "v", "nextPollMs": 30000, "applied": 0}
+
+    def test_printing_report_survives_until_door_reclamation_succeeds(self):
+        report = {"queueJobId": "q1", "state": "printing", "assignmentSeq": 1}
+        self.assertTrue(report_outbox.save([report]))
+        sent = []
+
+        def post(url, body, stop):
+            sent.append(body)
+            stop.set()
+            return http.Response(200, {**self.OK, "ok": True})
+
+        self.one_beat(post, reconcile=False)
+        self.assertEqual(report_outbox.load(), [report])
+        self.assertNotIn(report, sent)
+        self.one_beat(post, reconcile=True)
+        self.assertEqual(report_outbox.load(), [])
+        self.assertIn(report, sent)
 
     def test_results_waiting_for_a_heartbeat_are_sent_after_a_restart_and_cleared_on_its_200(self):
         report_outbox.save([{"requestId": "r9", "command": "ams_dry", "status": "ok"}], report_outbox.COMMAND_RESULTS_PATH)

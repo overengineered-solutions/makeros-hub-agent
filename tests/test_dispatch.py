@@ -20,7 +20,7 @@ def _write_3mf_with_objects(path: Path, plate: int, objects: list[tuple[int, str
     )
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("Metadata/slice_info.config", slice_info)
-        zf.writestr(f"Metadata/plate_{plate}.gcode", "; sliced")   # a sliced plate holds its G-code (v0.80.1 checks it)
+        zf.writestr(f"Metadata/plate_{plate}.gcode", "; sliced\nM624 AQE=\n")
 
 
 class FakeAdapter:

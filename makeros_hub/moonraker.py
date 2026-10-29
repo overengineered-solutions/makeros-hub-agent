@@ -32,7 +32,28 @@ STAGE_TTL = 24 * 60 * 60
 MAX_RECORDS = 256
 MAX_SPOOL_BYTES = 4 * 1024**3
 MAX_MEMBER_STAGES = 16
-LANES = 16  # Orca's 32-bit tray bitmask; keep this below 32, with explicit empty slots.
+LANES = 16  # Maximum displayed spools; Orca's tray bitmask must stay below 32.
+REFUSAL_CODES = frozenset(str(c) for c in (400, 403, 404, 405, 408, 409, 410, 413, 502, 503, 507)) | {"other"}
+
+
+class DoorHealth:
+    def __init__(self):
+        self.state = "off"
+        self.refusals = {}
+        self._lock = threading.Lock()
+
+    def set_state(self, state):
+        with self._lock:
+            self.state = state
+
+    def refuse(self, code):
+        code = str(code) if str(code) in REFUSAL_CODES else "other"
+        with self._lock:
+            self.refusals[code] = min(2**31 - 1, self.refusals.get(code, 0) + 1)
+
+    def snapshot(self):
+        with self._lock:
+            return {"state": self.state, "refusals": dict(self.refusals)}
 
 
 class DoorError(Exception):
@@ -127,13 +148,15 @@ class LivePools:
         capacity = capacities.get(model, LANES)
         trays = vp_pool_from_statuses_ranked(scoped, 1, capacity, ranking, time.time())
         lanes = {}
-        for i in range(LANES):
-            tray = trays[i] if i < len(trays) else {}
+        for i, tray in enumerate(trays):
             # The VP's min/max temperatures can be catalog fallbacks, not a spool's
             # chosen printing temperature. Zero is Orca's explicit unknown sentinel.
             lanes[f"lane{i + 1}"] = {"lane": str(i), "material": tray.get("tray_type", ""),
                                     "color": "#" + tray.get("tray_color", "000000FF")[:6],
                                     "bed_temp": 0, "nozzle_temp": 0}
+            filament_id = tray.get("tray_info_idx")
+            if isinstance(filament_id, str) and re.fullmatch(r"[A-Za-z0-9_+-]{1,32}", filament_id):
+                lanes[f"lane{i + 1}"]["filament_id"] = filament_id
         return lanes
 
 
@@ -152,7 +175,8 @@ class StagedUploads:
     any network request. A killed process releases flock; the next start reuses
     the UID and relies on the site's atomic UID conflict check to recover a receipt.
     """
-    def __init__(self, spool_dir):
+    def __init__(self, spool_dir, health=None):
+        self.health = health or DoorHealth()
         self.spool = Path(spool_dir)
         self.spool.mkdir(parents=True, exist_ok=True)
         self.db_path = self.spool / ".moonraker.sqlite3"
@@ -165,6 +189,8 @@ class StagedUploads:
                 name TEXT, sha TEXT, size INTEGER NOT NULL, created REAL NOT NULL,
                 state TEXT NOT NULL CHECK(state IN ('receiving','staged','submitting','queued')),
                 facts TEXT, job TEXT)""")
+            if "released" not in {r["name"] for r in db.execute("PRAGMA table_info(uploads)")}:
+                db.execute("ALTER TABLE uploads ADD COLUMN released INTEGER NOT NULL DEFAULT 0")
             os.chmod(self.db_path, 0o600)
             _sync_dir(self.spool)
             self._clean(db)
@@ -199,13 +225,26 @@ class StagedUploads:
         db.execute("DELETE FROM uploads WHERE uid = ?", (uid,))
 
     def _clean(self, db):
-        rows = db.execute("SELECT uid FROM uploads WHERE state='receiving' OR (state='staged' AND created < ?)",
+        rows = db.execute("""SELECT uid FROM uploads WHERE state='receiving'
+                          OR (state='queued' AND released=1) OR (state='staged' AND created < ?)""",
                           (time.time() - STAGE_TTL,)).fetchall()
         for row in rows:
             self._remove(db, row["uid"])
         self._last_clean = time.monotonic()
+        self.health.set_state("ok")
         if rows:
             log.info("moonraker expiry processed=%d expected=%d", len(rows), len(rows))
+
+    def release(self, job_ids):
+        """Only a confirmed handover or explicit site release can reclaim a queued file.
+
+        Mark first: interrupted deletion is retried on startup/maintenance. SUBMITTING
+        rows remain untouched, including starts whose site receipt was lost.
+        """
+        with self.locked(blocking=False) as db:
+            for job_id in job_ids:
+                db.execute("UPDATE uploads SET released=1 WHERE state='queued' AND job=?", (job_id,))
+            self._clean(db)
 
     def maintain(self):
         if time.monotonic() - self._last_clean < 60:
@@ -216,6 +255,7 @@ class StagedUploads:
         except DoorError:
             pass  # A live operation owns the files; try again on the next server tick.
         except (OSError, sqlite3.Error):
+            self.health.set_state("store_unavailable")
             self._last_clean = time.monotonic()  # retry in a minute, not on every 0.1 s tick of every listener
             log.exception("Moonraker staged-file maintenance failed; files retained")
 
@@ -250,7 +290,7 @@ class StagedUploads:
                     raise DoorError(400, "Upload to root=gcodes without a directory path.")
                 if set(fields) - {"root", "path", "print", "plateindex"}:
                     raise DoorError(400, "Unsupported upload fields.")
-                # Even print=true is storage only; Orca 2.4.2 explicitly starts next.
+                # Even print=true is storage only; both Orca versions explicitly start next.
                 name = _safe_filename(name)
                 target = directory / name
                 pending.replace(target)
@@ -262,7 +302,10 @@ class StagedUploads:
             except Exception:
                 self._remove(db, uid)
                 raise
-            return {"result": {"item": {"path": f"{uid}/{name}", "root": "gcodes"}, "print_started": False}}
+            result = {"item": {"path": f"{uid}/{name}", "root": "gcodes"},
+                      "print_started": False, "print_queued": False}
+            # INTERIM — keep result until the operator retires Orca 2.4.2; 2.5 reads the top level.
+            return {**result, "result": result}
 
     def start(self, stored_path, access, token, submit):
         if not isinstance(stored_path, str) or not re.fullmatch(r"[0-9a-f]{32}/[A-Za-z0-9-][A-Za-z0-9._-]{0,199}", stored_path):
@@ -271,7 +314,7 @@ class StagedUploads:
         with self.locked() as db:
             row = db.execute("SELECT * FROM uploads WHERE uid=? AND name=? AND member=? AND pool=?",
                              (uid, name, access["memberId"], access["modelPool"])).fetchone()
-            if row is None or row["state"] == "receiving":
+            if row is None or row["state"] == "receiving" or row["released"]:
                 raise DoorError(404, "Staged file not found for this member and model.")
             if row["state"] == "queued":
                 if not isinstance(row["job"], str) or not row["job"].strip():
@@ -314,24 +357,27 @@ class StagedUploads:
 
 
 class MoonrakerDoor:
-    def __init__(self, spool_dir, authorize, pools):
-        self.store = StagedUploads(spool_dir)
+    def __init__(self, spool_dir, authorize, pools, health=None):
+        self.health = health or DoorHealth()
+        self.store = StagedUploads(spool_dir, self.health)
         self.authorize = authorize
         self.pools = pools
 
     def handle(self, handler):
         url = urlsplit(handler.path)
         pool, endpoint = handler.model_pool, url.path
-        if pool is None or not endpoint.startswith(("/server/", "/printer/", "/machine/", "/access/")):
+        if pool is None or not (endpoint == "/websocket" or endpoint.startswith(("/server/", "/printer/", "/machine/", "/access/"))):
             return False
         try:
             allowed = {("GET", "/server/info"), ("GET", "/server/database/item"),
                        ("GET", "/server/files/roots"), ("POST", "/server/files/upload"),
+                       ("GET", "/server/files/directory"),
                        ("POST", "/printer/print/start")}
             if (handler.command, endpoint) not in allowed:
                 raise DoorError(405, CONTROLS)
-            if (endpoint == "/server/database/item" and parse_qs(url.query) != {"namespace": ["lane_data"]}) or (
-                    endpoint != "/server/database/item" and url.query):
+            expected_query = {"/server/database/item": {"namespace": ["lane_data"]},
+                              "/server/files/directory": {"path": ["gcodes"]}}.get(endpoint, {})
+            if (not expected_query and url.query) or parse_qs(url.query, keep_blank_values=True) != expected_query:
                 raise DoorError(400, "Unsupported query. " + CONTROLS)
             token = handler.headers.get("X-Api-Key", "").strip()
             if not token or len(token) > 512:
@@ -348,6 +394,13 @@ class MoonrakerDoor:
                 result = {"result": {"namespace": "lane_data", "value": self.pools.lanes(access)}}
             elif endpoint == "/server/files/roots":
                 result = {"result": [{"name": "gcodes", "permissions": "rw"}]}
+            elif endpoint == "/server/files/directory":
+                from .ingest import MIN_FREE_BYTES
+                with self.store.locked() as db:
+                    self.store.check_room(db, 0, access["memberId"])
+                    size = db.execute("SELECT coalesce(sum(size),0) FROM uploads").fetchone()[0]
+                    free = max(0, min(MAX_SPOOL_BYTES - size, shutil.disk_usage(self.store.spool).free - MIN_FREE_BYTES))
+                result = {"result": {"dirs": [], "files": [], "disk_usage": {"free": free}}}
             elif endpoint == "/server/files/upload":
                 from .ingest import MAX_FORM_OVERHEAD
                 length = self._length(handler, handler.max_bytes + MAX_FORM_OVERHEAD)
@@ -367,7 +420,7 @@ class MoonrakerDoor:
                 body = json.loads(b"".join(handler._read_chunks(length)))
                 if not isinstance(body, dict) or set(body) != {"filename"}:
                     raise DoorError(400, "Start requires only the staged filename returned by upload.")
-                result = self.store.start(body["filename"], access, token, handler.submit_fn)
+                result = self.store.start(body["filename"], access, token, handler.submit_with_device)
             handler._json(201 if endpoint == "/server/files/upload" else 200, result)
         except DoorError as exc:
             self._error(handler, exc.code, str(exc))
@@ -381,6 +434,7 @@ class MoonrakerDoor:
             log.warning("Moonraker request/file validation failed", exc_info=True)
             self._error(handler, 400, "Invalid request or sliced-file facts. Check the model, selected plate, filament and nozzle settings.")
         except (OSError, sqlite3.Error):
+            self.health.set_state("store_unavailable")
             log.exception("Moonraker spool operation failed; uncertain submissions retained")
             self._error(handler, 507, "The spool could not persist this operation. Check Your prints and ask the shop.")
         except Exception:
@@ -404,5 +458,6 @@ class MoonrakerDoor:
 
     @staticmethod
     def _error(handler, code, message):
+        handler.door_health.refuse(code)
         handler.close_connection = True
         handler._json(code, {"error": {"code": code, "message": message}})

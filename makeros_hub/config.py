@@ -65,6 +65,7 @@ class Config:
     # v0.70: telemetry push cadence in seconds, 0 = off (last so positional construction of older callers is unchanged).
     telemetry_sec: int = DEFAULT_TELEMETRY_SEC
     moonraker_pool: str = "p2s"
+    members_tailscale_socket: str = "/run/tailscale-members.sock"
 
     def __post_init__(self):
         self.cloud_url = validate_cloud_url(self.cloud_url)
@@ -401,6 +402,7 @@ def load_config(cloud_url_override: str | None = None) -> Config:
         laser=laser,
         telemetry_sec=telemetry_sec,
         moonraker_pool=data.get("moonraker_pool", "p2s"),
+        members_tailscale_socket=data.get("members_tailscale_socket", "/run/tailscale-members.sock"),
     )
 
 

@@ -30,10 +30,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
 
-from . import job_files
+from . import device_evidence, job_files
 from .multipart import MultipartError, UploadTooLarge, boundary_from_content_type, stream_multipart
 from .printers.gcode_meta import read_gcode_meta
-from .moonraker import LivePools, MoonrakerDoor
+from .moonraker import DoorError, DoorHealth, LivePools, MoonrakerDoor
 
 log = logging.getLogger("makeros-hub.ingest")
 
@@ -70,6 +70,17 @@ class _Handler(BaseHTTPRequestHandler):
     upload_slot: threading.BoundedSemaphore
     moonraker: MoonrakerDoor | None = None
     model_pool: str | None = None
+    members_tailscale_socket = device_evidence.DEFAULT_SOCKET
+
+    def submit_with_device(self, **kwargs):
+        # Looked up only for a submit, while its connection is still open (tailscaled's port mapping lives as long as the
+        # connection): Orca's sync and status polls never wait on the members daemon.
+        source, device = device_evidence.lookup(self.client_address, self.members_tailscale_socket)
+        log.info("ingest submit source=%s nodeId=%s", source, device["nodeId"] if device else "-")
+        if device:
+            kwargs["device"] = device
+        return self.submit_fn(**kwargs)
+
     # Per-request socket timeout — bounds a slow/stalled connection (a partial
     # upload won't hold a thread forever). A normal LAN upload is seconds;
     # 120s is generous headroom.
@@ -213,7 +224,7 @@ class _Handler(BaseHTTPRequestHandler):
             }
 
         try:
-            outcome = self.submit_fn(
+            outcome = self.submit_with_device(
                 member_token=member_token,
                 submission_uid=submission_uid,
                 file_name=file_name,
@@ -312,6 +323,7 @@ def make_handler(submit_fn: SubmitFn, spool_dir: Path, max_bytes: int):
     Handler.spool_dir = spool_dir
     Handler.max_bytes = max_bytes
     Handler.upload_slot = threading.BoundedSemaphore(1)
+    Handler.door_health = DoorHealth()
     return Handler
 
 
@@ -352,17 +364,45 @@ class IngestServer:
     down cleanly. Bind host 0.0.0.0 so members on the LAN can reach it."""
 
     def __init__(self, submit_fn: SubmitFn, *, port: int, spool_dir: Path, max_bytes: int,
-                 moonraker_authorize=None, moonraker_pools=None, moonraker_pool="p2s"):
+                 moonraker_authorize=None, moonraker_pools=None, moonraker_pool="p2s",
+                 members_tailscale_socket=None):
         self.port = port
         spool_dir.mkdir(parents=True, exist_ok=True)
         handler = make_handler(submit_fn, spool_dir, max_bytes)
+        handler.members_tailscale_socket = members_tailscale_socket or device_evidence.DEFAULT_SOCKET
+        self._door_health = handler.door_health
         if moonraker_pool and moonraker_authorize is not None:
             try:
-                handler.moonraker = MoonrakerDoor(spool_dir, moonraker_authorize, moonraker_pools or LivePools())
+                handler.moonraker = MoonrakerDoor(spool_dir, moonraker_authorize, moonraker_pools or LivePools(), self._door_health)
                 handler.model_pool = moonraker_pool
             except Exception:  # noqa: BLE001 — the staff trial's store must never take member ingest or the hub down
+                self._door_health.set_state("store_unavailable")
                 log.exception("Moonraker staged-file store unavailable; door off, member ingest stays available")
         self._server = _BoundedServer(("0.0.0.0", port), handler)
+
+    def moonraker_health(self):
+        return self._door_health.snapshot()
+
+    def reconcile_moonraker(self, reports, released_jobs=()):
+        door = self._server.RequestHandlerClass.moonraker
+        if door is None:
+            return True
+        jobs = {r["queueJobId"] for r in reports
+                if isinstance(r, dict) and r.get("state") in {"printing", "completed"}
+                and isinstance(r.get("queueJobId"), str)}
+        if isinstance(released_jobs, (list, tuple)) and len(released_jobs) <= 256 and all(
+                isinstance(j, str) and 0 < len(j) <= 128 for j in released_jobs):
+            jobs.update(released_jobs)
+        if jobs:
+            try:
+                door.store.release(jobs)
+            except DoorError:
+                return False  # An upload/start owns the lock; retain the report and retry next heartbeat.
+            except Exception:
+                self._door_health.set_state("store_unavailable")
+                log.exception("Moonraker file release failed; retained for reconciliation")
+                return False
+        return True
 
     def start(self) -> None:
         threading.Thread(target=self._server.serve_forever, kwargs={"poll_interval": 0.1},

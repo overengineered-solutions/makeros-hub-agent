@@ -10,11 +10,13 @@ from makeros_hub.printers.threemf_objects import parse_plate_objects
 _SLICE = "Metadata/slice_info.config"
 
 
-def make_3mf(path: Path, slice_info: str | None) -> None:
+def make_3mf(path: Path, slice_info: str | None, gcode=b'M624 AQE=\n', plate=1) -> None:
     with zipfile.ZipFile(path, "w") as zf:
         zf.writestr("3D/3dmodel.model", "<model/>")  # decoy, ignored
         if slice_info is not None:
             zf.writestr(_SLICE, slice_info)
+        if gcode is not None:
+            zf.writestr(f'Metadata/plate_{plate}.gcode', gcode)
 
 
 def plate_xml(objects: str, plate_index: int = 1, label_enabled: str = "true") -> str:
@@ -81,8 +83,20 @@ class TestParsePlateObjects(unittest.TestCase):
     <object identify_id="9" name="X"/><object identify_id="10" name="Y"/>
   </plate>
 </config>"""
-        path = self._write(two_plates)
+        path = Path(self._d) / 'job.3mf'
+        make_3mf(path, two_plates, plate=2)
         self.assertEqual(parse_plate_objects(path, 2), [{"id": 9, "name": "X"}, {"id": 10, "name": "Y"}])
+
+    def test_objects_require_executable_m624_on_the_selected_plate(self):
+        path = Path(self._d) / 'job.3mf'
+        for gcode in (None, b'G1 X1\n', b'; M624 AQE=\n', b'M6240 AQE=\n', b'G1 X1 ; M624 AQE=\n'):
+            with self.subTest(gcode=gcode):
+                make_3mf(path, plate_xml(TWO_OBJECTS), gcode)
+                self.assertEqual(parse_plate_objects(path), [])
+        make_3mf(path, plate_xml(TWO_OBJECTS), b'  M624 AQE= ; objects\n')
+        self.assertEqual(len(parse_plate_objects(path)), 2)
+        make_3mf(path, plate_xml(TWO_OBJECTS), plate=2)
+        self.assertEqual(parse_plate_objects(path, 1), [])
 
     def test_dedups_repeated_ids_preserving_order(self):
         objs = (

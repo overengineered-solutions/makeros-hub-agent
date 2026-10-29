@@ -286,8 +286,9 @@ def test_lane_data_shape_membership_empty_remove_reorder_and_unknown_temps(door)
     assert status == 200
     value = body["result"]["value"]
     assert body["result"]["namespace"] == "lane_data"
-    assert value["lane1"] == {"lane": "0", "material": "PLA", "color": "#FFFFFF", "bed_temp": 0, "nozzle_temp": 0}
-    assert len(value) == moonraker.LANES
+    assert value["lane1"] == {"lane": "0", "material": "PLA", "color": "#FFFFFF", "bed_temp": 0, "nozzle_temp": 0,
+                              "filament_id": "GFL99"}
+    assert len(value) == 1
     other = door.request(endpoint, token="bob")[1]["result"]["value"]
     assert other["lane1"]["material"] == "PETG"
     assert all(l["material"] != "PETG" for l in value.values())
@@ -298,8 +299,7 @@ def test_lane_data_shape_membership_empty_remove_reorder_and_unknown_temps(door)
     door.statuses = []
     door.refresh()
     empty = door.request(endpoint)[1]["result"]["value"]
-    # {} makes Orca 2.4.2 return false; explicit empty lanes make it clear old trays.
-    assert len(empty) == moonraker.LANES and all(l["material"] == "" for l in empty.values())
+    assert empty == {}
 
 
 def test_failed_or_stale_refresh_never_serves_old_pool(door):
@@ -636,3 +636,146 @@ def test_door_submit_sends_unknown_weight_as_explicit_null(monkeypatch):
         member_token="alice", submission_uid="a" * 32, file_name="part.gcode", file_sha256="b" * 64, file_size=1,
         print_now=True, est_grams=None, file_facts={"plate": 1, "modelPool": "sv08-max", "estGrams": None})
     assert "estGrams" in sent[0] and sent[0]["estGrams"] is None
+
+
+@pytest.mark.parametrize('filament_id', ['GFA00', 'GFA01', 'GFG01', 'Custom_+-12', '', None, 123, 'bad id', 'x' * 33, 'GFA00\n'])
+def test_lane_ids_are_optional_bounded_strings_and_lanes_follow_ranked_order(door, monkeypatch, filament_id):
+    trays = [{'tray_type': 'PLA', 'tray_color': '123456FF', 'tray_info_idx': filament_id},
+             {'tray_type': 'PETG', 'tray_color': 'ABCDEFFF', 'tray_info_idx': 'GFG01'}]
+    monkeypatch.setattr(moonraker, 'vp_pool_from_statuses_ranked', lambda *args: trays)
+    lanes = door.pools.lanes(door.authorize('alice', 'sv08-max'))
+    assert list(lanes) == ['lane1', 'lane2']
+    assert [l['lane'] for l in lanes.values()] == ['0', '1']
+    assert lanes['lane2']['filament_id'] == 'GFG01'
+    if filament_id in ('GFA00', 'GFA01', 'GFG01', 'Custom_+-12'):
+        assert lanes['lane1']['filament_id'] == filament_id
+    else:
+        assert 'filament_id' not in lanes['lane1']
+
+
+def test_beta_upload_uses_top_level_path_and_explicit_start(door):
+    code, uploaded = door.upload(fields={'print': 'true'})
+    assert code == 201
+    assert uploaded['item'] == uploaded['result']['item']
+    assert uploaded['print_started'] is uploaded['print_queued'] is False
+    assert door.calls == []
+    assert door.start(uploaded['item']['path'])[0] == 200
+    assert len(door.calls) == 1
+
+
+def test_beta_storage_check_is_authorized_and_reveals_no_files(door, monkeypatch):
+    path = door.stage()
+    code, body = door.request('/server/files/directory?path=gcodes')
+    assert code == 200
+    assert body['result']['disk_usage']['free'] > 0
+    assert body['result']['files'] == body['result']['dirs'] == []
+    assert path not in json.dumps(body)
+    assert door.request('/server/files/directory?path=gcodes', token='bad')[0] == 403
+    assert door.request('/server/files/directory?path=config')[0] == 400
+    assert door.request('/server/files/directory?path=gcodes&path=config')[0] == 400
+    monkeypatch.setattr(moonraker, 'MAX_RECORDS', 1)
+    assert door.request('/server/files/directory?path=gcodes')[0] == 507
+
+
+@pytest.mark.parametrize('path', ['/websocket', '/printer/objects/list',
+    '/printer/objects/query?print_stats&virtual_sdcard&extruder&heater_bed&fan'])
+def test_beta_monitor_requests_get_plain_refusal(door, path):
+    code, body = door.request(path)
+    assert code == 405
+    assert 'Your prints' in body['error']['message']
+
+
+def test_reconcile_releases_only_confirmed_jobs_and_keeps_uncertain_starts(door):
+    staged = door.stage()
+    queued = door.stage()
+    uncertain = door.stage()
+    job_id = door.start(queued)[1]['result']['jobId']
+    door.submit_mode = 'lost_reply'
+    assert door.start(uncertain)[0] == 502
+    unknown_job = door.jobs[uncertain.split('/')[0]]['jobId']
+    door.server.reconcile_moonraker([{'queueJobId': job_id, 'state': 'uploading'}])
+    assert (door.path / queued).exists()
+    door.server.reconcile_moonraker([{'queueJobId': job_id, 'state': 'printing'}], [unknown_job])
+    assert not (door.path / queued).exists()
+    assert (door.path / staged).exists() and (door.path / uncertain).exists()
+    door.restart()
+    assert door.start(queued)[0] == 404
+    door.submit_mode = 'ok'
+    assert door.start(uncertain)[0] == 200
+    door.server.reconcile_moonraker([], [unknown_job])
+    assert not (door.path / uncertain).exists()
+    with door.store.locked() as db:
+        assert db.execute('SELECT count(*) FROM uploads').fetchone()[0] == 1
+
+
+def test_reconcile_frees_quota_and_retries_failed_deletion(door, monkeypatch):
+    monkeypatch.setattr(moonraker, 'MAX_RECORDS', 1)
+    for _ in range(3):
+        path = door.stage()
+        job = door.start(path)[1]['result']['jobId']
+        assert door.upload()[0] == 507
+        with monkeypatch.context() as patch:
+            patch.setattr(moonraker.shutil, 'rmtree', lambda *_: (_ for _ in ()).throw(OSError('disk failure')))
+            door.server.reconcile_moonraker([], [job])
+        door.restart()
+        assert not (door.path / path).exists()
+    assert door.request('/server/info')[0] == 200
+
+
+def test_door_health_counts_only_fixed_codes(door):
+    assert door.server.moonraker_health() == {'state': 'ok', 'refusals': {}}
+    door.request('/server/info', token='private-token')
+    door.request('/websocket')
+    health = door.server.moonraker_health()
+    assert health == {'state': 'ok', 'refusals': {'403': 1, '405': 1}}
+    assert agent.heartbeat_payload(moonraker_door=health)['moonrakerDoor'] == health
+    assert 'private-token' not in json.dumps(health)
+
+
+def test_klipper_has_no_bambu_bed_requirement(door):
+    path = door.stage(data=gcode().replace(b'; curr_bed_type = Textured PEI Plate\n', b''))
+    assert door.start(path)[0] == 200
+    assert door.calls[-1]['file_facts']['bedType'] is None
+
+
+def test_health_is_bounded_and_recovers_after_store_repair(door, monkeypatch):
+    health = door.server._door_health
+    for code in range(1000):
+        health.refuse(code)
+    snapshot = health.snapshot()
+    assert len(snapshot['refusals']) <= 12
+    assert set(snapshot['refusals']) == moonraker.REFUSAL_CODES
+    assert set(agent.heartbeat_payload(moonraker_door={
+        'state': 'ok', 'refusals': {'private-data': 10, '403': 2**100, '400': 'private-data'}}
+        )['moonrakerDoor']['refusals']) == {'403'}
+    with monkeypatch.context() as patch:
+        patch.setattr(door.store, 'check_room', lambda *args: (_ for _ in ()).throw(OSError('private-path')))
+        assert door.request('/server/info')[0] == 507
+        assert door.server.moonraker_health()['state'] == 'store_unavailable'
+    door.store._last_clean = 0
+    door.store.maintain()
+    assert door.server.moonraker_health()['state'] == 'ok'
+
+
+def test_malformed_site_release_cannot_delete_files(door):
+    path = door.stage()
+    job = door.start(path)[1]['result']['jobId']
+    for released in (job, [job, None], [job] * 257, {'queueJobId': job}):
+        door.server.reconcile_moonraker([], released)
+        assert (door.path / path).exists()
+    door.server.reconcile_moonraker([{'queueJobId': job, 'state': 'held', 'reason': 'start_not_observed'}])
+    assert (door.path / path).exists()
+
+
+def test_cleanup_never_waits_for_an_upload_or_start_lock(door):
+    path = door.stage()
+    job = door.start(path)[1]['result']['jobId']
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        with door.store.locked():
+            # The old blocking lock would stall the heartbeat behind a 120-second upload.
+            future = workers.submit(door.server.reconcile_moonraker, [{'queueJobId': job, 'state': 'printing'}])
+            assert future.result(timeout=1) is False
+    assert door.server.moonraker_health()['state'] == 'ok'
+    assert (door.path / path).exists()
+    assert door.server.reconcile_moonraker([{'queueJobId': job, 'state': 'printing'}]) is True
+    assert not (door.path / path).exists()

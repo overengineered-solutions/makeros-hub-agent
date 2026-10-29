@@ -23,6 +23,8 @@ max_upload_mb = 1024
 # Staff-only Moonraker trial on ingest_port, for one pool. Restart after a reviewed change.
 # Known pools: p2s, sv08-max, giga, a1-mini, x1c. Empty disables only the Moonraker door.
 moonraker_pool = "p2s"
+# Optional device evidence for uploads forwarded by the members tailscaled. Print tokens remain the identity.
+members_tailscale_socket = "/run/tailscale-members.sock"
 
 # Lasers (v0.68). Optional; without it every laser reports "not configured". See docs/laser-ha.md.
 # [laser]

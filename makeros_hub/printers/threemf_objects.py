@@ -56,6 +56,22 @@ def parse_plate_objects(threemf_path, plate: int = 1) -> list[dict]:
                 )
                 return []
             raw = zf.read(info)
+            # Metadata alone enables billing credits for parts the printer cannot skip.
+            with zf.open(f"Metadata/plate_{plate}.gcode") as gcode:
+                remaining = 2 * 1024**3
+                marked = False
+                while remaining > 0:
+                    line = gcode.readline(min(remaining, 64 * 1024))
+                    if not line:
+                        break
+                    remaining -= len(line)
+                    if re.match(rb"^[ \t]*M624[ \t]+[^;\s]", line):
+                        marked = True
+                        break
+                    if len(line) == 64 * 1024 and not line.endswith(b'\n'):
+                        return []  # An oversized line cannot safely be split into executable commands.
+                if not marked:
+                    return []
         root = ET.fromstring(raw)
     except Exception as exc:  # noqa: BLE001 — a malformed 3MF must never block dispatch
         log.info("3mf object parse skipped (%s): %s", threemf_path, exc)

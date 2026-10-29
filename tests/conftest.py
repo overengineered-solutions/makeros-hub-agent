@@ -30,7 +30,7 @@ Reads happen through the module global at call time, so rebinding the attribute 
 
 import pytest
 
-from makeros_hub import laser, report_outbox, update
+from makeros_hub import device_evidence, laser, report_outbox, update
 from makeros_hub.printers import bambu, klipper, manager
 
 # (module, attribute, is_dir) — a directory is created so code that lists it finds an empty dir, not a missing one.
@@ -53,6 +53,7 @@ _STATE_PATHS = [
 @pytest.fixture(autouse=True)
 def isolate_agent_state(tmp_path, monkeypatch):
     """Point every persisted path at this test's own tmp_path. Autouse so unittest.TestCase tests get it too."""
+    monkeypatch.setattr(device_evidence, "DEFAULT_SOCKET", str(tmp_path / "absent-members.sock"))
     for module, attr, is_dir in _STATE_PATHS:
         target = tmp_path / f"{module.__name__.rsplit('.', 1)[-1]}-{attr.lower()}"
         if is_dir:

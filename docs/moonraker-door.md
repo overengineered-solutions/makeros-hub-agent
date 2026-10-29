@@ -1,6 +1,7 @@
-# Orca 2.4.2 Moonraker queue door
+# Orca 2.4.2 / 2.5.0-beta Moonraker queue door
 
-This is the hub half of the contract, unreleased. The site additions below are required before connection tests succeed.
+Build H (2026-10-29) is an uncommitted hub change for review. The operator has already verified a 2.4.2 send through
+hub 0.89.1; this build has only local automated verification. The site contract below must remain in place.
 An old/unavailable site fails closed; neither the session check nor an upload creates a job. Nothing in this HTTP door sends
 commands to a printer. The normal cloud queue and existing final dispatch guards own physical printing.
 
@@ -39,24 +40,38 @@ model-prefixed URLs return 404.
 
 | Request on the ingest port | Result |
 | --- | --- |
-| `GET /server/info` | `{result:{machine_name:"PS P2S queue",model_pool:"p2s",moonraker_version:"makeros-hub-0.88.0",klippy_state:"ready"}}`. Ready means the authenticated queue door has spool capacity, not that a printer is idle. |
+| `GET /server/info` | `{result:{machine_name:"PS P2S queue",model_pool:"p2s",moonraker_version:"makeros-hub-<version>",klippy_state:"ready"}}`. Ready means the authenticated queue door has spool capacity, not that a printer is idle. |
+| `GET /server/files/directory?path=gcodes` | `{result:{dirs:[],files:[],disk_usage:{free:<usable-bytes>}}}`. Fresh authorization and the same quota/disk checks as upload; no member filenames or directory contents. Other queries are refused. |
 | `GET /server/files/roots` | `{result:[{name:"gcodes",permissions:"rw"}]}`. |
-| `GET /server/database/item?namespace=lane_data` | `{result:{namespace:"lane_data",value:{lane1:{lane:"0",material:"PLA",color:"#FFFFFF",bed_temp:0,nozzle_temp:0},...}}}`. |
-| `POST /server/files/upload` | Multipart `file`, `root=gcodes`, optional `plateindex` (1–64), empty `path`, optional `print`. Returns HTTP 201 `{result:{item:{path:"<opaque-uid>/<safe-name>",root:"gcodes"},print_started:false}}`. Even `print=true` only stages. |
+| `GET /server/database/item?namespace=lane_data` | `{result:{namespace:"lane_data",value:{lane1:{lane:"0",material:"PLA",color:"#FFFFFF",bed_temp:0,nozzle_temp:0,filament_id:"GFA00"},...}}}`. |
+| `POST /server/files/upload` | Multipart `file`, `root=gcodes`, optional `plateindex` (1–64), empty `path`, optional `print`. Returns HTTP 201 with top-level `item:{path:"<opaque-uid>/<safe-name>",root:"gcodes"}`, `print_started:false`, `print_queued:false`, and the same object under `result` for 2.4.2. Even `print=true` only stages. |
 | `POST /printer/print/start` | JSON `{filename:"<returned-path>"}`. Returns `{result:{jobId:"...",status:"queued"}}`; eligibility, member/pool ownership, file hash, size and facts are checked. |
-| Other requests under `/server/`, `/printer/`, `/machine/` or `/access/` | HTTP 405 with `{error:{code,message}}` directing members to the PS site's **Your prints and printer controls**. This includes G-code, pause/resume/cancel, temperature changes, deletes and alternate methods. |
+| Other requests under `/server/`, `/printer/`, `/machine/`, `/access/`, or `/websocket` | HTTP 405 with `{error:{code,message}}` directing members to the PS site's **Your prints and printer controls**. This includes G-code, pause/resume/cancel, temperature changes, deletes and alternate methods. |
 
 Lane data uses the existing VP live-pool builder and ranking, filtered by the freshly authorized printer IDs before deriving
 a member view. Bambu spools come from heartbeat statuses; Klipper's staff-set spool comes from the site's current record,
 only while that printer is connected. Refresh invalidates the previous snapshot first; snapshots expire after
-`max(90 seconds, 2 × heartbeat interval)`. Sixteen explicit lanes, including empty-material placeholders, clear removed slots.
-An empty object would trigger Orca's Happy Hare fallback (`MoonrakerPrinterAgent.cpp:727–819`). Integer zero is **unknown**:
-Orca only emits temperature fields when positive (`:505–509`); catalog ranges are not invented printing temperatures.
+`max(90 seconds, 2 × heartbeat interval)`. Only occupied spools are sent, in the existing ranked order, numbered consecutively
+from `"0"`; 16 is a ceiling, never a required count. Empty pools return `{}`. Each lane includes `filament_id` only when its
+ranked tray's `tray_info_idx` is a string matching `[A-Za-z0-9_+-]{1,32}`. Material, colour and zero (unknown) temperatures
+remain unchanged. The beta uses this ID to select a compatible base preset, including hidden presets; 2.4.2 ignores it and
+still uses material type. No profile identity is invented from colour or temperature.
+
+The upload facts, submit contract and dispatch do not consume display lane numbers. File filament slots and their
+material/colour/nozzle facts still drive the physical AMS translator; the existing dispatch regression proves display lane
+0 can resolve to physical tray 1. The 16-filament file limit remains a ceiling, not a padding requirement.
+
+An entirely empty pool makes both Orca versions try Happy Hare, which this door refuses. In beta source that path returns
+false without rebuilding the AMS payload (`MoonrakerPrinterAgent.cpp:614–641,885–887`), so clearing old GUI selections in
+that case is **not guaranteed**. Do not represent a stale GUI lane as a loaded spool. The operator must check this in the GUI.
 
 The original sliced bytes are preserved. G-code is limited to the known Klipper model aliases and one used filament/nozzle.
 Bambu requires a sliced 3MF, consistent native model ID (`N7`, `N1`, `BL-P001`), matching profile alias, selected plate,
 material/colour/nozzle facts and a single extruder. Missing or conflicting model IDs are refused, never stamped or repaired.
 A1 mini remains PLA-only. Unknown weight/bed stays null; the site must review missing cost and apply its normal bed rules.
+The hub door reads the bed value but applies no Bambu bed admission check to any pool (`printers/ingest_facts.py`). There is
+therefore no hub Klipper exemption to add. A regression submits Klipper G-code without `curr_bed_type`; the paired site's
+admission must exempt Klipper from its Bambu bed rule just as its heartbeat does.
 Multi-plate files need an explicit plate; single-plate files can use their sole actual plate number.
 
 ## Site changes required (separate repository)
@@ -128,11 +143,25 @@ timestamps and receipt, never a token. A process/file lock spans file operations
 recovers the same UID, and a recorded receipt is replayed without another cloud submission. A new upload intentionally
 creates a new UID, even for identical bytes.
 
-Unstarted uploads expire after 24 hours; interrupted receiving files are removed on startup/maintenance. **Queued and
-uncertain files are never automatically deleted.** There is no terminal-job reconciliation API in this change: after 256
-retained records or 4 GiB of retained/reserved bytes, intake refuses with 507 and requires staff reconciliation. Do not
-delete uncertain rows/files to make room; first establish the site's durable outcome and file-retention needs. Retain
-receipts if terminal payloads are reclaimed, so old starts cannot recreate jobs.
+Unstarted uploads expire after 24 hours; interrupted receiving files are removed on startup/maintenance. Queued files
+and their records are released after the existing durable queue reports prove `printing` or `completed`. `uploading`,
+`held`, an absent assignment, a timeout, or a failed start is not proof of handover. Before those reports can be acknowledged
+and removed from the outbox, reconciliation must succeed. A busy upload/start lock defers cleanup to the next heartbeat
+without blocking that heartbeat. An older hub's queued rows are covered by the same reconciliation.
+
+For jobs cancelled or removed before handover (including jobs moved to another hub), the site may explicitly return
+`moonrakerReleasedJobs: [<queue-job-id>, ...]` in a successful heartbeat. Maximum 256 nonempty IDs, each at most 128
+characters. The site must repeat this authoritative list on later heartbeats while cleanup may still be needed. It must
+only name this hub's jobs whose local file is no longer needed: a confirmed terminal/gone job, or a job safely handed to
+another hub with its bytes preserved. A job merely absent from `assignments` must never enter this list. No new network
+request is made to discover missing jobs. **This optional response field requires the paired site build.**
+
+Release only matches rows with a recorded `queued` receipt. `submitting` rows remain intact even if a matching job ID is
+mentioned; retrying the original staged path can recover the site's receipt using the same UID. Release first persists a
+`released` marker, then removes bytes and the row. Startup and periodic maintenance retry interrupted deletion. A released
+path returns 404 and cannot mint another job. While a receipt is retained, repeated starts still return the same job.
+The existing 256-record / 4-GiB quotas bound active and uncertain records; sustained uncertainty can still fill them and
+requires reconciliation, never blind deletion. The local store has an additive column migration, with no version bump.
 
 Other bounds: 16 unstarted stages per member, configured per-file limit (default 1 GiB), 1 MiB multipart overhead,
 128 MiB free-disk reserve, one upload shared with legacy ingest, four connections total on the shared listener, 120-second
@@ -142,10 +171,10 @@ duplicate/traversal/encrypted/unsupported-compression entries are refused.
 
 ## Ten-minute operator test after both halves are available in the approved test environment
 
-1. **0–2 minutes:** use Orca 2.4.2 and the stage-1 PS P2S preset, matching the configured `p2s` pool. Set the
+1. **0–2 minutes:** use Orca 2.5.0-beta with `use_printer_agents=false` and the stage-1 PS P2S preset, matching the configured `p2s` pool. Set the
    ingest URL/API key above. Test connection; an invalid token must fail. Keep the existing connection available as fallback.
 2. **2–4:** Sync filaments in Prepare. Compare material/colour against the shop's current P2S spools; repeat sync.
-   Remove/reorder a test spool, then empty the test pool and sync: stale choices must clear. Make the site
+   Remove/reorder a test spool, then empty the test pool and sync: record whether stale choices remain; the source does not guarantee clearing. Make the site
    session unavailable: sync must report failure. Check two differently tuned PLA presets/custom material and colour-only
    sync; matching colour alone does not prove the intended flow/temperature preset survived.
 3. **4–6:** slice a tiny one-filament part. Upload only: **zero new queue jobs**. Upload and Print: exactly one job in
@@ -157,26 +186,100 @@ duplicate/traversal/encrypted/unsupported-compression entries are refused.
    switch tailnets and recheck the selected model and Sync. Only an operator-approved tiny physical print can establish
    actual end-to-end dispatch; use the site's controls for it.
 
-Not verified here: real Orca GUI/cache clearing, Windows/Mac preset installation, actual site transaction/eligibility
-implementation, or any physical print. Orca derives filament preset identity from material, ignoring an exact preset ID
-in lane data; this cannot promise distinct tuned PLA identities. Its live websocket status path is compiled out in 2.4.2.
-This change does not restore PS Bambu object markers or prove multi-colour/H2D behavior. Keep the existing sync fallback
-until the GUI and stage-1 gates pass.
+Not verified here: the actual beta binary, GUI/cache behaviour, Windows/Mac installation, paired site changes, or any
+physical print. The M624 check does not restore missing markers; such a PS plate deliberately reports no skippable objects.
+Keep the existing member presets and downloads byte-for-byte unchanged, with `MOONRAKER` / `PS_P2S_TESTING` still enabled
+in the site. This checkout contains no site/download files and cannot run that site's `orca-member-bytes` test.
 
-Automated verification for the shared ingest listener (2026-10-29):
+## Beta source audit (local files, no network)
 
-- Before the implementation, the new default-pool HTTP test failed with 404 on `/server/info`; six disabled/invalid-config
-  cases failed because the single-pool setting did not exist.
-- `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh -k 'moonraker or H9RunLoop' --tb=short`:
-  **116 passed, 3 skipped, 1,725 deselected, 5 subtests passed**.
-- `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh --tb=short`:
-  **1,800 passed, 42 skipped, 2 failed, 165,065 subtests passed** in 258.05 seconds. Both failures are in the unchanged
-  `tests/test_real_splitjoints.py` (`fit` and `floors`): the cached slicer image cannot import NumPy. This full run is
-  **not green**. No image or dependency was fetched or modified. The one warning is the intentional duplicate-ZIP fixture.
-- The README's shell syntax checks and `git diff --check` passed.
+References below are to the supplied sparse source under
+`/tmp/claude-1000/-home-marsh-projects-pstation/c72320da-3e62-4be4-829a-7f3d24214d16/scratchpad/orca-250-profiles/`;
+comparison source is the sibling `orca-src/`. These establish source behaviour, not installed-binary verification.
 
-One self-review covered the whole diff: routing and configuration, member/pool isolation, submission and money behavior,
-privacy, wording, and tests. The connection-limit description and operator test now match the single listener.
-The old port configuration, extra listeners and listener heartbeat field have been removed. Cloud commit/retry tests use a
-fake control plane; the separate site's staff gate, transaction and preset installer still require paired verification.
-No commit, release, deployment or live-system request was made.
+`src/slic3r/Utils/MoonrakerPrinterAgent.cpp` changes the connect/status path from `#if 0` in 2.4.2
+(lines 2084–2101) to `#if 1` in beta (2316–2337). Every newly active endpoint/query is:
+
+| Newly active request | Beta source lines | Door response |
+| --- | --- | --- |
+| `GET /printer/objects/query?print_stats&virtual_sdcard&extruder&heater_bed&fan` | 1223,2318–2328 | Plain 405 control guidance. Initial status failure does not fail connection. |
+| `GET /websocket` upgrade | 120,1651,2335 | Plain 405 control guidance; no printer monitor or command channel. |
+| `GET /printer/objects/list` after websocket handshake | 1324,1673 | Plain 405; not reached after our refused upgrade. |
+| `GET /server/files/directory?path=gcodes` | 1344–1364,1711–1715,1759–1765,1925–1936 | Authenticated capacity response as above. New storage query; the upstream caller is inside its status stream. |
+| Websocket JSON-RPC `server.connection.identify`, `printer.objects.subscribe` | 1659–1666,1717–1726 | Unreachable after the refused upgrade. No JSON-RPC command transport added. |
+
+Sync still uses `GET /server/database/item?namespace=lane_data` (794) and the optional Happy Hare fallback
+`GET /printer/objects/query?mmu` (897). No new sync URL; the new field is the string `filament_id` (864–879).
+Connect still uses `GET /server/info` (1204). Agent upload/start URLs did not change: `/server/files/upload` (2183),
+`/printer/gcode/script` (1285,409–410), and the existing helper `/printer/print/start` (2248).
+Raw G-code commands remain refused; the helper is not an alternate member control path.
+
+The PS non-Bambu preset's normal send uses `src/slic3r/Utils/Moonraker.cpp`, not the agent's raw-G-code start.
+There are no new Print Host URLs: `server/info` (72), `server/files/roots` (125), `server/files/upload` (242),
+`printer/print/start` (184). **Its upload response changed:** beta reads top-level `item.path` (283), sends
+`print=true` for Upload and Print (266), checks `print_started` / `print_queued` (294–295), and falls back to explicit
+start (326). The dual response shape preserves 2.4.2's `result.item.path` while making beta use the opaque stored path.
+
+Keep the beta's experimental `use_printer_agents` preference **false**, its upstream default
+(`src/libslic3r/AppConfig.cpp:724–727`). `src/slic3r/GUI/Plater.cpp:13838–13842` selects the legacy send for that setting
+and a non-Bambu vendor. Enabling it selects the machine dialog: that path depends on monitor/storage state and uses raw
+G-code start, so it is outside this door's supported trial. This does not disable the Moonraker agent used for filament sync.
+The installer build must preserve this distinction and the PS profile's real Bambu filament IDs.
+
+## Skippable objects and billing
+
+`PrinterManager.dispatch_assignments` reads the selected plate through `parse_plate_objects` and includes the result in
+its `uploading` report. The shared reader now requires an executable `M624` line with an argument in that same plate's
+G-code, as well as the existing enabled-label metadata and 2–64 object count. Comments mentioning M624, M6240, markers on
+another plate, missing G-code or unreadable data produce no objects. The scan is streamed and bounded; it does not edit
+sliced bytes. Without markers no objects or object boxes are reported, so the site must not offer Skip or apply skipped-part
+billing credits. Real hardware behaviour and restored marker generation belong to a separate approved trial/build.
+
+## Admin door health and device evidence
+
+Every heartbeat includes `moonrakerDoor: {state, refusals}`. States are `ok`, `off` (disabled/unbound), and
+`store_unavailable` (initialization, maintenance or file-store failure). Successful maintenance restores `ok`.
+`ok` describes the local door/store, not printer readiness or guaranteed site availability. Refusals are counts since this
+process started, keyed only by `400,403,404,405,408,409,410,413,502,503,507,other`: at most 12 keys, saturated at 2,147,483,647.
+No member, filename, token, device, or exception text enters this field. The parallel site build must validate and display it.
+
+For every parsed request on the shared ingest listener, a loopback socket peer is looked up using stdlib HTTP over the Unix
+socket configured by top-level `members_tailscale_socket` (default `/run/tailscale-members.sock`). The request is
+`GET /localapi/v0/whois?addr=<actual-peer-ip:port>`, with a 1-second socket timeout and a 64-KiB response limit. The original
+peer port is needed for tailscaled's userspace forwarding map. IPv6 uses bracketed addresses. Forwarding headers are ignored.
+Non-loopback LAN peers never cause a lookup. Missing socket, timeout, non-200 or invalid response never refuses a request.
+
+Both OctoPrint upload submit and Moonraker start submit optionally add
+`device: {nodeId: <Node.StableID, else ID as string>, name: <Node.ComputedName, else Name, trimmed to 64 characters>}`.
+Node IDs are bounded to 128 alphanumeric/underscore/hyphen characters; names must be printable. Absent/invalid evidence is
+omitted. Only this small projection is sent; no WhoIs user identity, addresses or full node data are forwarded. Each actual
+submit logs one INFO line with `source=tailnet|lan|unknown` and node ID only; a local receipt replay is not another submit.
+The print token remains the sole member identity and gate. The site build must accept/store optional evidence without
+using it to refuse or authorize a print. Unix socket access and tailscaled ProxyMapper behaviour are unverified on hardware.
+
+## Build H verification
+
+Results are recorded below after the final local suite and one whole-diff self-review. Tests use fake services and temporary
+files; no real printer, shop host, site/preview, tailscaled, or external network is contacted. No commit, version bump,
+release or deployment is made by this build.
+
+- Before implementation, the focused regressions produced **17 failures** for lane shape/IDs, beta upload and storage,
+  websocket refusal, reconciliation and health. The M624 regression was also checked against `HEAD`: the old reader
+  reported two objects without markers; the working tree reported none.
+- `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh -k 'moonraker or device_evidence or threemf_objects or test_dispatch or plate_facts or entry_points' --tb=short`:
+  **209 passed, 5 skipped, 1,673 deselected, 10 subtests passed**. This includes all six fresh-interpreter/service-entry checks.
+- `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh -k 'printing_report_survives or cleanup_never or H9RunLoop' --tb=short`:
+  **3 passed, 3 skipped, 1,885 deselected** after the recovery fixes.
+- Final `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh --tb=short`:
+  **1,847 passed, 42 skipped, 2 failed, 166,655 subtests passed**, in 296.93 seconds. Both failures are the unchanged
+  `tests/test_real_splitjoints.py` cases (`fit`, `floors`): the cached slicer image cannot import NumPy. This matches the
+  previously recorded environment failure; the full suite is **not green**. No image or dependency was fetched or changed.
+  The one warning is the intentional duplicate-ZIP fixture.
+- `bash -n install.sh bootstrap.sh scripts/tailscale-setup.sh laser_gate/install.sh`, `sh -n update.sh`, and
+  `git diff --check` passed.
+
+One self-review covered the whole code/test/documentation diff for correctness, member isolation, billing, privacy,
+wording, test coverage and fresh-import safety. It caught two recovery gaps: blocking on the file-operation lock could
+stall the heartbeat, and acknowledging a report after failed reclamation could lose the cleanup evidence. Reclamation
+now defers on a busy lock and keeps the durable reports until it succeeds. Both cases have regression checks. The review
+also corrected the beta send-path instructions and explicitly records the empty-pool GUI limitation.

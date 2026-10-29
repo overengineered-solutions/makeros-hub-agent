@@ -42,6 +42,7 @@ def test_default_pool_and_member_ingest_share_the_only_listener(tmp_path, monkey
     server.start()
     base = f"http://127.0.0.1:{server._server.server_address[1]}"
     try:
+        assert server.moonraker_health() == {"state": "ok", "refusals": {}}
         request = urllib.request.Request(base + "/server/info", headers={"X-Api-Key": "synthetic-token"})
         with urllib.request.urlopen(request, timeout=2) as response:
             assert json.load(response)["result"]["model_pool"] == "p2s"
@@ -81,6 +82,7 @@ def test_disabled_or_invalid_pool_leaves_member_ingest_up(tmp_path, monkeypatch,
         assert refused.value.code == 404
         assert authorized == []
         assert server._server.RequestHandlerClass.model_pool is None
+        assert server.moonraker_health() == {"state": "off", "refusals": {}}
         assert_member_ingest(base, calls)
         errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
         assert len(errors) == (0 if raw == '""' else 1)
@@ -100,6 +102,7 @@ def test_unreadable_door_store_keeps_member_ingest_serving(tmp_path, caplog):
         assert_member_ingest(f"http://127.0.0.1:{server._server.server_address[1]}", calls)
         assert server._server.RequestHandlerClass.model_pool is None
         assert "staged-file store unavailable" in caplog.text
+        assert server.moonraker_health() == {"state": "store_unavailable", "refusals": {}}
     finally:
         server.stop()
 

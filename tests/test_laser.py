@@ -892,9 +892,16 @@ class H9RunLoop(Base):
 
     def test_one_beat(self):
         stop = threading.Event()
-        sent, offered, acks = [], [], []
+        sent, offered, acks, releases = [], [], [], []
 
         class Nothing:
+            def moonraker_health(self):
+                return {"state": "off", "refusals": {}}
+
+            def reconcile_moonraker(self, reports, released_jobs=()):
+                releases.append((list(reports), released_jobs))
+                return True
+
             def __init__(self, *a, **k):
                 pass
 
@@ -921,7 +928,8 @@ class H9RunLoop(Base):
             sent.append(body)
             stop.set()
             return hub_http.Response(200, {"hubId": "h", "configVersion": "v", "nextPollMs": 30000, "applied": 0,
-                                           "laserChecks": [offer()], "laserAck": {"runKeys": [], "fileIds": []}})
+                                           "laserChecks": [offer()], "laserAck": {"runKeys": [], "fileIds": []},
+                                           "moonrakerReleasedJobs": ["gone-job"]})
 
         with mock.patch("makeros_hub.agent.read_credential", return_value="cred"), \
                 mock.patch("makeros_hub.agent._pull_config", side_effect=pull), \
@@ -932,7 +940,8 @@ class H9RunLoop(Base):
                 mock.patch("makeros_hub.agent._drain_vprinter_submissions_safely", return_value=0):
             agent.run(Config(cloud_url="https://host.example", heartbeat_sec=5), _stop_event=stop, _install_signals=False)
         [body] = sent
-        self.assertFalse(any(key.startswith("moonraker") for key in body))
+        self.assertEqual(body["moonrakerDoor"], {"state": "off", "refusals": {}})
+        self.assertIn(([], ["gone-job"]), releases)
         self.assertEqual([e["machineId"] for e in body["lasers"]], [LASER_ID])
         self.assertEqual((body["lasers"][0]["haLink"], body["lasers"][0]["gateLink"]), ("not_configured", "not_configured"))
         self.assertIn({"requestId": "L1", "command": "laser_load", "status": "ok"}, body["commandResults"])

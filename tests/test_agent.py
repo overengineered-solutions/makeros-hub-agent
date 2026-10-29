@@ -993,6 +993,12 @@ class TestRunLoopShutdown(unittest.TestCase):
         drains = []
 
         class FakeIngest:
+            def moonraker_health(self):
+                return {"state": "off", "refusals": {}}
+
+            def reconcile_moonraker(self, reports, released_jobs=()):
+                return True
+
             def __init__(self, *args, **kwargs):
                 pass
 
@@ -1048,6 +1054,12 @@ class TestRunLoopShutdown(unittest.TestCase):
         drain_seen = []
 
         class FakeIngest:
+            def moonraker_health(self):
+                return {"state": "off", "refusals": {}}
+
+            def reconcile_moonraker(self, reports, released_jobs=()):
+                return True
+
             def __init__(self, *args, **kwargs):
                 pass
 
@@ -1096,6 +1108,12 @@ class TestRunLoopShutdown(unittest.TestCase):
         outbox = _FakeVPrinterOutbox([_captured_job()])
 
         class FakeIngest:
+            def moonraker_health(self):
+                return {"state": "off", "refusals": {}}
+
+            def reconcile_moonraker(self, reports, released_jobs=()):
+                return True
+
             def __init__(self, *args, **kwargs):
                 pass
 
@@ -1141,6 +1159,12 @@ class TestRunLoopShutdown(unittest.TestCase):
         submitted = []
 
         class FakeIngest:
+            def moonraker_health(self):
+                return {"state": "off", "refusals": {}}
+
+            def reconcile_moonraker(self, reports, released_jobs=()):
+                return True
+
             def __init__(self, *args, **kwargs):
                 pass
 

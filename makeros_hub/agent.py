@@ -44,7 +44,7 @@ from .vprinter.pool_ranking import PoolRankingState
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import MAX_RAW_FILE_BYTES, get_to_file, TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
-from .moonraker import DoorError, LivePools, PROTOCOL, site_words
+from .moonraker import DoorError, LivePools, PROTOCOL, REFUSAL_CODES, site_words
 from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import SLICE_RUNNER, SLICER_CAPS, PrinterManager, probe_slicer
@@ -125,7 +125,7 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
     cloud. Maps the /api/print/hub/submit response to an ingest outcome dict."""
 
     def submit(*, member_token, submission_uid, file_name, file_sha256, file_size, print_now,
-               printer_model=None, est_grams=None, required_filaments=None, file_facts=None):
+               printer_model=None, est_grams=None, required_filaments=None, file_facts=None, device=None):
         body = {
             "memberToken": member_token,
             "hubSubmissionUid": submission_uid,
@@ -133,6 +133,8 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
             "fileSha256": file_sha256,
             "fileSizeBytes": file_size,
         }
+        if device is not None:
+            body["device"] = device
         # What the G-code says it was sliced for (gcode_meta) — additive, omitted when absent, so an older cloud is unaffected.
         if isinstance(printer_model, str) and printer_model:
             body["printerModel"] = printer_model
@@ -815,6 +817,7 @@ def heartbeat_payload(
     camera_live_stats: list[dict] | None = None,
     screen_events: list[dict] | None = None,
     printer_starts: list[dict] | None = None,
+    moonraker_door: dict | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -835,6 +838,13 @@ def heartbeat_payload(
         # Prints started at the printer, not through the site (printers/start_guard.py): always sent, so the site can tell a hub
         # that reports them; it answers printerStartsAck and, when its switch is on, a guard_stop command
         "printerStarts": list(printer_starts or [])[:16],
+    }
+    door = moonraker_door or {"state": "off", "refusals": {}}
+    counts = door.get("refusals", {})
+    payload["moonrakerDoor"] = {
+        "state": door.get("state") if door.get("state") in {"ok", "off", "store_unavailable"} else "off",
+        "refusals": {code: min(counts[code], 2**31 - 1) for code in REFUSAL_CODES
+                     if isinstance(counts, dict) and type(counts.get(code)) is int and counts[code] >= 0},
     }
     if isinstance(tailscale_status, dict):
         for key in TAILSCALE_HEARTBEAT_FIELDS:
@@ -1706,6 +1716,7 @@ def run(
             moonraker_authorize=make_moonraker_authorize(cfg, credential),
             moonraker_pools=moonraker_pools,
             moonraker_pool=cfg.moonraker_pool,
+            members_tailscale_socket=cfg.members_tailscale_socket,
         )
         ingest.start()
     except OSError as exc:
@@ -2089,6 +2100,7 @@ def run(
                         camera_live_stats=live_views.stats(),
                         screen_events=screen_events,
                         printer_starts=printer_starts,
+                        moonraker_door=ingest.moonraker_health() if ingest is not None else {"state": "off", "refusals": {}},
                     ),
                     bearer=credential,
                     retries=3,
@@ -2096,6 +2108,8 @@ def run(
                 )
                 if resp.status == 200:
                     _validate_heartbeat(resp.body)
+                    if ingest is not None:
+                        ingest.reconcile_moonraker([], resp.body.get("moonrakerReleasedJobs", []))
                     try:
                         manager.update_screens(resp.body, screen_events)
                     except Exception as exc:  # a screen failure must not lose the print/command acknowledgements
@@ -2229,7 +2243,7 @@ def run(
                                 paper_lock.release()
 
                         threading.Thread(target=_paper_worker, name="paper-print", daemon=True).start()
-                    if pending_queue_reports:
+                    if pending_queue_reports and (ingest is None or ingest.reconcile_moonraker(pending_queue_reports)):
                         before = len(pending_queue_reports)
                         pending_queue_reports = _flush_queue_status_reports(
                             queue_status_reporter,
