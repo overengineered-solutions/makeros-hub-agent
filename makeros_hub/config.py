@@ -24,7 +24,6 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .laser import parse_laser_config
-from .printers.ingest_facts import POOLS
 
 CONFIG_PATH = Path(os.environ.get("MAKEROS_HUB_CONFIG", "/etc/makeros-hub/config.toml"))
 CREDENTIAL_PATH = Path(
@@ -69,6 +68,9 @@ class Config:
 
     def __post_init__(self):
         self.cloud_url = validate_cloud_url(self.cloud_url)
+        # Imported here, not at the top: printers -> vprinter imports this module, and a top-level import made
+        # `makeros-hub run` die at start with a circular import (0.89.0, 2026-10-29). test_entry_points guards it.
+        from .printers.ingest_facts import POOLS
         if not isinstance(self.moonraker_pool, str) or (self.moonraker_pool and self.moonraker_pool not in POOLS):
             log.error("moonraker_pool must name a known pool or be empty; Moonraker door disabled, member ingest remains available")
             self.moonraker_pool = ""
