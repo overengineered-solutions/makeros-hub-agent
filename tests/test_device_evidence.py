@@ -1,4 +1,5 @@
 """Device evidence from a fake Unix LocalAPI only; no real tailscaled or identity changes."""
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import socket
@@ -104,7 +105,7 @@ def test_both_submit_paths_send_device_and_only_log_node_id(door, whois, caplog)
     data = build_multipart('DEVICE', 'part.gcode', b'G1 X1', {'print': 'true'})
     assert door.request('/api/files/local', method='POST', data=data,
                         content_type='multipart/form-data; boundary=DEVICE')[0] == 201
-    assert len(whois['requests']) == 2  # one lookup per submit (Moonraker start, OctoPrint upload); the staging upload asks none
+    assert len(whois['requests']) == 3  # One lookup per connection, reused by submit; staging is attributed too.
     assert len(door.calls) == 2
     assert all(c['device'] == {'nodeId': 'n-test', 'name': 'Test laptop'} for c in door.calls)
     lines = [r.message for r in caplog.records if r.message.startswith('ingest submit source=')]
@@ -117,6 +118,48 @@ def test_lookup_failure_does_not_refuse_submit_or_add_device(door, caplog):
     assert door.start(door.stage())[0] == 200
     assert 'device' not in door.calls[0]
     assert 'ingest submit source=unknown nodeId=-' in caplog.text
+
+
+@pytest.mark.parametrize('route', ['moonraker', 'octoprint'])
+def test_upload_survives_more_connections_from_its_device(door, whois, monkeypatch, route):
+    handler = door.server._server.RequestHandlerClass
+    handler.members_tailscale_socket = whois['path']
+    reading, resume = threading.Event(), threading.Event()
+    read_chunks = handler._read_chunks
+
+    def slow_read(self, length):
+        reading.set()
+        assert resume.wait(5)
+        yield from read_chunks(self, length)
+
+    monkeypatch.setattr(handler, '_read_chunks', slow_read)
+    sockets = []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        if route == 'moonraker':
+            upload = pool.submit(door.upload)
+        else:
+            data = build_multipart('BUSY', 'part.gcode', b'G1 X1', {'print': 'true'})
+            upload = pool.submit(door.request, '/api/files/local', method='POST', data=data,
+                                 content_type='multipart/form-data; boundary=BUSY')
+        try:
+            assert reading.wait(3)
+            for _ in range(10):
+                sockets.append(socket.create_connection(('127.0.0.1', door.server._server.server_address[1]), timeout=3))
+            deadline = time.monotonic() + 3
+            while len(whois['requests']) < 11 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert len(whois['requests']) == 11
+            # A completed request proves the replacement handlers are also being served.
+            assert door.request('/api/version')[0] == 200
+        finally:
+            resume.set()
+            for connection in sockets:
+                connection.close()
+        assert upload.result(timeout=3)[0] == 201
+    if route == 'moonraker':
+        stored_path = upload.result()[1]['result']['item']['path']
+        assert door.start(stored_path)[0] == 200
+    assert len(door.calls) == 1
 
 
 def test_submit_contract_and_socket_config(tmp_path, monkeypatch):

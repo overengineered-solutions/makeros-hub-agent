@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import base64
 import copy
 import fcntl
 import json
@@ -20,7 +21,7 @@ import xml.etree.ElementTree as ET
 from . import __version__, job_files
 from .multipart import MultipartError, UploadTooLarge, boundary_from_content_type, stream_multipart
 from .printers.ingest_facts import POOLS, read_file_facts
-from .printers.threemf_objects import Unreadable3mf
+from .printers.threemf_objects import Unreadable3mf, plate_picture
 from .vprinter.capture import sha256_file
 from .vprinter.live_pool import vp_pool_from_statuses_ranked
 from .vprinter.outbox import validate_submission_uid
@@ -335,11 +336,16 @@ class StagedUploads:
             if facts != json.loads(row["facts"]):
                 raise DoorError(409, "Staged file facts changed. Ask the shop to reconcile it.")
             db.execute("UPDATE uploads SET state='submitting' WHERE uid=?", (uid,))
+            picture_kwargs = {}
+            if target.suffix.lower() == ".3mf":
+                picture = plate_picture(target, facts["plate"])
+                if picture is not None:
+                    picture_kwargs["plate_image"] = base64.b64encode(picture).decode("ascii")
             try:
                 result = submit(member_token=token, submission_uid=uid, file_name=name,
                                 file_sha256=row["sha"], file_size=row["size"], print_now=True,
                                 printer_model=facts["printerModel"], est_grams=facts["estGrams"],
-                                required_filaments=facts["requiredFilaments"], file_facts=facts)
+                                required_filaments=facts["requiredFilaments"], file_facts=facts, **picture_kwargs)
             except Exception:
                 log.warning("Moonraker submit unconfirmed uid=%s; retained for retry", uid)
                 result = None

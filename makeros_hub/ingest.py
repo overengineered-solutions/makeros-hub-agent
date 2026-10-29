@@ -19,11 +19,13 @@ without a network or a real cloud.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +35,7 @@ from typing import Callable
 from . import device_evidence, job_files
 from .multipart import MultipartError, UploadTooLarge, boundary_from_content_type, stream_multipart
 from .printers.gcode_meta import read_gcode_meta
+from .printers.threemf_objects import plate_picture
 from .moonraker import DoorError, DoorHealth, LivePools, MoonrakerDoor
 
 log = logging.getLogger("makeros-hub.ingest")
@@ -73,9 +76,7 @@ class _Handler(BaseHTTPRequestHandler):
     members_tailscale_socket = device_evidence.DEFAULT_SOCKET
 
     def submit_with_device(self, **kwargs):
-        # Looked up only for a submit, while its connection is still open (tailscaled's port mapping lives as long as the
-        # connection): Orca's sync and status polls never wait on the members daemon.
-        source, device = device_evidence.lookup(self.client_address, self.members_tailscale_socket)
+        source, device = self.device_evidence
         log.info("ingest submit source=%s nodeId=%s", source, device["nodeId"] if device else "-")
         if device:
             kwargs["device"] = device
@@ -93,6 +94,11 @@ class _Handler(BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(self.REQUEST_LINE_TIMEOUT)
+
+    def handle(self):
+        self.device_evidence = device_evidence.lookup(self.client_address, self.members_tailscale_socket)
+        if self.server.admit_device(self.connection, self.client_address, *self.device_evidence):
+            super().handle()
 
     def parse_request(self):
         self.connection.settimeout(self.timeout)
@@ -123,6 +129,16 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        # Keep the connection through body receipt, spool persistence and the submit reply.
+        if not self.server.set_uploading(self.connection, True):
+            self.close_connection = True
+            return
+        try:
+            self._post()
+        finally:
+            self.server.set_uploading(self.connection, False)
+
+    def _post(self):
         if self.moonraker and self.moonraker.handle(self):
             return
         if not self.upload_slot.acquire(blocking=False):
@@ -234,6 +250,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "est_grams": meta["estGrams"],
                 "required_filaments": meta["requiredFilaments"],
             }
+        if file_name.lower().endswith(".3mf"):
+            picture = plate_picture(dest_dir / file_name)
+            if picture is not None:
+                meta_kwargs["plate_image"] = base64.b64encode(picture).decode("ascii")
 
         try:
             outcome = self.submit_with_device(
@@ -344,9 +364,13 @@ class _BoundedServer(ThreadingHTTPServer):
     # 32, not 4: every member's slicer shares this port, and Orca 2.5 opens several at once (sync, status, uploads).
     # Uploads still go one at a time (upload_slot); this bounds threads, not work.
     MAX_CONNECTIONS = 32
+    MAX_DEVICE_CONNECTIONS = 6
 
     def __init__(self, *args):
         self.connections = threading.BoundedSemaphore(self.MAX_CONNECTIONS)
+        self._connection_lock = threading.Lock()
+        self._devices = {}  # In accept order, including connections still waiting for WhoIs.
+        self._uploading = set()
         self._last_full_log = 0.0
         super().__init__(*args)
 
@@ -362,15 +386,54 @@ class _BoundedServer(ThreadingHTTPServer):
                 self.shutdown_request(request)
             return
         try:
+            with self._connection_lock:
+                self._devices[request] = None
             super().process_request(request, client_address)
         except Exception:
+            with self._connection_lock:
+                self._devices.pop(request, None)
             self.connections.release()
             raise
+
+    def admit_device(self, request, peer, source, device):
+        bucket = ("tailnet", device["nodeId"]) if device else (("lan", peer[0]) if source == "lan" else ("unknown",))
+        with self._connection_lock:
+            self._devices[request] = bucket
+            own = [conn for conn, key in self._devices.items() if key == bucket and conn is not request]
+            # Only an identified device is capped: if whois is down every tailnet client lands in "unknown", and a shared
+            # cap of six would refuse members wholesale; the global slots still bound them.
+            if bucket != ("unknown",) and len(own) >= self.MAX_DEVICE_CONNECTIONS:
+                oldest = next((conn for conn in own if conn not in self._uploading), None)
+                if oldest is None:
+                    del self._devices[request]
+                    return False
+                del self._devices[oldest]
+                # SHUT_RDWR wakes a handler blocked in a buffered read; close alone does not.
+                try:
+                    oldest.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.close_request(oldest)
+                log.info("ingest closed oldest idle connection nodeId=%s", device["nodeId"] if device else "-")
+            return True
+
+    def set_uploading(self, request, uploading):
+        with self._connection_lock:
+            if request not in self._devices:
+                return False
+            if uploading:
+                self._uploading.add(request)
+            else:
+                self._uploading.discard(request)
+            return True
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
+            with self._connection_lock:
+                self._devices.pop(request, None)
+                self._uploading.discard(request)
             self.connections.release()
 
     def service_actions(self):

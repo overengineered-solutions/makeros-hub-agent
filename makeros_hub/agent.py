@@ -125,7 +125,7 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
     cloud. Maps the /api/print/hub/submit response to an ingest outcome dict."""
 
     def submit(*, member_token, submission_uid, file_name, file_sha256, file_size, print_now,
-               printer_model=None, est_grams=None, required_filaments=None, file_facts=None, device=None):
+               printer_model=None, est_grams=None, required_filaments=None, file_facts=None, device=None, plate_image=None):
         body = {
             "memberToken": member_token,
             "hubSubmissionUid": submission_uid,
@@ -135,6 +135,8 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
         }
         if device is not None:
             body["device"] = device
+        if plate_image is not None:
+            body["plateImage"] = plate_image
         # What the G-code says it was sliced for (gcode_meta) — additive, omitted when absent, so an older cloud is unaffected.
         if isinstance(printer_model, str) and printer_model:
             body["printerModel"] = printer_model

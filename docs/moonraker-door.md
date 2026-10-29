@@ -164,8 +164,9 @@ The existing 256-record / 4-GiB quotas bound active and uncertain records; susta
 requires reconciliation, never blind deletion. The local store has an additive column migration, with no version bump.
 
 Other bounds: 16 unstarted stages per member, configured per-file limit (default 1 GiB), 1 MiB multipart overhead,
-128 MiB free-disk reserve, one upload shared with legacy ingest, four connections total on the shared listener, 120-second
-body deadline, 4 KiB start JSON, 1,024 ZIP entries, 2 MiB ZIP directory (checked before loading), 2 GiB total expanded size,
+128 MiB free-disk reserve, one upload shared with legacy ingest, 32 connections total on the shared listener, six per device,
+10-second request-line timeout, 120-second body deadline, 4 KiB start JSON, 1,024 ZIP entries,
+2 MiB ZIP directory (checked before loading), 2 GiB total expanded size,
 200:1 maximum expansion ratio, 10 MiB per metadata entry. ZIP64/multidisk archives and
 duplicate/traversal/encrypted/unsupported-compression entries are refused.
 
@@ -243,11 +244,13 @@ Every heartbeat includes `moonrakerDoor: {state, refusals}`. States are `ok`, `o
 process started, keyed only by `400,403,404,405,408,409,410,413,502,503,507,other`: at most 12 keys, saturated at 2,147,483,647.
 No member, filename, token, device, or exception text enters this field. The parallel site build must validate and display it.
 
-For every parsed request on the shared ingest listener, a loopback socket peer is looked up using stdlib HTTP over the Unix
+For every accepted connection on the shared ingest listener, a loopback socket peer is looked up using stdlib HTTP over the Unix
 socket configured by top-level `members_tailscale_socket` (default `/run/tailscale-members.sock`). The request is
 `GET /localapi/v0/whois?addr=<actual-peer-ip:port>`, with a 1-second socket timeout and a 64-KiB response limit. The original
 peer port is needed for tailscaled's userspace forwarding map. IPv6 uses bracketed addresses. Forwarding headers are ignored.
-Non-loopback LAN peers never cause a lookup. Missing socket, timeout, non-200 or invalid response never refuses a request.
+The lookup runs in the connection's handler thread before reading its request, never in the accept loop. Non-loopback LAN
+peers never cause a lookup. Missing socket, timeout, non-200 or invalid response uses the shared unknown-device bucket;
+it does not itself refuse a request. The result is reused when submitting a print.
 
 Both OctoPrint upload submit and Moonraker start submit optionally add
 `device: {nodeId: <Node.StableID, else ID as string>, name: <Node.ComputedName, else Name, trimmed to 64 characters>}`.
@@ -256,6 +259,68 @@ omitted. Only this small projection is sent; no WhoIs user identity, addresses o
 submit logs one INFO line with `source=tailnet|lan|unknown` and node ID only; a local receipt replay is not another submit.
 The print token remains the sole member identity and gate. The site build must accept/store optional evidence without
 using it to refuse or authorize a print. Unix socket access and tailscaled ProxyMapper behaviour are unverified on hardware.
+
+## Plate pictures on submit
+
+Moonraker start, OctoPrint upload submit and virtual-printer submit include optional `plateImage`, a base64 PNG read from
+the original sliced 3MF. They reuse the fetch path's `plate_picture` reader: first `Metadata/ps_views_N.png`, then
+`Metadata/plate_N.png`, then `Metadata/plate_N_small.png`. The decoded image is at most `PLATE_PICTURE_MAX` (192 KiB).
+Moonraker and virtual printers use their selected plate; a virtual-printer job with no selected plate omits the image.
+OctoPrint uses its existing plate-1 default. Missing, unreadable, invalid or oversized pictures are omitted, with a smaller
+fallback used when available. Picture availability never refuses a print. G-code uploads continue without a picture.
+
+This supplies the sliced view at queue submission, before dispatch. It does not capture printer screenshots. The paired
+site build must store and display this optional image beside the printer's existing camera pictures, keep member-visible
+changes behind `MOONRAKER` / `PS_P2S_TESTING` with the existing staff bypass, and verify `orca-member-bytes`. No site or
+installer files are present or changed in this checkout; those gates and member download bytes are not verified here.
+
+## Per-device connection space
+
+The shared ingest listener retains its global limit of 32 handler threads. Each attributed tailnet node may hold six
+connections; a LAN device is counted by its actual peer IP. All peers that cannot be attributed share one unknown bucket.
+This is a device limit, not an account limit: devices sharing a LAN source IP share space, and one member using two tailnet
+nodes has two buckets. Tokens and forwarding headers do not choose the bucket or authorize more connections.
+
+When a seventh connection arrives, the listener closes that device's oldest idle connection, using accept order, and
+serves the new one. It never evicts another device. An eviction logs one line containing the node ID (or `-` when none is
+known), without device names, peer addresses or tokens. The lookup uses the same one-second timeout described above.
+Connections awaiting attribution still occupy global slots; a burst can temporarily fill all 32 before lookups finish.
+
+An upload is protected from eviction before body reading begins, through local storage and the submit response. Moonraker
+start requests receive the same protection so replacement cannot interrupt a queue receipt. Upload deadlines and the
+existing single-upload limit still apply. If all six connections in a bucket are protected, the new connection closes;
+an active upload is never sacrificed to make room. Closed handlers return their global slots when they finish.
+
+## Build H2 verification
+
+Local verification included the full suite and one whole-diff self-review. The tests use fake
+ingest sockets, a fake Unix WhoIs server and local HTTP listeners. No real printer, shop host, site, preview or tailscaled
+is contacted. This build makes no commit, version bump, release or deployment.
+
+- Before implementation, the new picture and connection regressions produced **17 failures, 9 passes** against the old
+  code: missing submit pictures, absent device limits and absent upload protection.
+- `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh -k 'ingest or device_evidence or submit_pictures or entry_points or moonraker' --tb=short`:
+  **216 passed, 3 skipped, 1,705 deselected, 487 subtests passed**. All six fresh-interpreter entry-point checks passed.
+- After strengthening the other-device isolation check and adding both real-handler upload checks,
+  `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh -k 'ingest_connections or upload_survives_more_connections' --tb=short`:
+  **7 passed, 3 skipped, 1,916 deselected**.
+- `PATH=/home/marsh/.pyvenv/bin:$PATH ./scripts/test.sh --tb=short`:
+  **1,882 passed, 42 skipped, 2 failed, 167,325 subtests passed**, in 288.15 seconds. Both failures are the unchanged
+  `tests/test_real_splitjoints.py` cases (`fit`, `floors`): the cached slicer image cannot import NumPy, matching the
+  Build H failure recorded below. The full suite is **not green**. No image or dependency was fetched or changed.
+  The one warning is the intentional duplicate-ZIP fixture.
+- `git diff --check` passed.
+
+One self-review covered the whole diff for correctness, member isolation, money, privacy, wording, tests and import cycles.
+The connection test now makes another device own the globally oldest connection and proves it survives replacement.
+Admission and upload protection share a lock, so an evicted handler cannot begin an upload from buffered bytes. A refused
+new connection is removed from device accounting immediately; every worker returns exactly one global slot on exit.
+No queue, price, billing, member authorization or download rules were changed. Only existing leaf-module imports were
+extended for the picture reader.
+
+Unverified: real tailscaled forwarding/WhoIs behaviour, installed slicers, physical printing, site display and staff gates,
+and member download bytes. There are no open implementation questions for H2. The paired site build must supply the
+display and gate checks above; the slicer image needs its NumPy dependency before the two existing slicing tests can pass.
 
 ## Build H verification
 

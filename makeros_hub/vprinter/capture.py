@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import math
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
 
-from ..printers.threemf_objects import Unreadable3mf, gcode_plates, plate_named
+from ..printers.threemf_objects import Unreadable3mf, gcode_plates, plate_named, plate_picture
 
 log = logging.getLogger("makeros-hub.vprinter.capture")
 
@@ -430,6 +431,9 @@ def build_vp_submit_body(job: CapturedJob, *, model: str) -> dict[str, Any]:
         body["estSeconds"] = seconds
     if job.plate is not None:
         body["plate"] = job.plate
+        picture = plate_picture(job.file_path, job.plate)
+        if picture is not None:
+            body["plateImage"] = base64.b64encode(picture).decode("ascii")
     # Additive (cloud-side double-Send dedupe on member + VP + sha + plate + mapping): the mapping exactly
     # as OrcaSlicer sent it (list, or {ams_mapping, ams_mapping2} when both tray maps are present) + the VP serial.
     if job.ams_mapping is not None:
