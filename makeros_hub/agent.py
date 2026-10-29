@@ -44,6 +44,7 @@ from .vprinter.pool_ranking import PoolRankingState
 from .diagnostics import Diagnostics, collect_cheap_diagnostics, install_log_handler, redact, set_default
 from .http import MAX_RAW_FILE_BYTES, get_to_file, TransportError, get_json, post_bytes, post_json
 from .ingest import IngestServer
+from .moonraker import DoorError, LivePools, PROTOCOL, site_words
 from .laser import LASER_FILE_MAX_BYTES, LaserHub
 from .probes import PROBES, run_probe, set_camera_targets_provider, set_effective_config
 from .printers.manager import SLICE_RUNNER, SLICER_CAPS, PrinterManager, probe_slicer
@@ -124,7 +125,7 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
     cloud. Maps the /api/print/hub/submit response to an ingest outcome dict."""
 
     def submit(*, member_token, submission_uid, file_name, file_sha256, file_size, print_now,
-               printer_model=None, est_grams=None, required_filaments=None):
+               printer_model=None, est_grams=None, required_filaments=None, file_facts=None):
         body = {
             "memberToken": member_token,
             "hubSubmissionUid": submission_uid,
@@ -139,12 +140,16 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
             body["estGrams"] = est_grams
         if isinstance(required_filaments, list) and required_filaments:
             body["requiredFilaments"] = required_filaments
+        if file_facts is not None:
+            # estGrams always present for the door: the site's schema takes null for unknown weight, never a missing key
+            body.update(submissionProtocol=PROTOCOL, printNow=print_now, fileFacts=file_facts, estGrams=est_grams,
+                        plate=file_facts["plate"], modelPool=file_facts["modelPool"])
         try:
             resp = post_json(
                 cfg.submit_url,
                 body,
                 bearer=credential,
-                retries=2,
+                retries=0 if file_facts is not None else 2,
                 backoff_base=1.0,
             )
         except TransportError as exc:
@@ -153,7 +158,7 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
             return {"status": "error", "detail": f"transport: {safe}"}
 
         if resp.status == 200:
-            if _accepted_submission(resp.body):
+            if _accepted_submission(resp.body) and (file_facts is None or resp.body.get("submissionProtocol") == PROTOCOL):
                 return {"status": "queued", "jobId": resp.body["jobId"]}
             if _rejected_submission(resp.body):
                 if resp.body["reason"] == "invalid_token":
@@ -165,6 +170,27 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
         return {"status": "error", "detail": f"http_{resp.status}"}
 
     return submit
+
+
+def make_moonraker_authorize(cfg: Config, credential: str):
+    """New read-only site contract, reusing hub-submit's print-token/eligibility resolver.
+
+    No positive cache: revocation and a failed refresh apply on the next request.
+    See docs/moonraker-door.md for the required site implementation.
+    """
+    def authorize(member_token, model_pool):
+        try:
+            response = post_json(cfg.cloud_url + "/api/print/hub/moonraker/session",
+                                 {"memberToken": member_token, "modelPool": model_pool},
+                                 bearer=credential, timeout=8, retries=0)
+        except TransportError:
+            raise DoorError(503, "The site could not validate the print token. Retry when the shop is online.") from None
+        if response.status == 403:
+            raise DoorError(403, site_words(response.body) or "Print token or membership is no longer eligible. Check the PS site.")
+        if response.status != 200:
+            raise DoorError(503, "The site's Moonraker session endpoint is unavailable. Ask the shop.")
+        return response.body
+    return authorize
 
 
 def make_queue_status_reporter(cfg: Config, credential: str, diagnostics=None):
@@ -789,6 +815,7 @@ def heartbeat_payload(
     camera_live_stats: list[dict] | None = None,
     screen_events: list[dict] | None = None,
     printer_starts: list[dict] | None = None,
+    moonraker_listeners: list[dict] | None = None,
 ) -> dict:
     payload = {
         "agentVersion": __version__,
@@ -840,6 +867,8 @@ def heartbeat_payload(
         payload["piMetrics"] = pi_metrics
     if isinstance(camera_stats, dict) and camera_stats:
         payload["cameraStats"] = camera_stats   # v0.69: the site stores it in hubs.last_metrics (capped at 2 KB there)
+    if moonraker_listeners is not None:
+        payload["moonrakerListeners"] = moonraker_listeners
     if failure_samples:
         payload["failureSamples"] = list(failure_samples)[:64]
     # V4 Slice 2 — managed CA delivery. When the agent has an enabled VP
@@ -1670,12 +1699,16 @@ def run(
     # Start the OrcaSlicer ingest server (inbound HTTP on the LAN). Best-effort:
     # if the port is taken we log + continue (heartbeat/telemetry still work).
     ingest: IngestServer | None = None
+    moonraker_pools = LivePools(max_age=max(90, cfg.heartbeat_sec * 2))
     try:
         ingest = IngestServer(
             make_cloud_submit(cfg, credential, diagnostics=diagnostics),
             port=cfg.ingest_port,
             spool_dir=SPOOL_DIR,
             max_bytes=cfg.max_upload_mb * 1024 * 1024,
+            moonraker_authorize=make_moonraker_authorize(cfg, credential),
+            moonraker_pools=moonraker_pools,
+            moonraker_ports=cfg.moonraker_ports,
         )
         ingest.start()
     except OSError as exc:
@@ -1711,6 +1744,7 @@ def run(
                     diagnostics=diagnostics,
                 )
                 maybe_rehydrate_vprinter_outbox()
+                moonraker_pools.invalidate()
                 statuses = manager.statuses()
                 # Live-mirror the VP's reported AMS from the agent's OWN read of the
                 # real printers — so OrcaSlicer's Device tab (the send-time source of
@@ -1766,6 +1800,7 @@ def run(
                             "vprinter",
                             f"live AMS apply failed: {redact(str(exc))}",
                         )
+                moonraker_pools.update(statuses, pool_ranking, multi_vp_live)
                 # v0.69: one batch, sent AND acked (codex review: the payload kept 256 but the 200 acked every buffered
                 # report, so a backlog past 256 after an outage was deleted unsent); the rest go next beat, oldest first
                 jobs = manager.pending_jobs()
@@ -2044,6 +2079,7 @@ def run(
                         discovery_hits=discovery_hits,
                         vp_bindings=pending_vp_bindings,
                         pi_metrics=pi_metrics,
+                        moonraker_listeners=ingest.listener_status if ingest else None,
                         lasers=laser_report.lasers if laser_report else None,
                         laser_file_checks=laser_report.file_checks if laser_report else None,
                         camera_stats=camera_stats,

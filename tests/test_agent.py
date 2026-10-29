@@ -993,6 +993,8 @@ class TestRunLoopShutdown(unittest.TestCase):
         drains = []
 
         class FakeIngest:
+            listener_status = []
+
             def __init__(self, *args, **kwargs):
                 pass
 
@@ -1048,6 +1050,8 @@ class TestRunLoopShutdown(unittest.TestCase):
         drain_seen = []
 
         class FakeIngest:
+            listener_status = []
+
             def __init__(self, *args, **kwargs):
                 pass
 
@@ -1096,6 +1100,8 @@ class TestRunLoopShutdown(unittest.TestCase):
         outbox = _FakeVPrinterOutbox([_captured_job()])
 
         class FakeIngest:
+            listener_status = []
+
             def __init__(self, *args, **kwargs):
                 pass
 
@@ -1141,6 +1147,8 @@ class TestRunLoopShutdown(unittest.TestCase):
         submitted = []
 
         class FakeIngest:
+            listener_status = []
+
             def __init__(self, *args, **kwargs):
                 pass
 

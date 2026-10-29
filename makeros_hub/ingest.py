@@ -19,6 +19,7 @@ without a network or a real cloud.
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -33,6 +34,8 @@ from typing import Callable
 from . import job_files
 from .multipart import MultipartError, UploadTooLarge, boundary_from_content_type, stream_multipart
 from .printers.gcode_meta import read_gcode_meta
+from .config import DEFAULT_MOONRAKER_PORTS
+from .moonraker import LivePools, MoonrakerDoor
 
 log = logging.getLogger("makeros-hub.ingest")
 
@@ -67,6 +70,8 @@ class _Handler(BaseHTTPRequestHandler):
     spool_dir: Path
     max_bytes: int
     upload_slot: threading.BoundedSemaphore
+    moonraker: MoonrakerDoor | None = None
+    model_pool: str | None = None
     # Per-request socket timeout — bounds a slow/stalled connection (a partial
     # upload won't hold a thread forever). A normal LAN upload is seconds;
     # 120s is generous headroom.
@@ -81,10 +86,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(payload)
 
     def do_GET(self) -> None:  # noqa: N802
+        if self.moonraker and self.moonraker.handle(self):
+            return
         if self.path.rstrip("/") in ("/api/version", "/api/version".rstrip("/")):
             self._json(200, VERSION_BODY)
             return
@@ -94,6 +102,8 @@ class _Handler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not_found"})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.moonraker and self.moonraker.handle(self):
+            return
         if not self.upload_slot.acquire(blocking=False):
             self._json(503, {"error": "upload_busy", "detail": "Another upload is in progress. Try again shortly."})
             return
@@ -101,6 +111,13 @@ class _Handler(BaseHTTPRequestHandler):
             self._upload()
         finally:
             self.upload_slot.release()
+
+    def _refuse_method(self):
+        if self.moonraker and self.moonraker.handle(self):
+            return
+        MoonrakerDoor._error(self, 405, "Use the PS site's Your prints and printer controls.")
+
+    do_PUT = do_PATCH = do_DELETE = do_HEAD = do_OPTIONS = do_TRACE = do_CONNECT = _refuse_method
 
     def _upload(self) -> None:
         if self.path.split("?")[0].rstrip("/") != "/api/files/local":
@@ -326,28 +343,65 @@ class _BoundedServer(ThreadingHTTPServer):
         finally:
             self.connections.release()
 
+    def service_actions(self):
+        door = self.RequestHandlerClass.moonraker
+        if door:
+            door.store.maintain()
+
 
 class IngestServer:
     """The threaded HTTP server. start() spawns a daemon thread; stop() shuts it
     down cleanly. Bind host 0.0.0.0 so members on the LAN can reach it."""
 
-    def __init__(self, submit_fn: SubmitFn, *, port: int, spool_dir: Path, max_bytes: int):
+    def __init__(self, submit_fn: SubmitFn, *, port: int, spool_dir: Path, max_bytes: int,
+                 moonraker_authorize=None, moonraker_pools=None, moonraker_ports=None):
         self.port = port
         spool_dir.mkdir(parents=True, exist_ok=True)
         handler = make_handler(submit_fn, spool_dir, max_bytes)
+        if moonraker_authorize is not None:
+            try:
+                handler.moonraker = MoonrakerDoor(spool_dir, moonraker_authorize, moonraker_pools or LivePools())
+            except Exception:  # noqa: BLE001 — the staff trial's store must never take member ingest or the hub down
+                log.exception("Moonraker staged-file store unavailable; model listeners off, member ingest stays available")
         self._server = _BoundedServer(("0.0.0.0", port), handler)
-        self._thread: threading.Thread | None = None
+        self.model_servers = {}
+        self.listener_status = []
+        self._threads = []
+        if handler.moonraker:
+            ports = moonraker_ports if moonraker_ports is not None else DEFAULT_MOONRAKER_PORTS
+            for pool, model_port in ports.items():
+                status = {"modelPool": pool, "port": None, "state": "failed"}
+                try:
+                    if pool not in DEFAULT_MOONRAKER_PORTS or type(model_port) is not int or not 0 <= model_port <= 65535:
+                        raise ValueError("invalid model port")
+                    status["port"] = model_port
+                    model_handler = make_handler(submit_fn, spool_dir, max_bytes)
+                    model_handler.moonraker = handler.moonraker
+                    model_handler.model_pool = pool
+                    model_handler.upload_slot = handler.upload_slot
+                    self.model_servers[pool] = _BoundedServer(("0.0.0.0", model_port), model_handler)
+                    status.update(port=self.model_servers[pool].server_address[1], state="listening")
+                except (OSError, ValueError) as exc:
+                    # Only fixed codes cross the heartbeat boundary, never exception text or config values.
+                    status["error"] = errno.errorcode.get(exc.errno, "bind_failed") if isinstance(exc, OSError) else "invalid_port"
+                    log.error("Moonraker %s listener on port %s failed (%s); skipped. Member ingest and other models stay available.",
+                              pool, status["port"], status["error"])
+                self.listener_status.append(status)
+            log.log(logging.WARNING if ports and not self.model_servers else logging.INFO,
+                    "Moonraker listeners bound processed=%d, expected=%d", len(self.model_servers), len(ports))
 
     def start(self) -> None:
-        self._thread = threading.Thread(
-            target=self._server.serve_forever, name="makeros-hub-ingest", daemon=True
-        )
-        self._thread.start()
-        log.info("OrcaSlicer ingest server listening on :%d", self.port)
+        for pool, server in [("ingest", self._server), *self.model_servers.items()]:
+            thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1},
+                                      name=f"makeros-hub-{pool}", daemon=True)
+            thread.start()
+            self._threads.append(thread)
+            log.info("OrcaSlicer %s server listening on :%d", pool, server.server_address[1])
 
     def stop(self) -> None:
-        try:
-            self._server.shutdown()
-            self._server.server_close()
-        except Exception:  # noqa: BLE001 — best-effort teardown
-            pass
+        for server in [self._server, *self.model_servers.values()]:
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:  # noqa: BLE001 — best-effort teardown
+                pass

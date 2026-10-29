@@ -69,13 +69,18 @@ def read_gcode_meta(path) -> dict[str, Any] | None:
     if p.suffix.lower() not in GCODE_SUFFIXES:
         return None
     with p.open("rb") as fh:
-        size = fh.seek(0, 2)
-        tail_at = max(0, size - WINDOW_BYTES)
-        fh.seek(tail_at)
-        tail = fh.read(WINDOW_BYTES).decode("utf-8", errors="replace")
-        fh.seek(0)
-        # the whole first window, overlapping the tail: a top config block the tail cut in half is read whole here
-        head = fh.read(WINDOW_BYTES if tail_at else 0).decode("utf-8", errors="replace")
+        return read_gcode_stream(fh)[0]
+
+
+def read_gcode_stream(fh) -> tuple[dict[str, Any], dict[str, str]]:
+    """The same facts from a seekable file or bounded, selected ZIP entry, plus its config."""
+    size = fh.seek(0, 2)
+    tail_at = max(0, size - WINDOW_BYTES)
+    fh.seek(tail_at)
+    tail = fh.read(WINDOW_BYTES).decode("utf-8", errors="replace")
+    fh.seek(0)
+    # Overlap so a config block crossing the windows is read whole.
+    head = fh.read(WINDOW_BYTES if tail_at else 0).decode("utf-8", errors="replace")
 
     config = _config_block(tail)
     if config is None:
@@ -115,4 +120,4 @@ def read_gcode_meta(path) -> dict[str, Any] | None:
         "printerModel": model,
         "estGrams": total if total is not None and total <= MAX_EST_GRAMS else None,
         "requiredFilaments": filaments,
-    }
+    }, config
