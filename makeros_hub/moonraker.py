@@ -32,8 +32,9 @@ log = logging.getLogger("makeros-hub.moonraker")
 CONTROLS = "Use the PS site's Your prints and printer controls. This door only stages files and queues prints."
 PROTOCOL = "moonraker-v1"
 STAGE_TTL = 24 * 60 * 60
-# A staged upload whose notice the site never acknowledged is kept for retries this long, then expires like any other:
-# retention must stay bounded even if the site lacks the endpoint (a hub released ahead of its site build).
+STAGED_COPY_MAX_BYTES = 64 * 1024**2
+# A staged upload whose notice or copy the site never acknowledged is kept for retries this long, then expires like any
+# other: retention must stay bounded even if the site lacks the endpoint (a hub released ahead of its site build).
 NOTICE_TTL = 7 * 24 * 60 * 60
 MAX_RECORDS = 256
 MAX_SPOOL_BYTES = 4 * 1024**3
@@ -185,9 +186,10 @@ class StagedUploads:
     any network request. A killed process releases flock; the next start reuses
     the UID and relies on the site's atomic UID conflict check to recover a receipt.
     """
-    def __init__(self, spool_dir, health=None, *, notify_staged=None):
+    def __init__(self, spool_dir, health=None, *, notify_staged=None, copy_staged=None):
         self.health = health or DoorHealth()
         self.notify_staged = notify_staged
+        self.copy_staged = copy_staged
         self.spool = Path(spool_dir)
         self.spool.mkdir(parents=True, exist_ok=True)
         self.db_path = self.spool / ".moonraker.sqlite3"
@@ -207,7 +209,8 @@ class StagedUploads:
                 facts TEXT, job TEXT)""")
             if "released" not in {r["name"] for r in db.execute("PRAGMA table_info(uploads)")}:
                 db.execute("ALTER TABLE uploads ADD COLUMN released INTEGER NOT NULL DEFAULT 0")
-            for column, kind in (("notified_at", "REAL"), ("notice", "TEXT")):
+            for column, kind in (("notified_at", "REAL"), ("notice", "TEXT"),
+                                 ("copy_upload_id", "TEXT"), ("copied_at", "REAL")):
                 if column not in {r["name"] for r in db.execute("PRAGMA table_info(uploads)")}:
                     db.execute(f"ALTER TABLE uploads ADD COLUMN {column} {kind}")
             os.chmod(self.db_path, 0o600)
@@ -254,8 +257,11 @@ class StagedUploads:
 
     def _clean(self, db):
         rows = db.execute("""SELECT uid FROM uploads WHERE state='receiving'
-                          OR ((notice IS NULL OR created < ?) AND ((state='queued' AND released=1)
-                          OR (state='staged' AND max(created, coalesce(notified_at, created)) < ?)))""",
+                          OR (state='staged' AND released=1)
+                          OR (((notice IS NULL AND (copy_upload_id IS NULL OR copied_at IS NOT NULL)) OR created < ?)
+                          AND ((state='queued' AND released=1)
+                          OR (state='staged' AND max(created, coalesce(notified_at, created),
+                                                   coalesce(copied_at, created)) < ?)))""",
                           (time.time() - NOTICE_TTL, time.time() - STAGE_TTL)).fetchall()
         for row in rows:
             self._remove(db, row["uid"])
@@ -263,7 +269,7 @@ class StagedUploads:
         if rows:
             log.info("moonraker expiry processed=%d expected=%d", len(rows), len(rows))
 
-    def release(self, job_ids):
+    def release(self, job_ids, upload_uids=()):
         """Only a confirmed handover or explicit site release can reclaim a queued file.
 
         Mark first: interrupted deletion is retried on startup/maintenance. SUBMITTING
@@ -272,6 +278,8 @@ class StagedUploads:
         with self.locked(blocking=False) as db:
             for job_id in job_ids:
                 db.execute("UPDATE uploads SET released=1 WHERE state='queued' AND job=?", (job_id,))
+            for uid in upload_uids:
+                db.execute("UPDATE uploads SET released=1 WHERE state='staged' AND uid=?", (uid,))
             self._clean(db)
 
     def maintain(self):
@@ -281,11 +289,15 @@ class StagedUploads:
             with self.locked(blocking=False) as db:
                 self._clean(db)
                 self._last_clean = time.monotonic()
-                pending = [r["uid"] for r in db.execute("SELECT uid FROM uploads WHERE notice IS NOT NULL")]
+                pending = [r["uid"] for r in db.execute("""SELECT uid FROM uploads WHERE
+                           NOT (state='staged' AND released=1) AND
+                           (notice IS NOT NULL OR (copy_upload_id IS NOT NULL AND copied_at IS NULL))""")]
                 if self.notify_staged and pending and (self._retry_worker is None or not self._retry_worker.is_alive()):
-                    self._retry_worker = threading.Thread(target=self._retry_notices, args=(pending,),
-                                                          name="moonraker-staged-retry", daemon=True)
-                    self._retry_worker.start()
+                    worker = self._retry_worker = threading.Thread(target=self._retry_notices, args=(pending,),
+                                                                   name="moonraker-staged-retry", daemon=True)
+                else:
+                    return
+            worker.start()
         except DoorError:
             pass  # A live operation owns the files; try again on the next server tick.
         except (OSError, sqlite3.Error):
@@ -310,27 +322,41 @@ class StagedUploads:
             if uid in self._awaiting_reply or uid in self._notifying:
                 return
             self._notifying.add(uid)
+        operation = "notice"
         try:
             # Notice metadata is independent of file operations; even its short writes
             # must not make a simultaneous upload fail the nonblocking file lock.
             with self._database() as db:
-                row = db.execute("SELECT notice FROM uploads WHERE uid=?", (uid,)).fetchone()
-                if row is None or row["notice"] is None:
+                row = db.execute("SELECT * FROM uploads WHERE uid=?", (uid,)).fetchone()
+                if row is None or (row["state"] == "staged" and row["released"]):
                     return
-                body = json.loads(row["notice"])
-            result = self.notify_staged(body)
-            if (not isinstance(result, dict) or result.get("ok") is not True
-                    or not isinstance(result.get("uploadId"), str) or not result["uploadId"].strip()):
-                raise ValueError("Invalid staged notice acknowledgement")
+            if row["notice"] is not None:
+                result = self.notify_staged(json.loads(row["notice"]))
+                if (not isinstance(result, dict) or result.get("ok") is not True
+                        or not isinstance(result.get("uploadId"), str) or not result["uploadId"].strip()):
+                    raise ValueError("Invalid staged notice acknowledgement")
+                copy_id = result["uploadId"] if (Path(row["name"]).suffix.lower() == ".3mf"
+                                                 and row["size"] <= STAGED_COPY_MAX_BYTES) else None
+                with self._database() as db:
+                    db.execute("UPDATE uploads SET notified_at=?,notice=NULL,copy_upload_id=? WHERE uid=?",
+                               (time.time(), copy_id, uid))
+                with self._notice_lock:
+                    self._notice_failures.discard(uid)
+            operation = "file copy"
             with self._database() as db:
-                db.execute("UPDATE uploads SET notified_at=?,notice=NULL WHERE uid=?", (time.time(), uid))
+                row = db.execute("SELECT * FROM uploads WHERE uid=?", (uid,)).fetchone()
+            if (row is not None and row["copy_upload_id"] is not None and row["copied_at"] is None
+                    and not (row["state"] == "staged" and row["released"]) and self.copy_staged is not None):
+                self.copy_staged(row["copy_upload_id"], self.spool / uid / row["name"], row["size"])
+                with self._database() as db:
+                    db.execute("UPDATE uploads SET copied_at=? WHERE uid=?", (time.time(), uid))
             with self._notice_lock:
                 self._notice_failures.discard(uid)
         except Exception:
             with self._notice_lock:
                 if uid not in self._notice_failures:
                     self._notice_failures.add(uid)
-                    log.warning("Moonraker staged notice unconfirmed uid=%s; retained for retry", uid)
+                    log.warning("Moonraker staged %s unconfirmed uid=%s; retained for retry", operation, uid)
         finally:
             with self._notice_lock:
                 self._notifying.discard(uid)
@@ -410,7 +436,9 @@ class StagedUploads:
                     raise DoorError(503, "The stored job receipt is damaged. Ask the shop to reconcile it.")
                 return {"result": {"jobId": row["job"], "status": "queued"}}
             if (row["state"] == "staged" and row["notice"] is None
-                    and max(row["created"], row["notified_at"] or row["created"]) < time.time() - STAGE_TTL):
+                    and (row["copy_upload_id"] is None or row["copied_at"] is not None)
+                    and max(row["created"], row["notified_at"] or row["created"],
+                            row["copied_at"] or row["created"]) < time.time() - STAGE_TTL):
                 self._remove(db, uid)
                 raise DoorError(410, "Staged upload expired; upload it again.")
             target = self.spool / uid / name
@@ -452,9 +480,9 @@ class StagedUploads:
 
 
 class MoonrakerDoor:
-    def __init__(self, spool_dir, authorize, pools, health=None, *, hosts=None, notify_staged=None):
+    def __init__(self, spool_dir, authorize, pools, health=None, *, hosts=None, notify_staged=None, copy_staged=None):
         self.health = health or DoorHealth()
-        self.store = StagedUploads(spool_dir, self.health, notify_staged=notify_staged)
+        self.store = StagedUploads(spool_dir, self.health, notify_staged=notify_staged, copy_staged=copy_staged)
         self.authorize = authorize
         self.pools = pools
         self.hosts = dict(DEFAULT_MOONRAKER_HOSTS if hosts is None else hosts)

@@ -997,7 +997,7 @@ class TestRunLoopShutdown(unittest.TestCase):
             def moonraker_health(self):
                 return {"state": "off", "refusals": {}}
 
-            def reconcile_moonraker(self, reports, released_jobs=()):
+            def reconcile_moonraker(self, reports, released_jobs=(), released_uploads=()):
                 return True
 
             def __init__(self, *args, **kwargs):
@@ -1058,7 +1058,7 @@ class TestRunLoopShutdown(unittest.TestCase):
             def moonraker_health(self):
                 return {"state": "off", "refusals": {}}
 
-            def reconcile_moonraker(self, reports, released_jobs=()):
+            def reconcile_moonraker(self, reports, released_jobs=(), released_uploads=()):
                 return True
 
             def __init__(self, *args, **kwargs):
@@ -1112,7 +1112,7 @@ class TestRunLoopShutdown(unittest.TestCase):
             def moonraker_health(self):
                 return {"state": "off", "refusals": {}}
 
-            def reconcile_moonraker(self, reports, released_jobs=()):
+            def reconcile_moonraker(self, reports, released_jobs=(), released_uploads=()):
                 return True
 
             def __init__(self, *args, **kwargs):
@@ -1163,7 +1163,7 @@ class TestRunLoopShutdown(unittest.TestCase):
             def moonraker_health(self):
                 return {"state": "off", "refusals": {}}
 
-            def reconcile_moonraker(self, reports, released_jobs=()):
+            def reconcile_moonraker(self, reports, released_jobs=(), released_uploads=()):
                 return True
 
             def __init__(self, *args, **kwargs):

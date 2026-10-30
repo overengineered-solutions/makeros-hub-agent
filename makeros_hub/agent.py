@@ -30,6 +30,7 @@ import time
 from collections import OrderedDict
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import quote
 
 from . import __version__
 from . import report_outbox
@@ -184,6 +185,17 @@ def make_staged_notice(cfg: Config, credential: str):
             raise TransportError("staged notice was not acknowledged")
         return response.body
     return notify
+
+
+def make_staged_file_copy(cfg: Config, credential: str):
+    """Stream the original file once; the staged store persists and retries the receipt."""
+    def copy(upload_id, path, size):
+        with path.open("rb") as stream:
+            status = post_bytes(f"{cfg.vp_staged_url}/{quote(upload_id, safe='')}/file", stream,
+                                method="PUT", content_length=size, bearer=credential, timeout=30)
+        if status != 200:
+            raise TransportError("staged file copy was not acknowledged")
+    return copy
 
 
 def make_moonraker_authorize(cfg: Config, credential: str):
@@ -1727,6 +1739,7 @@ def run(
             max_bytes=cfg.max_upload_mb * 1024 * 1024,
             moonraker_authorize=make_moonraker_authorize(cfg, credential),
             moonraker_staged=make_staged_notice(cfg, credential),
+            moonraker_copy=make_staged_file_copy(cfg, credential),
             moonraker_pools=moonraker_pools,
             moonraker_pool=cfg.moonraker_pool,
             moonraker_hosts=cfg.moonraker_hosts,
@@ -2123,7 +2136,8 @@ def run(
                 if resp.status == 200:
                     _validate_heartbeat(resp.body)
                     if ingest is not None:
-                        ingest.reconcile_moonraker([], resp.body.get("moonrakerReleasedJobs", []))
+                        ingest.reconcile_moonraker([], resp.body.get("moonrakerReleasedJobs", []),
+                                                  resp.body.get("moonrakerReleasedUploads", []))
                     try:
                         manager.update_screens(resp.body, screen_events)
                     except Exception as exc:  # a screen failure must not lose the print/command acknowledgements

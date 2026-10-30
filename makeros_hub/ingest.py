@@ -448,7 +448,7 @@ class IngestServer:
 
     def __init__(self, submit_fn: SubmitFn, *, port: int, spool_dir: Path, max_bytes: int,
                  moonraker_authorize=None, moonraker_pools=None, moonraker_pool="p2s",
-                 members_tailscale_socket=None, moonraker_hosts=None, moonraker_staged=None):
+                 members_tailscale_socket=None, moonraker_hosts=None, moonraker_staged=None, moonraker_copy=None):
         self.port = port
         spool_dir.mkdir(parents=True, exist_ok=True)
         handler = make_handler(submit_fn, spool_dir, max_bytes)
@@ -457,7 +457,8 @@ class IngestServer:
         if moonraker_pool and moonraker_authorize is not None:
             try:
                 handler.moonraker = MoonrakerDoor(spool_dir, moonraker_authorize, moonraker_pools or LivePools(),
-                                                self._door_health, hosts=moonraker_hosts, notify_staged=moonraker_staged)
+                                                self._door_health, hosts=moonraker_hosts, notify_staged=moonraker_staged,
+                                                copy_staged=moonraker_copy)
                 handler.model_pool = moonraker_pool
             except Exception:  # noqa: BLE001 — the staff trial's store must never take member ingest or the hub down
                 self._door_health.set_state("store_unavailable")
@@ -467,7 +468,7 @@ class IngestServer:
     def moonraker_health(self):
         return self._door_health.snapshot()
 
-    def reconcile_moonraker(self, reports, released_jobs=()):
+    def reconcile_moonraker(self, reports, released_jobs=(), released_uploads=()):
         door = self._server.RequestHandlerClass.moonraker
         if door is None:
             return True
@@ -477,9 +478,13 @@ class IngestServer:
         if isinstance(released_jobs, (list, tuple)) and len(released_jobs) <= 256 and all(
                 isinstance(j, str) and 0 < len(j) <= 128 for j in released_jobs):
             jobs.update(released_jobs)
-        if jobs:
+        uploads = []
+        if isinstance(released_uploads, (list, tuple)) and len(released_uploads) <= 256 and all(
+                isinstance(uid, str) and re.fullmatch(r"[0-9a-f]{32}", uid) for uid in released_uploads):
+            uploads = released_uploads
+        if jobs or uploads:
             try:
-                door.store.release(jobs)
+                door.store.release(jobs, uploads)
             except DoorError:
                 return False  # An upload/start owns the lock; retain the report and retry next heartbeat.
             except Exception:

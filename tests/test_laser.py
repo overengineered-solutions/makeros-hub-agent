@@ -898,7 +898,7 @@ class H9RunLoop(Base):
             def moonraker_health(self):
                 return {"state": "off", "refusals": {}}
 
-            def reconcile_moonraker(self, reports, released_jobs=()):
+            def reconcile_moonraker(self, reports, released_jobs=(), released_uploads=()):
                 releases.append((list(reports), released_jobs))
                 return True
 

@@ -26,14 +26,39 @@ HTTP 200 `{ok:true,uploadId:<nonempty string>}`. The site must authenticate the 
 the existing member/model gates, and atomically deduplicate on the hub's `submissionUid`, binding it to the member and
 immutable file facts. A repeated identical notice returns the same receipt, without adding another upload or job.
 
-The uploads table gains nullable `notified_at` and `notice` columns. The pending notice (including the member token) is
+The uploads table gains nullable `notified_at`, `notice`, `copy_upload_id` and `copied_at` columns. The pending notice (including the member token) is
 committed with the staged row in the private mode-0600 database. A confirmed acknowledgement sets `notified_at` and clears
 the payload with SQLite secure deletion enabled. Failures log one warning per upload per process until acknowledged,
 with UID only, never token, response body or exception text. The existing minute maintenance pass starts a separate retry
 worker; network waits hold neither the file-operation lock nor the listener thread. An unacknowledged notice and its file
-survive restart, normal expiry and release cleanup. After acknowledgement an unstarted upload has at least 24 hours of
-retention. Existing quotas still refuse new uploads when full; they never evict pending notices. Older rows migrate in
-place; they have no saved member token and cannot be retroactively notified.
+survive restart, normal expiry and job-release cleanup until acknowledged or explicitly released as an unused upload.
+The former seven-day cutoff is removed so a prolonged site outage cannot discard pending work; spool quotas bound storage.
+After acknowledgement an unstarted upload has at least 24 hours of retention. Existing quotas still refuse new uploads
+when full; they never evict pending work to make room. Older rows migrate in place; they have no saved member token and
+cannot be retroactively notified.
+
+After the notice is acknowledged, a `.3mf` of **at most 64 MiB** is streamed unchanged to
+`PUT /api/print/hub/vp-staged/<uploadId>/file`, with the hub bearer, `Content-Type: application/octet-stream` and
+`Content-Length`. The site checks the original size and SHA-256 and keeps the bytes for its reslice flow. G-code and
+larger 3MF files are not copied; their notices already describe the file type and size. The eligible file's `uploadId`
+is persisted in `copy_upload_id` with the notice acknowledgement before attempting the PUT. HTTP 200 records `copied_at`;
+an acknowledged notice or copy is not sent again. A lost remote/local acknowledgement retries the same UID or file URL,
+so the site must handle these retries idempotently.
+
+Copies run after Orca's flushed reply, following the immediate notice; neither request waits for a heartbeat. Copy
+failure logs one warning line per upload per process until success, containing only the UID. The same minute maintenance
+worker retries notices and copies, outside the file-operation lock and listener thread. A copy may finish before or
+after Start. A pending copy retains its spool across restart, expiry and ordinary job release until acknowledged or
+explicitly released as an unused upload. After a delayed copy succeeds, an unused stage has at least another 24 hours;
+a released job can then be cleaned up. Existing spool quotas bound this retention. Rows acknowledged by an older build
+without saving `uploadId` cannot be retroactively copied.
+
+A successful heartbeat may include `moonrakerReleasedUploads: [<submissionUid>, ...]` for deleted or expired unused
+uploads (at most 256 lowercase 32-hex UIDs). Only rows still in `staged` state are removed, including pending notices or
+copies; unknown or repeated UIDs are harmless. `queued` and uncertain `submitting` rows remain for ordinary job
+reconciliation. Cleanup persists a release marker before removing the spool directory and row, so a restart or
+maintenance pass completes interrupted deletion. A busy file lock defers cleanup; the site must repeat the release
+list on later heartbeats while cleanup may still be needed. This does not change `moonrakerReleasedJobs` handling.
 
 Fresh session authorization remains required before an upload or start. If the notice endpoint fails after authorization,
 the local upload still succeeds and is retried. An authorization outage still returns 503; revoked tokens still return
@@ -223,8 +248,8 @@ operations; SQLite FULL synchronization records
 recovers the same UID, and a recorded receipt is replayed without another cloud submission. A new upload intentionally
 creates a new UID, even for identical bytes.
 
-Unstarted uploads expire after 24 hours (pending notices extend retention as described above); interrupted receiving files
-are removed on startup/maintenance. Queued files with no pending notice
+Unstarted uploads expire after 24 hours (pending notices/copies extend retention as described above); interrupted receiving files
+are removed on startup/maintenance. Queued files with no pending notice or copy
 and their records are released after the existing durable queue reports prove `printing` or `completed`. `uploading`,
 `held`, an absent assignment, a timeout, or a failed start is not proof of handover. Before those reports can be acknowledged
 and removed from the outbox, reconciliation must succeed. A busy upload/start lock defers cleanup to the next heartbeat

@@ -94,8 +94,9 @@ def post_bytes(
     timeout: float = 15.0,
     extra_headers: dict[str, str] | None = None,
     response_body: bool = False,
+    method: str = "POST",
 ) -> int | Response:
-    """POST bytes or a file stream (with content_length); return status, or Response when response_body is requested.
+    """Send bytes or a file stream (with content_length); return status, or Response when response_body is requested.
     Files and camera frames travel separately from the size-capped heartbeat. Raises TransportError on a network
     failure; callers are best-effort (a failed upload must never sink the heartbeat)."""
     headers = {**(extra_headers or {}), "Content-Type": content_type}
@@ -106,7 +107,7 @@ def post_bytes(
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
     try:
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         with _OPENER.open(req, timeout=timeout) as resp:
             raw = _read_capped(resp)  # drain (bounded) so the socket can be reused
             return _parse(resp.status, raw) if response_body else resp.status
