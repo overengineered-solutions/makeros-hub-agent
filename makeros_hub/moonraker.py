@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import base64
 import copy
 import fcntl
@@ -31,6 +32,9 @@ log = logging.getLogger("makeros-hub.moonraker")
 CONTROLS = "Use the PS site's Your prints and printer controls. This door only stages files and queues prints."
 PROTOCOL = "moonraker-v1"
 STAGE_TTL = 24 * 60 * 60
+# A staged upload whose notice the site never acknowledged is kept for retries this long, then expires like any other:
+# retention must stay bounded even if the site lacks the endpoint (a hub released ahead of its site build).
+NOTICE_TTL = 7 * 24 * 60 * 60
 MAX_RECORDS = 256
 MAX_SPOOL_BYTES = 4 * 1024**3
 MAX_MEMBER_STAGES = 16
@@ -181,13 +185,19 @@ class StagedUploads:
     any network request. A killed process releases flock; the next start reuses
     the UID and relies on the site's atomic UID conflict check to recover a receipt.
     """
-    def __init__(self, spool_dir, health=None):
+    def __init__(self, spool_dir, health=None, *, notify_staged=None):
         self.health = health or DoorHealth()
+        self.notify_staged = notify_staged
         self.spool = Path(spool_dir)
         self.spool.mkdir(parents=True, exist_ok=True)
         self.db_path = self.spool / ".moonraker.sqlite3"
         self.lock_path = self.spool / ".moonraker.lock"
         self._thread_lock = threading.Lock()
+        self._notice_lock = threading.Lock()
+        self._awaiting_reply = set()
+        self._notifying = set()
+        self._notice_failures = set()
+        self._retry_worker = None
         self._last_clean = 0.0
         with self.locked() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS uploads (
@@ -197,9 +207,24 @@ class StagedUploads:
                 facts TEXT, job TEXT)""")
             if "released" not in {r["name"] for r in db.execute("PRAGMA table_info(uploads)")}:
                 db.execute("ALTER TABLE uploads ADD COLUMN released INTEGER NOT NULL DEFAULT 0")
+            for column, kind in (("notified_at", "REAL"), ("notice", "TEXT")):
+                if column not in {r["name"] for r in db.execute("PRAGMA table_info(uploads)")}:
+                    db.execute(f"ALTER TABLE uploads ADD COLUMN {column} {kind}")
             os.chmod(self.db_path, 0o600)
             _sync_dir(self.spool)
             self._clean(db)
+            self._last_clean = time.monotonic()
+
+    @contextmanager
+    def _database(self):
+        db = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
+        try:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("PRAGMA secure_delete=ON")
+            yield db
+        finally:
+            db.close()
 
     @contextmanager
     def locked(self, blocking=True):
@@ -212,13 +237,8 @@ class StagedUploads:
                     fcntl.flock(lock, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
                 except BlockingIOError:
                     raise DoorError(503, "Another file operation is in progress. Retry shortly.") from None
-                db = sqlite3.connect(self.db_path, isolation_level=None, timeout=5)
-                try:
-                    db.row_factory = sqlite3.Row
-                    db.execute("PRAGMA synchronous=FULL")
+                with self._database() as db:
                     yield db
-                finally:
-                    db.close()
         finally:
             self._thread_lock.release()
 
@@ -229,14 +249,16 @@ class StagedUploads:
             shutil.rmtree(directory)
             _sync_dir(self.spool)
         db.execute("DELETE FROM uploads WHERE uid = ?", (uid,))
+        with self._notice_lock:
+            self._notice_failures.discard(uid)
 
     def _clean(self, db):
         rows = db.execute("""SELECT uid FROM uploads WHERE state='receiving'
-                          OR (state='queued' AND released=1) OR (state='staged' AND created < ?)""",
-                          (time.time() - STAGE_TTL,)).fetchall()
+                          OR ((notice IS NULL OR created < ?) AND ((state='queued' AND released=1)
+                          OR (state='staged' AND max(created, coalesce(notified_at, created)) < ?)))""",
+                          (time.time() - NOTICE_TTL, time.time() - STAGE_TTL)).fetchall()
         for row in rows:
             self._remove(db, row["uid"])
-        self._last_clean = time.monotonic()
         self.health.set_state("ok")
         if rows:
             log.info("moonraker expiry processed=%d expected=%d", len(rows), len(rows))
@@ -258,12 +280,60 @@ class StagedUploads:
         try:
             with self.locked(blocking=False) as db:
                 self._clean(db)
+                self._last_clean = time.monotonic()
+                pending = [r["uid"] for r in db.execute("SELECT uid FROM uploads WHERE notice IS NOT NULL")]
+                if self.notify_staged and pending and (self._retry_worker is None or not self._retry_worker.is_alive()):
+                    self._retry_worker = threading.Thread(target=self._retry_notices, args=(pending,),
+                                                          name="moonraker-staged-retry", daemon=True)
+                    self._retry_worker.start()
         except DoorError:
             pass  # A live operation owns the files; try again on the next server tick.
         except (OSError, sqlite3.Error):
             self.health.set_state("store_unavailable")
             self._last_clean = time.monotonic()  # retry in a minute, not on every 0.1 s tick of every listener
             log.exception("Moonraker staged-file maintenance failed; files retained")
+
+    def _retry_notices(self, pending):
+        for uid in pending:
+            self.notify(uid)
+
+    def upload_replied(self, uid):
+        with self._notice_lock:
+            self._awaiting_reply.discard(uid)
+        self.notify(uid)
+
+    def notify(self, uid):
+        """No network under the file lock; failures cannot change the upload reply."""
+        if self.notify_staged is None:
+            return
+        with self._notice_lock:
+            if uid in self._awaiting_reply or uid in self._notifying:
+                return
+            self._notifying.add(uid)
+        try:
+            # Notice metadata is independent of file operations; even its short writes
+            # must not make a simultaneous upload fail the nonblocking file lock.
+            with self._database() as db:
+                row = db.execute("SELECT notice FROM uploads WHERE uid=?", (uid,)).fetchone()
+                if row is None or row["notice"] is None:
+                    return
+                body = json.loads(row["notice"])
+            result = self.notify_staged(body)
+            if (not isinstance(result, dict) or result.get("ok") is not True
+                    or not isinstance(result.get("uploadId"), str) or not result["uploadId"].strip()):
+                raise ValueError("Invalid staged notice acknowledgement")
+            with self._database() as db:
+                db.execute("UPDATE uploads SET notified_at=?,notice=NULL WHERE uid=?", (time.time(), uid))
+            with self._notice_lock:
+                self._notice_failures.discard(uid)
+        except Exception:
+            with self._notice_lock:
+                if uid not in self._notice_failures:
+                    self._notice_failures.add(uid)
+                    log.warning("Moonraker staged notice unconfirmed uid=%s; retained for retry", uid)
+        finally:
+            with self._notice_lock:
+                self._notifying.discard(uid)
 
     def check_room(self, db, length, member):
         from .ingest import MIN_FREE_BYTES
@@ -274,7 +344,7 @@ class StagedUploads:
         if shutil.disk_usage(self.spool).free < length + MIN_FREE_BYTES:
             raise DoorError(507, "The shop must free spool disk space before another upload.")
 
-    def upload(self, handler, access, length, boundary):
+    def upload(self, handler, access, length, boundary, token):
         from .ingest import _safe_filename
         with self.locked(blocking=False) as db:
             self._clean(db)
@@ -301,15 +371,28 @@ class StagedUploads:
                 target = directory / name
                 pending.replace(target)
                 facts = read_file_facts(target, access["modelPool"], fields.get("plateindex"))
+                notice = None
+                if self.notify_staged is not None:
+                    notice = {"memberToken": token, "submissionUid": uid, "fileName": name,
+                              "fileSha256": sha, "fileSizeBytes": size, "printerModel": facts["printerModel"],
+                              "fileFacts": facts}
+                    if target.suffix.lower() == ".3mf":
+                        picture = plate_picture(target, facts["plate"])
+                        if picture is not None:
+                            notice["plateImage"] = base64.b64encode(picture).decode("ascii")
+                    notice["stagedAt"] = datetime.now(timezone.utc).isoformat()
                 _sync_dir(directory)
                 _sync_dir(self.spool)
-                db.execute("UPDATE uploads SET name=?,sha=?,size=?,facts=?,state='staged' WHERE uid=?",
-                           (name, sha, size, json.dumps(facts, sort_keys=True), uid))
+                db.execute("UPDATE uploads SET name=?,sha=?,size=?,facts=?,notice=?,state='staged' WHERE uid=?",
+                           (name, sha, size, json.dumps(facts, sort_keys=True),
+                            json.dumps(notice) if notice is not None else None, uid))
             except Exception:
                 self._remove(db, uid)
                 raise
             result = {"item": {"path": f"{uid}/{name}", "root": "gcodes"},
                       "print_started": False, "print_queued": False}
+            with self._notice_lock:
+                self._awaiting_reply.add(uid)
             # INTERIM — keep result until the operator retires Orca 2.4.2; 2.5 reads the top level.
             return {**result, "result": result}
 
@@ -326,7 +409,8 @@ class StagedUploads:
                 if not isinstance(row["job"], str) or not row["job"].strip():
                     raise DoorError(503, "The stored job receipt is damaged. Ask the shop to reconcile it.")
                 return {"result": {"jobId": row["job"], "status": "queued"}}
-            if row["state"] == "staged" and row["created"] < time.time() - STAGE_TTL:
+            if (row["state"] == "staged" and row["notice"] is None
+                    and max(row["created"], row["notified_at"] or row["created"]) < time.time() - STAGE_TTL):
                 self._remove(db, uid)
                 raise DoorError(410, "Staged upload expired; upload it again.")
             target = self.spool / uid / name
@@ -368,9 +452,9 @@ class StagedUploads:
 
 
 class MoonrakerDoor:
-    def __init__(self, spool_dir, authorize, pools, health=None, *, hosts=None):
+    def __init__(self, spool_dir, authorize, pools, health=None, *, hosts=None, notify_staged=None):
         self.health = health or DoorHealth()
-        self.store = StagedUploads(spool_dir, self.health)
+        self.store = StagedUploads(spool_dir, self.health, notify_staged=notify_staged)
         self.authorize = authorize
         self.pools = pools
         self.hosts = dict(DEFAULT_MOONRAKER_HOSTS if hosts is None else hosts)
@@ -387,6 +471,7 @@ class MoonrakerDoor:
         hosts = handler.headers.get_all("Host", [])
         if len(hosts) == 1:
             pool = self.hosts.get(moonraker_hostname(hosts[0]), pool)
+        staged_uid = None
         try:
             allowed = {("GET", "/server/info"), ("GET", "/server/database/item"),
                        ("GET", "/server/files/roots"), ("POST", "/server/files/upload"),
@@ -429,7 +514,8 @@ class MoonrakerDoor:
                 if not handler.upload_slot.acquire(blocking=False):
                     raise DoorError(503, "Another upload is in progress. Retry shortly.")
                 try:
-                    result = self.store.upload(handler, access, length, boundary)
+                    result = self.store.upload(handler, access, length, boundary, token)
+                    staged_uid = result["item"]["path"].split("/")[0]
                 finally:
                     handler.upload_slot.release()
             else:
@@ -441,6 +527,8 @@ class MoonrakerDoor:
                     raise DoorError(400, "Start requires only the staged filename returned by upload.")
                 result = self.store.start(body["filename"], access, token, handler.submit_with_device)
             handler._json(201 if endpoint == "/server/files/upload" else 200, result)
+            if staged_uid:
+                handler.wfile.flush()
         except DoorError as exc:
             self._error(handler, exc.code, str(exc))
         except UploadTooLarge:
@@ -459,6 +547,9 @@ class MoonrakerDoor:
         except Exception:
             log.exception("Moonraker request failed; no cached success returned")
             self._error(handler, 503, "The shop's queue or loaded-spool refresh is unavailable. Retry shortly.")
+        finally:
+            if staged_uid:
+                self.store.upload_replied(staged_uid)
         return True
 
     @staticmethod

@@ -175,6 +175,10 @@ class Config:
     def vp_submit_url(self) -> str:
         return self.cloud_url.rstrip("/") + "/api/print/hub/vp-submit"
 
+    @property
+    def vp_staged_url(self) -> str:
+        return self.cloud_url.rstrip("/") + "/api/print/hub/vp-staged"
+
 
 @dataclass(frozen=True)
 class VirtualPrinterMember:

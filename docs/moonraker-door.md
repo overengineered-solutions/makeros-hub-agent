@@ -5,6 +5,53 @@ hub 0.89.1; this build has only local automated verification. The site contract 
 An old/unavailable site fails closed; neither the session check nor an upload creates a job. Nothing in this HTTP door sends
 commands to a printer. The normal cloud queue and existing final dispatch guards own physical printing.
 
+## 0.92.0: staged uploads and plate waits
+
+Paired site build: `uploads-plates-2026-10-30`. Upload-only now registers an **uploaded, processing** record on the site;
+it still creates no queue job. After saving and syncing the file, hash, facts and optional selected-plate picture, the
+hub flushes Orca's existing HTTP 201 response, then immediately sends the notice in that request's own worker. It does
+not wait for a heartbeat or for the notice before answering Orca. The site must persist and display the record promptly
+to meet the one-second visibility target; network/site latency and outages can delay visibility.
+
+The new hub-bearer-authenticated endpoint is `POST /api/print/hub/vp-staged`, using the same hub credential as `vp-submit`:
+
+```text
+{memberToken, submissionUid, fileName, fileSha256, fileSizeBytes,
+ printerModel, fileFacts, plateImage?, stagedAt}
+```
+
+`fileFacts` is the existing version-1 object below. `plateImage` is the optional base64 PNG described under plate pictures;
+G-code omits it. `stagedAt` is the UTC ISO timestamp when staging finished and stays unchanged on retries. Success is
+HTTP 200 `{ok:true,uploadId:<nonempty string>}`. The site must authenticate the hub and resolve the member token, enforce
+the existing member/model gates, and atomically deduplicate on the hub's `submissionUid`, binding it to the member and
+immutable file facts. A repeated identical notice returns the same receipt, without adding another upload or job.
+
+The uploads table gains nullable `notified_at` and `notice` columns. The pending notice (including the member token) is
+committed with the staged row in the private mode-0600 database. A confirmed acknowledgement sets `notified_at` and clears
+the payload with SQLite secure deletion enabled. Failures log one warning per upload per process until acknowledged,
+with UID only, never token, response body or exception text. The existing minute maintenance pass starts a separate retry
+worker; network waits hold neither the file-operation lock nor the listener thread. An unacknowledged notice and its file
+survive restart, normal expiry and release cleanup. After acknowledgement an unstarted upload has at least 24 hours of
+retention. Existing quotas still refuse new uploads when full; they never evict pending notices. Older rows migrate in
+place; they have no saved member token and cannot be retroactively notified.
+
+Fresh session authorization remains required before an upload or start. If the notice endpoint fails after authorization,
+the local upload still succeeds and is retried. An authorization outage still returns 503; revoked tokens still return
+403. This change does not cache authorization or bypass nozzle validation.
+
+Start retains the existing `POST /api/print/hub/submit` route and `hubSubmissionUid` field. **The site must match that
+field to the staged endpoint's `submissionUid`**, promoting the same upload into one job. The separate Bambu virtual
+printer path still uses `/api/print/hub/vp-submit`. Deduplication must also cover a start arriving before a delayed notice:
+the late notice must reuse the job's upload identity and must not recreate an unqueued record or regress its status.
+Both submit endpoints must accept a plate that no printer currently has as an ordinary successful queued receipt with
+a site-visible wait reason, keeping physical dispatch blocked until compatible. A reason on a successful queued response
+is not a refusal. Token and nozzle refusals remain unchanged; a repeated start returns the original job receipt.
+
+The site build must supply the upload list/device-page display, timestamps, processing status, queue action, plate wait
+wording and the atomic promotion/deduplication above. It must preserve the existing staff/member gates and download checks.
+No real site, OrcaSlicer or printer has been tested here. The operator verifies those after the paired site is live and
+the hub target is set to **0.92.0**. This checkout's source/package versions remain unchanged for release review.
+
 ## Preset address
 
 Each model has its own hostname on the same hub address and port. Orca identifies a Moonraker connection by host and port,
@@ -20,7 +67,7 @@ If `ingest_port` changes, use that port in every preset. One listener serves bot
 | `http://sv08-printers.oes-mesh.internal:8787` | `sv08-max` | G-code, one filament |
 | `http://giga-printers.oes-mesh.internal:8787` | `giga` | G-code, one filament |
 
-These five mappings are the defaults for the optional `[moonraker_hosts]` table in `config.toml`:
+These five mappings are `DEFAULT_MOONRAKER_HOSTS`, the defaults for the optional `[moonraker_hosts]` table in `config.toml`:
 
 ```toml
 [moonraker_hosts]
@@ -170,12 +217,14 @@ site code come from the supplied review; no site files were edited here.
 ## Durability and limits
 
 Files use the existing `<spool>/<32-hex-submission-uid>/<safe-name>` layout. `.moonraker.sqlite3` stores ownership, facts,
-timestamps and receipt, never a token. A process/file lock spans file operations; SQLite FULL synchronization records
+timestamps and receipt, plus the private pending notice described for 0.92.0 above. A process/file lock spans file
+operations; SQLite FULL synchronization records
 `receiving → staged → submitting → queued`. Files/directories are fsynced before staging. Starts are serialized; a restart
 recovers the same UID, and a recorded receipt is replayed without another cloud submission. A new upload intentionally
 creates a new UID, even for identical bytes.
 
-Unstarted uploads expire after 24 hours; interrupted receiving files are removed on startup/maintenance. Queued files
+Unstarted uploads expire after 24 hours (pending notices extend retention as described above); interrupted receiving files
+are removed on startup/maintenance. Queued files with no pending notice
 and their records are released after the existing durable queue reports prove `printing` or `completed`. `uploading`,
 `held`, an absent assignment, a timeout, or a failed start is not proof of handover. Before those reports can be acknowledged
 and removed from the outbox, reconciliation must succeed. A busy upload/start lock defers cleanup to the next heartbeat

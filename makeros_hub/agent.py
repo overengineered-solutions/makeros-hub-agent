@@ -176,6 +176,16 @@ def make_cloud_submit(cfg: Config, credential: str, diagnostics=None):
     return submit
 
 
+def make_staged_notice(cfg: Config, credential: str):
+    """One attempt; the door owns durable retries and token-free failure logging."""
+    def notify(body):
+        response = post_json(cfg.vp_staged_url, body, bearer=credential, timeout=8, retries=0)
+        if response.status != 200:
+            raise TransportError("staged notice was not acknowledged")
+        return response.body
+    return notify
+
+
 def make_moonraker_authorize(cfg: Config, credential: str):
     """New read-only site contract, reusing hub-submit's print-token/eligibility resolver.
 
@@ -1716,6 +1726,7 @@ def run(
             spool_dir=SPOOL_DIR,
             max_bytes=cfg.max_upload_mb * 1024 * 1024,
             moonraker_authorize=make_moonraker_authorize(cfg, credential),
+            moonraker_staged=make_staged_notice(cfg, credential),
             moonraker_pools=moonraker_pools,
             moonraker_pool=cfg.moonraker_pool,
             moonraker_hosts=cfg.moonraker_hosts,
