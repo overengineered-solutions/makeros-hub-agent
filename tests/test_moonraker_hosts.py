@@ -5,10 +5,12 @@ import logging
 
 import pytest
 
-from makeros_hub import config, ingest, moonraker
+from makeros_hub import agent, config, ingest, moonraker
+from makeros_hub.http import Response
 from makeros_hub.printers.ingest_facts import POOLS
 from test_ingest import build_multipart
 from test_moonraker import door, gcode, threemf
+from test_ingest_facts_h2d import MISSING_MAP, NOZZLE_COUNT, h2d_threemf
 
 
 HOSTS = {
@@ -91,6 +93,8 @@ def test_each_host_scopes_authorization_lanes_upload_and_start(door, monkeypatch
     model_id = POOLS[pool][2]
     assert lanes["lane1"]["color"] == ("#ABCDEFFF" if model_id else "#123456FF")
     data = threemf(model=PROFILES[pool], model_id=model_id) if model_id else gcode(PROFILES[pool])
+    if pool == "h2d":
+        data = h2d_threemf()
     path = door.stage(host=host, name="part.3mf" if model_id else "part.gcode", data=data)
     assert (door.path / path).read_bytes() == data
     other = next(h for h, p in HOSTS.items() if p != pool)
@@ -100,6 +104,35 @@ def test_each_host_scopes_authorization_lanes_upload_and_start(door, monkeypatch
     assert door.auth_calls[-1] == ("alice", pool)
     assert door.calls[0]["file_facts"]["modelPool"] == pool
     assert door.calls[0]["printer_model"] == POOLS[pool][0]
+
+
+def test_h2d_host_submits_every_filaments_extruder_to_site(door, monkeypatch):
+    calls = []
+
+    def post(url, body, **kwargs):
+        calls.append((url, body))
+        return Response(200, {"ok": True, "jobId": "h2d-job", "submissionProtocol": moonraker.PROTOCOL})
+
+    monkeypatch.setattr(agent, "post_json", post)
+    submit = agent.make_cloud_submit(config.Config(cloud_url="https://site.invalid"), "synthetic-hub")
+    monkeypatch.setattr(door.server._server.RequestHandlerClass, "submit_with_device", staticmethod(submit))
+    host = "h2d-printers.oes-mesh.internal"
+    path = door.stage(host=host, name="h2d.3mf", data=h2d_threemf(stats=False))
+    assert calls == []
+    assert door.start(path, host=host)[0] == 200
+    assert len(calls) == 1 and calls[0][0] == "https://site.invalid/api/print/hub/submit"
+    body = calls[0][1]
+    assert body["fileFacts"]["modelPool"] == "h2d"
+    for filaments in (body["requiredFilaments"], body["fileFacts"]["requiredFilaments"]):
+        assert [(f["slot"], f["extruderId"], f["nozzleDiameterMm"]) for f in filaments] == [(1, 1, .4), (4, 0, .4)]
+
+
+@pytest.mark.parametrize("kwargs,message", [({"mapping": "no_groups"}, MISSING_MAP),
+                                          ({"nozzles": "0.4"}, NOZZLE_COUNT)])
+def test_h2d_nozzle_refusal_reaches_orca_without_submitting(door, kwargs, message):
+    status, body = door.upload(host="h2d-printers.oes-mesh.internal", name="h2d.3mf", data=h2d_threemf(**kwargs))
+    assert status == 400 and body["error"]["message"] == message
+    assert door.calls == [] and not list(door.path.glob("*/*.3mf"))
 
 
 def test_x1c_slice_via_p2s_host_keeps_existing_refusal(door):

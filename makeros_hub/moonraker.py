@@ -22,7 +22,7 @@ import xml.etree.ElementTree as ET
 from . import __version__, job_files
 from .config import DEFAULT_MOONRAKER_HOSTS, moonraker_hostname
 from .multipart import MultipartError, UploadTooLarge, boundary_from_content_type, stream_multipart
-from .printers.ingest_facts import POOLS, read_file_facts
+from .printers.ingest_facts import POOLS, NozzleFactsError, read_file_facts
 from .printers.threemf_objects import Unreadable3mf, plate_picture
 from .vprinter.capture import sha256_file
 from .vprinter.live_pool import vp_pool_from_statuses_ranked
@@ -565,6 +565,8 @@ class MoonrakerDoor:
             self._error(handler, 408, "Upload timed out. Retry the operation.")
         except EOFError:
             self._error(handler, 400, "The request body was truncated.")
+        except NozzleFactsError as exc:
+            self._error(handler, 400, str(exc))
         except (ValueError, KeyError, MultipartError, Unreadable3mf, zipfile.BadZipFile, ET.ParseError):
             log.warning("Moonraker request/file validation failed", exc_info=True)
             self._error(handler, 400, "Invalid request or sliced-file facts. Check the model, selected plate, filament and nozzle settings.")

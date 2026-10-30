@@ -89,10 +89,11 @@ If `ingest_port` changes, use that port in every preset. One listener serves bot
 | `http://p2s-printers.oes-mesh.internal:8787` | `p2s` | 3MF |
 | `http://x1c-printers.oes-mesh.internal:8787` | `x1c` | 3MF |
 | `http://a1mini-printers.oes-mesh.internal:8787` | `a1-mini` | 3MF, PLA only |
+| `http://h2d-printers.oes-mesh.internal:8787` | `h2d` | 3MF, two explicitly mapped nozzles |
 | `http://sv08-printers.oes-mesh.internal:8787` | `sv08-max` | G-code, one filament |
 | `http://giga-printers.oes-mesh.internal:8787` | `giga` | G-code, one filament |
 
-These five mappings are `DEFAULT_MOONRAKER_HOSTS`, the defaults for the optional `[moonraker_hosts]` table in `config.toml`:
+These six mappings are `DEFAULT_MOONRAKER_HOSTS`, the defaults for the optional `[moonraker_hosts]` table in `config.toml`:
 
 ```toml
 [moonraker_hosts]
@@ -101,10 +102,11 @@ These five mappings are `DEFAULT_MOONRAKER_HOSTS`, the defaults for the optional
 "a1mini-printers.oes-mesh.internal" = "a1-mini"
 "sv08-printers.oes-mesh.internal" = "sv08-max"
 "giga-printers.oes-mesh.internal" = "giga"
+"h2d-printers.oes-mesh.internal" = "h2d"
 ```
 
 An explicit table replaces the defaults; an empty table leaves every name using `moonraker_pool`. Put top-level settings
-before the table. An entry with an unknown pool (including H2D) or invalid DNS name logs one ERROR at config load and is
+before the table. An entry with an unknown pool or invalid DNS name logs one ERROR at config load and is
 ignored. A malformed table logs one ERROR and uses no host mappings. No request adds entries or changes configuration.
 
 Selection uses only the request's single `Host` header, ignoring case, its numeric port and one trailing dot. DNS names
@@ -114,7 +116,7 @@ in an absolute-form request line never select a pool. The selected pool applies 
 printers' lane data, upload model checks and staged-file ownership at start. A Host header supplies no authorization.
 
 The top-level fallback `moonraker_pool` setting in `config.toml` defaults to `"p2s"`. It accepts `p2s`, `sv08-max`, `giga`,
-`a1-mini` or `x1c`. An empty string disables the Moonraker door. An unknown name or a non-string value logs one ERROR
+`a1-mini`, `x1c` or `h2d`. An empty string disables the Moonraker door. An unknown name or a non-string value logs one ERROR
 and disables it; existing member ingest stays available. Restart the hub after a reviewed configuration change.
 A damaged Moonraker staged-file store also disables only the door. With the default fallback, today's
 `http://100.64.0.1:8787` P2S presets work unchanged. Disabling the door also disables all named Moonraker routes.
@@ -122,7 +124,7 @@ A damaged Moonraker staged-file store also disables only the door. With the defa
 Set `host_type=moonraker`, `printer_agent=moonraker`, and `printhost_apikey` to the member's existing **print token**.
 Leave `printhost_port` empty (or matching the inline port); set `print_host_webui` to the site's member print page.
 Use the matching non-Bambu-vendor PS preset: Bambu models use `use_3mf=1`; Sovol/Giga use `use_3mf=0`.
-H2D is unsupported because this door does not support dual nozzles. There is no model path prefix.
+H2D requires a slice for the PS H2D preset with explicit filament-to-nozzle mapping. There is no model path prefix.
 
 Testing remains **staff/admin only until the operator switches it on**. The site's session and submit gates must enforce
 that restriction; ordinary members keep their stock Bambu presets and virtual-printer sync.
@@ -168,13 +170,32 @@ false without rebuilding the AMS payload (`MoonrakerPrinterAgent.cpp:614–641,8
 that case is **not guaranteed**. Do not represent a stale GUI lane as a loaded spool. The operator must check this in the GUI.
 
 The original sliced bytes are preserved. G-code is limited to the known Klipper model aliases and one used filament/nozzle.
-Bambu requires a sliced 3MF, consistent native model ID (`N7`, `N1`, `BL-P001`), matching profile alias, selected plate,
-material/colour/nozzle facts and a single extruder. Missing or conflicting model IDs are refused, never stamped or repaired.
+Bambu requires a sliced 3MF, consistent native model ID (`N7`, `N1`, `BL-P001`, `O1D`), matching profile alias, selected plate,
+and material/colour/nozzle facts. Only H2D (`O1D`) accepts two extruders. Missing or conflicting model IDs are refused,
+never stamped or repaired.
 A1 mini remains PLA-only. Unknown weight/bed stays null; the site must review missing cost and apply its normal bed rules.
 The hub door reads the bed value but applies no Bambu bed admission check to any pool (`printers/ingest_facts.py`). There is
 therefore no hub Klipper exemption to add. A regression submits Klipper G-code without `curr_bed_type`; the paired site's
 admission must exempt Klipper from its Bambu bed rule just as its heartbeat does.
 Multi-plate files need an explicit plate; single-plate files can use their sole actual plate number.
+
+For H2D, the existing capture reader cross-checks each selected-plate filament's `group_id` (zero-based logical extruder)
+against that plate's `filament_maps` (one-based), then applies `Metadata/project_settings.config`'s
+`physical_extruder_map`. Each required filament carries `extruderId` (0 right, 1 left) and the corresponding G-code
+`nozzle_diameter` entry in logical extruder order. The header must name exactly two valid diameters even for a one-nozzle
+job. Missing/conflicting mapping is refused with: “This file does not say which nozzle each filament uses. Reslice it
+for the PS H2D preset.” No installed diameter is assumed; existing dispatch guards still compare against observed hardware.
+When G-code omits per-filament usage statistics, H2D takes used slots from the verified selected plate. Supplied statistics
+still must agree. The five single-extruder pools retain their prior facts and refusals.
+
+Local evidence (2026-10-30): the existing Orca 2.4.2 fixture
+`tests/fixtures/h2d-auto-for-match-2026-10-20.slice_info.config`, `capture._route_nozzles`, and the slicer wrapper's
+`nozzle_map`; read-only inspection also found 104 H2D archives under the operator's Windows
+`usb-h2d-backup-2026-10-28` directory. `02FloorPlates.gcode.3mf` (plate 1, right), `36x-Clips.gcode.3mf` (plate 4, left),
+and `FlyingProp-Set-Quality.gcode.3mf` (plate 1, both) carry the mapping above and `nozzle_diameter = 0.4,0.4`.
+Their project-wide `filament_map` differs from the selected plate, so it is deliberately not a fallback. Older exports
+missing `group_id`, such as `Ceiling.gcode.3mf`, require reslicing. No upstream slicer source checkout was found;
+OrcaSlicer, the live site and physical H2D operation remain unverified.
 
 ## Site changes required (separate repository)
 
@@ -210,7 +231,8 @@ site code come from the supplied review; no site files were edited here.
    ```
 
    `bedType` and `estGrams` may be null; Klipper `printerModelId` is null. Filaments use the existing schema, optionally
-   carrying `trayInfoIdx`/`idx` and `extruderId:0`. Validate agreement between top-level and nested facts. Protocol requests
+   carrying `trayInfoIdx`/`idx` and optional `extruderId:0` for single-extruder pools; H2D requires `extruderId:0|1` on every
+   filament and a matching installed nozzle for that extruder. Validate agreement between top-level and nested facts. Protocol requests
    require `printNow:true`; reject false/missing before any job insert. Upload-only never reaches this route.
    Extend the currently Klipper-only auto-targeting to the supported Bambu models using the existing eligibility,
    material/nozzle/bed, loaded-spool matching and missing-cost-review rules. Canonical models/aliases are in

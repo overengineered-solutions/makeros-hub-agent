@@ -9,7 +9,7 @@ import struct
 import zipfile
 import xml.etree.ElementTree as ET
 
-from .gcode_meta import GCODE_SUFFIXES, read_gcode_stream
+from .gcode_meta import GCODE_SUFFIXES, NozzleFactsError, read_gcode_stream
 from .threemf_objects import check_plate_entry, gcode_plates, plate_named
 from ..vprinter.capture import MAX_SLICE_INFO_BYTES, _vp_submit_filament, parse_required_filaments
 
@@ -67,6 +67,7 @@ def _check_zip(archive):
 
 def read_file_facts(path, pool: str, plateindex=None) -> dict:
     model, aliases, model_id = POOLS[pool]
+    extruder_count = 2 if model_id == "O1D" else 1
     plate = plate_named(plateindex)
     if plateindex is not None and plate is None:
         raise ValueError("plateindex must be a number from 1 to 64")
@@ -99,14 +100,22 @@ def read_file_facts(path, pool: str, plateindex=None) -> dict:
             declared = plates[0].findall("filament")
             slots = [f.get("id") for f in declared]
             if (not slots or any(s is None for s in slots) or len(slots) != len(set(slots))
-                    or any(f.get("group_id", "0") != "0" for f in declared)):
+                    or (extruder_count == 1 and any(f.get("group_id", "0") != "0" for f in declared))):
                 raise ValueError("Selected plate must name each filament once, on a single extruder")
             ids = {m.get("value", "").strip() for m in root.iter("metadata") if m.get("key") == "printer_model_id"}
             if ids != {model_id}:
                 raise ValueError("3MF model ID is missing, unknown or conflicts with the model URL")
+            filaments = [_vp_submit_filament(f) for f in parse_required_filaments(path, plate)]
+            groups = None
+            if extruder_count == 2:
+                # The shared reader cross-checks plate group_id/filament_maps and the project's physical map.
+                if (any(f.get("group_id") not in {"0", "1"} for f in declared)
+                        or not filaments or any(type(f.get("extruderId")) is not int
+                                                or f["extruderId"] not in (0, 1) for f in filaments)):
+                    raise NozzleFactsError("This file does not say which nozzle each filament uses. Reslice it for the PS H2D preset.")
+                groups = {int(f.get("id")): int(f.get("group_id")) for f in declared}
             with archive.open(f"Metadata/plate_{plate}.gcode") as stream:
-                meta, config = read_gcode_stream(stream)
-        filaments = [_vp_submit_filament(f) for f in parse_required_filaments(path, plate)]
+                meta, config = read_gcode_stream(stream, filament_groups=groups)
         # Do not silently prefer either producer when the two descriptions conflict.
         gc_filaments = {f["slot"]: f for f in meta["requiredFilaments"]}
         if set(gc_filaments) != {f.get("slot") for f in filaments}:
@@ -135,7 +144,7 @@ def read_file_facts(path, pool: str, plateindex=None) -> dict:
                 or type(f.get("nozzleDiameterMm")) not in (int, float)
                 or not 0 < f["nozzleDiameterMm"] <= 2):
             raise ValueError("File must identify each used filament's material, colour and nozzle diameter")
-        if "extruderId" in f and f["extruderId"] != 0:
+        if extruder_count == 1 and "extruderId" in f and f["extruderId"] != 0:
             raise ValueError("This model URL does not support a second extruder")
         if pool == "a1-mini" and not f["type"].upper().startswith("PLA"):
             raise ValueError("The shop's A1 minis print PLA only")

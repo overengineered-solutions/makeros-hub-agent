@@ -29,6 +29,10 @@ _BLOCK_START = "; CONFIG_BLOCK_START"
 _BLOCK_END = "; CONFIG_BLOCK_END"
 
 
+class NozzleFactsError(ValueError):
+    """A fixed, member-safe nozzle refusal that the upload door may display."""
+
+
 def _pairs(text: str) -> dict[str, str]:
     """First "; key = value" per key (the tail window comes first, so the end-of-file block wins)."""
     out: dict[str, str] = {}
@@ -72,8 +76,8 @@ def read_gcode_meta(path) -> dict[str, Any] | None:
         return read_gcode_stream(fh)[0]
 
 
-def read_gcode_stream(fh) -> tuple[dict[str, Any], dict[str, str]]:
-    """The same facts from a seekable file or bounded, selected ZIP entry, plus its config."""
+def read_gcode_stream(fh, *, filament_groups: dict[int, int] | None = None) -> tuple[dict[str, Any], dict[str, str]]:
+    """File/ZIP facts plus config; H2D filament_groups names verified logical extruder indices by slot."""
     size = fh.seek(0, 2)
     tail_at = max(0, size - WINDOW_BYTES)
     fh.seek(tail_at)
@@ -90,19 +94,29 @@ def read_gcode_stream(fh) -> tuple[dict[str, Any], dict[str, str]]:
         stats.setdefault(key, value)
 
     model = config.get("printer_model", "").strip().strip('"').strip()[:MODEL_MAX_CHARS] or None
-    # One-extruder G-code only: a multi-extruder file needs an explicit physical map, never a guessed index.
+    # Nozzle sizes follow logical extruder order, not physical left/right or filament slot order.
     nozzles = _numbers(config.get("nozzle_diameter") or stats.get("nozzle_diameter"))
     diameter = nozzles[0] if len(nozzles) == 1 else None
+    if filament_groups is not None:
+        if len(nozzles) != 2:
+            raise NozzleFactsError("This file's G-code must name exactly two nozzle diameters. Reslice it for the PS H2D preset.")
+        if any(n is None or not 0 < n <= 2 for n in nozzles):
+            raise NozzleFactsError("This file's G-code must name two valid nozzle diameters. Reslice it for the PS H2D preset.")
     types = _list(config.get("filament_type"))
     colours = _list(config.get("filament_colour"))
     used_mm = _numbers(stats.get("filament used [mm]"))
     used_g = _numbers(stats.get("filament used [g]"))   # exact key: "total filament used [g]" is a different key
 
     slots = [i for i, mm in enumerate(used_mm, 1) if mm and mm > 0] if used_mm else list(range(1, len(types) + 1))
+    if not used_mm and filament_groups is not None:
+        slots = sorted(filament_groups)  # H2D exports can omit usage stats; the selected plate names used slots.
     filaments: list[dict[str, Any]] = []
     grams: list[float] = []
     for slot in slots:
         item: dict[str, Any] = {"slot": slot}
+        if filament_groups is not None:
+            group = filament_groups.get(slot)
+            diameter = nozzles[group] if group in (0, 1) else None
         if diameter is not None and 0 < diameter <= 2:
             item["nozzleDiameterMm"] = diameter
         if slot <= len(types) and types[slot - 1]:
