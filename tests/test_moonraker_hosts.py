@@ -17,9 +17,10 @@ HOSTS = {
     "a1mini-printers.oes-mesh.internal": "a1-mini",
     "sv08-printers.oes-mesh.internal": "sv08-max",
     "giga-printers.oes-mesh.internal": "giga",
+    "h2d-printers.oes-mesh.internal": "h2d",
 }
 PROFILES = {"p2s": "PS P2S", "x1c": "PS X1 Carbon", "a1-mini": "PS A1 mini",
-            "sv08-max": "PS SV08 MAX", "giga": "PS Giga"}
+            "sv08-max": "PS SV08 MAX", "giga": "PS Giga", "h2d": "PS H2D"}
 
 
 def test_config_defaults_and_normalized_replacement_table(tmp_path, monkeypatch):
@@ -47,7 +48,7 @@ def test_invalid_host_config_keeps_fallback_and_logs_once(caplog, hosts):
     assert len([r for r in caplog.records if r.levelno >= logging.ERROR]) == 1
 
 
-@pytest.mark.parametrize("raw", ['"unknown"', '"h2d"', '42', 'true', '[]', '{}'])
+@pytest.mark.parametrize("raw", ['"unknown"', '"x1e"', '42', 'true', '[]', '{}'])
 def test_invalid_host_pool_logs_once_and_ignores_only_that_entry(tmp_path, monkeypatch, caplog, raw):
     path = tmp_path / "config.toml"
     path.write_text('cloud_url = "https://example.invalid"\n[moonraker_hosts]\n'
@@ -73,6 +74,11 @@ def test_each_host_scopes_authorization_lanes_upload_and_start(door, monkeypatch
                       "ams": [{"trays": [{"slot": 0, "material": "PLA", "colorHex": "ABCDEF"}]}],
                       "vtTray": {"material": "PETG", "colorHex": "000000"} if POOLS[p][2] is None else None}
                      for p in HOSTS.values()]
+    for status in door.statuses:  # an H2D reports two extruders; its AMS units name the extruder they feed
+        if status["model"] == "H2D":
+            status["extruderCount"] = 2
+            status["nozzles"] = [{"id": 0, "extruderId": 0, "diameterMm": 0.4}, {"id": 1, "extruderId": 1, "diameterMm": 0.4}]
+            status["ams"][0]["extruderId"] = 0
     door.refresh()
     for name in (host, host.upper() + ".:8787"):
         status, body = door.request("/server/info", host=name)
@@ -120,7 +126,7 @@ def test_named_klipper_pool_still_requires_one_filament_and_site_spool(door, mon
 
 
 @pytest.mark.parametrize("host", [None, "100.64.0.1:8787", "[::1]:8787", "unknown.example:8787",
-    "h2d-printers.oes-mesh.internal", "x1c-printers.oes-mesh.internal.evil", "x" * 10000,
+    "x1e-printers.oes-mesh.internal", "x1c-printers.oes-mesh.internal.evil", "x" * 10000,
     "x1c-printers.oes-mesh.internal@evil", "evil@x1c-printers.oes-mesh.internal",
     "x1c-printers.oes-mesh.internal/path", "x1c-printers.oes-mesh.internal?x", "x1c-printers.oes-mesh.internal#x",
     "x1c-printers.oes-mesh.internal..", "x1c-printers.oes-mesh.internal:bad",

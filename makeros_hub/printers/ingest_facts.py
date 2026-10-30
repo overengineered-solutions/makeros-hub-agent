@@ -21,6 +21,7 @@ POOLS = {
     "p2s": ("P2S", {"Bambu Lab P2S", "PS P2S"}, "N7"),
     "a1-mini": ("A1 Mini", {"Bambu Lab A1 mini", "PS A1 mini"}, "N1"),
     "x1c": ("X1C", {"Bambu Lab X1 Carbon", "PS X1 Carbon"}, "BL-P001"),
+    "h2d": ("H2D", {"Bambu Lab H2D", "PS H2D"}, "O1D"),
 }
 MAX_ZIP_ENTRIES = 1024
 MAX_ZIP_DIRECTORY_BYTES = 2 * 1024**2

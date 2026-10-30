@@ -45,6 +45,7 @@ DEFAULT_MOONRAKER_HOSTS = {
     "a1mini-printers.oes-mesh.internal": "a1-mini",
     "sv08-printers.oes-mesh.internal": "sv08-max",
     "giga-printers.oes-mesh.internal": "giga",
+    "h2d-printers.oes-mesh.internal": "h2d",
 }
 VPRINTER_CODE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 
